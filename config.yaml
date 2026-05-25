@@ -3,7 +3,7 @@ remote_server:
   host: 127.0.0.1
   port: 8080
   project_id: openclaw
-  user_id: zx0522claude47
+  user_id: xxx
   url_path: /v1/env/gem
   http_client:
     max_retry_count: 1
@@ -19,15 +19,15 @@ s3:
 
 
 env_make:
-  image_name: swr.cn-southwest-2.myhuaweicloud.com/rl_team/openclaw:0.0.8
+  image_name: xxxx
   wait_for_ready: true
   wait_timeout: 300
   env_id: null
   runtime_type: k8s  # 运行时类型: k8s | docker | local
   rabbitmq:
     is_use: false  # 是否使用rabbitmq进行make
-    url: "amqp://guest:guest@7.242.108.134:5672/"
-    queue: "test.direct.reply.queue"
+    url: "xxx"
+    queue: "xxx"
     priority: 10
   args:
     resources:
