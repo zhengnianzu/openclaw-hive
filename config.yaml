@@ -62,6 +62,7 @@ run_config:
     task_failed_record: "failed.jsonl"  # 失败任务记录文件
     task_download_path: "downloads"
     main_code_tar: "uploads/openclaw-task.tar"
+    main_code_dir: ""  # 源码目录路径，非空时自动打包替代 main_code_tar，如 "openclaw-task"
     main_python_file: "openclaw_automation.py"  # start脚本文件
   obs:
     download_timeout: 1200

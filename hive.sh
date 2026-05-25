@@ -1,0 +1,266 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 默认配置文件
+CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
+
+# 解析参数
+ACTION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --start)
+            ACTION="start"
+            shift
+            ;;
+        --stop)
+            ACTION="stop"
+            shift
+            ;;
+        --restart)
+            ACTION="restart"
+            shift
+            ;;
+        --status)
+            ACTION="status"
+            shift
+            ;;
+        --clear)
+            ACTION="clear"
+            shift
+            ;;
+        --stats)
+            ACTION="stats"
+            shift
+            ;;
+        *)
+            echo "Usage: $0 {--start|--stop|--restart|--status|--clear|--stats} [--config <path>]"
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z "$ACTION" ]; then
+    echo "Usage: $0 {--start|--stop|--restart|--status|--clear|--stats} [--config <path>]"
+    exit 1
+fi
+
+# PID/LOG 按 config 文件名隔离，支持多实例并行
+CONFIG_BASENAME="$(basename "${CONFIG_FILE}" .yaml)"
+PID_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}.pid"
+LOG_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}.log"
+
+get_pid() {
+    if [ -f "$PID_FILE" ]; then
+        cat "$PID_FILE"
+    else
+        echo ""
+    fi
+}
+
+is_running() {
+    pid=$(get_pid)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+do_start() {
+    if is_running; then
+        pid=$(get_pid)
+        echo "Service is already running (PID: $pid, config: $CONFIG_FILE)"
+        return 1
+    fi
+    echo "Starting service (config: $CONFIG_FILE)..."
+    nohup python hive.py --config "$CONFIG_FILE" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "Service started (PID: $(get_pid), log: $LOG_FILE)"
+}
+
+do_stop() {
+    if ! is_running; then
+        echo "Service is not running (config: $CONFIG_FILE)"
+    else
+        pid=$(get_pid)
+        echo "Stopping service (PID: $pid)..."
+        kill "$pid" 2>/dev/null
+        rm -f "$PID_FILE"
+        echo "Service stopped"
+    fi
+    # 清理 pods
+    do_clear
+}
+
+do_restart() {
+    do_stop
+    sleep 2
+    do_start
+}
+
+do_status() {
+    if is_running; then
+        echo "$(get_pid)"
+    else
+        echo "0"
+    fi
+}
+
+do_clear() {
+    if [ -z "$CONFIG_FILE" ]; then
+        echo "Error: --config is required for clear"
+        exit 1
+    fi
+    echo "Clearing pods..."
+    python run_clear.py --config "$CONFIG_FILE" --delete
+}
+
+do_stats() {
+    python3 << 'PYEOF'
+import os, sys, re
+from collections import Counter
+
+try:
+    from omegaconf import OmegaConf
+except ImportError:
+    print("Error: omegaconf not installed (pip install omegaconf)")
+    sys.exit(1)
+
+config_file = os.environ.get("_STATS_CONFIG")
+log_file = os.environ.get("_STATS_LOG")
+pid_file = os.environ.get("_STATS_PID")
+
+cfg = OmegaConf.load(config_file)
+run_cfg = cfg.run_config
+
+input_path = run_cfg.task.task_input_path
+output_path = run_cfg.task.task_output_path
+complete_record = run_cfg.task.get("task_complete_record", "complete.jsonl")
+failed_record = run_cfg.task.get("task_failed_record", "failed.jsonl")
+complete_file = os.path.join(output_path, complete_record)
+failed_file = os.path.join(output_path, failed_record)
+
+# --- 基础统计 ---
+total = 0
+if os.path.isdir(input_path):
+    total = len([f for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f))])
+
+complete_set = set()
+if os.path.exists(complete_file):
+    with open(complete_file, "r") as f:
+        complete_set = set(line.strip() for line in f if line.strip())
+
+failed_set = set()
+if os.path.exists(failed_file):
+    with open(failed_file, "r") as f:
+        failed_set = set(line.strip() for line in f if line.strip())
+
+done = len(complete_set)
+fail = len(failed_set)
+finished = done + fail
+pending = total - finished
+rate = (done / finished * 100) if finished > 0 else 0
+
+# --- 进程状态 ---
+proc_status = "NOT RUNNING"
+if pid_file and os.path.exists(pid_file):
+    with open(pid_file) as f:
+        pid = f.read().strip()
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            proc_status = f"RUNNING (PID: {pid})"
+        except (OSError, ValueError):
+            proc_status = "NOT RUNNING (stale PID)"
+
+# --- 错误分类（从日志分析）---
+error_categories = Counter()
+error_pattern = re.compile(r"Task \d+ failed:.*?RuntimeError: (.+?)(?:\\n|$)")
+traceback_pattern = re.compile(r"Traceback \(most recent call last\)")
+
+error_keywords = [
+    ("Gateway startup timeout", "Gateway startup timeout"),
+    ("Gateway start failed", "Gateway start failed"),
+    ("Gateway start unexpected", "Gateway unexpected output"),
+    ("Failed to update port", "Port update failed"),
+    ("Script execution failed", "Script execution failed"),
+    ("Skill download failed", "Skill download failed"),
+    ("User profile download failed", "User profile download failed"),
+    ("Agents download failed", "Agents download failed"),
+    ("Upload failed", "OBS upload failed"),
+    ("upload .* failed", "File upload to sandbox failed"),
+    ("extract code failed", "Code extraction failed"),
+]
+
+if log_file and os.path.exists(log_file):
+    with open(log_file, "r", errors="replace") as f:
+        log_content = f.read()
+
+    for match in error_pattern.finditer(log_content):
+        msg = match.group(1)
+        classified = False
+        for keyword, category in error_keywords:
+            if re.search(keyword, msg, re.IGNORECASE):
+                error_categories[category] += 1
+                classified = True
+                break
+        if not classified:
+            error_categories["Other RuntimeError"] += 1
+
+    unmatched_tracebacks = len(traceback_pattern.findall(log_content)) - sum(error_categories.values())
+    if unmatched_tracebacks > 0:
+        error_categories["Uncategorized Traceback"] += unmatched_tracebacks
+
+# --- 输出 ---
+print("=" * 50)
+print(f"  Config:          {config_file}")
+print(f"  Process:         {proc_status}")
+print(f"  Total tasks:     {total}")
+print(f"  Completed:       {done}")
+print(f"  Failed:          {fail}")
+print(f"  Pending/Running: {pending}")
+print(f"  Success rate:    {rate:.1f}% ({done}/{finished} finished)")
+print("=" * 50)
+
+if error_categories:
+    print("\nError Breakdown (from log):")
+    for cat, cnt in error_categories.most_common():
+        print(f"  {cat:.<36s} {cnt}")
+
+if failed_set:
+    recent = sorted(failed_set)[-10:]
+    print(f"\nRecent Failures (last {len(recent)}):")
+    for t in recent:
+        print(f"  - {t}")
+
+if not error_categories and fail == 0 and done > 0:
+    print("\nAll finished tasks completed successfully.")
+PYEOF
+}
+
+case "$ACTION" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_restart
+        ;;
+    status)
+        do_status
+        ;;
+    clear)
+        do_clear
+        ;;
+    stats)
+        _STATS_CONFIG="$CONFIG_FILE" _STATS_LOG="$LOG_FILE" _STATS_PID="$PID_FILE" do_stats
+        ;;
+esac
+
+exit 0

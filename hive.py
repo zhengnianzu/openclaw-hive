@@ -76,6 +76,7 @@ class SandboxConfig:
     openclaw_remote_config_file: str = "/home/ma-user/.openclaw/openclaw.json"
     openclaw_local_config_file: str = "uploads/openclaw.json"
     openclaw_bash: str = "/usr/local/node22/bin/openclaw"
+    gateway_log: str = "gateway.log"
     openclaw_start_timeout: int = 10
     upload_session_dir: str = f"{home}/.openclaw/agents"
     user_proxy_model_local_file: str = "uploads/user_proxy_model.json"
@@ -92,6 +93,7 @@ class TaskConfig:
     task_failed_record: str = "failed.jsonl"
     task_download_path: str = "downloads"
     main_code_tar: str = "uploads/openclaw-task.tar"
+    main_code_dir: str = ""
     main_python_file: str = "openclaw_automation.py"
     main_python_timeout: int = 7200
     openclaw_gateway_timeout: int = 300
@@ -324,10 +326,14 @@ class OpenClawDistillationTask:
                     raise RuntimeError(f"Failed to update port: {result.msg}")
 
             # Start gateway
+            gateway_log_path = os.path.join(
+                self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
+            )
             gateway_cmd = [
                 "/bin/bash", "-c",
+                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
                 f"nohup {self.config.sandbox_config.openclaw_bash} gateway --port {port} "
-                f"> gateway.log 2>&1 & sleep {self.config.sandbox_config.openclaw_start_timeout} && cat gateway.log"
+                f"> {gateway_log_path} 2>&1 & sleep {self.config.sandbox_config.openclaw_start_timeout} && cat {gateway_log_path}"
             ]
             exec_request = ExtendExecCommand(
                 command=gateway_cmd,
@@ -488,6 +494,7 @@ class OpenClawDistillationTask:
 
         api_log = os.path.join(sandbox_cfg.workspace, code_stem, "api_use.log")
         run_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.result_log)
+        gateway_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.gateway_log)
         session_dir = sandbox_cfg.upload_session_dir
 
         upload_cmd = get_obsutil_uploader_command(
@@ -495,7 +502,7 @@ class OpenClawDistillationTask:
             local_folder_absolute_path=upload_dir,
             bucket_path=self.config.obs_config.traj_save_path,
         )
-        exec_cmd = f"mkdir -p {upload_dir} && cp -r {api_log} {run_log} {session_dir} {upload_dir} && {upload_cmd}"
+        exec_cmd = f"mkdir -p {upload_dir} && cp -r {api_log} {run_log} {gateway_log} {session_dir} {upload_dir} && {upload_cmd}"
 
         for retry in range(3, 0, -1):
             exec_request = ExtendExecCommand(
@@ -688,6 +695,20 @@ async def run_tasks(
         f"Starting {task_num} tasks (offset={task_start}) with {concurrent_num} workers, "
         f"total available: {len(config.run_input_config_files)}"
     )
+
+    # Auto-pack source directory if main_code_dir is set
+    if config.main_code_dir and os.path.isdir(config.main_code_dir):
+        dir_basename = os.path.basename(config.main_code_dir.rstrip(os.sep))
+        tar_path = os.path.join("uploads", f"{dir_basename}.tar")
+        logger.info(f"Auto-packing source dir: {config.main_code_dir} -> {tar_path}")
+        parent_dir = os.path.dirname(os.path.abspath(config.main_code_dir))
+        await asyncio.to_thread(
+            run_cmd_stream,
+            ["tar", "-cf", tar_path, "-C", parent_dir, dir_basename],
+            timeout=120,
+        )
+        config.main_code_tar = tar_path
+        logger.info(f"Auto-pack complete: {tar_path}")
 
     # Build task queue
     task_queue = asyncio.Queue()
