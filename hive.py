@@ -13,6 +13,7 @@ import copy
 import json
 import logging
 import os
+import re
 import random
 import shutil
 import subprocess
@@ -39,13 +40,48 @@ from execution_client.core.rmq_client import get_rmq_client
 # Module-level logger
 logger = ManageLogger(__name__).get_logger()
 
-# Add a clean log file (no timestamps) for easier reading
+# ---------------------------------------------------------------------------
+# Clean log file: no timestamps, filter out RPC noise, extract SSE stdout
+# ---------------------------------------------------------------------------
+_SSE_STDOUT_RE = re.compile(r"sse data: \[#\d+\]\[.*?\]: exit_code: \[.*?\], stdout: \[(.*)\], stderr:", re.DOTALL)
+
+class _CleanLogFilter(logging.Filter):
+    """Rewrite SSE stream logs to show only stdout content; drop RPC request/response noise."""
+
+    # client.py RPC logs we want to suppress
+    _SKIP_PREFIXES = ("[extend]request_id:", "[make]request_id:", "[make]request:")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+
+        # Drop low-value client.py RPC request/response logs
+        if record.filename == "client.py":
+            if any(msg.startswith(p) for p in self._SKIP_PREFIXES):
+                return False
+            # SSE stream: extract just the stdout content
+            m = _SSE_STDOUT_RE.search(msg)
+            if m:
+                stdout = m.group(1).strip()
+                if not stdout or stdout == "None":
+                    return False
+                record.msg = f"[SSE] {stdout}"
+                record.args = None
+                return True
+
+        return True
+
+
 _clean_log_path = os.path.join("outputs", "hive_clean.log")
 os.makedirs(os.path.dirname(_clean_log_path), exist_ok=True)
 _clean_handler = logging.FileHandler(_clean_log_path, mode="a")
 _clean_handler.setLevel(logging.DEBUG)
 _clean_handler.setFormatter(logging.Formatter("%(levelname)s|%(message)s"))
-logger.addHandler(_clean_handler)
+_clean_handler.addFilter(_CleanLogFilter())
+
+# Attach to root logger so it captures logs from all modules (client.py, etc.)
+_root_logger = logging.getLogger()
+_root_logger.addHandler(_clean_handler)
+_root_logger.setLevel(logging.DEBUG)
 
 # Async lock for file writes
 _file_lock = asyncio.Lock()
