@@ -77,7 +77,7 @@ do_start() {
         return 1
     fi
     echo "Starting service (config: $CONFIG_FILE)..."
-    nohup python hive.py --config "$CONFIG_FILE" >> "$LOG_FILE" 2>&1 &
+    nohup python hive.py --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo "Service started (PID: $(get_pid), log: $LOG_FILE)"
 }
@@ -94,6 +94,8 @@ do_stop() {
     fi
     # 清理 pods
     do_clear
+    # 删除环境信息数据库，避免残留
+    rm -f "${SCRIPT_DIR}/env_info.db"
 }
 
 do_restart() {
