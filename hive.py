@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import copy
 import json
+import logging
 import os
 import random
 import shutil
@@ -37,6 +38,14 @@ from execution_client.core.rmq_client import get_rmq_client
 
 # Module-level logger
 logger = ManageLogger(__name__).get_logger()
+
+# Add a clean log file (no timestamps) for easier reading
+_clean_log_path = os.path.join("outputs", "hive_clean.log")
+os.makedirs(os.path.dirname(_clean_log_path), exist_ok=True)
+_clean_handler = logging.FileHandler(_clean_log_path, mode="a")
+_clean_handler.setLevel(logging.DEBUG)
+_clean_handler.setFormatter(logging.Formatter("%(levelname)s|%(message)s"))
+logger.addHandler(_clean_handler)
 
 # Async lock for file writes
 _file_lock = asyncio.Lock()
