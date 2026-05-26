@@ -367,6 +367,7 @@ class OpenClawDistillationTask:
         command = (
             f"source /home/ma-user/.bashrc && cd {self.config.sandbox_config.workspace} && "
             f"mkdir -p {log_path} && cd {code_stem} && "
+            f"pip install -r requirements.txt && "
             f"python {python_file} --config {config_path} 2>&1 | "
             f"tee {log_path}/{self.config.sandbox_config.result_log}"
         )
