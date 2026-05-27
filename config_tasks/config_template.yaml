@@ -1,0 +1,104 @@
+# ============================================================================
+# OpenClaw V4 Hive 配置模板
+# 复制此文件到 task_configs/ 目录并重命名为 config_<任务名>.yaml
+# 例如: cp config_template.yaml task_configs/config_web_search.yaml
+# ============================================================================
+
+remote_server:
+  schema: http
+  host: 127.0.0.1
+  port: 8080
+  project_id: openclaw
+  user_id: your_user_id  # ⚠️ 必改：用户标识，用于 Pod 隔离和清理，建议格式: 姓名缩写+日期+模型
+  url_path: /v1/env/gem
+  http_client:
+    max_retry_count: 1
+    connect_timeout: 10.0
+    read_timeout: 180.0
+    write_timeout: 60.0
+
+
+s3:
+  s3_uploader_script: /home/ma-user/obsutil/obsutil
+  s3_download_script: /home/ma-user/obsutil/obsutil
+  bucket_name: "obs://rl-agentdata"
+
+
+env_make:
+  image_name: swr.cn-southwest-2.myhuaweicloud.com/rl_team/openclaw:0.0.6  # 目前稳定版本：0.0.6
+  wait_for_ready: true
+  wait_timeout: 300           
+  env_id: null                
+  runtime_type: k8s           
+  rabbitmq:
+    is_use: false             
+    url: "amqp://guest:guest@7.242.108.134:5672/"
+    queue: "test.direct.reply.queue"
+    priority: 10
+  args:
+    resources:
+      cpu_request: "1"
+      cpu_limit: "2"
+      memory_request: "5Gi"
+      memory_limit: "8Gi"
+    env:
+      - name: PIP_INDEX_URL
+        value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
+      - name: PIP_TRUSTED_HOST
+        value: "mirrors.huaweicloud.com"
+      - name: NODE_TLS_REJECT_UNAUTHORIZED
+        value: "0"
+      - name: SERPER_API_KEY
+        value: "your_serper_api_key"   # ⚠️ 必改：搜索 API Key
+
+
+run_config:
+  start_index: 0              # 从第几个子任务开始（跳过前 N 个）
+  total_num: 0                # 执行多少个子任务，0 = 全部执行
+  concurrent_num: 100         # ⚠️ 按需调整：并发 Worker 数（同时运行的 Pod 数）
+
+  sandbox:
+    result_log: "run.log"
+    openclaw_local_config_file: "uploads/openclaw.json" # gateway配置
+    user_proxy_model_local_file: "uploads/user_proxy_model.json" # 代理模型配置
+    openclaw_start_timeout: 10  # Gateway 启动等待（秒），镜像 >0.0.6 建议80
+
+  task:
+    task_input_path: "uploads/configs"          # 子任务 JSON 配置目录
+    task_output_path: "outputs/your_task_name"  # ⚠️ 必改：输出目录，多任务并行时用不同子目录
+    task_complete_record: "complete.jsonl"
+    task_failed_record: "failed.jsonl"
+    task_download_path: "downloads"
+    main_code_tar: "uploads/openclaw-task.tar"
+    main_python_file: "openclaw_automation.py"
+
+  obs:
+    download_timeout: 1200 
+    upload_timeout: 900
+    traj_save_bucket: "obs://rl-agentdata"
+
+    # ⚠️ 必改：轨迹上传路径，末尾不加 "/"
+    traj_save_path: "openclaw_trajs/your_traj_folder"
+
+    # 技能库下载的 OBS 默认路径，实际下载哪些 skill 由子任务 JSON 的 agents[0].skills 列表决定
+    skill_download_path: "skills/260325/skill_localize/skills_library"
+
+    # 子任务配置 OBS 路径
+    # - 非空：从 OBS 下载到 downloads/ 缓存，再复制到 uploads/configs/（覆盖本地）
+    # - 留空：使用本地 uploads/configs/ 目录中已有的 JSON 文件
+    user_config_download_path:
+
+    # 用户画像 OBS 路径
+    # - 非空：拼接子任务 JSON 中 input_dir.user_dir.path 作为子路径下载
+    # - 留空：跳过。注意如果子任务 JSON 引用了 user_dir.path 会报错
+    user_profile_download_path:
+
+    # Agent 会话配置 OBS 路径
+    # - 非空：下载整个目录到沙箱代码目录下
+    # - 留空：跳过
+    agents_download_path:
+
+    # 默认技能列表：无论子任务 JSON 的 agents[0].skills 是否为空，都会加载这些 skill
+    # 会与子任务中指定的 skills 合并（去重）后一起下载，无需加载默认技能可删除/置空
+    default_skills:
+      - "find-skills"
