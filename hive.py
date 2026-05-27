@@ -742,6 +742,12 @@ def main() -> None:
     config_obj = load_yaml_config(args.config)
     run_cfg = config_obj.run_config
 
+    # Isolate output/download paths by config name to avoid cross-contamination
+    config_basename = Path(args.config).stem
+    task_dict = OmegaConf.to_container(run_cfg.task, resolve=True)
+    task_dict["task_output_path"] = os.path.join(task_dict.get("task_output_path", "outputs"), config_basename)
+    task_dict["task_download_path"] = os.path.join(task_dict.get("task_download_path", "downloads"), config_basename)
+
     start_index = run_cfg.start_index
     total_num = run_cfg.total_num
     concurrent_num = run_cfg.concurrent_num
@@ -752,11 +758,12 @@ def main() -> None:
     print(f"  Start index: {start_index}, Total: {total_num}, Concurrent: {concurrent_num}")
     print(f"  OBS user_config: {run_cfg.obs.user_config_download_path}")
     print(f"  OBS user_profile: {run_cfg.obs.user_profile_download_path}")
+    print(f"  Output dir: {task_dict['task_output_path']}")
     print("=" * 60)
 
     task_config = TaskConfig(
         run_config_file=args.config,
-        **run_cfg.task,
+        **task_dict,
         obs_config=ObsBucketConfig(**run_cfg.obs),
         sandbox_config=SandboxConfig(**run_cfg.sandbox)
     )

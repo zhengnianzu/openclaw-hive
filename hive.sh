@@ -49,11 +49,13 @@ if [ -z "$ACTION" ]; then
     exit 1
 fi
 
-# PID/LOG 按 config 文件名隔离，支持多实例并行
+# PID/LOG 放到 output 目录下，按 config 文件名隔离
 CONFIG_BASENAME="$(basename "${CONFIG_FILE}" .yaml)"
-PID_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}.pid"
-LOG_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}.log"
-CLEAN_LOG_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}_clean.log"
+OUTPUT_DIR="${SCRIPT_DIR}/outputs/${CONFIG_BASENAME}"
+mkdir -p "$OUTPUT_DIR"
+PID_FILE="${OUTPUT_DIR}/hive.pid"
+LOG_FILE="${OUTPUT_DIR}/nohup.log"
+CLEAN_LOG_FILE="${OUTPUT_DIR}/nohup_clean.log"
 
 get_pid() {
     if [ -f "$PID_FILE" ]; then
