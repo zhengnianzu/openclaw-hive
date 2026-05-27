@@ -2,6 +2,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+
 # 默认配置文件
 CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 
@@ -199,6 +200,7 @@ error_keywords = [
     ("Upload failed", "OBS upload failed"),
     ("upload .* failed", "File upload to sandbox failed"),
     ("extract code failed", "Code extraction failed"),
+    ('LLM error api_error')
 ]
 
 if log_file and os.path.exists(log_file):
