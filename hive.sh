@@ -53,6 +53,7 @@ fi
 CONFIG_BASENAME="$(basename "${CONFIG_FILE}" .yaml)"
 PID_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}.pid"
 LOG_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}.log"
+CLEAN_LOG_FILE="${SCRIPT_DIR}/nohup_${CONFIG_BASENAME}_clean.log"
 
 get_pid() {
     if [ -f "$PID_FILE" ]; then
@@ -77,9 +78,9 @@ do_start() {
         return 1
     fi
     echo "Starting service (config: $CONFIG_FILE)..."
-    nohup python hive.py --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    RLXF_CLEAN_LOG_PATH="$CLEAN_LOG_FILE" nohup python hive.py --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
-    echo "Service started (PID: $(get_pid), log: $LOG_FILE)"
+    echo "Service started (PID: $(get_pid), log: $LOG_FILE, clean_log: $CLEAN_LOG_FILE)"
 }
 
 do_stop() {

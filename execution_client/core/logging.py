@@ -216,6 +216,16 @@ class ManageLogger:
             mox_handler.setFormatter(self.formatter)
             self.logger.addHandler(mox_handler)
 
+        # Clean log without timestamps (controlled by RLXF_CLEAN_LOG_PATH env var)
+        clean_log_path = os.environ.get("RLXF_CLEAN_LOG_PATH")
+        if clean_log_path:
+            os.makedirs(osp.dirname(clean_log_path) or ".", exist_ok=True)
+            clean_formatter = SafeFormatter("%(levelname)s|%(message)s")
+            clean_handler = logging.FileHandler(clean_log_path)
+            clean_handler.setLevel(self.level)
+            clean_handler.setFormatter(clean_formatter)
+            self.logger.addHandler(clean_handler)
+
     def __call__(self, *args, **kwargs):
         return self.wrap_interface_msg(**kwargs)
 
