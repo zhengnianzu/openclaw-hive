@@ -76,6 +76,7 @@ class SandboxConfig:
     openclaw_remote_config_file: str = "/home/ma-user/.openclaw/openclaw.json"
     openclaw_local_config_file: str = "uploads/openclaw.json"
     openclaw_bash: str = "/usr/local/node22/bin/openclaw"
+    gateway_log: str = "gateway.log"
     openclaw_start_timeout: int = 10
     upload_session_dir: str = f"{home}/.openclaw/agents"
     user_proxy_model_local_file: str = "uploads/user_proxy_model.json"
@@ -325,10 +326,14 @@ class OpenClawDistillationTask:
                     raise RuntimeError(f"Failed to update port: {result.msg}")
 
             # Start gateway
+            gateway_log_path = os.path.join(
+                self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
+            )
             gateway_cmd = [
                 "/bin/bash", "-c",
+                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
                 f"nohup {self.config.sandbox_config.openclaw_bash} gateway --port {port} "
-                f"> gateway.log 2>&1 & sleep {self.config.sandbox_config.openclaw_start_timeout} && cat gateway.log"
+                f"> {gateway_log_path} 2>&1 & sleep {self.config.sandbox_config.openclaw_start_timeout} && cat {gateway_log_path}"
             ]
             exec_request = ExtendExecCommand(
                 command=gateway_cmd,
@@ -495,7 +500,7 @@ class OpenClawDistillationTask:
 
         api_log = os.path.join(sandbox_cfg.workspace, code_stem, "api_use.log")
         run_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.result_log)
-        gateway_log = os.path.join(sandbox_cfg.home, "gateway.log")
+        gateway_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.gateway_log)
         session_dir = sandbox_cfg.upload_session_dir
         workspace_dir = sandbox_cfg.upload_workspace_dir
 

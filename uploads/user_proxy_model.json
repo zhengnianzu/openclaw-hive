@@ -1,5 +1,5 @@
 {
   "model": "gemini-3-flash-preview",
-  "api_key": "sk-18842394415-api",
+  "api_key": "your-api-key",
   "base_url": "http://192.168.30.95:8084"
 }

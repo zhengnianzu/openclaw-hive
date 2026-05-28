@@ -14,7 +14,7 @@
     "providers": {
       "local": {
         "baseUrl": "http://192.168.30.95:8084",
-        "apiKey": "sk-18842394415-api",
+        "apiKey": "your-api-key",
         "api": "anthropic-messages",
         "models": [
           {
@@ -75,7 +75,7 @@
     },
     "auth": {
       "mode": "token",
-      "token": "f18ccb1719a4978f7exx"
+      "token": "your-token"
     },
     "tailscale": {
       "mode": "off",
@@ -98,7 +98,7 @@
     "web": {
       "search": {
         "enabled": true,
-        "apiKey": "BSAGqO4xyWP9kyBfvitCOw2lT_6T_vb",
+        "apiKey": "your-api-key",
         "timeoutSeconds": 600
       },
       "fetch": {

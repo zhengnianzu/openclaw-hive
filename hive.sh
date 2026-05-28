@@ -2,7 +2,6 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-
 # 默认配置文件
 CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 

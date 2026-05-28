@@ -43,7 +43,7 @@ env_make:
       - name: NODE_TLS_REJECT_UNAUTHORIZED
         value: "0"
       - name: SERPER_API_KEY
-        value: 36b77e7659c306a2dc35cbd0b7caced8eb21c78f
+        value: your-api-key
 
 
 run_config:
@@ -70,8 +70,10 @@ run_config:
     traj_save_bucket: "obs://rl-agentdata"
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
     traj_save_path: "openclaw_trajs/traj_0522_webconfig"
-    workspace_save_path: "openclaw_trajs/traj_0522_webconfig_workspace"
     skill_download_path: "skills/260325/skill_localize/skills_library"
     user_config_download_path: "task_data/260520/web_configs"
     user_profile_download_path: 
     agents_download_path: "task_data/260413_noenv/noenv_configs/agents"
+    default_skills: # 注意文件名
+      - "find-skills"
+      - "skill-scope"
