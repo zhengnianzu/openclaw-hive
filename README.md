@@ -344,6 +344,15 @@ python run_clear.py --config config.yaml --delete
 - 检查 `s3.bucket_name` 配置
 - 上传操作已内置 3 次重试
 
+## 镜像版本说明
+
+| 镜像版本 | 对应 OpenClaw 版本 | 备注 |
+|---------|-------------------|------|
+| 0.0.6   | 2026.3.2          | 旧版本 |
+| 0.0.8   | 2026.4.26         | Gateway 启动较慢，`openclaw_start_timeout` 建议 ≥60 |
+
+---
+
 ## 环境要求
 
 - Python 3.10+

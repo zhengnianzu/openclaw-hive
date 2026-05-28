@@ -199,6 +199,7 @@ error_keywords = [
     ("Upload failed", "OBS upload failed"),
     ("upload .* failed", "File upload to sandbox failed"),
     ("extract code failed", "Code extraction failed"),
+    ('LLM error api_error')
 ]
 
 if log_file and os.path.exists(log_file):

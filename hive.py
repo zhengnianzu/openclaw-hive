@@ -61,7 +61,7 @@ class ObsBucketConfig:
     user_profile_download_path: str = ""
     user_config_download_path: str = ""
     agents_download_path: str = ""
-    workspace_save_path: str = ""
+    default_skills: list = field(default_factory=list)
 
 
 @dataclass
@@ -386,7 +386,13 @@ class OpenClawDistillationTask:
         """Download skills from S3 to sandbox."""
         data_cfg = parse_data_config(data_config_file)
 
-        if not data_cfg.agents or not data_cfg.agents[0].get("skills"):
+        task_skills = []
+        if data_cfg.agents and data_cfg.agents[0].get("skills"):
+            task_skills = data_cfg.agents[0]["skills"]
+
+        all_skills = list(set(task_skills + (self.config.obs_config.default_skills or [])))
+
+        if not all_skills:
             self.logger.warning("No skills found, skipping download")
             return
 
@@ -409,9 +415,8 @@ class OpenClawDistillationTask:
                 raise RuntimeError(f"Skill download failed: {result.msg}")
 
         start_time = time.time()
-        skills = data_cfg.agents[0]["skills"]
-        await asyncio.gather(*[download_skill(s) for s in skills])
-        self.logger.info(f"Downloaded {len(skills)} skills in {time.time() - start_time:.1f}s")
+        await asyncio.gather(*[download_skill(s) for s in all_skills])
+        self.logger.info(f"Downloaded {len(all_skills)} skills in {time.time() - start_time:.1f}s")
 
     async def _download_s3_user_profile(self, data_config_file: str) -> None:
         """Download user profile from S3 to sandbox."""
@@ -497,13 +502,14 @@ class OpenClawDistillationTask:
         run_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.result_log)
         gateway_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.gateway_log)
         session_dir = sandbox_cfg.upload_session_dir
+        workspace_dir = sandbox_cfg.upload_workspace_dir
 
         upload_cmd = get_obsutil_uploader_command(
             self.client_config.s3,
             local_folder_absolute_path=upload_dir,
             bucket_path=self.config.obs_config.traj_save_path,
         )
-        exec_cmd = f"mkdir -p {upload_dir} && cp -r {api_log} {run_log} {gateway_log} {session_dir} {upload_dir} && {upload_cmd}"
+        exec_cmd = f"mkdir -p {upload_dir} && cp -r {api_log} {run_log} {gateway_log} {session_dir} {workspace_dir} {upload_dir} && {upload_cmd}"
 
         for retry in range(3, 0, -1):
             exec_request = ExtendExecCommand(
@@ -513,33 +519,6 @@ class OpenClawDistillationTask:
             result = await self.execution_client.extend(args=exec_request.to_dict())
             if result.code == ErrorCode.SUCCESS[0]:
                 self.logger.info(f"Uploaded traj to OBS: {config_file}")
-                return True
-
-            self.logger.warning(f"Upload failed, {retry} retries left: {result.msg}")
-            await asyncio.sleep(random.uniform(3, 10))
-
-        return False
-
-
-    async def _upload_workspace_to_obs(self, config_file: str) -> bool:
-        """Upload execution workspace to OBS."""
-        sandbox_cfg = self.config.sandbox_config
-        workspace_dir = sandbox_cfg.upload_workspace_dir
-
-        upload_cmd = get_obsutil_uploader_command(
-            self.client_config.s3,
-            local_folder_absolute_path=workspace_dir,
-            bucket_path=self.config.obs_config.workspace_save_path,
-        )
-      
-        for retry in range(3, 0, -1):
-            exec_request = ExtendExecCommand(
-                command=["/bin/bash", "-c", upload_cmd],
-                timeout=self.config.obs_config.upload_timeout,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code == ErrorCode.SUCCESS[0]:
-                self.logger.info(f"Uploaded workspace to OBS: {workspace_dir}")
                 return True
 
             self.logger.warning(f"Upload failed, {retry} retries left: {result.msg}")
@@ -559,8 +538,7 @@ class OpenClawDistillationTask:
         await self._run_main_script(config_file, task_idx)
 
         uploaded = await self._upload_traj_to_obs(config_file)
-        uploaded_1 = await self._upload_workspace_to_obs(config_file)
-        if uploaded and uploaded_1:
+        if uploaded:
             await self._save_record(self.complete_record_file, config_file)
         else:
             await self._save_record(self.failed_record_file, config_file)
