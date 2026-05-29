@@ -563,8 +563,8 @@ class OpenClawDistillationTask:
             self.logger.error(f"Task {task_idx} failed: {traceback.format_exc()}")
             await self._save_record(self.failed_record_file, config_file)
         finally:
-            # if self.execution_client is not None:
-            #     await self.execution_client.close()
+            if self.execution_client is not None:
+                await self.execution_client.close()
             self.logger.info(f"Task {task_idx} finished, elapsed={time.time() - start_time:.1f}s")
 
 
