@@ -390,23 +390,32 @@ class OpenClawDistillationTask:
         if data_cfg.agents and data_cfg.agents[0].get("skills"):
             task_skills = data_cfg.agents[0]["skills"]
 
-        all_skills = list(set(task_skills + (self.config.obs_config.default_skills or [])))
+        default_skills = self.config.obs_config.default_skills or []
 
-        if not all_skills:
+        if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
             return
 
-        async def download_skill(skill_path: str) -> None:
+        # task_skills 下载到 workspace/openclaw-task/{skill_dir}, openclaw_automation.py 对齐
+        code_stem = Path(self.config.main_code_tar).stem
+        skill_dir = data_cfg.input_dir.get("skill_dir", "skills")
+        task_target_path = os.path.join(
+            self.config.sandbox_config.workspace, code_stem, skill_dir
+        )
+        # default_skills 下载到 ~/.openclaw/skills
+        default_target_path = f"{self.config.sandbox_config.target_skill_path}"
+
+        async def download_skill(skill_path: str, target_path: str) -> None:
             bucket_path = os.path.join(
                 self.config.obs_config.skill_download_path, skill_path
             ) + "/"
             command = get_obsutil_downloader_command(
                 self.client_config.s3,
-                objects_storage_path=self.config.sandbox_config.target_skill_path,
+                objects_storage_path=target_path,
                 bucket_path=bucket_path,
             )
             exec_request = ExtendExecCommand(
-                command=["/bin/bash", "-c", command],
+                command=["/bin/bash", "-c", f"mkdir -p {target_path} && {command}"],
                 timeout=self.config.obs_config.download_timeout,
                 mode="stream",
             )
@@ -415,8 +424,13 @@ class OpenClawDistillationTask:
                 raise RuntimeError(f"Skill download failed: {result.msg}")
 
         start_time = time.time()
-        await asyncio.gather(*[download_skill(s) for s in all_skills])
-        self.logger.info(f"Downloaded {len(all_skills)} skills in {time.time() - start_time:.1f}s")
+        tasks = []
+        for s in set(task_skills):
+            tasks.append(download_skill(s, task_target_path))
+        for s in set(default_skills):
+            tasks.append(download_skill(s, default_target_path))
+        await asyncio.gather(*tasks)
+        self.logger.info(f"Downloaded skills (task={len(task_skills)}, default={len(default_skills)}) in {time.time() - start_time:.1f}s")
 
     async def _download_s3_user_profile(self, data_config_file: str) -> None:
         """Download user profile from S3 to sandbox."""
