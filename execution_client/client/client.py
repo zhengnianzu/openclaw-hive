@@ -272,7 +272,7 @@ async def make(request: EnvMakeRequest, config: DictConfig, rmq_client: RmqClien
     return result
 
 
-def delete_env(config: DictConfig):
+def delete_env(config: DictConfig, env_ids: list = None):
     client_config = config.remote_server.http_client
     http_config = AsyncHttpClientConfig(max_retry_count=client_config.max_retry_count, 
                                         connect_timeout=client_config.connect_timeout,
@@ -287,6 +287,6 @@ def delete_env(config: DictConfig):
             soft_delete_env_info(env_id)
 
     async def close_all_clients():
-        tasks = [close_client(env_id) for env_id in get_all_use_env_id()]
+        tasks = [close_client(env_id) for env_id in env_ids]
         await asyncio.gather(*tasks)
     asyncio.run(close_all_clients())
