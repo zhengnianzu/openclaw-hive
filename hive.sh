@@ -7,11 +7,17 @@ CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 
 # 解析参数
 ACTION=""
+FAILED_MODE=false   # 仅执行失败标志
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)
             CONFIG_FILE="$2"
             shift 2
+            ;;
+        --failed)
+            FAILED_MODE=true
+            shift
             ;;
         --start)
             ACTION="start"
@@ -38,14 +44,15 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            echo "Usage: $0 {--start|--stop|--restart|--status|--clear|--stats} [--config <path>]"
+            echo "Usage: $0 {--start|--stop|--restart|--status|--clear|--stats} [--config <path>] [--failed]"
+            echo "  --failed : only effective when used with --start, passes --failed to hive.py"
             exit 1
             ;;
     esac
 done
 
 if [ -z "$ACTION" ]; then
-    echo "Usage: $0 {--start|--stop|--restart|--status|--clear|--stats} [--config <path>]"
+    echo "Usage: $0 {--start|--stop|--restart|--status|--clear|--stats} [--config <path>] [--failed]"
     exit 1
 fi
 
@@ -80,7 +87,12 @@ do_start() {
         return 1
     fi
     echo "Starting service (config: $CONFIG_FILE)..."
-    RLXF_CLEAN_LOG_PATH="$CLEAN_LOG_FILE" nohup python hive.py --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    # 构造命令
+    local cmd_args=("python" "hive.py" "--config" "$CONFIG_FILE")
+    if [ "$FAILED_MODE" = true ]; then
+        cmd_args+=("--failed")
+    fi
+    RLXF_CLEAN_LOG_PATH="$CLEAN_LOG_FILE" nohup "${cmd_args[@]}" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo "Service started (PID: $(get_pid), log: $LOG_FILE, clean_log: $CLEAN_LOG_FILE)"
 }
@@ -96,9 +108,7 @@ do_stop() {
         echo "Service stopped"
     fi
     # 清理 pods
-    do_clear
-    # 删除环境信息数据库，避免残留
-    rm -f "${SCRIPT_DIR}/env_info.db"
+    python run_clear.py --config "$CONFIG_FILE"
 }
 
 do_restart() {
@@ -116,12 +126,10 @@ do_status() {
 }
 
 do_clear() {
-    if [ -z "$CONFIG_FILE" ]; then
-        echo "Error: --config is required for clear"
-        exit 1
-    fi
     echo "Clearing pods..."
-    python run_clear.py --config "$CONFIG_FILE" --delete
+    python run_clear.py --config "$CONFIG_FILE" --del_all
+    # 删除环境信息数据库，避免残留
+    rm -f "${SCRIPT_DIR}/env_info.db"
 }
 
 do_stats() {
@@ -138,21 +146,24 @@ except ImportError:
 config_file = os.environ.get("_STATS_CONFIG")
 log_file = os.environ.get("_STATS_LOG")
 pid_file = os.environ.get("_STATS_PID")
+output_dir = os.environ.get("_STATS_OUTPUT")
 
 cfg = OmegaConf.load(config_file)
 run_cfg = cfg.run_config
 
 input_path = run_cfg.task.task_input_path
-output_path = run_cfg.task.task_output_path
 complete_record = run_cfg.task.get("task_complete_record", "complete.jsonl")
 failed_record = run_cfg.task.get("task_failed_record", "failed.jsonl")
-complete_file = os.path.join(output_path, complete_record)
-failed_file = os.path.join(output_path, failed_record)
+complete_file = os.path.join(output_dir, complete_record)
+failed_file = os.path.join(output_dir, failed_record)
 
 # --- 基础统计 ---
 total = 0
-if os.path.isdir(input_path):
-    total = len([f for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f))])
+if run_cfg.total_num != 0:
+    total = run_cfg.total_num
+else:
+    if os.path.isdir(input_path):
+        total = len([f for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f))])
 
 complete_set = set()
 if os.path.exists(complete_file):
@@ -224,6 +235,7 @@ if log_file and os.path.exists(log_file):
 # --- 输出 ---
 print("=" * 50)
 print(f"  Config:          {config_file}")
+print(f"  Output:          {output_dir}")
 print(f"  Process:         {proc_status}")
 print(f"  Total tasks:     {total}")
 print(f"  Completed:       {done}")
@@ -236,12 +248,6 @@ if error_categories:
     print("\nError Breakdown (from log):")
     for cat, cnt in error_categories.most_common():
         print(f"  {cat:.<36s} {cnt}")
-
-if failed_set:
-    recent = sorted(failed_set)[-10:]
-    print(f"\nRecent Failures (last {len(recent)}):")
-    for t in recent:
-        print(f"  - {t}")
 
 if not error_categories and fail == 0 and done > 0:
     print("\nAll finished tasks completed successfully.")
@@ -265,7 +271,7 @@ case "$ACTION" in
         do_clear
         ;;
     stats)
-        _STATS_CONFIG="$CONFIG_FILE" _STATS_LOG="$LOG_FILE" _STATS_PID="$PID_FILE" do_stats
+        _STATS_CONFIG="$CONFIG_FILE" _STATS_LOG="$LOG_FILE" _STATS_PID="$PID_FILE" _STATS_OUTPUT="$OUTPUT_DIR" do_stats
         ;;
 esac
 
