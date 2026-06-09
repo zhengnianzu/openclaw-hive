@@ -117,7 +117,20 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
     if req.agent_dir:
         base.run_config.obs.agents_download_path = req.agent_dir
     if req.user_config_dir:
-        base.run_config.obs.user_config_download_path = req.user_config_dir
+        # 直接下载到实例目录，hive.py 不再重复下载
+        configs_dir = os.path.join(instance_dir, "configs")
+        os.makedirs(configs_dir, exist_ok=True)
+        obs_src = f"{base.s3.bucket_name}/{req.user_config_dir}"
+        if not obs_src.endswith("/"):
+            obs_src += "/"
+        ret = subprocess.run(
+            [settings.OBSUTIL_PATH, "cp", obs_src, configs_dir, "-r", "-f"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if ret.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"OBS下载失败: {ret.stderr[:500]}")
+        base.run_config.task.task_input_path = configs_dir
+        base.run_config.obs.user_config_download_path = ""
     if req.user_profile_dir:
         base.run_config.obs.user_profile_download_path = req.user_profile_dir
     if req.traj_save_path:
@@ -172,7 +185,7 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
 
     # --- 4. 统计任务数并入库 ---
     total_tasks = 0
-    task_input = base.run_config.task.task_input_path
+    task_input = str(base.run_config.task.task_input_path)
     if os.path.isdir(task_input):
         total_tasks = len([f for f in os.listdir(task_input) if os.path.isfile(os.path.join(task_input, f))])
 
