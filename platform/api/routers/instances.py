@@ -1,8 +1,9 @@
-import asyncio
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -18,6 +19,12 @@ from ..core.security import get_current_user
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
+
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json"}
+
+
+def _get_instance_dir(instance_id: str) -> str:
+    return os.path.join(settings.HIVE_ROOT, "platform", "instances", instance_id)
 
 
 def _get_output_dir(config_path: str) -> str:
@@ -43,7 +50,6 @@ def _is_pid_running(pid: int) -> bool:
 
 
 def _sync_instance_status(instance: dict) -> dict:
-    """Refresh status based on actual PID state and completion records."""
     inst = dict(instance)
     output_dir = _get_output_dir(inst["config_path"])
 
@@ -69,12 +75,14 @@ def _sync_instance_status(instance: dict) -> dict:
     return inst
 
 
+# ============================================================================
+# CRUD
+# ============================================================================
+
 @router.get("", response_model=list[InstanceInfo])
 def list_instances(user: dict = Depends(get_current_user)):
     with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM task_instances ORDER BY created_at DESC"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM task_instances ORDER BY created_at DESC").fetchall()
     return [InstanceInfo(**_sync_instance_status(dict(r))) for r in rows]
 
 
@@ -90,13 +98,15 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
 @router.post("", response_model=InstanceInfo)
 def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user)):
     instance_id = uuid.uuid4().hex[:12]
+    instance_dir = _get_instance_dir(instance_id)
+    os.makedirs(instance_dir, exist_ok=True)
 
+    # --- 1. 生成 config.yaml ---
     template_path = settings.CONFIG_TEMPLATE
     if not os.path.exists(template_path):
         raise HTTPException(status_code=500, detail=f"模板配置文件不存在: {template_path}")
 
     base = OmegaConf.load(template_path)
-
     base.remote_server.user_id = req.task_name
     base.run_config.concurrent_num = req.concurrent_num
     base.run_config.start_index = req.start_index
@@ -117,12 +127,50 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
     if req.image_name:
         base.env_make.image_name = req.image_name
 
-    configs_dir = os.path.join(settings.HIVE_ROOT, "platform", "configs")
-    os.makedirs(configs_dir, exist_ok=True)
-    config_filename = f"config-{instance_id}.yaml"
-    config_path = os.path.join(configs_dir, config_filename)
+    openclaw_path = os.path.join(instance_dir, "openclaw.json")
+    user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
+    base.run_config.sandbox.openclaw_local_config_file = openclaw_path
+    base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
+
+    config_path = os.path.join(instance_dir, "config.yaml")
     OmegaConf.save(base, config_path)
 
+    # --- 2. 生成 openclaw.json ---
+    openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
+    with open(openclaw_template, "r", encoding="utf-8") as f:
+        openclaw_cfg = json.load(f)
+
+    if req.model_api_key:
+        openclaw_cfg["models"]["providers"]["local"]["apiKey"] = req.model_api_key
+    if req.model_base_url:
+        openclaw_cfg["models"]["providers"]["local"]["baseUrl"] = req.model_base_url
+    if req.model_id:
+        models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
+        if models_list:
+            models_list[0]["id"] = req.model_id
+            models_list[0]["name"] = req.model_id
+        openclaw_cfg["agents"]["defaults"]["model"]["primary"] = f"local/{req.model_id}"
+        openclaw_cfg["agents"]["defaults"]["models"] = {f"local/{req.model_id}": {}}
+
+    with open(openclaw_path, "w", encoding="utf-8") as f:
+        json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
+
+    # --- 3. 生成 user_proxy_model.json ---
+    user_proxy_template = os.path.join(settings.SETTINGS_DIR, "user_proxy_model.json")
+    with open(user_proxy_template, "r", encoding="utf-8") as f:
+        user_proxy_cfg = json.load(f)
+
+    if req.user_proxy_model_name:
+        user_proxy_cfg["model"] = req.user_proxy_model_name
+    if req.user_proxy_api_key:
+        user_proxy_cfg["api_key"] = req.user_proxy_api_key
+    if req.user_proxy_base_url:
+        user_proxy_cfg["base_url"] = req.user_proxy_base_url
+
+    with open(user_proxy_path, "w", encoding="utf-8") as f:
+        json.dump(user_proxy_cfg, f, indent=2, ensure_ascii=False)
+
+    # --- 4. 统计任务数并入库 ---
     total_tasks = 0
     task_input = base.run_config.task.task_input_path
     if os.path.isdir(task_input):
@@ -140,6 +188,48 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
 
     return InstanceInfo(**dict(row))
 
+
+# ============================================================================
+# 配置查看
+# ============================================================================
+
+@router.get("/{instance_id}/configs")
+def list_instance_configs(instance_id: str, user: dict = Depends(get_current_user)):
+    instance_dir = _get_instance_dir(instance_id)
+    if not os.path.isdir(instance_dir):
+        raise HTTPException(status_code=404, detail="实例目录不存在")
+
+    files = []
+    for name in ALLOWED_CONFIG_FILES:
+        fpath = os.path.join(instance_dir, name)
+        if os.path.exists(fpath):
+            files.append({
+                "name": name,
+                "size": os.path.getsize(fpath),
+                "modified_at": datetime.fromtimestamp(os.path.getmtime(fpath)).isoformat(),
+            })
+    return {"instance_id": instance_id, "files": files}
+
+
+@router.get("/{instance_id}/configs/{filename}")
+def get_instance_config(instance_id: str, filename: str, user: dict = Depends(get_current_user)):
+    if filename not in ALLOWED_CONFIG_FILES:
+        raise HTTPException(status_code=400, detail=f"不允许访问的文件: {filename}")
+
+    fpath = os.path.join(_get_instance_dir(instance_id), filename)
+    if not os.path.exists(fpath):
+        raise HTTPException(status_code=404, detail="配置文件不存在")
+
+    with open(fpath, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    file_type = "yaml" if filename.endswith(".yaml") else "json"
+    return {"filename": filename, "type": file_type, "content": content}
+
+
+# ============================================================================
+# 启动 / 停止 / 重跑
+# ============================================================================
 
 @router.post("/{instance_id}/start")
 def start_instance(instance_id: str, user: dict = Depends(get_current_user)):
@@ -162,7 +252,6 @@ def start_instance(instance_id: str, user: dict = Depends(get_current_user)):
     env = os.environ.copy()
     env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
 
-    import subprocess
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
             ["python", hive_py, "--config", config_path],
@@ -196,7 +285,6 @@ def stop_instance(instance_id: str, user: dict = Depends(get_current_user)):
         except ProcessLookupError:
             pass
 
-    import subprocess
     config_path = inst["config_path"]
     subprocess.Popen(
         ["python", os.path.join(settings.HIVE_ROOT, "run_clear.py"), "--config", config_path],
@@ -233,7 +321,6 @@ def retry_failed(instance_id: str, user: dict = Depends(get_current_user)):
     env = os.environ.copy()
     env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
 
-    import subprocess
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
             ["python", hive_py, "--config", config_path, "--failed"],
@@ -330,8 +417,9 @@ def delete_instance(instance_id: str, user: dict = Depends(get_current_user)):
     if inst["status"] == "running" and _is_pid_running(inst.get("pid")):
         raise HTTPException(status_code=400, detail="实例正在运行中，请先停止")
 
-    if os.path.exists(inst["config_path"]):
-        os.remove(inst["config_path"])
+    instance_dir = _get_instance_dir(instance_id)
+    if os.path.isdir(instance_dir):
+        shutil.rmtree(instance_dir)
 
     with get_connection() as conn:
         conn.execute("DELETE FROM task_instances WHERE id=?", (instance_id,))

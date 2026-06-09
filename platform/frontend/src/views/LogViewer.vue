@@ -1,16 +1,23 @@
 <template>
   <div>
     <el-page-header @back="$router.push('/dashboard')" style="margin-bottom:20px">
-      <template #content>实时日志 - {{ inst.name || route.params.id }}</template>
+      <template #content>日志查看 - {{ inst.name || route.params.id }}</template>
     </el-page-header>
 
     <el-radio-group v-model="logMode" style="margin-bottom:12px">
-      <el-radio-button value="realtime">实时日志</el-radio-button>
       <el-radio-button value="main">主进程日志</el-radio-button>
+      <el-radio-button value="realtime">实时日志</el-radio-button>
       <el-radio-button value="clean">错误日志</el-radio-button>
     </el-radio-group>
 
-    <el-input v-model="filterKeyword" placeholder="过滤关键词..." clearable style="width:300px;margin-left:12px;margin-bottom:12px" />
+    <el-select v-model="selectedTask" placeholder="按任务过滤" clearable style="width:280px;margin-left:12px;margin-bottom:12px"
+      @change="onTaskFilterChange" filterable>
+      <el-option v-for="t in taskList" :key="t.task_idx"
+        :label="`Task ${t.task_idx} - ${t.config_name || t.env_id}`"
+        :value="t.env_id || t.config_name" />
+    </el-select>
+
+    <el-input v-model="filterKeyword" placeholder="过滤关键词..." clearable style="width:200px;margin-left:12px;margin-bottom:12px" />
 
     <el-button @click="scrollToBottom" style="margin-left:12px">滚到底部</el-button>
     <el-button @click="clearLogs" style="margin-left:4px">清屏</el-button>
@@ -33,17 +40,30 @@ import api from '../api'
 const route = useRoute()
 const id = route.params.id
 const inst = ref({})
-const logMode = ref('realtime')
+const logMode = ref('main')
 const filterKeyword = ref('')
 const logLines = ref([])
 const logContainer = ref(null)
+const taskList = ref([])
+const selectedTask = ref('')
 let ws = null
 
 const filteredLines = computed(() => {
-  if (!filterKeyword.value) return logLines.value
-  const kw = filterKeyword.value.toLowerCase()
-  return logLines.value.filter(l => l.toLowerCase().includes(kw))
+  let lines = logLines.value
+  if (selectedTask.value) {
+    const kw = selectedTask.value.toLowerCase()
+    lines = lines.filter(l => l.toLowerCase().includes(kw))
+  }
+  if (filterKeyword.value) {
+    const kw = filterKeyword.value.toLowerCase()
+    lines = lines.filter(l => l.toLowerCase().includes(kw))
+  }
+  return lines
 })
+
+function onTaskFilterChange() {
+  // 切换任务过滤时清空关键词避免冲突
+}
 
 function lineClass(line) {
   if (/error|failed|exception|traceback/i.test(line)) return 'log-error'
@@ -86,6 +106,13 @@ async function loadStaticLogs(type) {
   } catch { /* handled by interceptor */ }
 }
 
+async function loadTaskList() {
+  try {
+    const res = await api.get(`/logs/${id}/tasks`)
+    taskList.value = res.tasks || []
+  } catch { /* ignore */ }
+}
+
 watch(logMode, (mode) => {
   logLines.value = []
   if (mode === 'realtime') connectWs()
@@ -97,7 +124,8 @@ watch(logMode, (mode) => {
 
 onMounted(async () => {
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
-  connectWs()
+  loadTaskList()
+  loadStaticLogs('main')
 })
 onUnmounted(() => { if (ws) ws.close() })
 </script>

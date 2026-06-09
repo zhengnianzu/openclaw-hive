@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +66,40 @@ async def get_clean_log(
     total = len(all_lines)
     lines = all_lines[-tail:] if tail < total else all_lines
     return {"lines": [l.rstrip("\n") for l in lines], "total_lines": total}
+
+
+@router.get("/{instance_id}/tasks")
+async def list_log_tasks(
+    instance_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """解析 nohup.log 提取所有任务的 task_idx / env_id / config_name。"""
+    inst = _get_instance(instance_id)
+    output_dir = _get_output_dir(inst["config_path"])
+    log_file = os.path.join(output_dir, "nohup.log")
+    if not os.path.exists(log_file):
+        return {"tasks": []}
+
+    # 匹配: "Worker {w} starting task {idx}: {config_name}"
+    start_pattern = re.compile(r"Worker (\d+) starting task (\d+): (.+?) =")
+    # 匹配: "Task {idx}: env={env_id}"
+    env_pattern = re.compile(r"Task (\d+): env=(\w+)")
+
+    tasks = {}
+    async with aiofiles.open(log_file, "r", errors="replace") as f:
+        async for line in f:
+            m = start_pattern.search(line)
+            if m:
+                idx = m.group(2)
+                tasks.setdefault(idx, {"task_idx": idx, "config_name": m.group(3), "env_id": ""})
+            m = env_pattern.search(line)
+            if m:
+                idx = m.group(1)
+                tasks.setdefault(idx, {"task_idx": idx, "config_name": "", "env_id": ""})
+                tasks[idx]["env_id"] = m.group(2)
+
+    sorted_tasks = sorted(tasks.values(), key=lambda t: int(t["task_idx"]))
+    return {"tasks": sorted_tasks}
 
 
 @router.websocket("/ws/{instance_id}")

@@ -12,9 +12,18 @@ class InstanceCreate(BaseModel):
     concurrent_num: int = 100
     image_name: Optional[str] = None
     traj_save_path: Optional[str] = None
-    openclaw_config: Optional[str] = None
     start_index: int = 0
     total_num: int = 0
+
+    # openclaw.json 可配置项
+    model_api_key: str = ""
+    model_base_url: str = ""
+    model_id: str = ""
+
+    # user_proxy_model.json 可配置项
+    user_proxy_model_name: str = ""
+    user_proxy_api_key: str = ""
+    user_proxy_base_url: str = ""
 
 
 class InstanceInfo(BaseModel):

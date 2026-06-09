@@ -15,6 +15,7 @@ platform/platform.log
 platform/platform.pid
 platform/tmp/
 platform/configs/
+platform/instances/
 
 # obsutil 二进制（太大，各环境自行部署）
 platform/obsutil/

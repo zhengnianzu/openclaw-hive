@@ -58,6 +58,16 @@
       </el-col>
     </el-row>
 
+    <!-- 配置文件查看 -->
+    <el-card header="配置文件" style="margin-top:20px">
+      <el-tabs v-model="activeConfigTab" @tab-change="loadConfigContent">
+        <el-tab-pane v-for="cf in configFiles" :key="cf.name" :label="cf.name" :name="cf.name" />
+      </el-tabs>
+      <el-button size="small" style="margin-bottom:12px" @click="loadConfigFiles" :loading="configLoading">刷新</el-button>
+      <pre class="config-preview" v-if="configContent">{{ configContent }}</pre>
+      <el-empty v-else-if="!configLoading" description="选择配置文件查看" :image-size="40" />
+    </el-card>
+
     <!-- OBS Logs Section -->
     <el-card header="OBS 历史日志" style="margin-top:20px" v-if="['completed','finished','stopped'].includes(inst.status)">
       <el-button @click="loadObsLogs" :loading="obsLoading" style="margin-bottom:12px">加载OBS日志列表</el-button>
@@ -140,6 +150,32 @@ const obsLoading = ref(false)
 const obsLogVisible = ref(false)
 const obsLogContent = ref('')
 
+// Config Files
+const configFiles = ref([])
+const configLoading = ref(false)
+const activeConfigTab = ref('')
+const configContent = ref('')
+
+async function loadConfigFiles() {
+  configLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/configs`)
+    configFiles.value = res.files || []
+    if (configFiles.value.length && !activeConfigTab.value) {
+      activeConfigTab.value = configFiles.value[0].name
+      loadConfigContent(activeConfigTab.value)
+    }
+  } finally { configLoading.value = false }
+}
+
+async function loadConfigContent(filename) {
+  if (!filename) return
+  try {
+    const res = await api.get(`/instances/${id}/configs/${filename}`)
+    configContent.value = res.content
+  } catch { configContent.value = '' }
+}
+
 async function loadObsLogs() {
   obsLoading.value = true
   try {
@@ -161,6 +197,7 @@ function downloadObsLog(row) {
 
 onMounted(() => {
   loadData()
+  loadConfigFiles()
   timer = setInterval(loadData, 10000)
 })
 onUnmounted(() => clearInterval(timer))
@@ -168,5 +205,5 @@ onUnmounted(() => clearInterval(timer))
 
 <style scoped>
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
-.log-preview { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; max-height: 500px; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+.log-preview, .config-preview { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; max-height: 500px; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
 </style>

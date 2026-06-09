@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     OBSUTIL_PATH: str = ""
     OBS_BUCKET: str = "obs://rl-agentdata"
     CONFIG_TEMPLATE: str = ""
+    SETTINGS_DIR: str = ""
 
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
@@ -25,12 +26,15 @@ class Settings(BaseSettings):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        platform_dir = os.path.join(self.HIVE_ROOT, "platform")
         if not self.DB_PATH:
-            self.DB_PATH = os.path.join(self.HIVE_ROOT, "platform", "platform.db")
+            self.DB_PATH = os.path.join(platform_dir, "platform.db")
         if not self.CONFIG_TEMPLATE:
-            self.CONFIG_TEMPLATE = os.path.join(self.HIVE_ROOT, "config.yaml")
+            self.CONFIG_TEMPLATE = os.path.join(platform_dir, "settings", "config.yaml")
         if not self.OBSUTIL_PATH:
-            self.OBSUTIL_PATH = os.path.join(self.HIVE_ROOT, "platform", "obsutil", "obsutil")
+            self.OBSUTIL_PATH = os.path.join(platform_dir, "obsutil", "obsutil")
+        if not self.SETTINGS_DIR:
+            self.SETTINGS_DIR = os.path.join(platform_dir, "settings")
 
 
 settings = Settings()

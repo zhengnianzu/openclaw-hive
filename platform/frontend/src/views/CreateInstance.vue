@@ -33,7 +33,7 @@
         </el-input>
       </el-form-item>
 
-      <el-form-item label="用户Config目录">
+      <el-form-item label="用户Config目录" required>
         <el-input v-model="form.user_config_dir" placeholder="task_data/260520/web_configs">
           <template #append>
             <el-button @click="openObsBrowser('user_config_dir')"><el-icon><FolderOpened /></el-icon></el-button>
@@ -51,6 +51,37 @@
 
       <el-form-item label="轨迹保存路径">
         <el-input v-model="form.traj_save_path" placeholder="自动生成：openclaw_trajs/traj_{task_name}" />
+      </el-form-item>
+
+      <el-divider>模型配置 (openclaw.json)</el-divider>
+
+      <el-form-item label="模型 API Key">
+        <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" show-password />
+      </el-form-item>
+
+      <el-form-item label="模型 Base URL">
+        <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
+      </el-form-item>
+
+      <el-form-item label="模型 ID">
+        <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking">
+          <template #prepend>local/</template>
+        </el-input>
+        <div style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
+      </el-form-item>
+
+      <el-divider>User Proxy 模型配置 (user_proxy_model.json)</el-divider>
+
+      <el-form-item label="模型名称">
+        <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
+      </el-form-item>
+
+      <el-form-item label="API Key">
+        <el-input v-model="form.user_proxy_api_key" placeholder="留空使用模板默认值" show-password />
+      </el-form-item>
+
+      <el-form-item label="Base URL">
+        <el-input v-model="form.user_proxy_base_url" placeholder="例如：http://192.168.30.95:8084" />
       </el-form-item>
 
       <el-divider>高级配置</el-divider>
@@ -115,11 +146,13 @@ const form = ref({
   name: '', task_name: '', concurrent_num: 100,
   skill_dir: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
+  model_api_key: '', model_base_url: '', model_id: '',
+  user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
 })
 
 async function handleCreate() {
-  if (!form.value.name || !form.value.task_name) {
-    ElMessage.warning('请填写实例名称和任务标识')
+  if (!form.value.name || !form.value.task_name || !form.value.user_config_dir) {
+    ElMessage.warning('请填写实例名称、任务标识和用户Config目录')
     return
   }
   creating.value = true
