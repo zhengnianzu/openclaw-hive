@@ -75,6 +75,7 @@ class SandboxConfig:
     data_config_path: str = f"{workspace}/config"
     openclaw_remote_config_file: str = "/home/ma-user/.openclaw/openclaw.json"
     openclaw_local_config_file: str = "uploads/openclaw.json"
+    openclaw_api_key: str = ""
     openclaw_bash: str = "/usr/local/node22/bin/openclaw"
     gateway_log: str = "gateway.log"
     openclaw_start_timeout: int = 10
@@ -246,11 +247,23 @@ class OpenClawDistillationTask:
             raise RuntimeError(msg)
 
     async def _copy_openclaw_config(self) -> None:
-        """Copy OpenClaw configuration to sandbox."""
+        """Copy OpenClaw configuration to sandbox, inject openclaw_api_key."""
         remote_path = self.config.sandbox_config.openclaw_remote_config_file
         local_path = self.config.sandbox_config.openclaw_local_config_file
-        await self._upload_file("openclaw config", local_path, remote_path)
-        self.logger.info(f"Copied openclaw config: {local_path} -> {remote_path}")
+        api_key = self.config.sandbox_config.openclaw_api_key
+        if api_key:
+            with open(local_path, "r", encoding="utf-8") as f:
+                openclaw_config = json.load(f)
+            openclaw_config["models"]["providers"]["local"]["apiKey"] = api_key
+            patched_path = f"{local_path}.{api_key}"
+            with open(patched_path, 'w', encoding='utf-8') as f:
+                json.dump(openclaw_config, f, ensure_ascii=False, indent=2)
+            await self._upload_file("openclaw config", patched_path, remote_path)
+            os.remove(patched_path)
+            self.logger.info(f"Copied openclaw config (with api_key): {local_path} -> {remote_path}")    
+        else:
+            await self._upload_file("openclaw config", local_path, remote_path)
+            self.logger.info(f"Copied openclaw config: {local_path} -> {remote_path}")
 
     async def _upload_and_extract_code(self) -> None:
         """Upload and extract the main code tarball in sandbox."""

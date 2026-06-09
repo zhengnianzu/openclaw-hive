@@ -53,6 +53,7 @@ run_config:
   sandbox:
     result_log: "run.log"
     openclaw_local_config_file: "uploads/openclaw.json"
+    openclaw_api_key: sk-xxxxx-api
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:
@@ -74,6 +75,3 @@ run_config:
     user_config_download_path: "task_data/260520/web_configs"
     user_profile_download_path: 
     agents_download_path: "task_data/260413_noenv/noenv_configs/agents"
-    default_skills: # 注意文件名
-      - "find-skills"
-      - "skill-scope"
