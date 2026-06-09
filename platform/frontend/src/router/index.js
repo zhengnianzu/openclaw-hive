@@ -11,6 +11,7 @@ const routes = [
       { path: 'create', name: 'Create', component: () => import('../views/CreateInstance.vue') },
       { path: 'instance/:id', name: 'InstanceDetail', component: () => import('../views/InstanceDetail.vue') },
       { path: 'logs/:id', name: 'LogViewer', component: () => import('../views/LogViewer.vue') },
+      { path: 'outputs/:id', name: 'OutputViewer', component: () => import('../views/OutputViewer.vue') },
     ],
   },
 ]

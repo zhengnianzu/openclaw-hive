@@ -26,6 +26,11 @@
 
     <el-table :data="instances" v-loading="loading" stripe style="width:100%">
       <el-table-column prop="name" label="实例名称" min-width="150" />
+      <el-table-column prop="id" label="实例ID" width="130">
+        <template #default="{row}">
+          <span style="font-family:monospace;font-size:12px;color:#909399">{{ row.id }}</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="status" label="状态" width="120">
         <template #default="{row}">
           <el-tag :type="statusColor(row.status)">{{ statusText(row.status) }}</el-tag>
@@ -47,11 +52,12 @@
       </el-table-column>
       <el-table-column prop="concurrent_num" label="并发" width="80" />
       <el-table-column prop="created_at" label="创建时间" width="180" />
-      <el-table-column label="操作" width="300" fixed="right">
+      <el-table-column label="操作" width="360" fixed="right">
         <template #default="{row}">
           <el-button-group>
             <el-button size="small" @click="$router.push(`/instance/${row.id}`)">详情</el-button>
             <el-button size="small" type="primary" @click="$router.push(`/logs/${row.id}`)">日志</el-button>
+            <el-button size="small" type="info" @click="$router.push(`/outputs/${row.id}`)">输出</el-button>
             <el-button size="small" type="success" v-if="row.status !== 'running'" @click="startInstance(row.id)">启动</el-button>
             <el-button size="small" type="danger" v-if="row.status === 'running'" @click="stopInstance(row.id)">停止</el-button>
             <el-button size="small" type="warning" v-if="row.failed_tasks > 0 && row.status !== 'running'" @click="retryFailed(row.id)">重跑</el-button>

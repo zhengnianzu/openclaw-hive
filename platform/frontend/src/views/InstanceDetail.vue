@@ -6,6 +6,7 @@
       </el-page-header>
       <div>
         <el-button type="primary" @click="$router.push(`/logs/${inst.id}`)">查看日志</el-button>
+        <el-button type="info" @click="$router.push(`/outputs/${inst.id}`)">查看输出</el-button>
         <el-button type="success" v-if="inst.status !== 'running'" @click="startInstance">启动</el-button>
         <el-button type="danger" v-if="inst.status === 'running'" @click="stopInstance">停止</el-button>
         <el-button type="warning" v-if="inst.failed_tasks > 0 && inst.status !== 'running'" @click="retryFailed">重跑失败</el-button>
@@ -67,24 +68,6 @@
       <pre class="config-preview" v-if="configContent">{{ configContent }}</pre>
       <el-empty v-else-if="!configLoading" description="选择配置文件查看" :image-size="40" />
     </el-card>
-
-    <!-- OBS Logs Section -->
-    <el-card header="OBS 历史日志" style="margin-top:20px" v-if="['completed','finished','stopped'].includes(inst.status)">
-      <el-button @click="loadObsLogs" :loading="obsLoading" style="margin-bottom:12px">加载OBS日志列表</el-button>
-      <el-table :data="obsLogs" v-if="obsLogs.length">
-        <el-table-column prop="name" label="文件名" />
-        <el-table-column label="操作" width="200">
-          <template #default="{row}">
-            <el-button size="small" @click="viewObsLog(row)">查看</el-button>
-            <el-button size="small" type="primary" @click="downloadObsLog(row)">下载</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-
-      <el-dialog v-model="obsLogVisible" title="日志内容" width="80%" destroy-on-close>
-        <pre class="log-preview">{{ obsLogContent }}</pre>
-      </el-dialog>
-    </el-card>
   </div>
 </template>
 
@@ -144,12 +127,6 @@ async function retryFailed() {
   loadData()
 }
 
-// OBS Logs
-const obsLogs = ref([])
-const obsLoading = ref(false)
-const obsLogVisible = ref(false)
-const obsLogContent = ref('')
-
 // Config Files
 const configFiles = ref([])
 const configLoading = ref(false)
@@ -174,25 +151,6 @@ async function loadConfigContent(filename) {
     const res = await api.get(`/instances/${id}/configs/${filename}`)
     configContent.value = res.content
   } catch { configContent.value = '' }
-}
-
-async function loadObsLogs() {
-  obsLoading.value = true
-  try {
-    const res = await api.get(`/logs/${id}/obs-logs`)
-    obsLogs.value = res.items || []
-  } finally { obsLoading.value = false }
-}
-
-async function viewObsLog(row) {
-  const res = await api.get(`/logs/${id}/obs-view`, { params: { file_path: row.path, tail: 500 } })
-  obsLogContent.value = (res.lines || []).join('\n')
-  obsLogVisible.value = true
-}
-
-function downloadObsLog(row) {
-  const token = localStorage.getItem('token')
-  window.open(`/api/logs/${id}/obs-download?file_path=${encodeURIComponent(row.path)}&token=${token}`, '_blank')
 }
 
 onMounted(() => {

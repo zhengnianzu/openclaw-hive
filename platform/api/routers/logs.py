@@ -33,6 +33,7 @@ def _get_instance(instance_id: str) -> dict:
 async def get_main_log(
     instance_id: str,
     tail: int = Query(default=200, description="返回最后N行"),
+    task_filter: str = Query(default="", description="按 env_id 或 config_name 过滤"),
     user: dict = Depends(get_current_user),
 ):
     inst = _get_instance(instance_id)
@@ -41,12 +42,81 @@ async def get_main_log(
     if not os.path.exists(log_file):
         return {"lines": [], "total_lines": 0}
 
+    if task_filter:
+        lines = await _extract_task_lines(log_file, task_filter)
+        total = len(lines)
+        lines = lines[-tail:] if tail < total else lines
+        return {"lines": lines, "total_lines": total}
+
     async with aiofiles.open(log_file, "r", errors="replace") as f:
         all_lines = await f.readlines()
 
     total = len(all_lines)
     lines = all_lines[-tail:] if tail < total else all_lines
     return {"lines": [l.rstrip("\n") for l in lines], "total_lines": total}
+
+
+async def _extract_task_lines(log_file: str, task_filter: str) -> list[str]:
+    """
+    按 Worker 区间提取某个任务的完整日志。
+    Worker 从 "Worker X starting task Y: config_name" 开始，
+    到 "Worker X finished task Y" 或 "Worker X starting task Z" 结束。
+    """
+    start_re = re.compile(r"Worker (\d+) starting task (\d+): (.+?) =")
+    env_re = re.compile(r"Task (\d+): env=(\w+)")
+    finish_re = re.compile(r"Worker (\d+) (?:finished|error on) task")
+
+    # 第一遍：找到目标任务对应的 worker_id 和 task_idx
+    target_workers = set()
+    async with aiofiles.open(log_file, "r", errors="replace") as f:
+        async for line in f:
+            m = start_re.search(line)
+            if m and task_filter in line:
+                target_workers.add((m.group(1), m.group(2)))
+            m = env_re.search(line)
+            if m and task_filter in line:
+                target_workers.add((None, m.group(1)))
+
+    if not target_workers:
+        return []
+
+    target_task_idxs = {t[1] for t in target_workers}
+
+    # 第二遍：按 Worker 区间提取日志
+    result = []
+    active_workers = {}
+    async with aiofiles.open(log_file, "r", errors="replace") as f:
+        async for line in f:
+            stripped = line.rstrip("\n")
+
+            m = start_re.search(stripped)
+            if m:
+                worker_id, task_idx = m.group(1), m.group(2)
+                if task_idx in target_task_idxs:
+                    active_workers[worker_id] = True
+                    result.append(stripped)
+                    continue
+                else:
+                    active_workers.pop(worker_id, None)
+
+            m = finish_re.search(stripped)
+            if m:
+                worker_id = m.group(1)
+                if worker_id in active_workers:
+                    result.append(stripped)
+                    active_workers.pop(worker_id, None)
+                    continue
+
+            if active_workers:
+                for wid in list(active_workers):
+                    if f"Worker {wid}" in stripped or f"Task " in stripped:
+                        result.append(stripped)
+                        break
+                else:
+                    if any(active_workers.values()):
+                        result.append(stripped)
+
+    return result
 
 
 @router.get("/{instance_id}/clean")
@@ -106,6 +176,19 @@ async def list_log_tasks(
 @router.websocket("/ws/{instance_id}")
 async def websocket_log_stream(websocket: WebSocket, instance_id: str):
     """WebSocket endpoint for real-time log streaming."""
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001, reason="缺少token")
+        return
+
+    from jose import JWTError, jwt as jose_jwt
+    from ..core.config import settings as app_settings
+    try:
+        jose_jwt.decode(token, app_settings.SECRET_KEY, algorithms=[app_settings.ALGORITHM])
+    except JWTError:
+        await websocket.close(code=4001, reason="token无效")
+        return
+
     await websocket.accept()
 
     with get_connection() as conn:

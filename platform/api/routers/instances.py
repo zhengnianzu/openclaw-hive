@@ -102,7 +102,9 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
 
 @router.post("", response_model=InstanceInfo)
 def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user)):
-    instance_id = uuid.uuid4().hex[:12]
+    timestamp = datetime.now().strftime("%y%m%d%H%M")
+    short_id = uuid.uuid4().hex[:4]
+    instance_id = f"{timestamp}-{req.task_name}-{short_id}"
     instance_dir = _get_instance_dir(instance_id)
     os.makedirs(instance_dir, exist_ok=True)
 
