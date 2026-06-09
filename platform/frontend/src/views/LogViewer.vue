@@ -21,9 +21,9 @@
 
     <div ref="logContainer" class="log-container">
       <div v-for="(line, idx) in filteredLines" :key="idx"
-        :class="['log-line', lineClass(line)]">{{ verboseMode ? line : cleanLine(line) }}</div>
+        :class="['log-line', lineClass(line)]">{{ line }}</div>
       <div v-if="!filteredLines.length" style="color:#666;padding:20px;text-align:center">
-        {{ logMode === 'realtime' ? '等待日志...' : '暂无日志' }}
+        暂无日志
       </div>
     </div>
   </div>
@@ -46,6 +46,9 @@ const verboseMode = ref(false)
 
 const filteredLines = computed(() => {
   let lines = logLines.value
+  if (!verboseMode.value) {
+    lines = lines.map(l => cleanLine(l)).filter(l => l !== '')
+  }
   if (filterKeyword.value) {
     const kw = filterKeyword.value.toLowerCase()
     lines = lines.filter(l => l.toLowerCase().includes(kw))
@@ -65,9 +68,21 @@ function lineClass(line) {
 }
 
 function cleanLine(line) {
-  const m = line.match(/\|(?:INFO|WARNING|ERROR|DEBUG)\|[^|]*\|[^|]*\|(.+)/)
-  if (m) return m[1]
-  return line.replace(/^\[node_id:\d+\]/, '').trim()
+  let cleaned = line
+  // 去掉外层 logger 前缀: [node_id:X]时间|file:line|...|INFO|...|内容
+  const loggerMatch = cleaned.match(/\|(?:INFO|WARNING|ERROR|DEBUG)\|[^|]*\|[^|]*\|(.+)/)
+  if (loggerMatch) cleaned = loggerMatch[1]
+  cleaned = cleaned.replace(/^\[node_id:\d+\][^|]*\|/, '').trim()
+
+  // 去掉 SSE 包装: sse data: [#N][env_id:[命令]]: exit_code: [X], stdout: [内容], stderr: [内容]
+  const sseMatch = cleaned.match(/sse data: \[#\d+\]\[[^\]]*\[.*?\]\]:\s*exit_code:\s*\[[^\]]*\],\s*stdout:\s*\[(.*)?\],\s*stderr:\s*\[.*\]$/)
+  if (sseMatch) return sseMatch[1] || ''
+
+  // 简单 sse data 无 response 的情况
+  const sseNoResp = cleaned.match(/sse data: \[#\d+\]\[.*?\]:\s*no response/)
+  if (sseNoResp) return ''
+
+  return cleaned
 }
 
 function scrollToBottom() {
