@@ -76,7 +76,6 @@ def _sync_instance_status(instance: dict) -> dict:
                     "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
                     (completed, failed, inst["id"]),
                 )
-            )
 
     return inst
 
