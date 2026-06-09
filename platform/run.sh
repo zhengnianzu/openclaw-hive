@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 
 ACTION="${1:-help}"
 HOST="${2:-0.0.0.0}"
-PORT="${3:-8000}"
+PORT="${3:-8087}"
 
 case "$ACTION" in
     install)

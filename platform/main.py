@@ -29,8 +29,11 @@ with get_connection() as conn:
     existing = conn.execute("SELECT id FROM users WHERE username = ?", (settings.ADMIN_USERNAME,)).fetchone()
     if not existing:
         hashed = get_password_hash(settings.ADMIN_PASSWORD)
-        conn.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (settings.ADMIN_USERNAME, hashed))
-        print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
+        try:
+            conn.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (settings.ADMIN_USERNAME, hashed))
+            print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
+        except Exception:
+            pass
 
 static_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 if os.path.isdir(static_dir):
