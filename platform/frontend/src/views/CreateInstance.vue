@@ -63,6 +63,13 @@
         <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
       </el-form-item>
 
+      <el-form-item label="API 类型">
+        <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
+          <el-option label="Anthropic Messages" value="anthropic-messages" />
+          <el-option label="OpenAI Completions" value="openai-completions" />
+        </el-select>
+      </el-form-item>
+
       <el-form-item label="模型 ID">
         <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking">
           <template #prepend>local/</template>
@@ -146,7 +153,7 @@ const form = ref({
   name: '', task_name: '', concurrent_num: 100,
   skill_dir: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
-  model_api_key: '', model_base_url: '', model_id: '',
+  model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
 })
 

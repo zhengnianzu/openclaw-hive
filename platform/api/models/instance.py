@@ -19,6 +19,7 @@ class InstanceCreate(BaseModel):
     model_api_key: str = ""
     model_base_url: str = ""
     model_id: str = ""
+    model_api_type: str = ""          # anthropic-messages 或 openai-completions
 
     # user_proxy_model.json 可配置项
     user_proxy_model_name: str = ""
