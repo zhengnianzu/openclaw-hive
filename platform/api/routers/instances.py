@@ -117,7 +117,6 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
     if req.agent_dir:
         base.run_config.obs.agents_download_path = req.agent_dir
     if req.user_config_dir:
-        # 直接下载到实例目录，hive.py 不再重复下载
         configs_dir = os.path.join(instance_dir, "configs")
         os.makedirs(configs_dir, exist_ok=True)
         obs_src = f"{base.s3.bucket_name}/{req.user_config_dir}"
@@ -129,7 +128,15 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
         )
         if ret.returncode != 0:
             raise HTTPException(status_code=500, detail=f"OBS下载失败: {ret.stderr[:500]}")
-        base.run_config.task.task_input_path = configs_dir
+        # obsutil 会创建子目录（如 configs/demo_test/），找到实际包含文件的目录
+        actual_dir = configs_dir
+        while True:
+            entries = os.listdir(actual_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(actual_dir, entries[0])):
+                actual_dir = os.path.join(actual_dir, entries[0])
+            else:
+                break
+        base.run_config.task.task_input_path = actual_dir
         base.run_config.obs.user_config_download_path = ""
     if req.user_profile_dir:
         base.run_config.obs.user_profile_download_path = req.user_profile_dir
