@@ -47,7 +47,7 @@ const verboseMode = ref(false)
 const filteredLines = computed(() => {
   let lines = logLines.value
   if (!verboseMode.value) {
-    lines = lines.map(l => cleanLine(l)).filter(l => l !== '')
+    lines = lines.flatMap(l => cleanLine(l).split('\n')).filter(l => l !== '')
   }
   if (filterKeyword.value) {
     const kw = filterKeyword.value.toLowerCase()
@@ -61,6 +61,7 @@ function onTaskFilterChange() {
 }
 
 function lineClass(line) {
+  if (/^\[STDERR\]/i.test(line)) return 'log-error'
   if (/error|failed|exception|traceback/i.test(line)) return 'log-error'
   if (/warning|warn/i.test(line)) return 'log-warn'
   if (/success|completed|done/i.test(line)) return 'log-success'
@@ -74,12 +75,18 @@ function cleanLine(line) {
   if (loggerMatch) cleaned = loggerMatch[1]
   cleaned = cleaned.replace(/^\[node_id:\d+\][^|]*\|/, '').trim()
 
-  // 去掉 SSE 包装: sse data: [#N][env_id:[命令]]: exit_code: [X], stdout: [内容], stderr: [内容]
-  const sseMatch = cleaned.match(/sse data: \[#\d+\]\[[^\]]*\[.*?\]\]:\s*exit_code:\s*\[[^\]]*\],\s*stdout:\s*\[(.*)?\],\s*stderr:\s*\[.*\]$/)
-  if (sseMatch) return sseMatch[1] || ''
+  // 提取 stdout 和 stderr，分行显示
+  const sseMatch = cleaned.match(/,\s*stdout:\s*\[(.*)\],\s*stderr:\s*\[(.*)\]$/)
+  if (sseMatch && cleaned.startsWith('sse data:')) {
+    const stdout = sseMatch[1] || ''
+    const stderr = sseMatch[2] || ''
+    const parts = []
+    if (stdout && stdout !== 'None') parts.push(`[STDOUT] ${stdout}`)
+    if (stderr && stderr !== 'None') parts.push(`[STDERR] ${stderr}`)
+    return parts.join('\n') || ''
+  }
 
-  // 简单 sse data 无 response 的情况
-  const sseNoResp = cleaned.match(/sse data: \[#\d+\]\[.*?\]:\s*no response/)
+  const sseNoResp = cleaned.match(/sse data:.*no response/)
   if (sseNoResp) return ''
 
   return cleaned

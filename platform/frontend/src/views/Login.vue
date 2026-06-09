@@ -11,12 +11,9 @@
         </el-form-item>
         <el-form-item>
           <el-button type="primary" size="large" style="width:100%" :loading="loading" @click="handleSubmit">
-            {{ isRegister ? '注册' : '登录' }}
+            登录
           </el-button>
         </el-form-item>
-        <div class="toggle" @click="isRegister = !isRegister">
-          {{ isRegister ? '已有账号？去登录' : '没有账号？去注册' }}
-        </div>
       </el-form>
     </div>
   </div>
@@ -31,7 +28,6 @@ import api from '../api'
 const router = useRouter()
 const form = ref({ username: '', password: '' })
 const loading = ref(false)
-const isRegister = ref(false)
 
 async function handleSubmit() {
   if (!form.value.username || !form.value.password) {
@@ -40,16 +36,10 @@ async function handleSubmit() {
   }
   loading.value = true
   try {
-    if (isRegister.value) {
-      await api.post('/auth/register', form.value)
-      ElMessage.success('注册成功，请登录')
-      isRegister.value = false
-    } else {
-      const res = await api.post('/auth/login', form.value)
-      localStorage.setItem('token', res.access_token)
-      localStorage.setItem('username', form.value.username)
-      router.push('/dashboard')
-    }
+    const res = await api.post('/auth/login', form.value)
+    localStorage.setItem('token', res.access_token)
+    localStorage.setItem('username', form.value.username)
+    router.push('/dashboard')
   } finally {
     loading.value = false
   }
