@@ -28,8 +28,10 @@ def _get_instance_dir(instance_id: str) -> str:
 
 
 def _get_output_dir(config_path: str) -> str:
+    """hive.py 会把 output_path 拼上 config basename，推导实际输出目录。"""
     config_basename = Path(config_path).stem
-    return os.path.join(settings.HIVE_ROOT, "outputs", config_basename)
+    instance_dir = str(Path(config_path).parent)
+    return os.path.join(instance_dir, "outputs", config_basename)
 
 
 def _count_lines(file_path: str) -> int:
@@ -58,18 +60,22 @@ def _sync_instance_status(instance: dict) -> dict:
     inst["completed_tasks"] = completed
     inst["failed_tasks"] = failed
 
-    if inst["status"] == "running" and not _is_pid_running(inst.get("pid")):
-        inst["status"] = "completed" if failed == 0 else "finished"
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
-                (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
-            )
-    elif inst["status"] == "running":
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
-                (completed, failed, inst["id"]),
+    if inst["status"] == "running":
+        pid_alive = _is_pid_running(inst.get("pid"))
+        all_done = inst["total_tasks"] > 0 and (completed + failed) >= inst["total_tasks"]
+        if not pid_alive or all_done:
+            inst["status"] = "completed" if failed == 0 else "finished"
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
+                    (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
+                )
+        else:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
+                    (completed, failed, inst["id"]),
+                )
             )
 
     return inst
@@ -151,6 +157,10 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
     base.run_config.sandbox.openclaw_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
+
+    # 输出和下载目录都放在实例目录下
+    base.run_config.task.task_output_path = os.path.join(instance_dir, "outputs")
+    base.run_config.task.task_download_path = os.path.join(instance_dir, "downloads")
 
     config_path = os.path.join(instance_dir, "config.yaml")
     OmegaConf.save(base, config_path)

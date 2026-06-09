@@ -17,7 +17,8 @@ router = APIRouter(prefix="/api/logs", tags=["logs"])
 
 def _get_output_dir(config_path: str) -> str:
     config_basename = Path(config_path).stem
-    return os.path.join(settings.HIVE_ROOT, "outputs", config_basename)
+    instance_dir = str(Path(config_path).parent)
+    return os.path.join(instance_dir, "outputs", config_basename)
 
 
 def _get_instance(instance_id: str) -> dict:
