@@ -36,11 +36,14 @@
           <el-tag :type="statusColor(row.status)">{{ statusText(row.status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="进度" width="200">
+      <el-table-column label="进度" width="250">
         <template #default="{row}">
           <div style="display:flex;align-items:center;gap:8px">
             <el-progress :percentage="progress(row)" :stroke-width="10" style="flex:1" />
             <span style="font-size:12px;color:#999">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
+          </div>
+          <div v-if="timeEstimates[row.id]" style="font-size:11px;color:#909399;margin-top:2px">
+            {{ formatDuration(timeEstimates[row.id].estimated_remaining_seconds) }}
           </div>
         </template>
       </el-table-column>
@@ -58,6 +61,7 @@
             <el-button size="small" @click="$router.push(`/instance/${row.id}`)">详情</el-button>
             <el-button size="small" type="primary" @click="$router.push(`/logs/${row.id}`)">日志</el-button>
             <el-button size="small" type="info" @click="$router.push(`/outputs/${row.id}`)">输出</el-button>
+            <el-button size="small" @click="$router.push(`/create?copy_from=${row.id}`)">复制</el-button>
             <el-button size="small" type="success" v-if="row.status !== 'running'" @click="startInstance(row.id)">启动</el-button>
             <el-button size="small" type="danger" v-if="row.status === 'running'" @click="stopInstance(row.id)">停止</el-button>
             <el-button size="small" type="warning" v-if="row.failed_tasks > 0 && row.status !== 'running'" @click="retryFailed(row.id)">重跑</el-button>
@@ -76,11 +80,37 @@ import api from '../api'
 
 const instances = ref([])
 const loading = ref(false)
+const timeEstimates = ref({})
 let timer = null
 
 async function loadInstances() {
   loading.value = true
-  try { instances.value = await api.get('/instances') } finally { loading.value = false }
+  try {
+    instances.value = await api.get('/instances')
+    loadTimeEstimates()
+  } finally { loading.value = false }
+}
+
+async function loadTimeEstimates() {
+  const running = instances.value.filter(i => i.status === 'running')
+  for (const inst of running) {
+    try {
+      const ov = await api.get(`/instances/${inst.id}/overview`)
+      if (ov.estimated_remaining_seconds != null) {
+        timeEstimates.value[inst.id] = ov
+      }
+    } catch { /* ignore */ }
+  }
+}
+
+function formatDuration(seconds) {
+  if (seconds == null) return ''
+  const s = Math.round(seconds)
+  if (s < 60) return `~${s}s`
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (h > 0) return `~${h}h${m}m`
+  return `~${m}min`
 }
 
 function statusColor(s) {

@@ -36,9 +36,15 @@ def init_db():
                 failed_tasks INTEGER DEFAULT 0,
                 concurrent_num INTEGER DEFAULT 100,
                 config_snapshot TEXT,
-                error_summary TEXT
+                error_summary TEXT,
+                create_params TEXT
             );
         """)
+        # migrate: add create_params for existing databases
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN create_params TEXT")
+        except Exception:
+            pass
 
 
 @contextmanager

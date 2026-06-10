@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import copy
 import json
+import logging
 import os
 import random
 import shutil
@@ -41,9 +43,41 @@ logger = ManageLogger(__name__).get_logger()
 # Async lock for file writes
 _file_lock = asyncio.Lock()
 
+# ContextVar for per-task log routing
+_current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
+
 # Default timeout for OBS download operations (seconds)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
+
+
+class TaskFileHandler(logging.Handler):
+    """Routes log records to per-task files based on ContextVar."""
+
+    def __init__(self, log_dir):
+        super().__init__()
+        self.log_dir = log_dir
+        self._files = {}
+
+    def emit(self, record):
+        task_idx = _current_task_idx.get()
+        if task_idx is None:
+            return
+        try:
+            if task_idx not in self._files:
+                path = os.path.join(self.log_dir, f"task-{task_idx}.log")
+                self._files[task_idx] = open(path, 'a', encoding='utf-8')
+            msg = self.format(record)
+            self._files[task_idx].write(msg + '\n')
+            self._files[task_idx].flush()
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        for f in self._files.values():
+            f.close()
+        self._files.clear()
+        super().close()
 
 
 # ============================================================================
@@ -605,8 +639,12 @@ async def _worker(
                 continue
 
             logger.info(f"===== Worker {worker_id} starting task {task_idx}: {config_name} =====")
-            task = OpenClawDistillationTask(config)
-            await task.run(os.path.join(config.task_input_path, config_name), task_idx)
+            token = _current_task_idx.set(task_idx)
+            try:
+                task = OpenClawDistillationTask(config)
+                await task.run(os.path.join(config.task_input_path, config_name), task_idx)
+            finally:
+                _current_task_idx.reset(token)
             logger.info(f"!!!!! Worker {worker_id} finished task {task_idx}: {config_name} !!!!!")
         except Exception as e:
             logger.error(f"Worker {worker_id} error on task {config_name}: {e}")
@@ -689,6 +727,25 @@ async def run_tasks(
         f"total available: {len(config.run_input_config_files)}"
     )
 
+    # --- Per-task log splitting ---
+    logs_dir = os.path.join(config.task_output_path, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    fmt = logger.handlers[0].formatter if logger.handlers else None
+
+    main_handler = logging.FileHandler(os.path.join(logs_dir, "main.log"), encoding='utf-8')
+    main_handler.setFormatter(fmt)
+    logger.addHandler(main_handler)
+
+    task_handler = TaskFileHandler(logs_dir)
+    task_handler.setFormatter(fmt)
+    logger.addHandler(task_handler)
+
+    ec_logger = logging.getLogger("ExecutionClient")
+    ec_logger.addHandler(task_handler)
+    make_logger = logging.getLogger("execution_client.client.client")
+    make_logger.addHandler(task_handler)
+
     # Auto-pack source directory if main_code_dir is set
     if config.main_code_dir and os.path.isdir(config.main_code_dir):
         dir_basename = os.path.basename(config.main_code_dir.rstrip(os.sep))
@@ -717,6 +774,15 @@ async def run_tasks(
     ]
     if workers:
         await asyncio.gather(*workers)
+
+    # Cleanup per-task handlers
+    logger.removeHandler(main_handler)
+    logger.removeHandler(task_handler)
+    ec_logger.removeHandler(task_handler)
+    make_logger.removeHandler(task_handler)
+    main_handler.close()
+    task_handler.close()
+
     logger.info("所有任务执行完毕！")
 
 

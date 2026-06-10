@@ -51,6 +51,9 @@ class InstanceOverview(BaseModel):
     pending: int
     success_rate: float
     error_breakdown: dict = {}
+    avg_task_seconds: Optional[float] = None
+    estimated_remaining_seconds: Optional[float] = None
+    estimated_finish_time: Optional[str] = None
 
 
 class ObsItem(BaseModel):

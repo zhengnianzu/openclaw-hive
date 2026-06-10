@@ -6,7 +6,8 @@ import signal
 import subprocess
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
+from math import ceil
 from pathlib import Path
 from typing import Optional
 
@@ -212,10 +213,10 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO task_instances
-               (id, name, config_path, status, created_by, total_tasks, concurrent_num, config_snapshot)
-               VALUES (?, ?, ?, 'created', ?, ?, ?, ?)""",
+               (id, name, config_path, status, created_by, total_tasks, concurrent_num, config_snapshot, create_params)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], total_tasks,
-             req.concurrent_num, OmegaConf.to_yaml(base)),
+             req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json()),
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 
@@ -258,6 +259,17 @@ def get_instance_config(instance_id: str, filename: str, user: dict = Depends(ge
 
     file_type = "yaml" if filename.endswith(".yaml") else "json"
     return {"filename": filename, "type": file_type, "content": content}
+
+
+@router.get("/{instance_id}/create-params")
+def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
+    with get_connection() as conn:
+        row = conn.execute("SELECT create_params FROM task_instances WHERE id=?", (instance_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="实例不存在")
+    if not row["create_params"]:
+        raise HTTPException(status_code=404, detail="该实例无创建参数记录")
+    return json.loads(row["create_params"])
 
 
 # ============================================================================
@@ -393,12 +405,59 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
     rate = (completed / finished * 100) if finished > 0 else 0.0
 
     error_breakdown = _analyze_errors(inst["config_path"])
+    time_est = _estimate_remaining_time(
+        inst["config_path"], total, completed, failed,
+        inst["concurrent_num"], inst["status"],
+    )
 
     return InstanceOverview(
         total=total, completed=completed, failed=failed,
         running=running_pods, pending=pending,
         success_rate=round(rate, 1), error_breakdown=error_breakdown,
+        **time_est,
     )
+
+
+_ELAPSED_RE = re.compile(r"Task \d+ finished, elapsed=([\d.]+)s")
+
+
+def _estimate_remaining_time(
+    config_path: str, total: int, completed: int, failed: int,
+    concurrent_num: int, status: str,
+) -> dict:
+    result = {"avg_task_seconds": None, "estimated_remaining_seconds": None, "estimated_finish_time": None}
+    if status != "running" or total == 0:
+        return result
+
+    output_dir = _get_output_dir(config_path)
+    log_file = os.path.join(output_dir, "nohup.log")
+    if not os.path.exists(log_file):
+        return result
+
+    elapsed_times = []
+    with open(log_file, "r", errors="replace") as f:
+        for line in f:
+            m = _ELAPSED_RE.search(line)
+            if m:
+                elapsed_times.append(float(m.group(1)))
+
+    if not elapsed_times:
+        return result
+
+    avg = sum(elapsed_times) / len(elapsed_times)
+    remaining_tasks = max(0, total - completed - failed)
+    if remaining_tasks == 0:
+        return {"avg_task_seconds": round(avg, 1), "estimated_remaining_seconds": 0, "estimated_finish_time": None}
+
+    remaining_batches = ceil(remaining_tasks / max(concurrent_num, 1))
+    est_seconds = remaining_batches * avg
+    finish_time = (datetime.now() + timedelta(seconds=est_seconds)).isoformat(timespec="seconds")
+
+    return {
+        "avg_task_seconds": round(avg, 1),
+        "estimated_remaining_seconds": round(est_seconds, 0),
+        "estimated_finish_time": finish_time,
+    }
 
 
 def _analyze_errors(config_path: str) -> dict:

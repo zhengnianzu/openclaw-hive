@@ -26,6 +26,16 @@
       <el-col :span="4"><el-statistic title="成功率" :value="overview.success_rate + '%'" /></el-col>
     </el-row>
 
+    <div v-if="overview.avg_task_seconds" style="margin-bottom:16px;font-size:13px;color:#606266">
+      <span>平均耗时: <strong>{{ formatDuration(overview.avg_task_seconds) }}</strong></span>
+      <span v-if="overview.estimated_remaining_seconds != null && inst.status === 'running'" style="margin-left:24px">
+        预计剩余: <strong>{{ formatDuration(overview.estimated_remaining_seconds) }}</strong>
+      </span>
+      <span v-if="overview.estimated_finish_time && inst.status === 'running'" style="margin-left:24px;color:#909399">
+        (预计完成: {{ overview.estimated_finish_time?.replace('T', ' ') }})
+      </span>
+    </div>
+
     <el-progress :percentage="progressPct" :stroke-width="20" style="margin-bottom:24px" :status="progressStatus" />
 
     <el-row :gutter="20">
@@ -100,6 +110,16 @@ function statusColor(s) {
 }
 function statusText(s) {
   return { running: '运行中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+}
+
+function formatDuration(seconds) {
+  if (seconds == null) return ''
+  const s = Math.round(seconds)
+  if (s < 60) return `${s}s`
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (h > 0) return `${h}h${m}m`
+  return `${m}min`
 }
 
 async function loadData() {

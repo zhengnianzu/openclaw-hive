@@ -29,31 +29,92 @@ def _get_instance(instance_id: str) -> dict:
     return dict(row)
 
 
+_LOGGER_RE = re.compile(r'\|(?:INFO|WARNING|ERROR|DEBUG)\|[^|]*\|[^|]*\|(.+)', re.DOTALL)
+_NODE_ID_RE = re.compile(r'^\[node_id:\d+\][^|]*\|')
+_SSE_STDOUT_STDERR_RE = re.compile(r',\s*stdout:\s*\[(.*)\],\s*stderr:\s*\[(.*)\]$', re.DOTALL)
+_SSE_NO_RESP_RE = re.compile(r'sse data:.*no response')
+
+
+def _join_multiline(lines: list[str]) -> list[str]:
+    """SSE stdout/stderr 跨多行，把非 [node_id:] 开头的行合并到上一行。"""
+    joined = []
+    for line in lines:
+        if line.startswith('[node_id:') or not joined:
+            joined.append(line)
+        else:
+            joined[-1] += '\n' + line
+    return joined
+
+
+def _clean_line(line: str) -> list[str]:
+    cleaned = line
+    m = _LOGGER_RE.search(cleaned)
+    if m:
+        cleaned = m.group(1)
+    cleaned = _NODE_ID_RE.sub('', cleaned).strip()
+
+    m = _SSE_STDOUT_STDERR_RE.search(cleaned)
+    if m and 'sse data:' in cleaned:
+        stdout = (m.group(1) or '').replace('\n', ' ').strip()
+        stderr = (m.group(2) or '').replace('\n', ' ').strip()
+        parts = []
+        if stdout and stdout != 'None':
+            parts.append(f'[STDOUT] {stdout}')
+        if stderr and stderr != 'None':
+            parts.append(f'[STDERR] {stderr}')
+        return parts
+
+    if _SSE_NO_RESP_RE.search(cleaned):
+        return []
+
+    cleaned = cleaned.replace('\n', ' ').strip()
+    if not cleaned:
+        return []
+    return [cleaned]
+
+
 @router.get("/{instance_id}/main")
 async def get_main_log(
     instance_id: str,
     tail: int = Query(default=200, description="返回最后N行"),
     task_filter: str = Query(default="", description="按 env_id 或 config_name 过滤"),
+    mode: str = Query(default="verbose", description="verbose 或 concise"),
+    source: str = Query(default="main", description="main 优先读 logs/main.log，nohup 读 nohup.log"),
     user: dict = Depends(get_current_user),
 ):
     inst = _get_instance(instance_id)
     output_dir = _get_output_dir(inst["config_path"])
-    log_file = os.path.join(output_dir, "nohup.log")
+
+    structured_log = os.path.join(output_dir, "logs", "main.log")
+    legacy_log = os.path.join(output_dir, "nohup.log")
+
+    if source == "nohup" or task_filter:
+        log_file = legacy_log
+    elif os.path.exists(structured_log):
+        log_file = structured_log
+    else:
+        log_file = legacy_log
+
     if not os.path.exists(log_file):
         return {"lines": [], "total_lines": 0}
 
     if task_filter:
         lines = await _extract_task_lines(log_file, task_filter)
-        total = len(lines)
-        lines = lines[-tail:] if tail < total else lines
-        return {"lines": lines, "total_lines": total}
+    else:
+        async with aiofiles.open(log_file, "r", errors="replace") as f:
+            all_lines = await f.readlines()
+        lines = [l.rstrip("\n") for l in all_lines]
 
-    async with aiofiles.open(log_file, "r", errors="replace") as f:
-        all_lines = await f.readlines()
+    if mode == "concise":
+        lines = _join_multiline(lines)
+        cleaned = []
+        for l in lines:
+            cleaned.extend(_clean_line(l))
+        lines = cleaned
 
-    total = len(all_lines)
-    lines = all_lines[-tail:] if tail < total else all_lines
-    return {"lines": [l.rstrip("\n") for l in lines], "total_lines": total}
+    total = len(lines)
+    lines = lines[-tail:] if tail < total else lines
+    return {"lines": lines, "total_lines": total}
 
 
 async def _extract_task_lines(log_file: str, task_filter: str) -> list[str]:
@@ -171,6 +232,53 @@ async def list_log_tasks(
 
     sorted_tasks = sorted(tasks.values(), key=lambda t: int(t["task_idx"]))
     return {"tasks": sorted_tasks}
+
+
+@router.get("/{instance_id}/task-log-list")
+async def list_task_logs(
+    instance_id: str,
+    user: dict = Depends(get_current_user),
+):
+    inst = _get_instance(instance_id)
+    logs_dir = os.path.join(_get_output_dir(inst["config_path"]), "logs")
+    if not os.path.isdir(logs_dir):
+        return {"files": []}
+    files = sorted(
+        [f for f in os.listdir(logs_dir) if f.startswith("task-") and f.endswith(".log")],
+        key=lambda f: int(m.group()) if (m := re.search(r'\d+', f)) else 0,
+    )
+    return {"files": files}
+
+
+@router.get("/{instance_id}/task-log/{filename}")
+async def get_task_log(
+    instance_id: str,
+    filename: str,
+    tail: int = Query(default=200),
+    mode: str = Query(default="verbose"),
+    user: dict = Depends(get_current_user),
+):
+    if not re.match(r'^(task-\d+|main)\.log$', filename):
+        raise HTTPException(status_code=400, detail="无效的日志文件名")
+    inst = _get_instance(instance_id)
+    log_file = os.path.join(_get_output_dir(inst["config_path"]), "logs", filename)
+    if not os.path.exists(log_file):
+        return {"lines": [], "total_lines": 0}
+
+    async with aiofiles.open(log_file, "r", errors="replace") as f:
+        all_lines = await f.readlines()
+    lines = [l.rstrip("\n") for l in all_lines]
+
+    if mode == "concise":
+        lines = _join_multiline(lines)
+        cleaned = []
+        for l in lines:
+            cleaned.extend(_clean_line(l))
+        lines = cleaned
+
+    total = len(lines)
+    lines = lines[-tail:] if tail < total else lines
+    return {"lines": lines, "total_lines": total}
 
 
 @router.websocket("/ws/{instance_id}")

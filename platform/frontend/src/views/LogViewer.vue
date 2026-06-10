@@ -5,7 +5,15 @@
     </el-page-header>
 
     <div class="toolbar">
-      <el-select v-model="selectedTask" placeholder="按任务过滤" clearable style="width:280px"
+      <el-select v-model="logSource" placeholder="日志源" style="width:180px" @change="onLogSourceChange">
+        <el-option label="主进程日志" value="main" />
+        <el-option label="完整日志 (nohup)" value="nohup" />
+        <el-option v-for="f in taskLogFiles" :key="f"
+          :label="f.replace('.log', '')" :value="f" />
+      </el-select>
+
+      <el-select v-if="logSource === 'main' || logSource === 'nohup'" v-model="selectedTask"
+        placeholder="按任务过滤" clearable style="width:280px"
         @change="onTaskFilterChange" filterable>
         <el-option v-for="t in taskList" :key="t.task_idx"
           :label="`Task ${t.task_idx} - ${t.config_name || t.env_id}`"
@@ -43,12 +51,11 @@ const logContainer = ref(null)
 const taskList = ref([])
 const selectedTask = ref('')
 const verboseMode = ref(false)
+const logSource = ref('main')
+const taskLogFiles = ref([])
 
 const filteredLines = computed(() => {
   let lines = logLines.value
-  if (!verboseMode.value) {
-    lines = lines.flatMap(l => cleanLine(l).split('\n')).filter(l => l !== '')
-  }
   if (filterKeyword.value) {
     const kw = filterKeyword.value.toLowerCase()
     lines = lines.filter(l => l.toLowerCase().includes(kw))
@@ -60,36 +67,21 @@ function onTaskFilterChange() {
   loadLogs()
 }
 
+function onLogSourceChange() {
+  selectedTask.value = ''
+  loadLogs()
+}
+
+watch(verboseMode, () => {
+  loadLogs()
+})
+
 function lineClass(line) {
   if (/^\[STDERR\]/i.test(line)) return 'log-error'
   if (/error|failed|exception|traceback/i.test(line)) return 'log-error'
   if (/warning|warn/i.test(line)) return 'log-warn'
   if (/success|completed|done/i.test(line)) return 'log-success'
   return ''
-}
-
-function cleanLine(line) {
-  let cleaned = line
-  // 去掉外层 logger 前缀: [node_id:X]时间|file:line|...|INFO|...|内容
-  const loggerMatch = cleaned.match(/\|(?:INFO|WARNING|ERROR|DEBUG)\|[^|]*\|[^|]*\|(.+)/)
-  if (loggerMatch) cleaned = loggerMatch[1]
-  cleaned = cleaned.replace(/^\[node_id:\d+\][^|]*\|/, '').trim()
-
-  // 提取 stdout 和 stderr，分行显示
-  const sseMatch = cleaned.match(/,\s*stdout:\s*\[(.*)\],\s*stderr:\s*\[(.*)\]$/)
-  if (sseMatch && cleaned.startsWith('sse data:')) {
-    const stdout = sseMatch[1] || ''
-    const stderr = sseMatch[2] || ''
-    const parts = []
-    if (stdout && stdout !== 'None') parts.push(`[STDOUT] ${stdout}`)
-    if (stderr && stderr !== 'None') parts.push(`[STDERR] ${stderr}`)
-    return parts.join('\n') || ''
-  }
-
-  const sseNoResp = cleaned.match(/sse data:.*no response/)
-  if (sseNoResp) return ''
-
-  return cleaned
 }
 
 function scrollToBottom() {
@@ -102,11 +94,17 @@ function clearLogs() { logLines.value = [] }
 
 async function loadLogs() {
   try {
-    const params = { tail: 1000 }
-    if (selectedTask.value) {
-      params.task_filter = selectedTask.value
+    const mode = verboseMode.value ? 'verbose' : 'concise'
+    let res
+    if (logSource.value === 'main' || logSource.value === 'nohup') {
+      const params = { tail: 1000, mode, source: logSource.value }
+      if (selectedTask.value) params.task_filter = selectedTask.value
+      res = await api.get(`/logs/${id}/main`, { params })
+    } else {
+      res = await api.get(`/logs/${id}/task-log/${logSource.value}`, {
+        params: { tail: 1000, mode }
+      })
     }
-    const res = await api.get(`/logs/${id}/main`, { params })
     logLines.value = res.lines || []
     scrollToBottom()
   } catch { /* handled by interceptor */ }
@@ -119,9 +117,17 @@ async function loadTaskList() {
   } catch { /* ignore */ }
 }
 
+async function loadTaskLogFiles() {
+  try {
+    const res = await api.get(`/logs/${id}/task-log-list`)
+    taskLogFiles.value = res.files || []
+  } catch { /* ignore */ }
+}
+
 onMounted(async () => {
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
   loadTaskList()
+  loadTaskLogFiles()
   loadLogs()
 })
 onUnmounted(() => {})

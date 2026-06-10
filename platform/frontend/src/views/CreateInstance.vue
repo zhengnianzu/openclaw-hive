@@ -141,12 +141,13 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 
 const router = useRouter()
+const route = useRoute()
 const creating = ref(false)
 
 const form = ref({
@@ -216,4 +217,19 @@ function confirmObsSelect() {
   form.value[obsTargetField] = relative
   obsVisible.value = false
 }
+
+onMounted(async () => {
+  const copyFrom = route.query.copy_from
+  if (copyFrom) {
+    try {
+      const params = await api.get(`/instances/${copyFrom}/create-params`)
+      Object.assign(form.value, params)
+      form.value.name = params.name + '-copy'
+      form.value.task_name = ''
+      ElMessage.info('已从已有实例复制配置，请修改任务标识后创建')
+    } catch {
+      ElMessage.warning('无法加载源实例配置')
+    }
+  }
+})
 </script>
