@@ -52,6 +52,7 @@
             <el-descriptions-item label="创建时间">{{ inst.created_at }}</el-descriptions-item>
             <el-descriptions-item label="启动时间">{{ inst.started_at || '-' }}</el-descriptions-item>
             <el-descriptions-item label="创建者">{{ inst.created_by }}</el-descriptions-item>
+            <el-descriptions-item label="模型 API Key">{{ createParams.model_api_key || '默认值' }}</el-descriptions-item>
           </el-descriptions>
         </el-card>
       </el-col>
@@ -93,6 +94,7 @@ const id = route.params.id
 const loading = ref(false)
 const inst = ref({})
 const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {} })
+const createParams = ref({})
 let timer = null
 
 const progressPct = computed(() => {
@@ -128,6 +130,12 @@ async function loadData() {
     inst.value = i
     overview.value = o
   } catch (e) { /* will be shown by interceptor */ }
+}
+
+async function loadCreateParams() {
+  try {
+    createParams.value = await api.get(`/instances/${id}/create-params`)
+  } catch { /* old instances may not have create_params */ }
 }
 
 async function startInstance() {
@@ -175,6 +183,7 @@ async function loadConfigContent(filename) {
 
 onMounted(() => {
   loadData()
+  loadCreateParams()
   loadConfigFiles()
   timer = setInterval(loadData, 10000)
 })

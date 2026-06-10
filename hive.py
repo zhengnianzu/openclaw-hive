@@ -599,9 +599,12 @@ class OpenClawDistillationTask:
 
         try:
             request = EnvMakeRequest(**OmegaConf.to_container(self.client_config.env_make))
-            self.execution_client = await make(
+            result = await make(
                 request, config=self.client_config, rmq_client=self.rmq_client
             )
+            if isinstance(result, Result):
+                raise RuntimeError(f"Environment creation failed: {result.msg}")
+            self.execution_client = result
             self.logger.info(
                 f">>>>>> Task {task_idx}: env={self.execution_client.get_env_id()} "
                 f"elapsed={time.time() - start_time:.1f}s <<<<<<"
@@ -611,7 +614,7 @@ class OpenClawDistillationTask:
             self.logger.error(f"Task {task_idx} failed: {traceback.format_exc()}")
             await self._save_record(self.failed_record_file, config_file)
         finally:
-            if self.execution_client is not None:
+            if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
                 await self.execution_client.close()
             self.logger.info(f"Task {task_idx} finished, elapsed={time.time() - start_time:.1f}s")
 

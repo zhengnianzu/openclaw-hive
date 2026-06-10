@@ -122,6 +122,8 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
 
     if req.skill_dir:
         base.run_config.obs.skill_download_path = req.skill_dir
+    if req.default_skills:
+        base.run_config.obs.default_skills = [s.strip() for s in req.default_skills.split(",") if s.strip()]
     if req.agent_dir:
         base.run_config.obs.agents_download_path = req.agent_dir
     if req.user_config_dir:
@@ -208,15 +210,19 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
     total_tasks = 0
     task_input = str(base.run_config.task.task_input_path)
     if os.path.isdir(task_input):
-        total_tasks = len([f for f in os.listdir(task_input) if os.path.isfile(os.path.join(task_input, f))])
+        file_count = len([f for f in os.listdir(task_input) if os.path.isfile(os.path.join(task_input, f))])
+        actual_start = min(req.start_index, file_count)
+        available = file_count - actual_start
+        total_tasks = min(req.total_num, available) if req.total_num > 0 else available
 
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO task_instances
-               (id, name, config_path, status, created_by, total_tasks, concurrent_num, config_snapshot, create_params)
-               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?)""",
+               (id, name, config_path, status, created_by, total_tasks, concurrent_num, config_snapshot, create_params, created_at)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], total_tasks,
-             req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json()),
+             req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json(),
+             datetime.now().isoformat()),
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 

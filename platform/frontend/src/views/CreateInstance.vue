@@ -25,6 +25,10 @@
         </el-input>
       </el-form-item>
 
+      <el-form-item label="默认技能">
+        <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，留空使用模板默认值）" />
+      </el-form-item>
+
       <el-form-item label="Agent 目录">
         <el-input v-model="form.agent_dir" placeholder="task_data/260413_noenv/noenv_configs/agents">
           <template #append>
@@ -152,7 +156,7 @@ const creating = ref(false)
 
 const form = ref({
   name: '', task_name: '', concurrent_num: 100,
-  skill_dir: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
+  skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',

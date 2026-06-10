@@ -6,6 +6,7 @@ class InstanceCreate(BaseModel):
     name: str
     task_name: str
     skill_dir: str = ""
+    default_skills: str = ""
     agent_dir: str = ""
     user_config_dir: str = ""
     user_profile_dir: str = ""
