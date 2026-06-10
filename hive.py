@@ -744,9 +744,12 @@ async def run_tasks(
     task_handler.setFormatter(fmt)
     logger.addHandler(task_handler)
 
-    ec_logger = logging.getLogger("ExecutionClient")
+    # Trigger ManageLogger init FIRST so it configures level/stderr/filter,
+    # then append our task_handler on top. If we getLogger() before ManageLogger
+    # runs, it sees existing handlers and skips all configuration.
+    ec_logger = ManageLogger("ExecutionClient").get_logger()
     ec_logger.addHandler(task_handler)
-    make_logger = logging.getLogger("execution_client.client.client")
+    make_logger = ManageLogger("execution_client.client.client").get_logger()
     make_logger.addHandler(task_handler)
 
     # Auto-pack source directory if main_code_dir is set
