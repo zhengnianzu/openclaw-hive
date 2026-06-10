@@ -5,7 +5,6 @@ import shutil
 import signal
 import subprocess
 import uuid
-from collections import Counter
 from datetime import datetime, timedelta
 from math import ceil
 from pathlib import Path
@@ -410,7 +409,7 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
     pending = max(0, total - finished - running_pods)
     rate = (completed / finished * 100) if finished > 0 else 0.0
 
-    error_breakdown = _analyze_errors(inst["config_path"])
+    error_breakdown = _analyze_task_status(inst["config_path"], total)
     time_est = _estimate_remaining_time(
         inst["config_path"], total, completed, failed,
         inst["concurrent_num"], inst["status"],
@@ -466,42 +465,50 @@ def _estimate_remaining_time(
     }
 
 
-def _analyze_errors(config_path: str) -> dict:
+def _analyze_task_status(config_path: str, total_tasks: int) -> dict:
     output_dir = _get_output_dir(config_path)
-    log_file = os.path.join(output_dir, "nohup.log")
-    if not os.path.exists(log_file):
-        return {}
+    logs_dir = os.path.join(output_dir, "logs")
 
-    error_keywords = [
-        ("Gateway startup timeout", "Gateway启动超时"),
-        ("Gateway start failed", "Gateway启动失败"),
-        ("Failed to update port", "端口更新失败"),
-        ("Script execution failed", "脚本执行失败"),
-        ("Skill download failed", "技能下载失败"),
-        ("User profile download failed", "用户配置下载失败"),
-        ("Agents download failed", "Agent下载失败"),
-        ("Upload failed", "OBS上传失败"),
-        ("extract code failed", "代码解压失败"),
-    ]
+    succeeded = 0
+    failed = 0
+    abnormal = 0
 
-    counts = Counter()
-    error_pattern = re.compile(r"Task \d+ failed:.*?RuntimeError: (.+?)(?:\\n|$)")
+    if os.path.isdir(logs_dir):
+        task_files = [f for f in os.listdir(logs_dir) if f.startswith("task-") and f.endswith(".log")]
+        for fname in task_files:
+            fpath = os.path.join(logs_dir, fname)
+            has_success = False
+            has_failed = False
+            try:
+                with open(fpath, "r", errors="replace") as f:
+                    for line in f:
+                        if "[INFO] 任务完成" in line:
+                            has_success = True
+                        if "[INFO] 任务失败" in line:
+                            has_failed = True
+            except OSError:
+                continue
 
-    with open(log_file, "r", errors="replace") as f:
-        content = f.read()
+            if has_failed:
+                failed += 1
+            elif has_success:
+                succeeded += 1
+            else:
+                abnormal += 1
 
-    for match in error_pattern.finditer(content):
-        msg = match.group(1)
-        classified = False
-        for keyword, category in error_keywords:
-            if keyword.lower() in msg.lower():
-                counts[category] += 1
-                classified = True
-                break
-        if not classified:
-            counts["其他错误"] += 1
+    executed = succeeded + failed + abnormal
+    not_executed = max(0, total_tasks - executed)
 
-    return dict(counts)
+    result = {}
+    if succeeded:
+        result["任务成功"] = succeeded
+    if failed:
+        result["任务失败"] = failed
+    if abnormal:
+        result["异常退出"] = abnormal
+    if not_executed:
+        result["未执行"] = not_executed
+    return result
 
 
 @router.delete("/{instance_id}")

@@ -33,6 +33,7 @@ _LOGGER_RE = re.compile(r'\|(?:INFO|WARNING|ERROR|DEBUG)\|[^|]*\|[^|]*\|(.+)', r
 _NODE_ID_RE = re.compile(r'^\[node_id:\d+\][^|]*\|')
 _SSE_STDOUT_STDERR_RE = re.compile(r',\s*stdout:\s*\[(.*)\],\s*stderr:\s*\[(.*)\]$', re.DOTALL)
 _SSE_NO_RESP_RE = re.compile(r'sse data:.*no response')
+_SSE_CMD_RE = re.compile(r'sse data:\s*\[#(\d+)\]\[([^\]]*:\[.+?\])\]')
 
 
 def _join_multiline(lines: list[str]) -> list[str]:
@@ -46,31 +47,87 @@ def _join_multiline(lines: list[str]) -> list[str]:
     return joined
 
 
-def _clean_line(line: str) -> list[str]:
+def _extract_sse_payload(line: str) -> Optional[tuple[str, str, str]]:
+    """从一条已 join 的日志行中提取 (cmd_key, stdout, stderr)，非 SSE 行返回 None。"""
     cleaned = line
     m = _LOGGER_RE.search(cleaned)
     if m:
         cleaned = m.group(1)
     cleaned = _NODE_ID_RE.sub('', cleaned).strip()
 
-    m = _SSE_STDOUT_STDERR_RE.search(cleaned)
-    if m and 'sse data:' in cleaned:
-        stdout = (m.group(1) or '').replace('\n', ' ').strip()
-        stderr = (m.group(2) or '').replace('\n', ' ').strip()
-        parts = []
-        if stdout and stdout != 'None':
-            parts.append(f'[STDOUT] {stdout}')
-        if stderr and stderr != 'None':
-            parts.append(f'[STDERR] {stderr}')
-        return parts
-
     if _SSE_NO_RESP_RE.search(cleaned):
-        return []
+        return None
+    if 'sse data:' not in cleaned:
+        return None
 
-    cleaned = cleaned.replace('\n', ' ').strip()
-    if not cleaned:
-        return []
-    return [cleaned]
+    m_cmd = _SSE_CMD_RE.search(cleaned)
+    cmd_key = m_cmd.group(2) if m_cmd else ''
+
+    m_data = _SSE_STDOUT_STDERR_RE.search(cleaned)
+    if not m_data:
+        return None
+    stdout = m_data.group(1) or ''
+    stderr = m_data.group(2) or ''
+    return (cmd_key, stdout, stderr)
+
+
+def _concat_sse_groups(lines: list[str]) -> list[str]:
+    """把同一命令的连续 SSE stdout/stderr 拼接成完整文本，然后按行输出。"""
+    result = []
+    current_cmd = None
+    stdout_buf = []
+    stderr_buf = []
+
+    def _flush():
+        text = ''.join(stdout_buf)
+        seen_out = set()
+        for out_line in text.splitlines():
+            stripped = out_line.strip()
+            if stripped and stripped not in seen_out:
+                seen_out.add(stripped)
+                result.append(f'[STDOUT] {stripped}')
+        err_text = ''.join(stderr_buf)
+        seen_err = set()
+        for err_line in err_text.splitlines():
+            stripped = err_line.strip()
+            if stripped and stripped != 'None' and stripped not in seen_err:
+                seen_err.add(stripped)
+                result.append(f'[STDERR] {stripped}')
+
+    for line in lines:
+        payload = _extract_sse_payload(line)
+        if payload is not None:
+            cmd_key, stdout, stderr = payload
+            if cmd_key != current_cmd and current_cmd is not None:
+                _flush()
+                stdout_buf.clear()
+                stderr_buf.clear()
+            current_cmd = cmd_key
+            if stdout and stdout != 'None':
+                stdout_buf.append(stdout)
+            if stderr and stderr != 'None':
+                stderr_buf.append(stderr)
+        else:
+            if current_cmd is not None:
+                _flush()
+                stdout_buf.clear()
+                stderr_buf.clear()
+                current_cmd = None
+            cleaned = line
+            m = _LOGGER_RE.search(cleaned)
+            if m:
+                cleaned = m.group(1)
+            cleaned = _NODE_ID_RE.sub('', cleaned).strip()
+            if _SSE_NO_RESP_RE.search(cleaned):
+                continue
+            cleaned = cleaned.replace('\n', ' ').strip()
+            if cleaned:
+                result.append(cleaned)
+
+    if current_cmd is not None:
+        _flush()
+
+    return result
 
 
 @router.get("/{instance_id}/main")
@@ -107,10 +164,7 @@ async def get_main_log(
 
     if mode == "concise":
         lines = _join_multiline(lines)
-        cleaned = []
-        for l in lines:
-            cleaned.extend(_clean_line(l))
-        lines = cleaned
+        lines = _concat_sse_groups(lines)
 
     total = len(lines)
     lines = lines[-tail:] if tail < total else lines
@@ -271,10 +325,7 @@ async def get_task_log(
 
     if mode == "concise":
         lines = _join_multiline(lines)
-        cleaned = []
-        for l in lines:
-            cleaned.extend(_clean_line(l))
-        lines = cleaned
+        lines = _concat_sse_groups(lines)
 
     total = len(lines)
     lines = lines[-tail:] if tail < total else lines

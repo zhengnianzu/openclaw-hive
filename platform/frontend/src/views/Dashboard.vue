@@ -25,7 +25,7 @@
     </el-row>
 
     <el-table :data="instances" v-loading="loading" stripe style="width:100%">
-      <el-table-column prop="name" label="实例名称" min-width="150" />
+      <el-table-column prop="name" label="实例名称" width="200" show-overflow-tooltip />
       <el-table-column prop="id" label="实例ID" width="130">
         <template #default="{row}">
           <span style="font-family:monospace;font-size:12px;color:#909399">{{ row.id }}</span>

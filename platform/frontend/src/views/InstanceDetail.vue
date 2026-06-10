@@ -57,15 +57,15 @@
         </el-card>
       </el-col>
       <el-col :span="12">
-        <el-card header="错误分布">
+        <el-card header="任务执行情况">
           <div v-if="Object.keys(overview.error_breakdown || {}).length">
             <div v-for="(count, category) in overview.error_breakdown" :key="category"
               style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0">
               <span>{{ category }}</span>
-              <el-tag type="danger" size="small">{{ count }}</el-tag>
+              <el-tag :type="taskTagType(category)" size="small">{{ count }}</el-tag>
             </div>
           </div>
-          <el-empty v-else description="暂无错误" :image-size="60" />
+          <el-empty v-else description="暂无数据" :image-size="60" />
         </el-card>
       </el-col>
     </el-row>
@@ -112,6 +112,10 @@ function statusColor(s) {
 }
 function statusText(s) {
   return { running: '运行中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+}
+
+function taskTagType(category) {
+  return { '任务成功': 'success', '任务失败': 'danger', '异常退出': 'warning', '未执行': 'info' }[category] || ''
 }
 
 function formatDuration(seconds) {
