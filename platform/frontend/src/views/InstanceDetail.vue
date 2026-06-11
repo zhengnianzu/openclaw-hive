@@ -26,8 +26,13 @@
       <el-col :span="4"><el-statistic title="成功率" :value="overview.success_rate + '%'" /></el-col>
     </el-row>
 
-    <div v-if="overview.avg_task_seconds" style="margin-bottom:16px;font-size:13px;color:#606266">
-      <span>平均耗时: <strong>{{ formatDuration(overview.avg_task_seconds) }}</strong></span>
+    <div style="margin-bottom:16px;font-size:13px;color:#606266">
+      <span v-if="overview.elapsed_seconds != null">
+        已用时间: <strong>{{ formatDuration(overview.elapsed_seconds) }}</strong>
+      </span>
+      <span v-if="overview.avg_task_seconds" style="margin-left:24px">
+        平均耗时: <strong>{{ formatDuration(overview.avg_task_seconds) }}</strong>
+      </span>
       <span v-if="overview.estimated_remaining_seconds != null && inst.status === 'running'" style="margin-left:24px">
         预计剩余: <strong>{{ formatDuration(overview.estimated_remaining_seconds) }}</strong>
       </span>
