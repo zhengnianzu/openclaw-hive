@@ -607,7 +607,7 @@ class OpenClawDistillationTask:
             self.execution_client = result
             self.logger.info(
                 f">>>>>> Task {task_idx}: env={self.execution_client.get_env_id()} "
-                f"elapsed={time.time() - start_time:.1f}s <<<<<<"
+                f"elapsed={time.perf_counter() - start_time:.1f}s <<<<<<"
             )
             await self._execute_task(config_file, task_idx)
         except Exception as e:
@@ -616,7 +616,7 @@ class OpenClawDistillationTask:
         finally:
             if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
                 await self.execution_client.close()
-            self.logger.info(f"Task {task_idx} finished, elapsed={time.time() - start_time:.1f}s")
+            self.logger.info(f"Task {task_idx} finished, elapsed={time.perf_counter() - start_time:.1f}s")
 
 
 # ============================================================================
