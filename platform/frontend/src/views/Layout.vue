@@ -18,7 +18,7 @@
         <span style="margin-right:16px;color:#666">{{ username }}</span>
         <el-button text @click="logout">退出登录</el-button>
       </el-header>
-      <el-main style="padding:20px">
+      <el-main style="padding:20px;overflow-x:hidden">
         <router-view />
       </el-main>
     </el-container>
