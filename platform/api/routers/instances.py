@@ -178,6 +178,9 @@ def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user))
         openclaw_cfg["models"]["providers"]["local"]["baseUrl"] = req.model_base_url
     if req.model_api_type:
         openclaw_cfg["models"]["providers"]["local"]["api"] = req.model_api_type
+        models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
+        if models_list:
+            models_list[0]["api"] = req.model_api_type
     if req.model_id:
         models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
         if models_list:

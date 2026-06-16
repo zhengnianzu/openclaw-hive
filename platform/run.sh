@@ -58,13 +58,41 @@ case "$ACTION" in
         fi
         ;;
 
+    restart)
+        echo "=== 重启服务 ==="
+        if [ -f platform.pid ]; then
+            kill "$(cat platform.pid)" 2>/dev/null
+            rm -f platform.pid
+            echo "已停止旧进程"
+        fi
+        sleep 1
+        if [ ! -d "frontend/dist" ]; then
+            echo "前端未构建，正在构建..."
+            cd frontend && npm run build && cd ..
+        fi
+        echo "服务地址: http://${HOST}:${PORT}"
+        nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 2 > platform.log 2>&1 &
+        echo $! > platform.pid
+        echo "已启动 (PID: $(cat platform.pid))"
+        ;;
+
+    logs)
+        if [ -f platform.log ]; then
+            tail -f platform.log
+        else
+            echo "日志文件不存在，服务可能未启动"
+        fi
+        ;;
+
     *)
-        echo "用法: $0 {install|build|dev|start|stop} [host] [port]"
+        echo "用法: $0 {install|build|dev|start|stop|restart|logs} [host] [port]"
         echo ""
         echo "  install   安装依赖（后端 + 前端）"
         echo "  build     构建前端静态文件"
         echo "  dev       开发模式（后端热重载）"
         echo "  start     生产模式启动"
         echo "  stop      停止服务"
+        echo "  restart   重启服务"
+        echo "  logs      查看日志（实时）"
         ;;
 esac

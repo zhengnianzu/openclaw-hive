@@ -59,12 +59,18 @@
 
       <el-divider>模型配置 (openclaw.json)</el-divider>
 
-      <el-form-item label="模型 API Key">
-        <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" show-password />
-      </el-form-item>
-
       <el-form-item label="模型 Base URL">
         <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
+      </el-form-item>
+
+      <el-form-item label="模型 API Key">
+        <div style="display:flex;gap:8px;width:100%">
+          <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" />
+          <el-button type="primary" @click="openKeyDialog">新建KEY</el-button>
+        </div>
+        <div v-if="form.model_api_key" style="font-size:12px;color:#999;margin-top:4px">
+          {{ form.model_api_key.length > 8 ? form.model_api_key.slice(0, 4) + '****' + form.model_api_key.slice(-4) : '' }}
+        </div>
       </el-form-item>
 
       <el-form-item label="API 类型">
@@ -116,6 +122,22 @@
       </el-form-item>
     </el-form>
 
+    <!-- API Key 生成弹窗 -->
+    <el-dialog v-model="keyDialogVisible" title="新建 API Key" width="480px" destroy-on-close>
+      <el-form label-width="100px">
+        <el-form-item label="Invite Code">
+          <el-input v-model="keyForm.invite_code" placeholder="pangu" />
+        </el-form-item>
+        <el-form-item label="Name">
+          <el-input v-model="keyForm.name" placeholder="mtime-任务名称" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="keyDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="generateApiKey" :loading="keyGenerating">生成</el-button>
+      </template>
+    </el-dialog>
+
     <!-- OBS Browser Dialog -->
     <el-dialog v-model="obsVisible" title="选择OBS目录" width="700px" destroy-on-close>
       <div style="margin-bottom:12px">
@@ -153,6 +175,48 @@ import api from '../api'
 const router = useRouter()
 const route = useRoute()
 const creating = ref(false)
+
+const keyDialogVisible = ref(false)
+const keyGenerating = ref(false)
+const keyForm = ref({
+  invite_code: localStorage.getItem('last_invite_code') || 'pangu',
+  name: '',
+})
+
+function openKeyDialog() {
+  const now = new Date()
+  const ts = [
+    String(now.getFullYear()).slice(2),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+  ].join('')
+  keyForm.value.name = `${ts}-${form.value.name || '任务'}`
+  keyDialogVisible.value = true
+}
+
+async function generateApiKey() {
+  keyGenerating.value = true
+  try {
+    const params = {
+      invite_code: keyForm.value.invite_code,
+      name: keyForm.value.name,
+    }
+    if (form.value.model_base_url) {
+      params.base_url = form.value.model_base_url
+    }
+    const res = await api.post('/generate-api-key', null, { params })
+    form.value.model_api_key = res.api_key
+    localStorage.setItem('last_invite_code', keyForm.value.invite_code)
+    ElMessage.success(`API Key 已生成: ${res.api_key.slice(0, 4)}****${res.api_key.slice(-4)}`)
+    keyDialogVisible.value = false
+  } catch {
+    // error already shown by api interceptor
+  } finally {
+    keyGenerating.value = false
+  }
+}
 
 const form = ref({
   name: '', task_name: '', concurrent_num: 100,

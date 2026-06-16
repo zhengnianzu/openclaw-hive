@@ -1,13 +1,18 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import json
 import os
 import shutil
 import sys
 
+import httpx
+from fastapi import Depends, HTTPException, Query
+from typing import Optional
+
 from api.core.config import settings
 from api.core.database import init_db, get_connection
-from api.core.security import get_password_hash
+from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
@@ -52,11 +57,36 @@ with get_connection() as conn:
         except Exception:
             pass
 
-static_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
-if os.path.isdir(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")
-
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "project": settings.PROJECT_NAME}
+
+
+@app.post("/api/generate-api-key")
+async def generate_api_key(
+    base_url: Optional[str] = None,
+    invite_code: str = "pangu",
+    name: str = "test-user",
+    user: dict = Depends(get_current_user),
+):
+    if not base_url:
+        openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
+        with open(openclaw_template, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        base_url = cfg["models"]["providers"]["local"]["baseUrl"]
+    api_url = base_url.rstrip("/") + f"/api/invite?invite_code={invite_code}&name={name}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(api_url)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"API Key 服务返回错误: {e.response.text[:200]}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"无法连接 API Key 服务: {str(e)[:200]}")
+
+
+static_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.isdir(static_dir):
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")
