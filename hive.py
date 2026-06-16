@@ -686,17 +686,19 @@ async def run_tasks(
 
     # Load or discover task files
     failed_file = os.path.join(config.task_output_path, config.task_failed_record)
+    retry_file = os.path.join(config.task_output_path, "retry.jsonl")
     if run_failed:
-        if not os.path.exists(failed_file):
-            logger.info(f"No failed record file found ({failed_file}), exiting")
+        source_file = retry_file if os.path.exists(retry_file) else failed_file
+        if not os.path.exists(source_file):
+            logger.info(f"No failed/retry record file found, exiting")
             return
-        with open(failed_file, "r", encoding="utf-8") as f:
+        with open(source_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     config.run_input_config_files.add(line)
-        os.remove(failed_file)
-        logger.info(f"Loaded {len(config.run_input_config_files)} failed tasks")
+        os.remove(source_file)
+        logger.info(f"Loaded {len(config.run_input_config_files)} failed tasks from {os.path.basename(source_file)}")
     else:
         # Download config from OBS if needed
         if config.obs_config.user_config_download_path:

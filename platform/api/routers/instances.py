@@ -366,6 +366,16 @@ def retry_failed(instance_id: str, user: dict = Depends(get_current_user)):
     config_path = inst["config_path"]
     output_dir = _get_output_dir(config_path)
     os.makedirs(output_dir, exist_ok=True)
+
+    failed_file = os.path.join(output_dir, "failed.jsonl")
+    retry_file = os.path.join(output_dir, "retry.jsonl")
+    if os.path.exists(failed_file):
+        if os.path.exists(retry_file):
+            os.remove(retry_file)
+        os.rename(failed_file, retry_file)
+    elif not os.path.exists(retry_file):
+        raise HTTPException(status_code=400, detail="没有失败任务可重跑")
+
     log_file = os.path.join(output_dir, "nohup.log")
     clean_log_file = os.path.join(output_dir, "nohup_clean.log")
 
