@@ -2,6 +2,7 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 
 const routes = [
   { path: '/login', name: 'Login', component: () => import('../views/Login.vue') },
+  { path: '/register', name: 'Register', component: () => import('../views/Register.vue') },
   {
     path: '/',
     component: () => import('../views/Layout.vue'),
@@ -12,6 +13,9 @@ const routes = [
       { path: 'instance/:id', name: 'InstanceDetail', component: () => import('../views/InstanceDetail.vue') },
       { path: 'logs/:id', name: 'LogViewer', component: () => import('../views/LogViewer.vue') },
       { path: 'outputs/:id', name: 'OutputViewer', component: () => import('../views/OutputViewer.vue') },
+      { path: 'registrations', name: 'Registrations', component: () => import('../views/TaskRegistrationList.vue') },
+      { path: 'task-register', name: 'TaskRegister', component: () => import('../views/TaskRegister.vue') },
+      { path: 'users', name: 'UserManagement', component: () => import('../views/UserManagement.vue') },
     ],
   },
 ]
@@ -20,7 +24,7 @@ const router = createRouter({ history: createWebHashHistory(), routes })
 
 router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('token')
-  if (to.name !== 'Login' && !token) next({ name: 'Login' })
+  if (to.name !== 'Login' && to.name !== 'Register' && !token) next({ name: 'Login' })
   else next()
 })
 

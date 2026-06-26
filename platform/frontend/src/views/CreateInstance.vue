@@ -233,7 +233,13 @@ async function handleCreate() {
   }
   creating.value = true
   try {
-    await api.post('/instances', form.value)
+    const res = await api.post('/instances', form.value)
+    const fromRegistration = route.query.from_registration
+    if (fromRegistration && res.id) {
+      try {
+        await api.put(`/registrations/${fromRegistration}/link?instance_id=${res.id}`)
+      } catch { /* non-critical */ }
+    }
     ElMessage.success('创建成功')
     router.push('/dashboard')
   } finally { creating.value = false }
@@ -288,6 +294,7 @@ function confirmObsSelect() {
 
 onMounted(async () => {
   const copyFrom = route.query.copy_from
+  const fromRegistration = route.query.from_registration
   if (copyFrom) {
     try {
       const params = await api.get(`/instances/${copyFrom}/create-params`)
@@ -297,6 +304,19 @@ onMounted(async () => {
       ElMessage.info('已从已有实例复制配置，请修改任务标识后创建')
     } catch {
       ElMessage.warning('无法加载源实例配置')
+    }
+  } else if (fromRegistration) {
+    try {
+      const reg = await api.get(`/registrations/${fromRegistration}`)
+      form.value.name = `${reg.task_name}-${reg.requester || 'task'}`
+      form.value.task_name = reg.task_name
+      form.value.user_config_dir = reg.task_path_obs
+      form.value.skill_dir = reg.skill_dir_obs
+      form.value.agent_dir = reg.agent_dir_obs
+      form.value.total_num = reg.data_total || 0
+      ElMessage.info('已从任务登记预填配置')
+    } catch {
+      ElMessage.warning('无法加载登记信息')
     }
   }
 })

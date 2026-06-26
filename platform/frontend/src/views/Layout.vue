@@ -7,15 +7,28 @@
           <el-icon><Monitor /></el-icon>
           <span>任务管理</span>
         </el-menu-item>
-        <el-menu-item index="/create">
+        <el-menu-item index="/registrations">
+          <el-icon><Document /></el-icon>
+          <span>任务登记</span>
+        </el-menu-item>
+        <el-menu-item index="/task-register">
+          <el-icon><EditPen /></el-icon>
+          <span>提交登记</span>
+        </el-menu-item>
+        <el-menu-item v-if="authStore.isOperator" index="/create">
           <el-icon><Plus /></el-icon>
           <span>新建任务</span>
+        </el-menu-item>
+        <el-menu-item v-if="authStore.isAdmin" index="/users">
+          <el-icon><User /></el-icon>
+          <span>用户管理</span>
         </el-menu-item>
       </el-menu>
     </el-aside>
     <el-container>
       <el-header style="background:#fff;display:flex;align-items:center;justify-content:flex-end;border-bottom:1px solid #e6e6e6">
-        <span style="margin-right:16px;color:#666">{{ username }}</span>
+        <el-tag :type="roleTagType" size="small" style="margin-right:8px">{{ roleLabel }}</el-tag>
+        <span style="margin-right:16px;color:#666">{{ authStore.username }}</span>
         <el-button text @click="logout">退出登录</el-button>
       </el-header>
       <el-main style="padding:20px;overflow-x:hidden">
@@ -26,13 +39,29 @@
 </template>
 
 <script setup>
+import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+
 const route = useRoute()
 const router = useRouter()
-const username = localStorage.getItem('username') || ''
+const authStore = useAuthStore()
+
+const roleLabel = computed(() => {
+  const map = { admin: '管理员', operator: '运行者', viewer: '浏览者' }
+  return map[authStore.role] || '浏览者'
+})
+const roleTagType = computed(() => {
+  const map = { admin: 'danger', operator: 'warning', viewer: 'info' }
+  return map[authStore.role] || 'info'
+})
+
+onMounted(() => {
+  if (authStore.token) authStore.fetchMe()
+})
+
 function logout() {
-  localStorage.removeItem('token')
-  localStorage.removeItem('username')
+  authStore.clearAuth()
   router.push('/login')
 }
 </script>

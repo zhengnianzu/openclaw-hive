@@ -13,7 +13,7 @@ from typing import Optional
 from api.core.config import settings
 from api.core.database import init_db, get_connection
 from api.core.security import get_current_user, get_password_hash
-from api.routers import auth, instances, obs, logs
+from api.routers import auth, instances, obs, logs, registrations
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json"]
@@ -44,6 +44,7 @@ app.include_router(auth.router)
 app.include_router(instances.router)
 app.include_router(obs.router)
 app.include_router(logs.router)
+app.include_router(registrations.router)
 
 init_db()
 
@@ -52,7 +53,7 @@ with get_connection() as conn:
     if not existing:
         hashed = get_password_hash(settings.ADMIN_PASSWORD)
         try:
-            conn.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (settings.ADMIN_USERNAME, hashed))
+            conn.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, 'admin')", (settings.ADMIN_USERNAME, hashed))
             print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
         except Exception:
             pass

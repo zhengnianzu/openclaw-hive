@@ -7,9 +7,9 @@
       <div>
         <el-button type="primary" @click="$router.push(`/logs/${inst.id}`)">查看日志</el-button>
         <el-button type="info" @click="$router.push(`/outputs/${inst.id}`)">查看输出</el-button>
-        <el-button type="success" v-if="inst.status !== 'running'" @click="startInstance">启动</el-button>
-        <el-button type="danger" v-if="inst.status === 'running'" @click="stopInstance">停止</el-button>
-        <el-button type="warning" v-if="inst.failed_tasks > 0 && inst.status !== 'running'" @click="retryFailed">重跑失败</el-button>
+        <el-button type="success" v-if="authStore.isOperator && inst.status !== 'running'" @click="startInstance">启动</el-button>
+        <el-button type="danger" v-if="authStore.isOperator && inst.status === 'running'" @click="stopInstance">停止</el-button>
+        <el-button type="warning" v-if="authStore.isOperator && inst.failed_tasks > 0 && inst.status !== 'running'" @click="retryFailed">重跑失败</el-button>
       </div>
     </div>
 
@@ -92,7 +92,9 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api'
+import { useAuthStore } from '../stores/auth'
 
+const authStore = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const id = route.params.id

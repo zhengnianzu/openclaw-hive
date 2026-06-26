@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 
 from ..core.config import settings
 from ..core.database import get_connection
-from ..core.security import get_current_user
+from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
@@ -100,7 +100,7 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
 
 
 @router.post("", response_model=InstanceInfo)
-def create_instance(req: InstanceCreate, user: dict = Depends(get_current_user)):
+def create_instance(req: InstanceCreate, user: dict = Depends(require_operator)):
     timestamp = datetime.now().strftime("%y%m%d%H%M")
     short_id = uuid.uuid4().hex[:4]
     instance_id = f"{timestamp}-{req.task_name}-{short_id}"
@@ -284,7 +284,7 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
 # ============================================================================
 
 @router.post("/{instance_id}/start")
-def start_instance(instance_id: str, user: dict = Depends(get_current_user)):
+def start_instance(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
@@ -323,7 +323,7 @@ def start_instance(instance_id: str, user: dict = Depends(get_current_user)):
 
 
 @router.post("/{instance_id}/stop")
-def stop_instance(instance_id: str, user: dict = Depends(get_current_user)):
+def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
@@ -353,7 +353,7 @@ def stop_instance(instance_id: str, user: dict = Depends(get_current_user)):
 
 
 @router.post("/{instance_id}/retry-failed")
-def retry_failed(instance_id: str, user: dict = Depends(get_current_user)):
+def retry_failed(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
@@ -518,7 +518,7 @@ def _analyze_task_status(config_path: str, total_tasks: int) -> dict:
 
 
 @router.delete("/{instance_id}")
-def delete_instance(instance_id: str, user: dict = Depends(get_current_user)):
+def delete_instance(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:

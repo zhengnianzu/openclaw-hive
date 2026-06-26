@@ -2,7 +2,7 @@
   <div>
     <div class="header-row">
       <h2>任务实例管理</h2>
-      <el-button type="primary" @click="router.push('/create')">
+      <el-button v-if="authStore.isOperator" type="primary" @click="router.push('/create')">
         <el-icon><Plus /></el-icon> 新建任务
       </el-button>
     </div>
@@ -72,7 +72,7 @@
             <el-button size="small" @click="router.push(`/instance/${row.id}`)">详情</el-button>
             <el-button size="small" type="primary" @click="router.push(`/logs/${row.id}`)">日志</el-button>
             <el-button size="small" type="info" @click="router.push(`/outputs/${row.id}`)">输出</el-button>
-            <el-dropdown trigger="click" @command="cmd => handleCommand(cmd, row)">
+            <el-dropdown v-if="authStore.isOperator" trigger="click" @command="cmd => handleCommand(cmd, row)">
               <el-button size="small">更多<el-icon style="margin-left:4px"><ArrowDown /></el-icon></el-button>
               <template #dropdown>
                 <el-dropdown-menu>
@@ -97,7 +97,9 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Search } from '@element-plus/icons-vue'
 import api from '../api'
+import { useAuthStore } from '../stores/auth'
 
+const authStore = useAuthStore()
 const instances = ref([])
 const loading = ref(false)
 const timeEstimates = ref({})

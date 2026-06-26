@@ -15,6 +15,8 @@ api.interceptors.response.use(
     const msg = err.response?.data?.detail || err.message
     if (err.response?.status === 401) {
       localStorage.removeItem('token')
+      localStorage.removeItem('username')
+      localStorage.removeItem('role')
       window.location.hash = '#/login'
     }
     ElMessage.error(msg)

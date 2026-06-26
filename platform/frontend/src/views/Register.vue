@@ -1,21 +1,24 @@
 <template>
   <div class="login-container">
     <div class="login-card">
-      <h2>OpenClaw Hive Platform</h2>
+      <h2>注册账号</h2>
       <el-form :model="form" @submit.prevent="handleSubmit" label-width="0">
         <el-form-item>
-          <el-input v-model="form.username" placeholder="用户名" prefix-icon="User" size="large" />
+          <el-input v-model="form.username" placeholder="用户名（至少2个字符）" prefix-icon="User" size="large" />
         </el-form-item>
         <el-form-item>
-          <el-input v-model="form.password" type="password" placeholder="密码" prefix-icon="Lock" size="large" show-password />
+          <el-input v-model="form.password" type="password" placeholder="密码（至少4个字符）" prefix-icon="Lock" size="large" show-password />
+        </el-form-item>
+        <el-form-item>
+          <el-input v-model="form.confirmPassword" type="password" placeholder="确认密码" prefix-icon="Lock" size="large" show-password />
         </el-form-item>
         <el-form-item>
           <el-button type="primary" size="large" style="width:100%" :loading="loading" @click="handleSubmit">
-            登录
+            注册
           </el-button>
         </el-form-item>
       </el-form>
-      <div class="toggle" @click="router.push('/register')">没有账号？去注册</div>
+      <div class="toggle" @click="router.push('/login')">已有账号？去登录</div>
     </div>
   </div>
 </template>
@@ -29,18 +32,26 @@ import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
 const authStore = useAuthStore()
-const form = ref({ username: '', password: '' })
+const form = ref({ username: '', password: '', confirmPassword: '' })
 const loading = ref(false)
 
 async function handleSubmit() {
   if (!form.value.username || !form.value.password) {
-    ElMessage.warning('请输入用户名和密码')
+    ElMessage.warning('请填写完整信息')
+    return
+  }
+  if (form.value.password !== form.value.confirmPassword) {
+    ElMessage.warning('两次密码不一致')
     return
   }
   loading.value = true
   try {
-    const res = await api.post('/auth/login', form.value)
+    const res = await api.post('/auth/register', {
+      username: form.value.username,
+      password: form.value.password,
+    })
     authStore.setAuth(res)
+    ElMessage.success('注册成功')
     router.push('/dashboard')
   } finally {
     loading.value = false

@@ -46,3 +46,15 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     if user is None:
         raise credentials_exception
     return dict(user)
+
+
+def require_role(*allowed_roles):
+    def checker(user: dict = Depends(get_current_user)):
+        if user.get("role") not in allowed_roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="权限不足")
+        return user
+    return checker
+
+
+require_admin = require_role("admin")
+require_operator = require_role("admin", "operator")
