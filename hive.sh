@@ -113,7 +113,7 @@ do_stop() {
 
 do_restart() {
     do_stop
-    sleep 2
+    sleep 60
     do_start
 }
 
@@ -130,6 +130,7 @@ do_clear() {
     python run_clear.py --config "$CONFIG_FILE" --del_all
     # 删除环境信息数据库，避免残留
     rm -f "${SCRIPT_DIR}/env_info.db"
+    echo "成功删除 env_info.db !!!"
 }
 
 do_stats() {
@@ -164,6 +165,7 @@ if run_cfg.total_num != 0:
 else:
     if os.path.isdir(input_path):
         total = len([f for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f))])
+total = max(0, total - run_cfg.start_index)
 
 complete_set = set()
 if os.path.exists(complete_file):
@@ -236,7 +238,9 @@ if log_file and os.path.exists(log_file):
 print("=" * 50)
 print(f"  Config:          {config_file}")
 print(f"  Output:          {output_dir}")
+print(f"  APIKey:          {run_cfg.sandbox.openclaw_api_key}")
 print(f"  Process:         {proc_status}")
+print(f"  Concurrent:      {run_cfg.concurrent_num}")
 print(f"  Total tasks:     {total}")
 print(f"  Completed:       {done}")
 print(f"  Failed:          {fail}")
