@@ -83,11 +83,20 @@ def _sync_instance_status(instance: dict) -> dict:
 # CRUD
 # ============================================================================
 
+def _with_harness_type(d: dict) -> dict:
+    if d.get("create_params"):
+        try:
+            d["harness_type"] = json.loads(d["create_params"]).get("harness_type", "openclaw")
+        except Exception:
+            pass
+    return d
+
+
 @router.get("", response_model=list[InstanceInfo])
 def list_instances(user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM task_instances ORDER BY created_at DESC").fetchall()
-    return [InstanceInfo(**_sync_instance_status(dict(r))) for r in rows]
+    return [InstanceInfo(**_with_harness_type(_sync_instance_status(dict(r)))) for r in rows]
 
 
 @router.get("/{instance_id}", response_model=InstanceInfo)
@@ -96,7 +105,7 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="实例不存在")
-    return InstanceInfo(**_sync_instance_status(dict(row)))
+    return InstanceInfo(**_with_harness_type(_sync_instance_status(dict(row))))
 
 
 @router.post("", response_model=InstanceInfo)
@@ -162,10 +171,8 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
-        base.run_config.sandbox.openclaw_local_config_file = hermes_config_path
         base.run_config.sandbox.harness_local_config_file = hermes_config_path
     else:
-        base.run_config.sandbox.openclaw_local_config_file = openclaw_path
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
 
@@ -178,21 +185,17 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
 
     # --- 2. 生成 harness 配置文件 ---
     if req.harness_type == "hermes":
-        hermes_cfg = {
-            "model": {
-                "default": req.model_id or "claude-opus-4-6",
-                "provider": "custom",
-                "base_url": req.model_base_url or "http://127.0.0.1:4000/",
-                "api_key": req.model_api_key or "sky-1234",
-            },
-            "custom_providers": [{
-                "name": "local",
-                "base_url": req.model_base_url or "http://127.0.0.1:4001",
-                "api_key": req.model_api_key or "",
-                "api_mode": req.model_api_type.replace("-", "_") if req.model_api_type else "anthropic_messages",
-            }],
-        }
-        hermes_omega = OmegaConf.create(hermes_cfg)
+        hermes_template = os.path.join(settings.SETTINGS_DIR, "hermes_config.yaml")
+        hermes_omega = OmegaConf.load(hermes_template)
+
+        if req.model_id:
+            hermes_omega.model.default = req.model_id
+            hermes_omega.model.model = req.model_id
+        if req.model_base_url:
+            hermes_omega.model.base_url = req.model_base_url
+        if req.model_api_key:
+            hermes_omega.model.api_key = req.model_api_key
+
         OmegaConf.save(hermes_omega, hermes_config_path)
     else:
         openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")

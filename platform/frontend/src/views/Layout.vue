@@ -13,9 +13,9 @@
           <el-icon><Document /></el-icon>
           <span>任务登记</span>
         </el-menu-item>
-        <el-menu-item v-if="authStore.isOperator" index="/create">
-          <el-icon><Plus /></el-icon>
-          <span>新建任务</span>
+        <el-menu-item v-if="authStore.isOperator" index="/images">
+          <el-icon><Box /></el-icon>
+          <span>镜像管理</span>
         </el-menu-item>
         <el-menu-item v-if="authStore.isAdmin" index="/users">
           <el-icon><User /></el-icon>

@@ -44,6 +44,7 @@ class InstanceInfo(BaseModel):
     completed_tasks: int = 0
     failed_tasks: int = 0
     concurrent_num: int = 100
+    harness_type: str = "openclaw"
 
 
 class InstanceOverview(BaseModel):

@@ -58,13 +58,20 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="filteredInstances" v-loading="loading" stripe style="width:100%" border>
-        <el-table-column prop="name" label="实例名称" min-width="200" show-overflow-tooltip resizable />
+        <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
+        <el-table-column prop="harness_type" label="Harness" width="100" align="center" resizable>
+          <template #default="{row}">
+            <el-tag :type="row.harness_type === 'hermes' ? 'warning' : 'primary'" size="small">
+              {{ row.harness_type || 'openclaw' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="status" label="状态" width="90" resizable>
           <template #default="{row}">
             <el-tag :type="statusColor(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="进度" min-width="220" resizable>
+        <el-table-column label="进度" min-width="180" resizable>
           <template #default="{row}">
             <div style="display:flex;align-items:center;gap:8px">
               <el-progress :percentage="progress(row)" :stroke-width="8" style="flex:1;min-width:120px"

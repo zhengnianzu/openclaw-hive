@@ -31,7 +31,7 @@
       </span>
     </div>
 
-    <div class="glass-card" style="padding:16px 20px;margin-bottom:20px">
+    <div v-if="inst.status === 'running'" class="glass-card" style="padding:16px 20px;margin-bottom:20px">
       <el-progress :percentage="progressPct" :stroke-width="16" :status="progressStatus"
         :color="[{color:'#6366f1',percentage:50},{color:'#8b5cf6',percentage:80},{color:'#10b981',percentage:100}]" />
     </div>

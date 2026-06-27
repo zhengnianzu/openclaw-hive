@@ -2,6 +2,13 @@
   <div>
     <h2 class="page-title">新建任务实例</h2>
 
+    <div class="harness-switcher">
+      <el-radio-group v-model="form.harness_type" @change="onHarnessChange" size="large">
+        <el-radio-button value="openclaw">OpenClaw</el-radio-button>
+        <el-radio-button value="hermes">Hermes</el-radio-button>
+      </el-radio-group>
+    </div>
+
     <div class="glass-card" style="max-width:800px">
     <el-form :model="form" label-width="140px">
       <el-form-item label="实例名称" required>
@@ -59,7 +66,7 @@
           </el-form-item>
         </el-tab-pane>
 
-        <el-tab-pane label="模型配置" name="model">
+        <el-tab-pane label="Harness配置" name="model">
           <el-form-item label="模型 Base URL">
             <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
           </el-form-item>
@@ -74,7 +81,7 @@
             </div>
           </el-form-item>
 
-          <el-form-item label="API 类型">
+          <el-form-item v-if="form.harness_type !== 'hermes'" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
@@ -83,13 +90,13 @@
 
           <el-form-item label="模型 ID">
             <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking">
-              <template #prepend>local/</template>
+              <template v-if="form.harness_type !== 'hermes'" #prepend>local/</template>
             </el-input>
-            <div style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
+            <div v-if="form.harness_type !== 'hermes'" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
           </el-form-item>
         </el-tab-pane>
 
-        <el-tab-pane label="Proxy模型配置" name="proxy">
+        <el-tab-pane label="用户模拟配置" name="proxy">
           <el-form-item label="模型名称">
             <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
           </el-form-item>
@@ -114,7 +121,13 @@
           </el-form-item>
 
           <el-form-item label="镜像名称">
-            <el-input v-model="form.image_name" placeholder="使用模板默认镜像" />
+            <el-select v-model="form.image_name" filterable allow-create default-first-option
+              placeholder="选择或输入镜像地址" style="width:100%" clearable>
+              <el-option v-for="img in imageList" :key="img.id" :label="img.name" :value="img.address">
+                <span>{{ img.name }}</span>
+                <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
+              </el-option>
+            </el-select>
           </el-form-item>
         </el-tab-pane>
       </el-tabs>
@@ -230,6 +243,19 @@ const form = ref({
   harness_type: 'openclaw',
 })
 
+const imageList = ref([])
+
+async function loadImages() {
+  try {
+    imageList.value = await api.get('/images', { params: { harness_type: form.value.harness_type } })
+  } catch { imageList.value = [] }
+}
+
+function onHarnessChange() {
+  form.value.image_name = ''
+  loadImages()
+}
+
 async function handleCreate() {
   if (!form.value.name || !form.value.task_name || !form.value.user_config_dir) {
     ElMessage.warning('请填写实例名称、任务标识和用户Config目录')
@@ -320,12 +346,13 @@ onMounted(async () => {
       form.value.total_num = reg.data_total || 0
       form.value.harness_type = reg.harness_type || 'openclaw'
       if (reg.model_name) form.value.model_id = reg.model_name
-      if (reg.user_proxy_model_name) form.value.user_proxy_model_name = reg.user_proxy_model_name
+      if (reg.eval_model_name) form.value.user_proxy_model_name = reg.eval_model_name
       ElMessage.info('已从任务登记预填配置')
     } catch {
       ElMessage.warning('无法加载登记信息')
     }
   }
+  loadImages()
 })
 </script>
 
@@ -335,5 +362,9 @@ onMounted(async () => {
   font-size: 24px;
   font-weight: 700;
   margin-bottom: 24px;
+}
+.harness-switcher {
+  margin-bottom: 16px;
+  max-width: 800px;
 }
 </style>

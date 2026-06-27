@@ -18,14 +18,11 @@
           <el-option label="Hermes" value="hermes" />
         </el-select>
       </el-form-item>
-      <el-form-item label="模型名称" required>
+      <el-form-item label="Harness模型" required>
         <el-input v-model="form.model_name" placeholder="例如：claude-opus-4-7-thinking" />
       </el-form-item>
-      <el-form-item label="评估模型名称" required>
+      <el-form-item label="用户模拟模型">
         <el-input v-model="form.eval_model_name" placeholder="对应模型ID" />
-      </el-form-item>
-      <el-form-item label="User Proxy模型名称" required>
-        <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
       </el-form-item>
       <el-form-item label="任务路径OBS">
         <el-input v-model="form.task_path_obs" placeholder="OBS路径，如 obs://bucket/path/">
@@ -116,8 +113,8 @@ async function handleSubmit() {
     ElMessage.warning('请输入任务名称')
     return
   }
-  if (!form.value.model_name || !form.value.eval_model_name || !form.value.user_proxy_model_name) {
-    ElMessage.warning('请填写所有模型名称字段')
+  if (!form.value.model_name) {
+    ElMessage.warning('请填写Harness模型名称')
     return
   }
   submitting.value = true

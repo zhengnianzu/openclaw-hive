@@ -13,10 +13,10 @@ from typing import Optional
 from api.core.config import settings
 from api.core.database import init_db, get_connection
 from api.core.security import get_current_user, get_password_hash
-from api.routers import auth, instances, obs, logs, registrations
+from api.routers import auth, instances, obs, logs, registrations, images
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
-SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json"]
+SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml"]
 for name in SETTINGS_FILES:
     actual = os.path.join(settings.SETTINGS_DIR, name)
     example = actual.rsplit(".", 1)
@@ -45,6 +45,7 @@ app.include_router(instances.router)
 app.include_router(obs.router)
 app.include_router(logs.router)
 app.include_router(registrations.router)
+app.include_router(images.router)
 
 init_db()
 

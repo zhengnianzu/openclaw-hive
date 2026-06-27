@@ -18,7 +18,7 @@
           <el-tag :type="row.harness_type === 'hermes' ? 'warning' : ''" size="small">{{ row.harness_type || 'openclaw' }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="model_name" label="模型名称" min-width="140" show-overflow-tooltip resizable />
+      <el-table-column prop="model_name" label="Harness模型" min-width="140" show-overflow-tooltip resizable />
       <el-table-column prop="data_total" label="数据总量" width="90" align="center" resizable />
       <el-table-column prop="status" label="状态" width="90" resizable>
         <template #default="{row}">
@@ -61,9 +61,8 @@
         <el-descriptions-item label="Harness类型">
           <el-tag :type="currentReg.harness_type === 'hermes' ? 'warning' : ''" size="small">{{ currentReg.harness_type || 'openclaw' }}</el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="模型名称">{{ currentReg.model_name }}</el-descriptions-item>
-        <el-descriptions-item label="评估模型名称">{{ currentReg.eval_model_name }}</el-descriptions-item>
-        <el-descriptions-item label="User Proxy模型">{{ currentReg.user_proxy_model_name }}</el-descriptions-item>
+        <el-descriptions-item label="Harness模型">{{ currentReg.model_name }}</el-descriptions-item>
+        <el-descriptions-item label="用户模拟模型">{{ currentReg.eval_model_name }}</el-descriptions-item>
         <el-descriptions-item label="登记人">{{ currentReg.created_by }}</el-descriptions-item>
         <el-descriptions-item label="登记时间">{{ currentReg.created_at }}</el-descriptions-item>
         <el-descriptions-item label="任务路径OBS">{{ currentReg.task_path_obs }}</el-descriptions-item>
@@ -89,14 +88,11 @@
             <el-option label="Hermes" value="hermes" />
           </el-select>
         </el-form-item>
-        <el-form-item label="模型名称">
+        <el-form-item label="Harness模型">
           <el-input v-model="editForm.model_name" />
         </el-form-item>
-        <el-form-item label="评估模型名称">
+        <el-form-item label="用户模拟模型">
           <el-input v-model="editForm.eval_model_name" />
-        </el-form-item>
-        <el-form-item label="User Proxy模型">
-          <el-input v-model="editForm.user_proxy_model_name" />
         </el-form-item>
         <el-form-item label="导出路径OBS">
           <el-input v-model="editForm.export_path_obs" />

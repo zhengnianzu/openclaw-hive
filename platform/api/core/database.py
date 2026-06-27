@@ -81,6 +81,17 @@ def init_db():
                 pass
         conn.execute("UPDATE users SET role = 'admin' WHERE username = ?", (settings.ADMIN_USERNAME,))
 
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                harness_type TEXT NOT NULL DEFAULT 'openclaw',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT ''
+            );
+        """)
+
 
 @contextmanager
 def get_connection():
