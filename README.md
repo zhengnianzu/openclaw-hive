@@ -1,6 +1,6 @@
 # OpenClaw Hive
 
-OpenClaw 蒸馏任务批量编排系统。在 K8s 集群上并发创建沙箱 Pod，自动部署代码和数据，执行 AI Agent 多轮对话任务，并将执行轨迹上传至 OBS。
+AI Agent 蒸馏任务批量编排系统。在 K8s 集群上并发创建沙箱 Pod，自动部署代码和数据，执行 AI Agent 多轮对话任务，并将执行轨迹上传至 OBS。
 
 ## 系统架构
 
@@ -9,8 +9,8 @@ hive.sh (服务管理)
   └── hive.py (本地编排层)
         ├── 创建 K8s 沙箱 Pod
         ├── 上传代码 + 数据到 Pod
-        ├── 在 Pod 内启动 OpenClaw Gateway
-        ├── 在 Pod 内执行 openclaw_automation.py
+        ├── 在 Pod 内启动 OpenClaw Gateway (可选)
+        ├── 在 Pod 内执行 openclaw_automation.py / hermes_automation.py
         └── 回收结果至 OBS
 
 每个 Pod 内部:
@@ -19,6 +19,12 @@ hive.sh (服务管理)
     ├── 注册 Agent、安装技能
     ├── 执行多轮对话 (支持 User Simulator)
     └── 生成执行日志和交付件
+  hermes_automation.py
+    ├── 配置Hermes，自带python库
+    ├── 注册 Agent、安装技能
+    ├── 执行多轮对话 (支持 User Simulator)
+    └── 生成执行日志和交付件
+
 ```
 
 ## 目录结构
@@ -27,7 +33,8 @@ hive.sh (服务管理)
 openclaw-hive/
 ├── hive.py                    # 核心编排脚本
 ├── hive.sh                    # 服务管理脚本 (start/stop/stats)
-├── config.yaml                # 主配置文件
+├── config_openclaw.yaml       # 主配置文件:openclaw
+├── config_hermes.yaml         # 主配置文件:hermes
 ├── run_clear.py               # Pod 清理工具
 ├── requirements.txt           # Python 依赖
 ├── execution_client/          # 沙箱交互客户端库
@@ -36,10 +43,12 @@ openclaw-hive/
 │   └── models/                #   请求/响应数据模型
 ├── openclaw-task/             # 沙箱内执行的代码
 │   ├── openclaw_automation.py #   Agent 任务自动化主脚本
+│   ├── hermes_automation.py   #   Agent 任务自动化主脚本
 │   └── user_simulator.py      #   用户模拟器
 ├── uploads/                   # 上传到沙箱的文件
 │   ├── openclaw-task.tar      #   代码打包
 │   ├── openclaw.json          #   OpenClaw 配置
+│   ├── config.yaml            #   Hermes 配置
 │   ├── user_proxy_model.json  #   代理模型配置
 │   └── configs/               #   任务数据配置 (每个 JSON 一个任务)
 ├── outputs/                   # 执行结果
@@ -63,7 +72,7 @@ pip install -r requirements.txt
 
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
-| `env_make.image_name` | 沙箱 Docker 镜像 | `swr.../openclaw:0.0.8` |
+| `env_make.image_name` | 沙箱 Docker 镜像 | `swr.../openclaw:26.6.6` 或 `swr.../hermes:0.17.0`|
 | `env_make.runtime_type` | 运行时类型 | `k8s` / `docker` / `local` |
 | `remote_server.user_id` | 用户标识，用于 Pod 命名 | `zx0522claude47` |
 | `run_config.concurrent_num` | 并发数 | Claude 推荐 `100~150` |
@@ -177,7 +186,7 @@ remote_server:
   schema: http
   host: 127.0.0.1
   port: 8080
-  project_id: openclaw
+  project_id: openclaw              # agent框架名
   user_id: zx0522claude47           # Pod 命名前缀
   url_path: /v1/env/gem
   http_client:
@@ -243,6 +252,8 @@ run_config:
 ```
 
 ### 关键配置说明
+
+**project_id**: 复用project_id，一方面决定沙箱类型，一方面决定执行哪套Agent framework
 
 **concurrent_num**：并发 Pod 数量。Claude 模型推荐 100~150，GLM 等较轻模型可适当增大。默认先设 `1` 测试通过后再调大。
 
@@ -346,11 +357,13 @@ python run_clear.py --config config.yaml --delete
 
 ## 镜像版本说明
 
-| 镜像版本 | 对应 OpenClaw 版本 | 备注 |
+| 镜像版本 | 对应发布日期 | 备注 |
 |---------|-------------------|------|
-| 0.0.6   | 2026.3.2          | 旧版本 |
-| 0.0.8   | 2026.4.26         | Gateway 启动较慢，`openclaw_start_timeout` 建议 ≥60 |
-
+| openclaw:0.0.6   | 2026.3.2          | 旧版本 |
+| openclaw:0.0.8   | 2026.4.26         | Gateway 启动较慢，`openclaw_start_timeout` 建议 ≥60 |
+| openclaw:26.6.6  | 2026.6.6          | 按照发布日期打镜像名 |
+| hermes:0.17.0    | 2026.6.19         | hermes镜像 |
+- 镜像地址：swr.cn-southwest-2.myhuaweicloud.com/rl_team/
 ---
 
 ## 环境要求

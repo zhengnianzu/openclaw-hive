@@ -1,0 +1,78 @@
+remote_server:
+  schema: http
+  host: 127.0.0.1
+  port: 8080
+  project_id: openclaw # 复用，决定沙箱和agent框架
+  user_id: zxopenclaw # 沙箱名称，方便kill用
+  url_path: /v1/env/gem
+  http_client:
+    max_retry_count: 1
+    connect_timeout: 10.0
+    read_timeout: 180.0
+    write_timeout: 60.0
+
+
+s3:
+  s3_uploader_script: /home/ma-user/obsutil/obsutil
+  s3_download_script: /home/ma-user/obsutil/obsutil
+  bucket_name: "obs://rl-agentdata"
+
+
+env_make:
+  image_name: swr.cn-southwest-2.myhuaweicloud.com/rl_team/openclaw:26.6.6 # 仅有openclaw镜像
+  wait_for_ready: true
+  wait_timeout: 300
+  env_id: null
+  runtime_type: k8s
+  rabbitmq:
+    is_use: false
+    url: "amqp://guest:guest@7.242.108.134:5672/"
+    queue: "test.direct.reply.queue"
+    priority: 10
+  args:
+    resources:
+      cpu_request: "1"
+      cpu_limit: "2"
+      memory_request: "5Gi"
+      memory_limit: "8Gi"
+    env:
+      - name: PIP_INDEX_URL
+        value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
+      - name: PIP_TRUSTED_HOST
+        value: "mirrors.huaweicloud.com"
+      - name: NODE_TLS_REJECT_UNAUTHORIZED
+        value: "0"
+      - name: SERPER_API_KEY
+        value: xxx
+
+
+run_config:
+  start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
+  total_num: 0      # 任务总数, 0表示不限制任务数量
+  concurrent_num: 2   # 并发数 claude 100~150
+  sandbox:
+    result_log: "run.log"
+    agent_local_config_file: "uploads/openclaw.json"
+    agent_remote_config_file: "/home/ma-user/.openclaw/openclaw.json" # openclaw配置文件
+    user_proxy_model_local_file: "uploads/user_proxy_model.json"
+    openclaw_start_timeout: 80
+  task:
+    task_input_path: "uploads/0529_config_general_1136"  # 任务输入路径
+    task_output_path: "outputs"  # 任务输出路径
+    task_complete_record: "complete.jsonl"
+    task_failed_record: "failed.jsonl"
+    task_download_path: "downloads"
+    main_code_tar: "uploads/openclaw-task.tar"
+    main_code_dir: /mnt/zengxiang/openclaw-task-new/openclaw-task
+    main_python_file: "openclaw_automation.py"  # 不同agent的start脚本文件
+  obs:
+    download_timeout: 1200
+    upload_timeout: 900
+    traj_save_bucket: "obs://rl-agentdata"
+    # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
+    traj_save_path: openclaw_trajs/traj_0626_mem_change_general_opus47
+    skill_download_path: skills/260325/skill_localize/skills_library
+    user_profile_download_path: task_data/260519/轨迹任务0519_1
+    user_config_download_path:
+    agents_download_path: task_data/260604/0529记忆增删改_train_2160/0525_agent_general/agents
+    default_skills:
