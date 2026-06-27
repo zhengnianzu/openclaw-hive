@@ -1,8 +1,10 @@
 """
-OpenClaw Distillation Task Runner
+Agent Distillation Task Runner
 
-A configuration-driven task orchestration system for running OpenClaw AI Agent tasks
-in remote sandboxed environments (k8s/docker).
+A configuration-driven task orchestration system for running AI Agent tasks
+in remote sandboxed environments (k8s/docker). 
+- OpenClaw
+- Hermes
 """
 
 from __future__ import annotations
@@ -49,6 +51,53 @@ _current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
 # Default timeout for OBS download operations (seconds)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
+
+# ============================================================================
+# Agent framework — module-level switch
+# ============================================================================
+
+# 每框架的目录布局 — 用这个 dict 派生所有路径默认值
+_FRAMEWORK_LAYOUTS = {
+    "openclaw": {
+        "ai_agent_dir":        "/home/ma-user/.openclaw",
+        "default_skill_path":  "/home/ma-user/.openclaw/skills",
+        "agent_local_config":  "uploads/openclaw.json",
+        "agent_remote_config": "/home/ma-user/.openclaw/openclaw.json",
+        "main_python_file":    "openclaw_automation.py",
+        "upload_paths": [
+            "/home/ma-user/.openclaw/agents",
+            "/home/ma-user/.openclaw/workspace"
+        ]
+    },
+    "hermes": {
+        "ai_agent_dir":        "/home/ma-user/.hermes",
+        "default_skill_path":  "/home/ma-user/.hermes/skills",
+        "agent_local_config":  "uploads/config.yaml",
+        "agent_remote_config": "/home/ma-user/.hermes/config.yaml",
+        "main_python_file":    "hermes_automation.py",
+        "upload_paths": [
+            "/home/ma-user/.hermes/profiles",
+            "/home/ma-user/.hermes/sessions", 
+            "/home/ma-user/.hermes/logs", 
+            "/home/ma-user/.hermes/state.db", 
+            "/home/ma-user/.hermes/api_use.log"
+        ]
+    },
+}
+
+AGENT_FRAMEWORK: str = "openclaw"  # 占位默认, main() 会覆盖
+_FW: dict = _FRAMEWORK_LAYOUTS[AGENT_FRAMEWORK]
+
+def set_agent_framework(name: str) -> None:
+    """Set the module-level framework switch. Called from ``main()`` exactly once."""
+    global AGENT_FRAMEWORK, _FW
+    name = (name or "").strip().lower()
+    if name not in _FRAMEWORK_LAYOUTS:
+        raise RuntimeError(
+            f"remote_server.project_id 必须是 'openclaw' 或 'hermes', got {name!r}"
+        )
+    AGENT_FRAMEWORK = name
+    _FW = _FRAMEWORK_LAYOUTS[name]
 
 
 class TaskFileHandler(logging.Handler):
@@ -105,17 +154,17 @@ class SandboxConfig:
     workspace: str = f"{home}/workspace"
     result_workdir: str = f"{workspace}/workdir"
     result_log: str = "run.log"
-    target_skill_path: str = f"{home}/.openclaw/skills"
     data_config_path: str = f"{workspace}/config"
-    openclaw_remote_config_file: str = "/home/ma-user/.openclaw/openclaw.json"
-    openclaw_local_config_file: str = "uploads/openclaw.json"
-    openclaw_bash: str = "/usr/local/node22/bin/openclaw"
+    ai_agent_dir: str = field(default_factory=lambda: _FW["ai_agent_dir"])
+    default_skill_path: str = field(default_factory=lambda: _FW["default_skill_path"])
+    agent_remote_config_file: str = field(default_factory=lambda: _FW["agent_remote_config"])
+    agent_local_config_file: str = field(default_factory=lambda: _FW["agent_local_config"])
+    # openclaw用于启动gateway
+    openclaw_bash: str = "/usr/local/node24/bin/openclaw"
     gateway_log: str = "gateway.log"
     openclaw_start_timeout: int = 10
-    upload_session_dir: str = f"{home}/.openclaw/agents"
     user_proxy_model_local_file: str = "uploads/user_proxy_model.json"
     user_proxy_model_remote_file: str = "configs/user_proxy_model.json"
-    upload_workspace_dir:str = f"{home}/.openclaw/workspace"
 
 @dataclass
 class TaskConfig:
@@ -128,7 +177,7 @@ class TaskConfig:
     task_download_path: str = "downloads"
     main_code_tar: str = "uploads/openclaw-task.tar"
     main_code_dir: str = ""
-    main_python_file: str = "openclaw_automation.py"
+    main_python_file: str = field(default_factory=lambda: _FW["main_python_file"])
     main_python_timeout: int = 7200
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
@@ -279,12 +328,12 @@ class OpenClawDistillationTask:
             self.logger.error(msg)
             raise RuntimeError(msg)
 
-    async def _copy_openclaw_config(self) -> None:
-        """Copy OpenClaw configuration to sandbox."""
-        remote_path = self.config.sandbox_config.openclaw_remote_config_file
-        local_path = self.config.sandbox_config.openclaw_local_config_file
-        await self._upload_file("openclaw config", local_path, remote_path)
-        self.logger.info(f"Copied openclaw config: {local_path} -> {remote_path}")
+    async def _copy_agent_config(self) -> None:
+        """Copy main agent configuration to sandbox."""
+        remote_path = self.config.sandbox_config.agent_remote_config_file
+        local_path = self.config.sandbox_config.agent_local_config_file
+        await self._upload_file("agent config", local_path, remote_path)
+        self.logger.info(f"Copied agent config: {local_path} -> {remote_path}")
 
     async def _upload_and_extract_code(self) -> None:
         """Upload and extract the main code tarball in sandbox."""
@@ -327,7 +376,7 @@ class OpenClawDistillationTask:
     async def _start_openclaw_gateway(self, config_file: str) -> None:
         """Start the OpenClaw gateway in the sandbox."""
         # Read gateway port from local config
-        with open(self.config.sandbox_config.openclaw_local_config_file, "r", encoding="utf-8") as f:
+        with open(self.config.sandbox_config.agent_local_config_file, "r", encoding="utf-8") as f:
             openclaw_config = json.load(f)
             original_port = openclaw_config.get("gateway", {}).get("port")
 
@@ -346,10 +395,10 @@ class OpenClawDistillationTask:
             )
 
             # Re-copy original config before sed (needed because config may have been modified in previous retry)
-            await self._copy_openclaw_config()
+            await self._copy_agent_config()
 
             # Update port in remote config files
-            for remote_file in [self.config.sandbox_config.openclaw_remote_config_file, remote_config_path]:
+            for remote_file in [self.config.sandbox_config.agent_remote_config_file, remote_config_path]:
                 sed_cmd = f"sed -i 's/{original_port}/{port}/g' {remote_file}"
                 exec_request = ExtendExecCommand(
                     command=["/bin/bash", "-c", sed_cmd],
@@ -430,14 +479,14 @@ class OpenClawDistillationTask:
             self.logger.warning("No skills found, skipping download")
             return
 
-        # task_skills 下载到 workspace/openclaw-task/{skill_dir}, openclaw_automation.py 对齐
+        # task_skills 下载到 workspace/<project>/{skill_dir}
         code_stem = Path(self.config.main_code_tar).stem
         skill_dir = data_cfg.input_dir.get("skill_dir", "skills")
         task_target_path = os.path.join(
             self.config.sandbox_config.workspace, code_stem, skill_dir
         )
-        # default_skills 下载到 ~/.openclaw/skills
-        default_target_path = f"{self.config.sandbox_config.target_skill_path}"
+        # default_skills 下载到 default_skill_path:
+        default_target_path = f"{self.config.sandbox_config.default_skill_path}"
 
         async def download_skill(skill_path: str, target_path: str) -> None:
             bucket_path = os.path.join(
@@ -543,21 +592,18 @@ class OpenClawDistillationTask:
     async def _upload_traj_to_obs(self, config_file: str) -> bool:
         """Upload execution traj (logs) to OBS."""
         sandbox_cfg = self.config.sandbox_config
-        upload_dir = os.path.join(sandbox_cfg.result_workdir, Path(config_file).stem)
-        code_stem = Path(self.config.main_code_tar).stem
-
-        api_log = os.path.join(sandbox_cfg.workspace, code_stem, "api_use.log")
-        run_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.result_log)
-        gateway_log = os.path.join(sandbox_cfg.result_workdir, sandbox_cfg.gateway_log)
-        session_dir = sandbox_cfg.upload_session_dir
-        workspace_dir = sandbox_cfg.upload_workspace_dir
-
-        upload_cmd = get_obsutil_uploader_command(
-            self.client_config.s3,
-            local_folder_absolute_path=upload_dir,
-            bucket_path=self.config.obs_config.traj_save_path,
+        bucket_path = os.path.join(
+            self.config.obs_config.traj_save_path, Path(config_file).stem,
         )
-        exec_cmd = f"mkdir -p {upload_dir} && cp -r {api_log} {run_log} {gateway_log} {session_dir} {workspace_dir} {upload_dir} && {upload_cmd}"
+        upload_clauses = []
+        for src in [sandbox_cfg.result_workdir] + list(_FW["upload_paths"]):
+            up_cmd = get_obsutil_uploader_command(
+                self.client_config.s3, 
+                local_folder_absolute_path=src,
+                bucket_path=bucket_path
+            )
+            upload_clauses.append(f"([ -e {src} ] && {up_cmd}) || true")
+        exec_cmd = " && ".join(upload_clauses) if upload_clauses else "true"
 
         for retry in range(3, 0, -1):
             exec_request = ExtendExecCommand(
@@ -575,14 +621,25 @@ class OpenClawDistillationTask:
         return False
 
     async def _execute_task(self, config_file: str, task_idx: int) -> None:
-        """Execute the full task pipeline."""
+        """Execute the full task pipeline.
+
+        两种模式只差一步:
+          openclaw: 通过 _start_openclaw_gateway 启动 node gateway 进程
+                    (内部会先 _copy_agent_config 把 openclaw.json 上传)
+          hermes:   只 _copy_agent_config 把 ~/.hermes/config.yaml 上传
+                    (没有 gateway 进程, AIAgent 进程内调用)
+        其他步骤变量复用, 路径靠 config.yaml 覆写。
+        """
         await self._upload_and_extract_code()
         await self._download_s3_skills(config_file)
         await self._download_s3_user_profile(config_file)
         await self._download_s3_agents()
         await self._upload_data_config(config_file)
         await self._upload_user_proxy_model_config()
-        await self._start_openclaw_gateway(config_file)
+        if AGENT_FRAMEWORK.strip().lower() == "hermes":
+            await self._copy_agent_config()
+        else:
+            await self._start_openclaw_gateway(config_file)
         await self._run_main_script(config_file, task_idx)
 
         uploaded = await self._upload_traj_to_obs(config_file)
@@ -590,7 +647,6 @@ class OpenClawDistillationTask:
             await self._save_record(self.complete_record_file, config_file)
         else:
             await self._save_record(self.failed_record_file, config_file)
-        
 
     async def run(self, config_file: str, task_idx: int = 0) -> None:
         """Run a single distillation task."""
@@ -686,19 +742,17 @@ async def run_tasks(
 
     # Load or discover task files
     failed_file = os.path.join(config.task_output_path, config.task_failed_record)
-    retry_file = os.path.join(config.task_output_path, "retry.jsonl")
     if run_failed:
-        source_file = retry_file if os.path.exists(retry_file) else failed_file
-        if not os.path.exists(source_file):
-            logger.info(f"No failed/retry record file found, exiting")
+        if not os.path.exists(failed_file):
+            logger.info(f"No failed record file found ({failed_file}), exiting")
             return
-        with open(source_file, "r", encoding="utf-8") as f:
+        with open(failed_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     config.run_input_config_files.add(line)
-        os.remove(source_file)
-        logger.info(f"Loaded {len(config.run_input_config_files)} failed tasks from {os.path.basename(source_file)}")
+        os.remove(failed_file)
+        logger.info(f"Loaded {len(config.run_input_config_files)} failed tasks")
     else:
         # Download config from OBS if needed
         if config.obs_config.user_config_download_path:
@@ -807,6 +861,8 @@ def main() -> None:
 
     config_obj = load_yaml_config(args.config)
     run_cfg = config_obj.run_config
+    set_agent_framework(config_obj.remote_server.project_id)
+    print(f"  Framework: {AGENT_FRAMEWORK}")
 
     # Isolate output/download paths by config name to avoid cross-contamination
     config_basename = Path(args.config).stem
@@ -845,3 +901,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
