@@ -52,7 +52,7 @@ run_config:
   concurrent_num: 100   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
-    openclaw_local_config_file: "uploads/openclaw.json"
+    harness_local_config_file: "uploads/openclaw.json"
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:

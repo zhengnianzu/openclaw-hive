@@ -13,13 +13,13 @@ remote_server:
 
 
 s3:
-  s3_uploader_script: /home/ma-user/obsutil/obsutil
-  s3_download_script: /home/ma-user/obsutil/obsutil
+  s3_uploader_script: /home/nianzuzheng/project/llm-proxy-main/tools/obsutil/obsutil
+  s3_download_script: /home/nianzuzheng/project/llm-proxy-main/tools/obsutil/obsutil
   bucket_name: "obs://rl-agentdata"
 
 
 env_make:
-  image_name: swr.cn-southwest-2.myhuaweicloud.com/rl_team/hermes:0.16.0
+  image_name: swr.cn-southwest-2.myhuaweicloud.com/rl_team/hermes:0.17.0
   wait_for_ready: true
   wait_timeout: 300
   env_id: null
@@ -43,7 +43,7 @@ env_make:
       - name: NODE_TLS_REJECT_UNAUTHORIZED
         value: "0"
       - name: SERPER_API_KEY
-        value: xxx
+        value: 36b77e7659c306a2dc35cbd0b7caced8eb21c78f
 
 
 run_config:
@@ -52,8 +52,7 @@ run_config:
   concurrent_num: 1   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
-    agent_local_config_file: uploads/config.yaml
-    agent_remote_config_file: /home/ma-user/.hermes/config.yaml
+    harness_local_config_file: uploads/config.yaml
     user_proxy_model_local_file: uploads/user_proxy_model.json
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:
@@ -70,7 +69,7 @@ run_config:
     upload_timeout: 900
     traj_save_bucket: "obs://rl-agentdata"
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
-    traj_save_path: hermes_trajs/traj_0626_mem_change_general_opus47
+    traj_save_path: hermes_trajs/traj_0627_mem_change_general_opus47
     skill_download_path: skills/260325/skill_localize/skills_library
     user_profile_download_path: task_data/260519/轨迹任务0519_1
     user_config_download_path: task_data/260604/0529记忆增删改_train_2160/0529_config_general_1136

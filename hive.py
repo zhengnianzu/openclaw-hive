@@ -59,10 +59,10 @@ OBS_UPLOAD_TIMEOUT = 900
 # 每框架的目录布局 — 用这个 dict 派生所有路径默认值
 _FRAMEWORK_LAYOUTS = {
     "openclaw": {
-        "ai_agent_dir":        "/home/ma-user/.openclaw",
-        "default_skill_path":  "/home/ma-user/.openclaw/skills",
-        "agent_local_config":  "uploads/openclaw.json",
-        "agent_remote_config": "/home/ma-user/.openclaw/openclaw.json",
+        "harness_dir":            "/home/ma-user/.openclaw",
+        "default_skill_path":     "/home/ma-user/.openclaw/skills",
+        "harness_local_config":   "uploads/openclaw.json",
+        "harness_sandbox_config": "/home/ma-user/.openclaw/openclaw.json",
         "main_python_file":    "openclaw_automation.py",
         "upload_paths": [
             "/home/ma-user/.openclaw/agents",
@@ -70,10 +70,10 @@ _FRAMEWORK_LAYOUTS = {
         ]
     },
     "hermes": {
-        "ai_agent_dir":        "/home/ma-user/.hermes",
-        "default_skill_path":  "/home/ma-user/.hermes/skills",
-        "agent_local_config":  "uploads/config.yaml",
-        "agent_remote_config": "/home/ma-user/.hermes/config.yaml",
+        "harness_dir":            "/home/ma-user/.hermes",
+        "default_skill_path":     "/home/ma-user/.hermes/skills",
+        "harness_local_config":   "uploads/config.yaml",
+        "harness_sandbox_config": "/home/ma-user/.hermes/config.yaml",
         "main_python_file":    "hermes_automation.py",
         "upload_paths": [
             "/home/ma-user/.hermes/profiles",
@@ -138,6 +138,7 @@ class ObsBucketConfig:
     """OBS bucket configuration for traj and skill storage."""
     download_timeout: int = OBS_DOWNLOAD_TIMEOUT
     upload_timeout: int = OBS_UPLOAD_TIMEOUT
+    s3_download_script: str = "obsutil"
     traj_save_bucket: str = "obs://rl-agentdata"
     traj_save_path: str = ""
     skill_download_path: str = "skills/260325/skill_localize/skills_library"
@@ -155,10 +156,10 @@ class SandboxConfig:
     result_workdir: str = f"{workspace}/workdir"
     result_log: str = "run.log"
     data_config_path: str = f"{workspace}/config"
-    ai_agent_dir: str = field(default_factory=lambda: _FW["ai_agent_dir"])
+    harness_dir: str = field(default_factory=lambda: _FW["harness_dir"])
     default_skill_path: str = field(default_factory=lambda: _FW["default_skill_path"])
-    agent_remote_config_file: str = field(default_factory=lambda: _FW["agent_remote_config"])
-    agent_local_config_file: str = field(default_factory=lambda: _FW["agent_local_config"])
+    harness_sandbox_config_file: str = field(default_factory=lambda: _FW["harness_sandbox_config"])
+    harness_local_config_file: str = field(default_factory=lambda: _FW["harness_local_config"])
     # openclaw用于启动gateway
     openclaw_bash: str = "/usr/local/node24/bin/openclaw"
     gateway_log: str = "gateway.log"
@@ -330,8 +331,8 @@ class OpenClawDistillationTask:
 
     async def _copy_agent_config(self) -> None:
         """Copy main agent configuration to sandbox."""
-        remote_path = self.config.sandbox_config.agent_remote_config_file
-        local_path = self.config.sandbox_config.agent_local_config_file
+        remote_path = self.config.sandbox_config.harness_sandbox_config_file
+        local_path = self.config.sandbox_config.harness_local_config_file
         await self._upload_file("agent config", local_path, remote_path)
         self.logger.info(f"Copied agent config: {local_path} -> {remote_path}")
 
@@ -376,7 +377,7 @@ class OpenClawDistillationTask:
     async def _start_openclaw_gateway(self, config_file: str) -> None:
         """Start the OpenClaw gateway in the sandbox."""
         # Read gateway port from local config
-        with open(self.config.sandbox_config.agent_local_config_file, "r", encoding="utf-8") as f:
+        with open(self.config.sandbox_config.harness_local_config_file, "r", encoding="utf-8") as f:
             openclaw_config = json.load(f)
             original_port = openclaw_config.get("gateway", {}).get("port")
 
@@ -398,7 +399,7 @@ class OpenClawDistillationTask:
             await self._copy_agent_config()
 
             # Update port in remote config files
-            for remote_file in [self.config.sandbox_config.agent_remote_config_file, remote_config_path]:
+            for remote_file in [self.config.sandbox_config.harness_sandbox_config_file, remote_config_path]:
                 sed_cmd = f"sed -i 's/{original_port}/{port}/g' {remote_file}"
                 exec_request = ExtendExecCommand(
                     command=["/bin/bash", "-c", sed_cmd],
@@ -762,7 +763,8 @@ async def run_tasks(
             )
             if not os.path.exists(download_path):
                 obs_src = f"{config.obs_config.traj_save_bucket}/{config.obs_config.user_config_download_path}"
-                cmd = ["obsutil", "cp", obs_src, config.task_download_path, "-r", "-f"]
+                obsutil_bin = config.obs_config.s3_download_script or "obsutil"
+                cmd = [obsutil_bin, "cp", obs_src, config.task_download_path, "-r", "-f"]
                 await asyncio.to_thread(run_cmd_stream, cmd, timeout=config.obs_config.download_timeout)
                 if os.path.exists(config.task_input_path):
                     await asyncio.to_thread(shutil.rmtree, config.task_input_path)

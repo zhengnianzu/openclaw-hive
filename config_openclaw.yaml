@@ -52,8 +52,7 @@ run_config:
   concurrent_num: 2   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
-    agent_local_config_file: "uploads/openclaw.json"
-    agent_remote_config_file: "/home/ma-user/.openclaw/openclaw.json" # openclaw配置文件
+    harness_local_config_file: "uploads/openclaw.json"
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80
   task:
