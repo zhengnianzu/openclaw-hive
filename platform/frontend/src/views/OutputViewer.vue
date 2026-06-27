@@ -44,7 +44,7 @@
           <p style="color:#999;margin-top:8px">加载中...</p>
         </div>
         <div v-else-if="previewContent !== null">
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#2d2d2d;border-radius:8px 8px 0 0">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1e293b;border-radius:var(--radius-sm) var(--radius-sm) 0 0">
             <span style="color:#ccc;font-size:13px">{{ selectedFile?.name }} ({{ previewTotalLines }} 行)</span>
             <el-button size="small" text style="color:#ccc" @click="downloadFile(selectedFile)">下载</el-button>
           </div>
@@ -171,12 +171,16 @@ onMounted(async () => {
 <style scoped>
 .toolbar { display: flex; align-items: center; margin-bottom: 12px; }
 .split-layout { display: flex; gap: 16px; height: calc(100vh - 220px); }
-.file-list { width: 360px; flex-shrink: 0; overflow: auto; border: 1px solid #e4e7ed; border-radius: 8px; padding: 8px; }
+.file-list {
+  width: 360px; flex-shrink: 0; overflow: auto;
+  border: 1px solid var(--border-color); border-radius: var(--radius-md);
+  padding: 8px; background: #fff;
+}
 .file-preview { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .tree-node { display: flex; align-items: center; font-size: 13px; }
 .preview-content {
-  background: #1e1e1e; color: #d4d4d4; padding: 12px; margin: 0;
-  border-radius: 0 0 8px 8px; flex: 1; overflow: auto;
+  background: #1e293b; color: #e2e8f0; padding: 12px; margin: 0;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm); flex: 1; overflow: auto;
   font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
   white-space: pre-wrap; word-break: break-all;
 }

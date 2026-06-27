@@ -27,6 +27,8 @@ class InstanceCreate(BaseModel):
     user_proxy_api_key: str = ""
     user_proxy_base_url: str = ""
 
+    harness_type: str = "openclaw"
+
 
 class InstanceInfo(BaseModel):
     id: str

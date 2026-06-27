@@ -1,15 +1,31 @@
 <template>
   <div>
     <el-page-header @back="$router.push('/registrations')" style="margin-bottom:24px">
-      <template #content>提交任务登记</template>
+      <template #content>{{ isCopy ? '复制任务登记' : '提交任务登记' }}</template>
     </el-page-header>
 
-    <el-form :model="form" label-width="140px" style="max-width:700px">
+    <div class="glass-card" style="max-width:700px">
+    <el-form :model="form" label-width="160px">
       <el-form-item label="任务名称" required>
         <el-input v-model="form.task_name" placeholder="请输入任务名称" />
       </el-form-item>
       <el-form-item label="需求方">
         <el-input v-model="form.requester" placeholder="需求方名称" />
+      </el-form-item>
+      <el-form-item label="Harness类型" required>
+        <el-select v-model="form.harness_type" style="width:100%">
+          <el-option label="Openclaw" value="openclaw" />
+          <el-option label="Hermes" value="hermes" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="模型名称" required>
+        <el-input v-model="form.model_name" placeholder="例如：claude-opus-4-7-thinking" />
+      </el-form-item>
+      <el-form-item label="评估模型名称" required>
+        <el-input v-model="form.eval_model_name" placeholder="对应模型ID" />
+      </el-form-item>
+      <el-form-item label="User Proxy模型名称" required>
+        <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
       </el-form-item>
       <el-form-item label="任务路径OBS">
         <el-input v-model="form.task_path_obs" placeholder="OBS路径，如 obs://bucket/path/">
@@ -46,6 +62,7 @@
         <el-button type="primary" :loading="submitting" @click="handleSubmit">提交登记</el-button>
       </el-form-item>
     </el-form>
+    </div>
 
     <el-dialog v-model="obsDialogVisible" title="OBS 文件浏览" width="700px">
       <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center">
@@ -70,13 +87,16 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 
 const router = useRouter()
+const route = useRoute()
 const submitting = ref(false)
+const isCopy = computed(() => !!route.query.copy_from)
+
 const form = ref({
   task_name: '',
   requester: '',
@@ -85,11 +105,19 @@ const form = ref({
   skill_dir_obs: '',
   agent_dir_obs: '',
   user_folder_obs: '',
+  model_name: '',
+  eval_model_name: '',
+  user_proxy_model_name: '',
+  harness_type: 'openclaw',
 })
 
 async function handleSubmit() {
   if (!form.value.task_name) {
     ElMessage.warning('请输入任务名称')
+    return
+  }
+  if (!form.value.model_name || !form.value.eval_model_name || !form.value.user_proxy_model_name) {
+    ElMessage.warning('请填写所有模型名称字段')
     return
   }
   submitting.value = true
@@ -137,4 +165,29 @@ function confirmObsSelect() {
   form.value[obsTargetField] = obsCurrentPath.value
   obsDialogVisible.value = false
 }
+
+onMounted(async () => {
+  const copyFrom = route.query.copy_from
+  if (copyFrom) {
+    try {
+      const reg = await api.get(`/registrations/${copyFrom}`)
+      form.value = {
+        task_name: reg.task_name + '-copy',
+        requester: reg.requester || '',
+        task_path_obs: reg.task_path_obs || '',
+        data_total: reg.data_total || 0,
+        skill_dir_obs: reg.skill_dir_obs || '',
+        agent_dir_obs: reg.agent_dir_obs || '',
+        user_folder_obs: reg.user_folder_obs || '',
+        model_name: reg.model_name || '',
+        eval_model_name: reg.eval_model_name || '',
+        user_proxy_model_name: reg.user_proxy_model_name || '',
+        harness_type: reg.harness_type || 'openclaw',
+      }
+      ElMessage.info('已从已有登记复制，请修改后提交')
+    } catch {
+      ElMessage.warning('无法加载源登记信息')
+    }
+  }
+})
 </script>

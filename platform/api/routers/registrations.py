@@ -34,10 +34,12 @@ def create_registration(req: RegistrationCreate, user: dict = Depends(get_curren
         cursor = conn.execute(
             """INSERT INTO task_registrations
                (created_by, task_name, requester, task_path_obs, data_total,
-                skill_dir_obs, agent_dir_obs, user_folder_obs)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                skill_dir_obs, agent_dir_obs, user_folder_obs,
+                model_name, eval_model_name, user_proxy_model_name, harness_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user["username"], req.task_name, req.requester, req.task_path_obs,
-             req.data_total, req.skill_dir_obs, req.agent_dir_obs, req.user_folder_obs),
+             req.data_total, req.skill_dir_obs, req.agent_dir_obs, req.user_folder_obs,
+             req.model_name, req.eval_model_name, req.user_proxy_model_name, req.harness_type),
         )
         row = conn.execute("SELECT * FROM task_registrations WHERE id = ?", (cursor.lastrowid,)).fetchone()
     info = dict(row)

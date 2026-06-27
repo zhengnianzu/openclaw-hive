@@ -2,41 +2,68 @@
   <div>
     <div class="header-row">
       <h2>任务登记列表</h2>
+      <el-button type="primary" @click="router.push('/task-register')">
+        <el-icon><Plus /></el-icon> 新建
+      </el-button>
     </div>
 
-    <el-table :data="registrations" v-loading="loading" stripe style="width:100%">
-      <el-table-column prop="created_at" label="登记时间" width="160" />
-      <el-table-column prop="task_name" label="任务名称" min-width="160" show-overflow-tooltip />
-      <el-table-column prop="requester" label="需求方" width="100" />
-      <el-table-column prop="created_by" label="登记人" width="100" />
-      <el-table-column prop="data_total" label="数据总量" width="90" align="center" />
-      <el-table-column prop="status" label="状态" width="90">
+    <div class="glass-card" style="padding:0;overflow:hidden">
+    <el-table :data="registrations" v-loading="loading" stripe style="width:100%" border>
+      <el-table-column prop="created_at" label="登记时间" width="160" resizable />
+      <el-table-column prop="task_name" label="任务名称" min-width="160" show-overflow-tooltip resizable />
+      <el-table-column prop="requester" label="需求方" width="100" resizable />
+      <el-table-column prop="created_by" label="登记人" width="100" resizable />
+      <el-table-column prop="harness_type" label="Harness" width="100" resizable>
+        <template #default="{row}">
+          <el-tag :type="row.harness_type === 'hermes' ? 'warning' : ''" size="small">{{ row.harness_type || 'openclaw' }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="model_name" label="模型名称" min-width="140" show-overflow-tooltip resizable />
+      <el-table-column prop="data_total" label="数据总量" width="90" align="center" resizable />
+      <el-table-column prop="status" label="状态" width="90" resizable>
         <template #default="{row}">
           <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="completed_tasks" label="完成" width="70" align="center" />
-      <el-table-column prop="failed_tasks" label="失败" width="70" align="center">
+      <el-table-column prop="completed_tasks" label="完成" width="70" align="center" resizable />
+      <el-table-column prop="failed_tasks" label="失败" width="70" align="center" resizable>
         <template #default="{row}">
           <span :style="{color: row.failed_tasks > 0 ? '#f56c6c' : ''}">{{ row.failed_tasks }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="export_path_obs" label="导出路径" min-width="160" show-overflow-tooltip />
-      <el-table-column label="操作" width="200">
+      <el-table-column prop="export_path_obs" label="导出路径" min-width="160" show-overflow-tooltip resizable />
+      <el-table-column label="操作" width="220" fixed="right">
         <template #default="{row}">
-          <el-button size="small" @click="showDetail(row)">详情</el-button>
-          <el-button v-if="authStore.isAdmin && row.status === 'pending'" size="small" type="success" @click="executeReg(row)">执行</el-button>
-          <el-button v-if="authStore.isAdmin" size="small" type="warning" @click="openEditDialog(row)">编辑</el-button>
-          <el-button v-if="authStore.isAdmin" size="small" type="danger" @click="deleteReg(row)">删除</el-button>
+          <div style="display:flex;align-items:center;gap:4px">
+            <el-button size="small" @click="showDetail(row)">详情</el-button>
+            <el-button v-if="authStore.isAdmin" size="small" type="warning" @click="openEditDialog(row)">编辑</el-button>
+            <el-dropdown v-if="authStore.isAdmin" trigger="click" @command="cmd => handleCommand(cmd, row)">
+              <el-button size="small">更多<el-icon style="margin-left:4px"><ArrowDown /></el-icon></el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="copy">复制</el-dropdown-item>
+                  <el-dropdown-item v-if="row.status === 'pending'" command="execute">执行</el-dropdown-item>
+                  <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
     <!-- 详情弹窗 -->
-    <el-dialog v-model="detailVisible" title="登记详情" width="600px">
+    <el-dialog v-model="detailVisible" title="登记详情" width="650px">
       <el-descriptions :column="1" border v-if="currentReg">
         <el-descriptions-item label="任务名称">{{ currentReg.task_name }}</el-descriptions-item>
         <el-descriptions-item label="需求方">{{ currentReg.requester }}</el-descriptions-item>
+        <el-descriptions-item label="Harness类型">
+          <el-tag :type="currentReg.harness_type === 'hermes' ? 'warning' : ''" size="small">{{ currentReg.harness_type || 'openclaw' }}</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="模型名称">{{ currentReg.model_name }}</el-descriptions-item>
+        <el-descriptions-item label="评估模型名称">{{ currentReg.eval_model_name }}</el-descriptions-item>
+        <el-descriptions-item label="User Proxy模型">{{ currentReg.user_proxy_model_name }}</el-descriptions-item>
         <el-descriptions-item label="登记人">{{ currentReg.created_by }}</el-descriptions-item>
         <el-descriptions-item label="登记时间">{{ currentReg.created_at }}</el-descriptions-item>
         <el-descriptions-item label="任务路径OBS">{{ currentReg.task_path_obs }}</el-descriptions-item>
@@ -54,8 +81,23 @@
     </el-dialog>
 
     <!-- 编辑弹窗 -->
-    <el-dialog v-model="editVisible" title="编辑登记" width="500px">
-      <el-form :model="editForm" label-width="120px">
+    <el-dialog v-model="editVisible" title="编辑登记" width="550px">
+      <el-form :model="editForm" label-width="140px">
+        <el-form-item label="Harness类型">
+          <el-select v-model="editForm.harness_type" style="width:100%">
+            <el-option label="Openclaw" value="openclaw" />
+            <el-option label="Hermes" value="hermes" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="模型名称">
+          <el-input v-model="editForm.model_name" />
+        </el-form-item>
+        <el-form-item label="评估模型名称">
+          <el-input v-model="editForm.eval_model_name" />
+        </el-form-item>
+        <el-form-item label="User Proxy模型">
+          <el-input v-model="editForm.user_proxy_model_name" />
+        </el-form-item>
         <el-form-item label="导出路径OBS">
           <el-input v-model="editForm.export_path_obs" />
         </el-form-item>
@@ -75,6 +117,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Plus, ArrowDown } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 
@@ -87,7 +130,7 @@ const detailVisible = ref(false)
 const currentReg = ref(null)
 
 const editVisible = ref(false)
-const editForm = ref({ export_path_obs: '', traj_path: '' })
+const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', user_proxy_model_name: '', harness_type: 'openclaw' })
 const editLoading = ref(false)
 let editingId = null
 
@@ -112,13 +155,16 @@ function showDetail(row) {
   detailVisible.value = true
 }
 
-function executeReg(row) {
-  router.push(`/create?from_registration=${row.id}`)
-}
-
 function openEditDialog(row) {
   editingId = row.id
-  editForm.value = { export_path_obs: row.export_path_obs || '', traj_path: row.traj_path || '' }
+  editForm.value = {
+    export_path_obs: row.export_path_obs || '',
+    traj_path: row.traj_path || '',
+    model_name: row.model_name || '',
+    eval_model_name: row.eval_model_name || '',
+    user_proxy_model_name: row.user_proxy_model_name || '',
+    harness_type: row.harness_type || 'openclaw',
+  }
   editVisible.value = true
 }
 
@@ -141,10 +187,19 @@ async function deleteReg(row) {
   loadRegistrations()
 }
 
+function handleCommand(cmd, row) {
+  const actions = {
+    copy: () => router.push(`/task-register?copy_from=${row.id}`),
+    execute: () => router.push(`/create?from_registration=${row.id}`),
+    delete: () => deleteReg(row),
+  }
+  actions[cmd]?.()
+}
+
 onMounted(loadRegistrations)
 </script>
 
 <style scoped>
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-h2 { color: #303133; }
+h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 </style>

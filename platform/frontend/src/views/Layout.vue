@@ -1,8 +1,10 @@
 <template>
   <el-container style="min-height: 100vh">
-    <el-aside width="220px" style="background: #304156">
-      <div class="logo">Hive Platform</div>
-      <el-menu :default-active="route.path" router background-color="#304156" text-color="#bfcbd9" active-text-color="#409eff">
+    <el-aside width="240px" class="sidebar">
+      <div class="logo">
+        <span class="logo-text">Hive Platform</span>
+      </div>
+      <el-menu :default-active="route.path" router class="sidebar-menu">
         <el-menu-item index="/dashboard">
           <el-icon><Monitor /></el-icon>
           <span>任务管理</span>
@@ -10,10 +12,6 @@
         <el-menu-item index="/registrations">
           <el-icon><Document /></el-icon>
           <span>任务登记</span>
-        </el-menu-item>
-        <el-menu-item index="/task-register">
-          <el-icon><EditPen /></el-icon>
-          <span>提交登记</span>
         </el-menu-item>
         <el-menu-item v-if="authStore.isOperator" index="/create">
           <el-icon><Plus /></el-icon>
@@ -26,12 +24,15 @@
       </el-menu>
     </el-aside>
     <el-container>
-      <el-header style="background:#fff;display:flex;align-items:center;justify-content:flex-end;border-bottom:1px solid #e6e6e6">
-        <el-tag :type="roleTagType" size="small" style="margin-right:8px">{{ roleLabel }}</el-tag>
-        <span style="margin-right:16px;color:#666">{{ authStore.username }}</span>
-        <el-button text @click="logout">退出登录</el-button>
+      <el-header class="topbar">
+        <div></div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span class="role-badge" :class="'role-' + authStore.role">{{ roleLabel }}</span>
+          <span class="username">{{ authStore.username }}</span>
+          <el-button text class="logout-btn" @click="logout">退出</el-button>
+        </div>
       </el-header>
-      <el-main style="padding:20px;overflow-x:hidden">
+      <el-main class="main-content">
         <router-view />
       </el-main>
     </el-container>
@@ -51,10 +52,6 @@ const roleLabel = computed(() => {
   const map = { admin: '管理员', operator: '运行者', viewer: '浏览者' }
   return map[authStore.role] || '浏览者'
 })
-const roleTagType = computed(() => {
-  const map = { admin: 'danger', operator: 'warning', viewer: 'info' }
-  return map[authStore.role] || 'info'
-})
 
 onMounted(() => {
   if (authStore.token) authStore.fetchMe()
@@ -67,8 +64,101 @@ function logout() {
 </script>
 
 <style scoped>
+.sidebar {
+  background: var(--bg-sidebar);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
 .logo {
-  height: 60px; display: flex; align-items: center; justify-content: center;
-  color: #fff; font-size: 18px; font-weight: bold; border-bottom: 1px solid rgba(255,255,255,0.1);
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.logo-text {
+  font-size: 20px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.02em;
+}
+
+.sidebar-menu {
+  border-right: none !important;
+  background: transparent !important;
+  padding: 12px 8px;
+}
+
+.sidebar-menu .el-menu-item {
+  height: 44px;
+  line-height: 44px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 4px;
+  color: rgba(255,255,255,0.5);
+  font-weight: 500;
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.sidebar-menu .el-menu-item:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(255,255,255,0.85);
+}
+
+.sidebar-menu .el-menu-item.is-active {
+  background: rgba(99, 102, 241, 0.2) !important;
+  color: #fff !important;
+}
+
+.topbar {
+  background: #fff;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 60px;
+  padding: 0 24px;
+}
+
+.role-badge {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-weight: 600;
+}
+.role-admin {
+  background: #fef2f2;
+  color: #dc2626;
+}
+.role-operator {
+  background: #fffbeb;
+  color: #d97706;
+}
+.role-viewer {
+  background: #eef2ff;
+  color: #4f46e5;
+}
+
+.username {
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.logout-btn {
+  color: var(--text-muted) !important;
+  font-size: 13px;
+}
+.logout-btn:hover {
+  color: var(--danger) !important;
+}
+
+.main-content {
+  background: var(--bg-primary);
+  padding: 24px;
+  overflow-x: hidden;
 }
 </style>

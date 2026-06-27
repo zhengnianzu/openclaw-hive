@@ -1,7 +1,8 @@
 <template>
   <div class="login-container">
     <div class="login-card">
-      <h2>OpenClaw Hive Platform</h2>
+      <h2>OpenClaw Hive</h2>
+      <p class="subtitle">Smart Task Management Platform</p>
       <el-form :model="form" @submit.prevent="handleSubmit" label-width="0">
         <el-form-item>
           <el-input v-model="form.username" placeholder="用户名" prefix-icon="User" size="large" />
@@ -10,7 +11,7 @@
           <el-input v-model="form.password" type="password" placeholder="密码" prefix-icon="Lock" size="large" show-password />
         </el-form-item>
         <el-form-item>
-          <el-button type="primary" size="large" style="width:100%" :loading="loading" @click="handleSubmit">
+          <el-button type="primary" size="large" style="width:100%;height:44px;font-size:15px" :loading="loading" @click="handleSubmit">
             登录
           </el-button>
         </el-form-item>
@@ -50,13 +51,41 @@ async function handleSubmit() {
 
 <style scoped>
 .login-container {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  position: relative;
 }
 .login-card {
-  background: #fff; padding: 40px; border-radius: 12px; width: 400px;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  background: #fff;
+  padding: 48px 40px;
+  border-radius: 20px;
+  width: 420px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.15);
 }
-.login-card h2 { text-align: center; margin-bottom: 30px; color: #333; }
-.toggle { text-align: center; color: #409eff; cursor: pointer; font-size: 14px; }
+.login-card h2 {
+  text-align: center;
+  margin-bottom: 4px;
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.subtitle {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 14px;
+  margin-bottom: 32px;
+}
+.toggle {
+  text-align: center;
+  color: var(--accent-purple);
+  cursor: pointer;
+  font-size: 14px;
+  transition: color 0.2s;
+}
+.toggle:hover {
+  color: #4f46e5;
+}
 </style>

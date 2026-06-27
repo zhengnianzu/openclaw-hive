@@ -68,6 +68,17 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'")
         except Exception:
             pass
+        # migrate: add harness/model fields to task_registrations
+        for col in [
+            "model_name TEXT DEFAULT ''",
+            "eval_model_name TEXT DEFAULT ''",
+            "user_proxy_model_name TEXT DEFAULT ''",
+            "harness_type TEXT DEFAULT 'openclaw'",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE task_registrations ADD COLUMN {col}")
+            except Exception:
+                pass
         conn.execute("UPDATE users SET role = 'admin' WHERE username = ?", (settings.ADMIN_USERNAME,))
 
 

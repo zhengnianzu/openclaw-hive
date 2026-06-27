@@ -136,11 +136,11 @@ onUnmounted(() => {})
 <style scoped>
 .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 .log-container {
-  background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 8px;
+  background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: var(--radius-md);
   height: calc(100vh - 260px); overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
 }
 .log-line { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
-.log-error { color: #f56c6c; }
-.log-warn { color: #e6a23c; }
-.log-success { color: #67c23a; }
+.log-error { color: #f87171; }
+.log-warn { color: #fbbf24; }
+.log-success { color: #34d399; }
 </style>

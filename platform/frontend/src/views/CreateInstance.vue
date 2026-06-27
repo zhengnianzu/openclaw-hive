@@ -1,8 +1,9 @@
 <template>
   <div>
-    <h2 style="margin-bottom:20px">新建任务实例</h2>
+    <h2 class="page-title">新建任务实例</h2>
 
-    <el-form :model="form" label-width="140px" style="max-width:800px">
+    <div class="glass-card" style="max-width:800px">
+    <el-form :model="form" label-width="140px">
       <el-form-item label="实例名称" required>
         <el-input v-model="form.name" placeholder="例如：web_skill_test_0608" />
       </el-form-item>
@@ -15,114 +16,115 @@
         <el-input-number v-model="form.concurrent_num" :min="1" :max="500" />
       </el-form-item>
 
-      <el-divider>OBS 目录配置（点击输入框右侧按钮从OBS选择）</el-divider>
+      <el-tabs v-model="activeTab" style="margin-top:8px">
+        <el-tab-pane label="OBS配置" name="obs">
+          <el-form-item label="技能目录">
+            <el-input v-model="form.skill_dir" placeholder="skills/260325/skill_localize/skills_library">
+              <template #append>
+                <el-button @click="openObsBrowser('skill_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+              </template>
+            </el-input>
+          </el-form-item>
 
-      <el-form-item label="技能目录">
-        <el-input v-model="form.skill_dir" placeholder="skills/260325/skill_localize/skills_library">
-          <template #append>
-            <el-button @click="openObsBrowser('skill_dir')"><el-icon><FolderOpened /></el-icon></el-button>
-          </template>
-        </el-input>
-      </el-form-item>
+          <el-form-item label="默认技能">
+            <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，留空使用模板默认值）" />
+          </el-form-item>
 
-      <el-form-item label="默认技能">
-        <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，留空使用模板默认值）" />
-      </el-form-item>
+          <el-form-item label="Agent 目录">
+            <el-input v-model="form.agent_dir" placeholder="task_data/260413_noenv/noenv_configs/agents">
+              <template #append>
+                <el-button @click="openObsBrowser('agent_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+              </template>
+            </el-input>
+          </el-form-item>
 
-      <el-form-item label="Agent 目录">
-        <el-input v-model="form.agent_dir" placeholder="task_data/260413_noenv/noenv_configs/agents">
-          <template #append>
-            <el-button @click="openObsBrowser('agent_dir')"><el-icon><FolderOpened /></el-icon></el-button>
-          </template>
-        </el-input>
-      </el-form-item>
+          <el-form-item label="用户Config目录" required>
+            <el-input v-model="form.user_config_dir" placeholder="task_data/260520/web_configs">
+              <template #append>
+                <el-button @click="openObsBrowser('user_config_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+              </template>
+            </el-input>
+          </el-form-item>
 
-      <el-form-item label="用户Config目录" required>
-        <el-input v-model="form.user_config_dir" placeholder="task_data/260520/web_configs">
-          <template #append>
-            <el-button @click="openObsBrowser('user_config_dir')"><el-icon><FolderOpened /></el-icon></el-button>
-          </template>
-        </el-input>
-      </el-form-item>
+          <el-form-item label="用户Profile目录">
+            <el-input v-model="form.user_profile_dir" placeholder="可选">
+              <template #append>
+                <el-button @click="openObsBrowser('user_profile_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+              </template>
+            </el-input>
+          </el-form-item>
 
-      <el-form-item label="用户Profile目录">
-        <el-input v-model="form.user_profile_dir" placeholder="可选">
-          <template #append>
-            <el-button @click="openObsBrowser('user_profile_dir')"><el-icon><FolderOpened /></el-icon></el-button>
-          </template>
-        </el-input>
-      </el-form-item>
+          <el-form-item label="轨迹保存路径">
+            <el-input v-model="form.traj_save_path" placeholder="自动生成：openclaw_trajs/traj_{task_name}" />
+          </el-form-item>
+        </el-tab-pane>
 
-      <el-form-item label="轨迹保存路径">
-        <el-input v-model="form.traj_save_path" placeholder="自动生成：openclaw_trajs/traj_{task_name}" />
-      </el-form-item>
+        <el-tab-pane label="模型配置" name="model">
+          <el-form-item label="模型 Base URL">
+            <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
+          </el-form-item>
 
-      <el-divider>模型配置 (openclaw.json)</el-divider>
+          <el-form-item label="模型 API Key">
+            <div style="display:flex;gap:8px;width:100%">
+              <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" />
+              <el-button type="primary" @click="openKeyDialog">新建KEY</el-button>
+            </div>
+            <div v-if="form.model_api_key" style="font-size:12px;color:#999;margin-top:4px">
+              {{ form.model_api_key.length > 8 ? form.model_api_key.slice(0, 4) + '****' + form.model_api_key.slice(-4) : '' }}
+            </div>
+          </el-form-item>
 
-      <el-form-item label="模型 Base URL">
-        <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
-      </el-form-item>
+          <el-form-item label="API 类型">
+            <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
+              <el-option label="Anthropic Messages" value="anthropic-messages" />
+              <el-option label="OpenAI Completions" value="openai-completions" />
+            </el-select>
+          </el-form-item>
 
-      <el-form-item label="模型 API Key">
-        <div style="display:flex;gap:8px;width:100%">
-          <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" />
-          <el-button type="primary" @click="openKeyDialog">新建KEY</el-button>
-        </div>
-        <div v-if="form.model_api_key" style="font-size:12px;color:#999;margin-top:4px">
-          {{ form.model_api_key.length > 8 ? form.model_api_key.slice(0, 4) + '****' + form.model_api_key.slice(-4) : '' }}
-        </div>
-      </el-form-item>
+          <el-form-item label="模型 ID">
+            <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking">
+              <template #prepend>local/</template>
+            </el-input>
+            <div style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
+          </el-form-item>
+        </el-tab-pane>
 
-      <el-form-item label="API 类型">
-        <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
-          <el-option label="Anthropic Messages" value="anthropic-messages" />
-          <el-option label="OpenAI Completions" value="openai-completions" />
-        </el-select>
-      </el-form-item>
+        <el-tab-pane label="Proxy模型配置" name="proxy">
+          <el-form-item label="模型名称">
+            <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
+          </el-form-item>
 
-      <el-form-item label="模型 ID">
-        <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking">
-          <template #prepend>local/</template>
-        </el-input>
-        <div style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
-      </el-form-item>
+          <el-form-item label="API Key">
+            <el-input v-model="form.user_proxy_api_key" placeholder="留空使用模板默认值" show-password />
+          </el-form-item>
 
-      <el-divider>User Proxy 模型配置 (user_proxy_model.json)</el-divider>
+          <el-form-item label="Base URL">
+            <el-input v-model="form.user_proxy_base_url" placeholder="例如：http://192.168.30.95:8084" />
+          </el-form-item>
+        </el-tab-pane>
 
-      <el-form-item label="模型名称">
-        <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
-      </el-form-item>
+        <el-tab-pane label="高级配置" name="advanced">
+          <el-form-item label="起始索引">
+            <el-input-number v-model="form.start_index" :min="0" />
+          </el-form-item>
 
-      <el-form-item label="API Key">
-        <el-input v-model="form.user_proxy_api_key" placeholder="留空使用模板默认值" show-password />
-      </el-form-item>
+          <el-form-item label="任务总数">
+            <el-input-number v-model="form.total_num" :min="0" />
+            <span style="margin-left:8px;color:#999;font-size:12px">0 表示不限制</span>
+          </el-form-item>
 
-      <el-form-item label="Base URL">
-        <el-input v-model="form.user_proxy_base_url" placeholder="例如：http://192.168.30.95:8084" />
-      </el-form-item>
+          <el-form-item label="镜像名称">
+            <el-input v-model="form.image_name" placeholder="使用模板默认镜像" />
+          </el-form-item>
+        </el-tab-pane>
+      </el-tabs>
 
-      <el-divider>高级配置</el-divider>
-
-      <el-form-item label="起始索引">
-        <el-input-number v-model="form.start_index" :min="0" />
-      </el-form-item>
-
-      <el-form-item label="任务总数">
-        <el-input-number v-model="form.total_num" :min="0" />
-        <span style="margin-left:8px;color:#999;font-size:12px">0 表示不限制</span>
-      </el-form-item>
-
-      <el-form-item label="镜像名称">
-        <el-input v-model="form.image_name" placeholder="使用模板默认镜像" />
-      </el-form-item>
-
-      <el-form-item>
+      <el-form-item style="margin-top:20px">
         <el-button type="primary" @click="handleCreate" :loading="creating">创建实例</el-button>
         <el-button @click="$router.push('/dashboard')">取消</el-button>
       </el-form-item>
     </el-form>
-
-    <!-- API Key 生成弹窗 -->
+    </div>
     <el-dialog v-model="keyDialogVisible" title="新建 API Key" width="480px" destroy-on-close>
       <el-form label-width="100px">
         <el-form-item label="Invite Code">
@@ -175,6 +177,7 @@ import api from '../api'
 const router = useRouter()
 const route = useRoute()
 const creating = ref(false)
+const activeTab = ref('obs')
 
 const keyDialogVisible = ref(false)
 const keyGenerating = ref(false)
@@ -224,6 +227,7 @@ const form = ref({
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
+  harness_type: 'openclaw',
 })
 
 async function handleCreate() {
@@ -314,6 +318,9 @@ onMounted(async () => {
       form.value.skill_dir = reg.skill_dir_obs
       form.value.agent_dir = reg.agent_dir_obs
       form.value.total_num = reg.data_total || 0
+      form.value.harness_type = reg.harness_type || 'openclaw'
+      if (reg.model_name) form.value.model_id = reg.model_name
+      if (reg.user_proxy_model_name) form.value.user_proxy_model_name = reg.user_proxy_model_name
       ElMessage.info('已从任务登记预填配置')
     } catch {
       ElMessage.warning('无法加载登记信息')
@@ -321,3 +328,12 @@ onMounted(async () => {
   }
 })
 </script>
+
+<style scoped>
+.page-title {
+  color: var(--text-primary);
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 24px;
+}
+</style>

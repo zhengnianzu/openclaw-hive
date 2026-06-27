@@ -19,7 +19,7 @@ from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml"}
 
 
 def _get_instance_dir(instance_id: str) -> str:
@@ -114,6 +114,7 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
 
     base = OmegaConf.load(template_path)
     base.remote_server.user_id = req.task_name
+    base.remote_server.project_id = req.harness_type
     base.run_config.concurrent_num = req.concurrent_num
     base.run_config.start_index = req.start_index
     base.run_config.total_num = req.total_num
@@ -151,13 +152,21 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        base.run_config.obs.traj_save_path = f"openclaw_trajs/traj_{req.task_name}"
+        traj_prefix = "hermes_trajs" if req.harness_type == "hermes" else "openclaw_trajs"
+        base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
         base.env_make.image_name = req.image_name
 
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
+    hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
-    base.run_config.sandbox.openclaw_local_config_file = openclaw_path
+
+    if req.harness_type == "hermes":
+        base.run_config.sandbox.openclaw_local_config_file = hermes_config_path
+        base.run_config.sandbox.harness_local_config_file = hermes_config_path
+    else:
+        base.run_config.sandbox.openclaw_local_config_file = openclaw_path
+        base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
 
     # 输出和下载目录都放在实例目录下
@@ -167,30 +176,48 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     config_path = os.path.join(instance_dir, "config.yaml")
     OmegaConf.save(base, config_path)
 
-    # --- 2. 生成 openclaw.json ---
-    openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
-    with open(openclaw_template, "r", encoding="utf-8") as f:
-        openclaw_cfg = json.load(f)
+    # --- 2. 生成 harness 配置文件 ---
+    if req.harness_type == "hermes":
+        hermes_cfg = {
+            "model": {
+                "default": req.model_id or "claude-opus-4-6",
+                "provider": "custom",
+                "base_url": req.model_base_url or "http://127.0.0.1:4000/",
+                "api_key": req.model_api_key or "sky-1234",
+            },
+            "custom_providers": [{
+                "name": "local",
+                "base_url": req.model_base_url or "http://127.0.0.1:4001",
+                "api_key": req.model_api_key or "",
+                "api_mode": req.model_api_type.replace("-", "_") if req.model_api_type else "anthropic_messages",
+            }],
+        }
+        hermes_omega = OmegaConf.create(hermes_cfg)
+        OmegaConf.save(hermes_omega, hermes_config_path)
+    else:
+        openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
+        with open(openclaw_template, "r", encoding="utf-8") as f:
+            openclaw_cfg = json.load(f)
 
-    if req.model_api_key:
-        openclaw_cfg["models"]["providers"]["local"]["apiKey"] = req.model_api_key
-    if req.model_base_url:
-        openclaw_cfg["models"]["providers"]["local"]["baseUrl"] = req.model_base_url
-    if req.model_api_type:
-        openclaw_cfg["models"]["providers"]["local"]["api"] = req.model_api_type
-        models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
-        if models_list:
-            models_list[0]["api"] = req.model_api_type
-    if req.model_id:
-        models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
-        if models_list:
-            models_list[0]["id"] = req.model_id
-            models_list[0]["name"] = req.model_id
-        openclaw_cfg["agents"]["defaults"]["model"]["primary"] = f"local/{req.model_id}"
-        openclaw_cfg["agents"]["defaults"]["models"] = {f"local/{req.model_id}": {}}
+        if req.model_api_key:
+            openclaw_cfg["models"]["providers"]["local"]["apiKey"] = req.model_api_key
+        if req.model_base_url:
+            openclaw_cfg["models"]["providers"]["local"]["baseUrl"] = req.model_base_url
+        if req.model_api_type:
+            openclaw_cfg["models"]["providers"]["local"]["api"] = req.model_api_type
+            models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
+            if models_list:
+                models_list[0]["api"] = req.model_api_type
+        if req.model_id:
+            models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
+            if models_list:
+                models_list[0]["id"] = req.model_id
+                models_list[0]["name"] = req.model_id
+            openclaw_cfg["agents"]["defaults"]["model"]["primary"] = f"local/{req.model_id}"
+            openclaw_cfg["agents"]["defaults"]["models"] = {f"local/{req.model_id}": {}}
 
-    with open(openclaw_path, "w", encoding="utf-8") as f:
-        json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
+        with open(openclaw_path, "w", encoding="utf-8") as f:
+            json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
 
     # --- 3. 生成 user_proxy_model.json ---
     user_proxy_template = os.path.join(settings.SETTINGS_DIR, "user_proxy_model.json")

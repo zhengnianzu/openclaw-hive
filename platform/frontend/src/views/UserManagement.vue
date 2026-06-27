@@ -1,7 +1,8 @@
 <template>
   <div>
-    <h2 style="margin-bottom:20px">用户管理</h2>
+    <h2 style="margin-bottom:20px;color:var(--text-primary);font-size:24px;font-weight:700">用户管理</h2>
 
+    <div class="glass-card" style="padding:0;overflow:hidden">
     <el-table :data="users" v-loading="loading" stripe style="width:100%">
       <el-table-column prop="id" label="ID" width="60" />
       <el-table-column prop="username" label="用户名" min-width="150" />
@@ -38,6 +39,7 @@
         </template>
       </el-table-column>
     </el-table>
+    </div>
   </div>
 </template>
 

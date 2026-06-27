@@ -10,6 +10,10 @@ class RegistrationCreate(BaseModel):
     skill_dir_obs: str = ""
     agent_dir_obs: str = ""
     user_folder_obs: str = ""
+    model_name: str = ""
+    eval_model_name: str = ""
+    user_proxy_model_name: str = ""
+    harness_type: str = "openclaw"
 
 
 class RegistrationUpdate(BaseModel):
@@ -22,6 +26,10 @@ class RegistrationUpdate(BaseModel):
     skill_dir_obs: Optional[str] = None
     agent_dir_obs: Optional[str] = None
     user_folder_obs: Optional[str] = None
+    model_name: Optional[str] = None
+    eval_model_name: Optional[str] = None
+    user_proxy_model_name: Optional[str] = None
+    harness_type: Optional[str] = None
 
 
 class RegistrationInfo(BaseModel):
@@ -41,3 +49,7 @@ class RegistrationInfo(BaseModel):
     traj_path: str = ""
     completed_tasks: int = 0
     failed_tasks: int = 0
+    model_name: str = ""
+    eval_model_name: str = ""
+    user_proxy_model_name: str = ""
+    harness_type: str = "openclaw"
