@@ -201,8 +201,8 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
         if repo_row:
             repo = dict(repo_row)
             code_src_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "src", repo["name"], repo["version"])
-            code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar")
-            tar_path = os.path.join(code_tar_dir, f"{repo['name']}-{repo['version']}.tar")
+            code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar", repo["name"], repo["version"])
+            tar_path = os.path.join(code_tar_dir, "openclaw-task.tar")
 
             if not os.path.isfile(tar_path):
                 # Download from OBS if source not present

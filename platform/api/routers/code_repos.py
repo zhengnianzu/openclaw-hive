@@ -63,8 +63,8 @@ def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
 
     repo = dict(row)
     src_dir = os.path.join(_get_code_dir(), "src", repo["name"], repo["version"])
-    tar_dir = os.path.join(_get_code_dir(), "tar")
-    tar_path = os.path.join(tar_dir, f"{repo['name']}-{repo['version']}.tar")
+    tar_dir = os.path.join(_get_code_dir(), "tar", repo["name"], repo["version"])
+    tar_path = os.path.join(tar_dir, "openclaw-task.tar")
 
     if os.path.isfile(tar_path):
         return {"message": "代码仓已下载并打包", "tar_path": tar_path, "already_exists": True}
@@ -106,7 +106,7 @@ def check_code_repo_status(repo_id: int, user: dict = Depends(get_current_user))
         raise HTTPException(status_code=404, detail="代码仓不存在")
 
     repo = dict(row)
-    tar_path = os.path.join(_get_code_dir(), "tar", f"{repo['name']}.tar")
+    tar_path = os.path.join(_get_code_dir(), "tar", repo["name"], repo["version"], "-task.tar")
     src_dir = os.path.join(_get_code_dir(), "src", repo["name"], repo["version"])
     dir_name = _obs_dir_name(repo["obs_path"])
     actual_dir = os.path.join(src_dir, dir_name)
