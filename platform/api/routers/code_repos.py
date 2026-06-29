@@ -30,6 +30,12 @@ def list_code_repos(user: dict = Depends(get_current_user)):
 @router.post("", response_model=CodeRepoInfo)
 def create_code_repo(req: CodeRepoCreate, user: dict = Depends(require_operator)):
     with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM code_repos WHERE name = ? AND version = ?",
+            (req.name.strip(), req.version.strip()),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"代码仓 {req.name.strip()} 版本 {req.version.strip()} 已存在")
         cursor = conn.execute(
             "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, created_by) VALUES (?, ?, ?, ?, ?, ?)",
             (req.name.strip(), req.obs_path.strip(), req.version.strip(), req.description.strip(), req.main_python_file.strip(), user["username"]),
@@ -58,7 +64,7 @@ def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
     repo = dict(row)
     src_dir = os.path.join(_get_code_dir(), "src", repo["name"], repo["version"])
     tar_dir = os.path.join(_get_code_dir(), "tar")
-    tar_path = os.path.join(tar_dir, f"{repo['name']}.tar")
+    tar_path = os.path.join(tar_dir, f"{repo['name']}-{repo['version']}.tar")
 
     if os.path.isfile(tar_path):
         return {"message": "代码仓已下载并打包", "tar_path": tar_path, "already_exists": True}
