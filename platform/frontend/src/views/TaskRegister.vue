@@ -25,7 +25,7 @@
         <el-input v-model="form.eval_model_name" placeholder="对应模型ID" />
       </el-form-item>
       <el-form-item label="任务路径OBS">
-        <el-input v-model="form.task_path_obs" placeholder="OBS路径，如 obs://bucket/path/">
+        <el-input v-model="form.task_path_obs" placeholder="OBS路径，如 obs://rl-agentdata/path/">
           <template #append>
             <el-button @click="openObsBrowser('task_path_obs')">浏览</el-button>
           </template>
@@ -55,6 +55,18 @@
           </template>
         </el-input>
       </el-form-item>
+
+      <el-collapse style="margin-bottom:20px">
+        <el-collapse-item title="高级配置" name="advanced">
+          <el-form-item label="任务供应商URL">
+            <el-input v-model="form.base_url" placeholder="选填，例如：http://192.168.30.95:8084" />
+          </el-form-item>
+          <el-form-item label="任务供应商KEY">
+            <el-input v-model="form.api_key" placeholder="选填，仅管理员和登记人可查看完整KEY" show-password />
+          </el-form-item>
+        </el-collapse-item>
+      </el-collapse>
+
       <el-form-item>
         <el-button type="primary" :loading="submitting" @click="handleSubmit">提交登记</el-button>
       </el-form-item>
@@ -94,6 +106,8 @@ const route = useRoute()
 const submitting = ref(false)
 const isCopy = computed(() => !!route.query.copy_from)
 
+const OBS_DEFAULT_PATH = 'obs://rl-agentdata/'
+
 const form = ref({
   task_name: '',
   requester: '',
@@ -106,6 +120,8 @@ const form = ref({
   eval_model_name: '',
   user_proxy_model_name: '',
   harness_type: 'openclaw',
+  base_url: '',
+  api_key: '',
 })
 
 async function handleSubmit() {
@@ -135,10 +151,10 @@ let obsTargetField = ''
 
 function openObsBrowser(field) {
   obsTargetField = field
-  obsCurrentPath.value = form.value[field] || ''
+  obsCurrentPath.value = form.value[field] || OBS_DEFAULT_PATH
   obsItems.value = []
   obsDialogVisible.value = true
-  if (obsCurrentPath.value) loadObsItems()
+  loadObsItems()
 }
 
 async function loadObsItems() {
@@ -180,6 +196,8 @@ onMounted(async () => {
         eval_model_name: reg.eval_model_name || '',
         user_proxy_model_name: reg.user_proxy_model_name || '',
         harness_type: reg.harness_type || 'openclaw',
+        base_url: reg.base_url || '',
+        api_key: '',
       }
       ElMessage.info('已从已有登记复制，请修改后提交')
     } catch {

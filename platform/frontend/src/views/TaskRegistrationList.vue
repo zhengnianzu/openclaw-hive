@@ -63,6 +63,8 @@
         </el-descriptions-item>
         <el-descriptions-item label="Harness模型">{{ currentReg.model_name }}</el-descriptions-item>
         <el-descriptions-item label="用户模拟模型">{{ currentReg.eval_model_name }}</el-descriptions-item>
+        <el-descriptions-item label="任务供应商URL">{{ currentReg.base_url || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="任务供应商KEY">{{ currentReg.api_key || '-' }}</el-descriptions-item>
         <el-descriptions-item label="登记人">{{ currentReg.created_by }}</el-descriptions-item>
         <el-descriptions-item label="登记时间">{{ currentReg.created_at }}</el-descriptions-item>
         <el-descriptions-item label="任务路径OBS">{{ currentReg.task_path_obs }}</el-descriptions-item>
@@ -93,6 +95,12 @@
         </el-form-item>
         <el-form-item label="用户模拟模型">
           <el-input v-model="editForm.eval_model_name" />
+        </el-form-item>
+        <el-form-item label="任务供应商URL">
+          <el-input v-model="editForm.base_url" placeholder="例如：http://192.168.30.95:8084" />
+        </el-form-item>
+        <el-form-item label="任务供应商KEY">
+          <el-input v-model="editForm.api_key" placeholder="留空则不修改" show-password />
         </el-form-item>
         <el-form-item label="导出路径OBS">
           <el-input v-model="editForm.export_path_obs" />
@@ -126,7 +134,7 @@ const detailVisible = ref(false)
 const currentReg = ref(null)
 
 const editVisible = ref(false)
-const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', user_proxy_model_name: '', harness_type: 'openclaw' })
+const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '' })
 const editLoading = ref(false)
 let editingId = null
 
@@ -160,6 +168,8 @@ function openEditDialog(row) {
     eval_model_name: row.eval_model_name || '',
     user_proxy_model_name: row.user_proxy_model_name || '',
     harness_type: row.harness_type || 'openclaw',
+    base_url: row.base_url || '',
+    api_key: '',
   }
   editVisible.value = true
 }
@@ -167,7 +177,9 @@ function openEditDialog(row) {
 async function saveEdit() {
   editLoading.value = true
   try {
-    await api.put(`/registrations/${editingId}`, editForm.value)
+    const payload = { ...editForm.value }
+    if (!payload.api_key) delete payload.api_key
+    await api.put(`/registrations/${editingId}`, payload)
     ElMessage.success('保存成功')
     editVisible.value = false
     loadRegistrations()

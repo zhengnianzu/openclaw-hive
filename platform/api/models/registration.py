@@ -14,6 +14,8 @@ class RegistrationCreate(BaseModel):
     eval_model_name: str = ""
     user_proxy_model_name: str = ""
     harness_type: str = "openclaw"
+    base_url: str = ""
+    api_key: str = ""
 
 
 class RegistrationUpdate(BaseModel):
@@ -30,6 +32,8 @@ class RegistrationUpdate(BaseModel):
     eval_model_name: Optional[str] = None
     user_proxy_model_name: Optional[str] = None
     harness_type: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 class RegistrationInfo(BaseModel):
@@ -53,3 +57,5 @@ class RegistrationInfo(BaseModel):
     eval_model_name: str = ""
     user_proxy_model_name: str = ""
     harness_type: str = "openclaw"
+    base_url: str = ""
+    api_key: str = ""

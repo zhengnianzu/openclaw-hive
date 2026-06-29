@@ -29,6 +29,8 @@ class InstanceCreate(BaseModel):
 
     harness_type: str = "openclaw"
 
+    code_repo_id: Optional[int] = None
+
 
 class InstanceInfo(BaseModel):
     id: str

@@ -17,6 +17,7 @@ const routes = [
       { path: 'task-register', name: 'TaskRegister', component: () => import('../views/TaskRegister.vue') },
       { path: 'users', name: 'UserManagement', component: () => import('../views/UserManagement.vue') },
       { path: 'images', name: 'ImageManagement', component: () => import('../views/ImageManagement.vue') },
+      { path: 'code-repos', name: 'CodeManagement', component: () => import('../views/CodeManagement.vue') },
     ],
   },
 ]

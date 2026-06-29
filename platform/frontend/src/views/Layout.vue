@@ -17,6 +17,10 @@
           <el-icon><Box /></el-icon>
           <span>镜像管理</span>
         </el-menu-item>
+        <el-menu-item v-if="authStore.isOperator" index="/code-repos">
+          <el-icon><FolderOpened /></el-icon>
+          <span>代码管理</span>
+        </el-menu-item>
         <el-menu-item v-if="authStore.isAdmin" index="/users">
           <el-icon><User /></el-icon>
           <span>用户管理</span>

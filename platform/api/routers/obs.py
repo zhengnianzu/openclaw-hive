@@ -75,12 +75,18 @@ async def list_obs_dir(
     if not path.endswith("/"):
         path += "/"
 
-    args = ["ls", path, "-limit=200"]
-    if not show_files:
-        args.append("-d")
+    if show_files:
+        dir_output, file_output = await asyncio.gather(
+            _run_obsutil(["ls", path, "-limit=200", "-d"]),
+            _run_obsutil(["ls", path, "-limit=200"]),
+        )
+        dirs = _parse_obsutil_ls(dir_output, path)
+        files = _parse_obsutil_ls(file_output, path)
+        items = dirs + [f for f in files if not f.is_dir]
+    else:
+        output = await _run_obsutil(["ls", path, "-limit=200", "-d"])
+        items = _parse_obsutil_ls(output, path)
 
-    output = await _run_obsutil(args)
-    items = _parse_obsutil_ls(output, path)
     return ObsListResponse(path=path, items=items)
 
 

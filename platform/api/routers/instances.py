@@ -194,6 +194,49 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     base.run_config.task.task_output_path = os.path.join(instance_dir, "outputs")
     base.run_config.task.task_download_path = os.path.join(instance_dir, "downloads")
 
+    # --- 代码仓处理 ---
+    if req.code_repo_id:
+        with get_connection() as conn:
+            repo_row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (req.code_repo_id,)).fetchone()
+        if repo_row:
+            repo = dict(repo_row)
+            code_src_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "src", repo["name"], repo["version"])
+            code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar")
+            tar_path = os.path.join(code_tar_dir, f"{repo['name']}.tar")
+
+            if not os.path.isfile(tar_path):
+                # Download from OBS if source not present
+                if not (os.path.isdir(code_src_dir) and os.listdir(code_src_dir)):
+                    os.makedirs(code_src_dir, exist_ok=True)
+                    obs_src = repo["obs_path"]
+                    if not obs_src.endswith("/"):
+                        obs_src += "/"
+                    ret = subprocess.run(
+                        [settings.OBSUTIL_PATH, "cp", obs_src, code_src_dir, "-r", "-f"],
+                        capture_output=True, text=True, timeout=600,
+                    )
+                    if ret.returncode != 0:
+                        raise HTTPException(status_code=500, detail=f"代码仓下载失败: {ret.stderr[:500]}")
+
+                # obs_path 最后一级目录名即为 obsutil 下载后创建的子目录名
+                obs_dir_name = repo["obs_path"].rstrip("/").split("/")[-1]
+                actual_dir = os.path.join(code_src_dir, obs_dir_name)
+
+                # Package as tar
+                os.makedirs(code_tar_dir, exist_ok=True)
+                ret = subprocess.run(
+                    ["tar", "cf", tar_path, obs_dir_name],
+                    cwd=code_src_dir,
+                    capture_output=True, text=True, timeout=120,
+                )
+                if ret.returncode != 0:
+                    raise HTTPException(status_code=500, detail=f"打包失败: {ret.stderr[:500]}")
+
+            base.run_config.task.main_code_tar = tar_path
+            base.run_config.task.main_code_dir = ""
+            if repo.get("main_python_file"):
+                base.run_config.task.main_python_file = repo["main_python_file"]
+
     config_path = os.path.join(instance_dir, "config.yaml")
     OmegaConf.save(base, config_path)
 

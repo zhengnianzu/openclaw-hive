@@ -129,6 +129,16 @@
               </el-option>
             </el-select>
           </el-form-item>
+
+          <el-form-item label="代码仓">
+            <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
+              <el-option v-for="repo in codeRepoList" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
+                <span>{{ repo.name }} / {{ repo.version }}</span>
+                <span style="float:right;color:#999;font-size:12px">{{ repo.obs_path.length > 40 ? '...' + repo.obs_path.slice(-40) : repo.obs_path }}</span>
+              </el-option>
+            </el-select>
+            <div style="font-size:12px;color:#999;margin-top:4px">不选则使用默认uploads中的tar文件；选择后自动下载并打包，config.yaml 的 main_code_tar 将指向打包后的tar文件</div>
+          </el-form-item>
         </el-tab-pane>
       </el-tabs>
 
@@ -186,9 +196,11 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
+import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
 const route = useRoute()
+const authStore = useAuthStore()
 const creating = ref(false)
 const activeTab = ref('obs')
 
@@ -235,20 +247,28 @@ async function generateApiKey() {
 }
 
 const form = ref({
-  name: '', task_name: '', concurrent_num: 100,
+  name: '', task_name: authStore.username || '', concurrent_num: 100,
   skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
   harness_type: 'openclaw',
+  code_repo_id: null,
 })
 
 const imageList = ref([])
+const codeRepoList = ref([])
 
 async function loadImages() {
   try {
     imageList.value = await api.get('/images', { params: { harness_type: form.value.harness_type } })
   } catch { imageList.value = [] }
+}
+
+async function loadCodeRepos() {
+  try {
+    codeRepoList.value = await api.get('/code-repos')
+  } catch { codeRepoList.value = [] }
 }
 
 function onHarnessChange() {
@@ -330,7 +350,7 @@ onMounted(async () => {
       const params = await api.get(`/instances/${copyFrom}/create-params`)
       Object.assign(form.value, params)
       form.value.name = params.name + '-copy'
-      form.value.task_name = ''
+      form.value.task_name = authStore.username || ''
       ElMessage.info('已从已有实例复制配置，请修改任务标识后创建')
     } catch {
       ElMessage.warning('无法加载源实例配置')
@@ -353,6 +373,7 @@ onMounted(async () => {
     }
   }
   loadImages()
+  loadCodeRepos()
 })
 </script>
 

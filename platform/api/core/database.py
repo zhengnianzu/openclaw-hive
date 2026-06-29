@@ -74,6 +74,8 @@ def init_db():
             "eval_model_name TEXT DEFAULT ''",
             "user_proxy_model_name TEXT DEFAULT ''",
             "harness_type TEXT DEFAULT 'openclaw'",
+            "base_url TEXT DEFAULT ''",
+            "api_key TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(f"ALTER TABLE task_registrations ADD COLUMN {col}")
@@ -90,7 +92,24 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS code_repos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                obs_path TEXT NOT NULL,
+                version TEXT NOT NULL DEFAULT 'v1',
+                description TEXT DEFAULT '',
+                main_python_file TEXT DEFAULT 'openclaw_automation.py',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT ''
+            );
         """)
+
+        # migrate: add main_python_file to code_repos
+        try:
+            conn.execute("ALTER TABLE code_repos ADD COLUMN main_python_file TEXT DEFAULT 'openclaw_automation.py'")
+        except Exception:
+            pass
 
 
 @contextmanager

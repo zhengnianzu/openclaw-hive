@@ -53,6 +53,10 @@
         <el-option label="已停止" value="stopped" />
         <el-option label="待启动" value="created" />
       </el-select>
+      <el-select v-model="harnessFilter" placeholder="Harness筛选" clearable size="default" style="width:140px">
+        <el-option label="Openclaw" value="openclaw" />
+        <el-option label="Hermes" value="hermes" />
+      </el-select>
       <el-input v-model="nameSearch" placeholder="搜索任务名称" clearable size="default" style="width:260px" prefix-icon="Search" />
     </div>
 
@@ -71,16 +75,18 @@
             <el-tag :type="statusColor(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="进度" min-width="180" resizable>
+        <el-table-column label="进度" width="160" resizable>
           <template #default="{row}">
-            <div style="display:flex;align-items:center;gap:8px">
-              <el-progress :percentage="progress(row)" :stroke-width="8" style="flex:1;min-width:120px"
-                :color="progressColor" />
-              <span class="mono-num">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
-            </div>
+            <el-progress :percentage="progress(row)" :stroke-width="8" :show-text="false"
+              :color="progressColor" />
             <div v-if="timeEstimates[row.id]" style="font-size:11px;color:var(--text-muted);margin-top:2px">
               {{ formatDuration(timeEstimates[row.id].estimated_remaining_seconds) }}
             </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="数字进度" width="130" align="center" resizable>
+          <template #default="{row}">
+            <span class="mono-num">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="completed_tasks" label="成功" width="80" align="center" resizable>
@@ -96,7 +102,7 @@
         <el-table-column prop="concurrent_num" label="并发" width="70" align="center" resizable>
           <template #default="{row}"><span class="mono-num">{{ row.concurrent_num }}</span></template>
         </el-table-column>
-        <el-table-column prop="created_at" label="创建时间" width="160" resizable />
+        <el-table-column prop="created_at" label="创建时间" width="180" resizable />
         <el-table-column label="操作" width="280">
           <template #default="{row}">
             <div style="display:flex;align-items:center;gap:4px">
@@ -136,6 +142,7 @@ const instances = ref([])
 const loading = ref(false)
 const timeEstimates = ref({})
 const statusFilter = ref('')
+const harnessFilter = ref('')
 const nameSearch = ref('')
 const router = useRouter()
 let timer = null
@@ -151,6 +158,7 @@ const runningInstances = computed(() => instances.value.filter(i => i.status ===
 const filteredInstances = computed(() => {
   let list = instances.value
   if (statusFilter.value) list = list.filter(i => i.status === statusFilter.value)
+  if (harnessFilter.value) list = list.filter(i => (i.harness_type || 'openclaw') === harnessFilter.value)
   if (nameSearch.value) {
     const keyword = nameSearch.value.toLowerCase()
     list = list.filter(i => i.name.toLowerCase().includes(keyword))
@@ -250,5 +258,5 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 .stat-label { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
 
 .filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-.mono-num { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.mono-num { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-secondary); white-space: nowrap; }
 </style>

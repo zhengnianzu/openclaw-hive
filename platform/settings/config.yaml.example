@@ -63,7 +63,7 @@ run_config:
     task_download_path: "downloads"
     main_code_tar: "uploads/openclaw-task.tar"
     main_code_dir: ""  # 源码目录路径，非空时自动打包替代 main_code_tar，如 "openclaw-task"
-    main_python_file: "openclaw_automation.py"  # start脚本文件
+    main_python_file: "harness_automation.py"  # start脚本文件
   obs:
     download_timeout: 1200
     upload_timeout: 900
