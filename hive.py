@@ -23,7 +23,7 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional, List
 
@@ -251,7 +251,9 @@ def run_cmd_stream(cmd: List[str], timeout: Optional[int] = None) -> int:
 def parse_data_config(data_config_file: str) -> DataConfig:
     """Parse a data config JSON file into a DataConfig dataclass."""
     with open(data_config_file, "r", encoding="utf-8") as f:
-        return DataConfig(**json.load(f))
+        data = json.load(f)
+    known = {f.name for f in fields(DataConfig)}
+    return DataConfig(**{k: v for k, v in data.items() if k in known})
 
 
 def load_yaml_config(config_file: str) -> DictConfig:
