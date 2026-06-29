@@ -851,6 +851,26 @@ async def run_tasks(
 
 
 # ============================================================================
+# Compatibility
+# ============================================================================
+
+_SANDBOX_RENAMES = {
+    "openclaw_local_config_file": "harness_local_config_file",
+    "agent_local_config_file": "harness_local_config_file",
+    "agent_remote_config_file": "harness_sandbox_config_file",
+    "ai_agent_dir": "harness_dir",
+}
+
+def _compat_sandbox(cfg) -> dict:
+    """Map legacy sandbox field names to current names."""
+    d = dict(cfg) if not isinstance(cfg, dict) else cfg.copy()
+    for old, new in _SANDBOX_RENAMES.items():
+        if old in d:
+            d.setdefault(new, d.pop(old))
+    return d
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -889,7 +909,7 @@ def main() -> None:
         run_config_file=args.config,
         **task_dict,
         obs_config=ObsBucketConfig(**run_cfg.obs),
-        sandbox_config=SandboxConfig(**run_cfg.sandbox)
+        sandbox_config=SandboxConfig(**_compat_sandbox(run_cfg.sandbox))
     )
 
     asyncio.run(run_tasks(
