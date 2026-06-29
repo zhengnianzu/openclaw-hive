@@ -199,6 +199,7 @@ class DataConfig:
     api_key: Optional[str] = None
     workspace_base: str = ""
     simulator_config: str = ""
+    harness_type: str = ""
 
 
 # ============================================================================

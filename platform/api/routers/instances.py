@@ -156,6 +156,20 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
                 break
         base.run_config.task.task_input_path = actual_dir
         base.run_config.obs.user_config_download_path = ""
+        # 为每个 task config JSON 注入 harness_type
+        for _root, _dirs, _files in os.walk(actual_dir):
+            for _fname in _files:
+                if not _fname.endswith(".json"):
+                    continue
+                _fpath = os.path.join(_root, _fname)
+                try:
+                    with open(_fpath, "r", encoding="utf-8") as _f:
+                        _cfg = json.load(_f)
+                    _cfg["harness_type"] = req.harness_type
+                    with open(_fpath, "w", encoding="utf-8") as _f:
+                        json.dump(_cfg, _f, indent=2, ensure_ascii=False)
+                except (json.JSONDecodeError, OSError):
+                    pass
     if req.user_profile_dir:
         base.run_config.obs.user_profile_download_path = req.user_profile_dir
     if req.traj_save_path:
@@ -164,7 +178,7 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
         traj_prefix = "hermes_trajs" if req.harness_type == "hermes" else "openclaw_trajs"
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
-        base.env_make.image_name = req.image_name
+        base.env_make.image_name = req.image_name.strip()
 
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")

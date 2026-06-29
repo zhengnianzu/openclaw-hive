@@ -30,7 +30,7 @@ def create_image(req: ImageCreate, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         cursor = conn.execute(
             "INSERT INTO images (name, address, harness_type, created_by) VALUES (?, ?, ?, ?)",
-            (req.name, req.address, req.harness_type, user["username"]),
+            (req.name.strip(), req.address.strip(), req.harness_type, user["username"]),
         )
         row = conn.execute("SELECT * FROM images WHERE id = ?", (cursor.lastrowid,)).fetchone()
     return dict(row)
