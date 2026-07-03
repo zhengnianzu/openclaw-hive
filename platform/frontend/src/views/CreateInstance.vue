@@ -2,13 +2,6 @@
   <div>
     <h2 class="page-title">新建任务实例</h2>
 
-    <div class="harness-switcher">
-      <el-radio-group v-model="form.harness_type" @change="onHarnessChange" size="large">
-        <el-radio-button value="openclaw">OpenClaw</el-radio-button>
-        <el-radio-button value="hermes">Hermes</el-radio-button>
-      </el-radio-group>
-    </div>
-
     <div class="glass-card" style="max-width:800px">
     <el-form :model="form" label-width="140px">
       <el-form-item label="实例名称" required>
@@ -17,6 +10,13 @@
 
       <el-form-item label="任务标识 (user_id)" required>
         <el-input v-model="form.task_name" placeholder="用于Pod命名和OBS路径，例如：zx0608_webtest" />
+      </el-form-item>
+
+      <el-form-item label="Harness 类型">
+        <el-select v-model="form.harness_type" @change="onHarnessChange" style="width:200px">
+          <el-option label="OpenClaw" value="openclaw" />
+          <el-option label="Hermes" value="hermes" />
+        </el-select>
       </el-form-item>
 
       <el-form-item label="并发数">
@@ -74,7 +74,7 @@
           <el-form-item label="模型 API Key">
             <div style="display:flex;gap:8px;width:100%">
               <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" />
-              <el-button type="primary" @click="openKeyDialog">新建KEY</el-button>
+              <el-button type="primary" @click="openKeyDialog('harness')">新建KEY</el-button>
             </div>
             <div v-if="form.model_api_key" style="font-size:12px;color:#999;margin-top:4px">
               {{ form.model_api_key.length > 8 ? form.model_api_key.slice(0, 4) + '****' + form.model_api_key.slice(-4) : '' }}
@@ -97,17 +97,41 @@
         </el-tab-pane>
 
         <el-tab-pane label="用户模拟配置" name="proxy">
-          <el-form-item label="模型名称">
-            <el-input v-model="form.user_proxy_model_name" placeholder="例如：gemini-3-flash-preview" />
-          </el-form-item>
+          <div class="agent-tabs-header">
+            <el-button size="small" text type="primary" @click="addAgent"><el-icon><Plus /></el-icon></el-button>
+          </div>
+          <el-tabs v-model="activeAgentTab" type="card" @tab-remove="removeAgentTab">
+            <el-tab-pane v-for="(ag, idx) in form.agents" :key="idx" :label="ag.name || '未命名'" :name="String(idx)" :closable="idx !== 0">
+              <el-form-item label="Agent 名称">
+                <el-input v-model="ag.name" placeholder="例如：user_simulator" />
+              </el-form-item>
 
-          <el-form-item label="API Key">
-            <el-input v-model="form.user_proxy_api_key" placeholder="留空使用模板默认值" show-password />
-          </el-form-item>
+              <el-form-item label="模型 Base URL">
+                <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084" />
+              </el-form-item>
 
-          <el-form-item label="Base URL">
-            <el-input v-model="form.user_proxy_base_url" placeholder="例如：http://192.168.30.95:8084" />
-          </el-form-item>
+              <el-form-item label="模型 API Key">
+                <div style="display:flex;gap:8px;width:100%">
+                  <el-input v-model="ag.api_key" placeholder="留空使用模板默认值" style="flex:1" show-password />
+                  <el-button type="primary" @click="openKeyDialog('agent', idx)">新建KEY</el-button>
+                </div>
+                <div v-if="ag.api_key" style="font-size:12px;color:#999;margin-top:4px">
+                  {{ ag.api_key.length > 8 ? ag.api_key.slice(0, 4) + '****' + ag.api_key.slice(-4) : '' }}
+                </div>
+              </el-form-item>
+
+              <el-form-item label="API 类型">
+                <el-select v-model="ag.api" placeholder="可选" clearable style="width:100%">
+                  <el-option label="OpenAI Completions" value="openai-completions" />
+                  <el-option label="Anthropic Messages" value="anthropic-messages" />
+                </el-select>
+              </el-form-item>
+
+              <el-form-item label="模型 ID">
+                <el-input v-model="ag.model" placeholder="例如：gemini-3-flash-preview" />
+              </el-form-item>
+            </el-tab-pane>
+          </el-tabs>
         </el-tab-pane>
 
         <el-tab-pane label="高级配置" name="advanced">
@@ -210,8 +234,10 @@ const keyForm = ref({
   invite_code: localStorage.getItem('last_invite_code') || 'pangu',
   name: '',
 })
+let keyTarget = { type: 'harness', agentIdx: -1 }
 
-function openKeyDialog() {
+function openKeyDialog(type = 'harness', agentIdx = -1) {
+  keyTarget = { type, agentIdx }
   const now = new Date()
   const ts = [
     String(now.getFullYear()).slice(2),
@@ -231,11 +257,18 @@ async function generateApiKey() {
       invite_code: keyForm.value.invite_code,
       name: keyForm.value.name,
     }
-    if (form.value.model_base_url) {
-      params.base_url = form.value.model_base_url
+    const baseUrl = keyTarget.type === 'agent' && keyTarget.agentIdx >= 0
+      ? form.value.agents[keyTarget.agentIdx]?.base_url
+      : form.value.model_base_url
+    if (baseUrl) {
+      params.base_url = baseUrl
     }
     const res = await api.post('/generate-api-key', null, { params })
-    form.value.model_api_key = res.api_key
+    if (keyTarget.type === 'agent' && keyTarget.agentIdx >= 0) {
+      form.value.agents[keyTarget.agentIdx].api_key = res.api_key
+    } else {
+      form.value.model_api_key = res.api_key
+    }
     localStorage.setItem('last_invite_code', keyForm.value.invite_code)
     ElMessage.success(`API Key 已生成: ${res.api_key.slice(0, 4)}****${res.api_key.slice(-4)}`)
     keyDialogVisible.value = false
@@ -254,7 +287,24 @@ const form = ref({
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
   harness_type: 'openclaw',
   code_repo_id: null,
+  agents: [{ name: 'user_simulator', model: '', base_url: '', api_key: '', api: '' }],
 })
+
+const activeAgentTab = ref('0')
+
+function addAgent() {
+  form.value.agents.push({ name: '', model: '', base_url: '', api_key: '', api: '' })
+  activeAgentTab.value = String(form.value.agents.length - 1)
+}
+
+function removeAgentTab(tabName) {
+  const idx = parseInt(tabName)
+  if (idx === 0) return
+  form.value.agents.splice(idx, 1)
+  if (parseInt(activeAgentTab.value) >= form.value.agents.length) {
+    activeAgentTab.value = String(form.value.agents.length - 1)
+  }
+}
 
 const imageList = ref([])
 const codeRepoList = ref([])
@@ -351,6 +401,9 @@ onMounted(async () => {
       Object.assign(form.value, params)
       form.value.name = params.name + '-copy'
       form.value.task_name = authStore.username || ''
+      if (!form.value.agents || form.value.agents.length === 0) {
+        form.value.agents = [{ name: 'user_simulator', model: '', base_url: '', api_key: '', api: '' }]
+      }
       ElMessage.info('已从已有实例复制配置，请修改任务标识后创建')
     } catch {
       ElMessage.warning('无法加载源实例配置')
@@ -384,8 +437,8 @@ onMounted(async () => {
   font-weight: 700;
   margin-bottom: 24px;
 }
-.harness-switcher {
-  margin-bottom: 16px;
-  max-width: 800px;
+.agent-tabs-header {
+  float: right;
+  margin-top: 2px;
 }
 </style>

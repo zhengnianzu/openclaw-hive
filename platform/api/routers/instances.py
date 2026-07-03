@@ -284,12 +284,28 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     with open(user_proxy_template, "r", encoding="utf-8") as f:
         user_proxy_cfg = json.load(f)
 
-    if req.user_proxy_model_name:
-        user_proxy_cfg["model"] = req.user_proxy_model_name
-    if req.user_proxy_api_key:
-        user_proxy_cfg["api_key"] = req.user_proxy_api_key
-    if req.user_proxy_base_url:
-        user_proxy_cfg["base_url"] = req.user_proxy_base_url
+    if req.agents:
+        user_proxy_cfg = {}
+        for ag in req.agents:
+            entry = {}
+            if ag.model:
+                entry["model"] = ag.model
+            if ag.base_url:
+                entry["base_url"] = ag.base_url
+            if ag.api_key:
+                entry["api_key"] = ag.api_key
+            if ag.api:
+                entry["api"] = ag.api
+            user_proxy_cfg[ag.name] = entry
+    elif req.user_proxy_model_name or req.user_proxy_api_key or req.user_proxy_base_url:
+        sim = user_proxy_cfg.get("user_simulator", {})
+        if req.user_proxy_model_name:
+            sim["model"] = req.user_proxy_model_name
+        if req.user_proxy_api_key:
+            sim["api_key"] = req.user_proxy_api_key
+        if req.user_proxy_base_url:
+            sim["base_url"] = req.user_proxy_base_url
+        user_proxy_cfg["user_simulator"] = sim
 
     with open(user_proxy_path, "w", encoding="utf-8") as f:
         json.dump(user_proxy_cfg, f, indent=2, ensure_ascii=False)

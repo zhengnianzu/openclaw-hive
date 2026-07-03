@@ -2,6 +2,14 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 
+class AgentConfig(BaseModel):
+    name: str
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    api: str = ""
+
+
 class InstanceCreate(BaseModel):
     name: str
     task_name: str
@@ -22,10 +30,13 @@ class InstanceCreate(BaseModel):
     model_id: str = ""
     model_api_type: str = ""          # anthropic-messages 或 openai-completions
 
-    # user_proxy_model.json 可配置项
+    # user_proxy_model.json 可配置项（兼容旧字段，映射到 user_simulator）
     user_proxy_model_name: str = ""
     user_proxy_api_key: str = ""
     user_proxy_base_url: str = ""
+
+    # 新 agent 配置列表
+    agents: List[AgentConfig] = []
 
     harness_type: str = "openclaw"
 
