@@ -19,7 +19,7 @@ from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"}
 
 
 def _get_instance_dir(instance_id: str) -> str:
@@ -175,17 +175,21 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefix = "hermes_trajs" if req.harness_type == "hermes" else "openclaw_trajs"
+        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs"}
+        traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
         base.env_make.image_name = req.image_name.strip()
 
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
+    cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
         base.run_config.sandbox.harness_local_config_file = hermes_config_path
+    elif req.harness_type == "claude-code":
+        base.run_config.sandbox.harness_local_config_file = cc_settings_path
     else:
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -254,6 +258,20 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
             hermes_omega.model.api_key = req.model_api_key
 
         OmegaConf.save(hermes_omega, hermes_config_path)
+    elif req.harness_type == "claude-code":
+        cc_template = os.path.join(settings.SETTINGS_DIR, "cc_settings.json")
+        with open(cc_template, "r", encoding="utf-8") as f:
+            cc_cfg = json.load(f)
+
+        if req.model_base_url:
+            cc_cfg["env"]["ANTHROPIC_BASE_URL"] = req.model_base_url
+        if req.model_api_key:
+            cc_cfg["env"]["ANTHROPIC_AUTH_TOKEN"] = req.model_api_key
+        if req.model_id:
+            cc_cfg["env"]["ANTHROPIC_MODEL"] = req.model_id
+
+        with open(cc_settings_path, "w", encoding="utf-8") as f:
+            json.dump(cc_cfg, f, indent=2, ensure_ascii=False)
     else:
         openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
         with open(openclaw_template, "r", encoding="utf-8") as f:

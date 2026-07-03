@@ -16,6 +16,7 @@
         <el-select v-model="form.harness_type" @change="onHarnessChange" style="width:200px">
           <el-option label="OpenClaw" value="openclaw" />
           <el-option label="Hermes" value="hermes" />
+          <el-option label="Claude Code" value="claude-code" />
         </el-select>
       </el-form-item>
 
@@ -71,7 +72,7 @@
             <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
           </el-form-item>
 
-          <el-form-item label="模型 API Key">
+          <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">
             <div style="display:flex;gap:8px;width:100%">
               <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" />
               <el-button type="primary" @click="openKeyDialog('harness')">新建KEY</el-button>
@@ -81,7 +82,7 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="form.harness_type !== 'hermes'" label="API 类型">
+          <el-form-item v-if="form.harness_type === 'openclaw'" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
@@ -89,10 +90,10 @@
           </el-form-item>
 
           <el-form-item label="模型 ID">
-            <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking">
-              <template v-if="form.harness_type !== 'hermes'" #prepend>local/</template>
+            <el-input v-model="form.model_id" :placeholder="form.harness_type === 'claude-code' ? '例如：claude-opus-4-7-thinking' : '例如：claude-opus-4-7-thinking'">
+              <template v-if="form.harness_type === 'openclaw'" #prepend>local/</template>
             </el-input>
-            <div v-if="form.harness_type !== 'hermes'" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
+            <div v-if="form.harness_type === 'openclaw'" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
           </el-form-item>
         </el-tab-pane>
 

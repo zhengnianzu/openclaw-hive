@@ -16,7 +16,7 @@ from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
-SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml"]
+SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
 for name in SETTINGS_FILES:
     actual = os.path.join(settings.SETTINGS_DIR, name)
     example = actual.rsplit(".", 1)

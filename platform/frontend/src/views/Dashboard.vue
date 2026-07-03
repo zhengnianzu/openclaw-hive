@@ -56,6 +56,7 @@
       <el-select v-model="harnessFilter" placeholder="Harness筛选" clearable size="default" style="width:140px">
         <el-option label="Openclaw" value="openclaw" />
         <el-option label="Hermes" value="hermes" />
+        <el-option label="Claude Code" value="claude-code" />
       </el-select>
       <el-input v-model="nameSearch" placeholder="搜索任务名称" clearable size="default" style="width:260px" prefix-icon="Search" />
     </div>
@@ -65,7 +66,7 @@
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
         <el-table-column prop="harness_type" label="Harness" width="100" align="center" resizable>
           <template #default="{row}">
-            <el-tag :type="row.harness_type === 'hermes' ? 'warning' : 'primary'" size="small">
+            <el-tag :type="row.harness_type === 'hermes' ? 'warning' : row.harness_type === 'claude-code' ? 'success' : 'primary'" size="small">
               {{ row.harness_type || 'openclaw' }}
             </el-tag>
           </template>
