@@ -60,10 +60,8 @@ OBS_UPLOAD_TIMEOUT = 900
 _FRAMEWORK_LAYOUTS = {
     "openclaw": {
         "harness_dir":            "/home/ma-user/.openclaw",
-        "default_skill_path":     "/home/ma-user/.openclaw/skills",
         "harness_local_config":   "uploads/openclaw.json",
         "harness_sandbox_config": "/home/ma-user/.openclaw/openclaw.json",
-        "main_python_file":    "openclaw_automation.py",
         "upload_paths": [
             "/home/ma-user/.openclaw/agents",
             "/home/ma-user/.openclaw/workspace"
@@ -71,16 +69,25 @@ _FRAMEWORK_LAYOUTS = {
     },
     "hermes": {
         "harness_dir":            "/home/ma-user/.hermes",
-        "default_skill_path":     "/home/ma-user/.hermes/skills",
         "harness_local_config":   "uploads/config.yaml",
         "harness_sandbox_config": "/home/ma-user/.hermes/config.yaml",
-        "main_python_file":    "hermes_automation.py",
         "upload_paths": [
             "/home/ma-user/.hermes/profiles",
             "/home/ma-user/.hermes/sessions", 
             "/home/ma-user/.hermes/logs", 
-            "/home/ma-user/.hermes/state.db", 
-            "/home/ma-user/.hermes/api_use.log"
+            "/home/ma-user/.hermes/state.db"
+        ]
+    },
+    "claudecode": {
+        "harness_dir":            "/home/ma-user/.claude",
+        "harness_local_config":   "uploads/settings.json",
+        "harness_sandbox_config": "/home/ma-user/.claude/settings.json",
+        "upload_paths": [
+            "/home/ma-user/.claude/projects",
+            "/home/ma-user/.claude/todos",
+            "/home/ma-user/.claude/debug",
+            "/home/ma-user/.claude/session-env",
+            "/home/ma-user/.claude/workspace"
         ]
     },
 }
@@ -157,7 +164,7 @@ class SandboxConfig:
     result_log: str = "run.log"
     data_config_path: str = f"{workspace}/config"
     harness_dir: str = field(default_factory=lambda: _FW["harness_dir"])
-    default_skill_path: str = field(default_factory=lambda: _FW["default_skill_path"])
+    default_skill_path: str = f"{harness_dir}/skills"
     harness_sandbox_config_file: str = field(default_factory=lambda: _FW["harness_sandbox_config"])
     harness_local_config_file: str = field(default_factory=lambda: _FW["harness_local_config"])
     # openclaw用于启动gateway
@@ -178,7 +185,7 @@ class TaskConfig:
     task_download_path: str = "downloads"
     main_code_tar: str = "uploads/openclaw-task.tar"
     main_code_dir: str = ""
-    main_python_file: str = field(default_factory=lambda: _FW["main_python_file"])
+    main_python_file: str = "harness_automation.py"
     main_python_timeout: int = 7200
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
@@ -336,6 +343,79 @@ class OpenClawDistillationTask:
         """Copy main agent configuration to sandbox."""
         remote_path = self.config.sandbox_config.harness_sandbox_config_file
         local_path = self.config.sandbox_config.harness_local_config_file
+        local_model_path = self.config.sandbox_config.user_proxy_model_local_file
+        # 根据不同的harness更新文件
+        if AGENT_FRAMEWORK == "openclaw":
+            data = json.loads(Path(local_path).read_text(encoding="utf-8"))
+            model_cfg = json.loads(Path(local_model_path).read_text(encoding="utf-8"))
+
+            data.setdefault("models", {}).setdefault("mode", "merge")
+            providers = data["models"].setdefault("providers", {})
+            agents_section = data.setdefault("agents", {})
+            agents_list = agents_section.setdefault("list", [])
+
+            for agent_name, cfg in model_cfg.items():
+                if agent_name == "user_simulator":
+                    continue
+                if not (cfg.get("model") and cfg.get("base_url")
+                        and cfg.get("api_key") and cfg.get("provider")):
+                    self.logger.warning(
+                        f"agent {agent_name} missing model/base_url/api_key/provider, skip"
+                    )
+                    continue
+
+                api_kind = cfg.get("api") or "anthropic-messages"
+                provider_key = cfg["provider"]
+                model_ref = f"{provider_key}/{cfg['model']}"
+
+                # 1) providers 注入
+                providers[provider_key] = {
+                    "baseUrl": cfg["base_url"],
+                    "apiKey": cfg["api_key"],
+                    "api": api_kind,
+                    "models": [
+                        {
+                            "id": cfg["model"],
+                            "name": cfg["model"],
+                            "api": api_kind,
+                            "reasoning": True,
+                            "input": ["text"],
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                            "contextWindow": 200000,
+                            "maxTokens": 327680,
+                            "compat": {"maxTokensField": "max_tokens"},
+                        }
+                    ],
+                }
+
+                # 2) agents.list 里 upsert 对应条目
+                entry = {
+                    "id": agent_name,
+                    "name": agent_name,
+                    "workspace": f"/home/ma-user/.openclaw/workspace-{agent_name}",
+                    "agentDir": f"/home/ma-user/.openclaw/agents/{agent_name}",
+                    "model": {"primary": model_ref},
+                    "models": {model_ref: {}},
+                }
+                idx = next(
+                    (i for i, e in enumerate(agents_list)
+                     if isinstance(e, dict) and e.get("id") == agent_name),
+                    None,
+                )
+                if idx is None:
+                    agents_list.append(entry)
+                else:
+                    agents_list[idx] = {**agents_list[idx], **entry}
+
+                self.logger.info(
+                    f"Injected provider={provider_key} model={model_ref} for agent {agent_name}"
+                )
+
+            Path(local_path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
         await self._upload_file("agent config", local_path, remote_path)
         self.logger.info(f"Copied agent config: {local_path} -> {remote_path}")
 
@@ -599,8 +679,10 @@ class OpenClawDistillationTask:
         bucket_path = os.path.join(
             self.config.obs_config.traj_save_path, Path(config_file).stem,
         )
+        code_stem = Path(self.config.main_code_tar).stem
+        task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
         upload_clauses = []
-        for src in [sandbox_cfg.result_workdir] + list(_FW["upload_paths"]):
+        for src in [sandbox_cfg.result_workdir, task_logs] + list(_FW["upload_paths"]):
             up_cmd = get_obsutil_uploader_command(
                 self.client_config.s3, 
                 local_folder_absolute_path=src,
