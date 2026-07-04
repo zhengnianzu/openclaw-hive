@@ -3,3 +3,28 @@ serper/
 env_info.db
 __pycache__/
 *.pyc
+
+# ===== Platform =====
+# 前端
+platform/frontend/node_modules/
+platform/frontend/dist/
+
+# 后端运行时
+platform/platform.db
+platform/platform.log
+platform/platform.pid
+platform/tmp/
+platform/configs/
+platform/instances/
+
+# obsutil 二进制（太大，各环境自行部署）
+platform/obsutil/
+
+# settings 实际配置文件（含密钥，不提交；.example 提交）
+platform/settings/config.yaml
+platform/settings/openclaw.json
+platform/settings/user_proxy_model.json
+
+# 通用
+.env
+*.log

@@ -1,0 +1,7 @@
+{
+  "user_simulator": {
+    "model": "gemini-3-flash-preview",
+    "base_url": "http://192.168.30.95:8084",
+    "api_key": "xxxxx"
+  }
+}
