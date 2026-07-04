@@ -1,0 +1,8 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://192.168.30.95:8084",
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7-thinking",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-opus-4-7-thinking"
+  }
+}
