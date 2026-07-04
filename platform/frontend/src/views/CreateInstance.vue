@@ -121,6 +121,11 @@
                 </div>
               </el-form-item>
 
+              <el-form-item label="Provider">
+                <el-input v-model="ag.provider" placeholder="例如：local-evaluator" />
+                <div style="font-size:12px;color:#999;margin-top:4px">留空时该 agent 不会被注入到 openclaw.json</div>
+              </el-form-item>
+
               <el-form-item label="API 类型">
                 <el-select v-model="ag.api" placeholder="可选" clearable style="width:100%">
                   <el-option label="OpenAI Completions" value="openai-completions" />
@@ -288,13 +293,13 @@ const form = ref({
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
   harness_type: 'openclaw',
   code_repo_id: null,
-  agents: [{ name: 'user_simulator', model: '', base_url: '', api_key: '', api: '' }],
+  agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '' }],
 })
 
 const activeAgentTab = ref('0')
 
 function addAgent() {
-  form.value.agents.push({ name: '', model: '', base_url: '', api_key: '', api: '' })
+  form.value.agents.push({ name: '', model: '', provider: '', base_url: '', api_key: '', api: '' })
   activeAgentTab.value = String(form.value.agents.length - 1)
 }
 
@@ -403,7 +408,7 @@ onMounted(async () => {
       form.value.name = params.name + '-copy'
       form.value.task_name = authStore.username || ''
       if (!form.value.agents || form.value.agents.length === 0) {
-        form.value.agents = [{ name: 'user_simulator', model: '', base_url: '', api_key: '', api: '' }]
+        form.value.agents = [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '' }]
       }
       ElMessage.info('已从已有实例复制配置，请修改任务标识后创建')
     } catch {

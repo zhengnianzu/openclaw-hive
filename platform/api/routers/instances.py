@@ -308,6 +308,8 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
             entry = {}
             if ag.model:
                 entry["model"] = ag.model
+            if ag.provider:
+                entry["provider"] = ag.provider
             if ag.base_url:
                 entry["base_url"] = ag.base_url
             if ag.api_key:

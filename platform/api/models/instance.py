@@ -5,6 +5,7 @@ from typing import Optional, List
 class AgentConfig(BaseModel):
     name: str
     model: str = ""
+    provider: str = ""
     base_url: str = ""
     api_key: str = ""
     api: str = ""
