@@ -565,7 +565,7 @@ class OpenClawDistillationTask:
 
         # task_skills 下载到 workspace/<project>/{skill_dir}
         code_stem = Path(self.config.main_code_tar).stem
-        skill_dir = data_cfg.input_dir.get("skill_dir", "skills")
+        skill_dir = (data_cfg.input_dir or {}).get("skill_dir", "skills")
         task_target_path = os.path.join(
             self.config.sandbox_config.workspace, code_stem, skill_dir
         )
@@ -606,11 +606,15 @@ class OpenClawDistillationTask:
             return
 
         data_cfg = parse_data_config(data_config_file)
-        user_profile_path = data_cfg.input_dir.get("user_dir", {}).get("path", "")
+        user_profile_path = (data_cfg.input_dir or {}).get("user_dir", {})
+        if isinstance(user_profile_path, dict):
+            user_profile_path = user_profile_path.get("path", "")
+        if not user_profile_path:
+            user_profile_path = ""
 
         if not user_profile_path:
-            self.logger.warning("No user profile path found")
-            raise RuntimeError("No user profile path found")
+            self.logger.warning("No user profile path found in task config, skipping")
+            return
 
         code_stem = Path(self.config.main_code_tar).stem
         objects_storage_path = os.path.join(
