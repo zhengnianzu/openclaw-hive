@@ -585,7 +585,6 @@ def _get_obs_base_path(inst: dict) -> str:
 
 
 # 内存缓存
-_eval_stats_cache: dict[str, dict[str, dict]] = {}  # instance_id -> {task: {score, completion, gate, ...}}
 _task_completed_cache: dict[str, dict[str, bool]] = {}  # instance_id -> {task: True/False}
 
 
@@ -608,6 +607,9 @@ async def _list_obs_dirs(obs_base: str) -> list[str]:
         if name and not name.startswith("."):
             dirs.append(name)
     return dirs
+
+
+_EVAL_SCORE_FILE = "_eval_score.json"
 
 
 async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
@@ -730,10 +732,21 @@ async def get_eval_stats(
     inst = _get_instance(instance_id)
     obs_base = _get_obs_base_path(inst)
 
+    # 本地缓存文件路径: instances/<id>/_eval_score.json
+    inst_dir = str(Path(inst["config_path"]).parent)
+    local_cache_file = os.path.join(inst_dir, _EVAL_SCORE_FILE)
+
+    # 1) 尝试读本地缓存（非全量刷新时）
+    cached_scores: dict[str, dict] = {}
+    if not refresh and os.path.exists(local_cache_file):
+        try:
+            async with aiofiles.open(local_cache_file, "r") as f:
+                cached_scores = json.loads(await f.read())
+        except Exception:
+            cached_scores = {}
+
     if refresh:
-        _eval_stats_cache.pop(instance_id, None)
         _task_completed_cache.pop(instance_id, None)
-    cached_scores = _eval_stats_cache.get(instance_id, {})
     cached_completed = _task_completed_cache.get(instance_id, {})
 
     all_dirs = await _list_obs_dirs(obs_base)
@@ -746,7 +759,6 @@ async def get_eval_stats(
     os.makedirs(tmp_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(10)
 
-    # 并发下载 evaluator_use.log 和 run.log
     all_tasks = []
     for d in new_dirs_scores:
         all_tasks.append(_download_eval_score(obs_base, d, tmp_dir, semaphore))
@@ -765,12 +777,18 @@ async def get_eval_stats(
             new_completed[task_dir] = val
 
     all_scores = {**cached_scores, **new_scores}
-    _eval_stats_cache[instance_id] = all_scores
+
+    # 2) 有新数据时写回本地缓存
+    if new_scores:
+        try:
+            async with aiofiles.open(local_cache_file, "w") as f:
+                await f.write(json.dumps(all_scores, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
 
     all_completed = {**cached_completed, **new_completed}
     _task_completed_cache[instance_id] = all_completed
 
-    # task_scores: {task: float} 兼容旧前端；task_eval_details: {task: {...}} 明细
     simple_scores = {k: v["score"] for k, v in all_scores.items()}
 
     return {

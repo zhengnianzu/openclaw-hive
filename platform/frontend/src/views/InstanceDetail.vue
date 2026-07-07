@@ -259,8 +259,7 @@ const taskCompletedCountDisplay = computed(() => {
   const completed = evalStats.value.task_completed || {}
   const total = Object.keys(completed).length
   if (!total) return '-'
-  const count = Object.values(completed).filter(Boolean).length
-  return `${count}/${total}`
+  return Object.values(completed).filter(Boolean).length
 })
 const taskCompletedRateDisplay = computed(() => {
   const completed = evalStats.value.task_completed || {}

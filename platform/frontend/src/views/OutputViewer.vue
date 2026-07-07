@@ -246,8 +246,7 @@ const taskCompletedCount = computed(() => Object.values(taskCompleted.value).fil
 const taskCompletedCountDisplay = computed(() => {
   const total = Object.keys(taskCompleted.value).length
   if (!total) return '-'
-  const count = taskCompletedCount.value
-  return `${count}/${total}`
+  return taskCompletedCount.value
 })
 const taskCompletedRateDisplay = computed(() => {
   const total = Object.keys(taskCompleted.value).length
