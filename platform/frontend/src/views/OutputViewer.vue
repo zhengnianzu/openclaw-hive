@@ -17,7 +17,7 @@
       </template>
       <div v-if="evalAvailable">
         <div class="eval-two-col">
-          <!-- 左列: 5个指标 (flex:7) -->
+          <!-- 左列: 6个指标 (flex:7) -->
           <div class="eval-stat-grid">
             <div class="eval-stat-item">
               <span class="eval-stat-num">{{ evalTotalSamples }}</span>
@@ -28,15 +28,19 @@
               <span class="eval-stat-label">上传轨迹</span>
             </div>
             <div class="eval-stat-item">
-              <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedDisplay }}</span>
-              <span class="eval-stat-label">任务完成</span>
+              <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedCountDisplay }}</span>
+              <span class="eval-stat-label">任务完成数</span>
+            </div>
+            <div class="eval-stat-item">
+              <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedRateDisplay }}</span>
+              <span class="eval-stat-label">任务完成率</span>
             </div>
             <div class="eval-stat-item">
               <span class="eval-stat-num" style="color:#10b981">{{ evalCount }}</span>
               <span class="eval-stat-label">已评估</span>
             </div>
-            <div class="eval-stat-item">
-              <span class="eval-stat-num" style="color:#f59e0b">{{ avgScoreDisplay }}</span>
+            <div class="eval-stat-item" style="cursor:pointer" @click="scoreDetailVisible = true">
+              <span class="eval-stat-num avg-score-link">{{ avgScoreDisplay }}</span>
               <span class="eval-stat-label">平均分</span>
             </div>
           </div>
@@ -148,6 +152,45 @@
         <el-empty v-else description="点击左侧文件预览内容" :image-size="80" />
       </div>
     </div>
+    <!-- 分数明细弹窗 -->
+    <el-dialog v-model="scoreDetailVisible" title="评估分数明细" width="900px" destroy-on-close>
+      <div style="margin-bottom:12px;color:#666;font-size:13px">
+        计算公式：score = Π(gate) × Σ(norm_weight × passed/total)
+      </div>
+      <el-table :data="scoreDetailRows" stripe border max-height="500" style="width:100%"
+        :default-sort="{ prop: 'task', order: 'ascending' }">
+        <el-table-column prop="task" label="任务" min-width="180" show-overflow-tooltip sortable />
+        <el-table-column label="Gate" width="110" align="center" sortable :sort-by="row => row.gate">
+          <template #default="{ row }">
+            <div :style="{ color: row.gate === 0 ? '#f56c6c' : '#67c23a', fontWeight: 700 }">{{ row.gate }}</div>
+            <div style="font-size:11px;color:#999;margin-top:2px">{{ row.gateExpr }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="Bucket 得分" min-width="160">
+          <template #default="{ row }">
+            <div>{{ row.bucketSum != null ? row.bucketSum.toFixed(4) : '-' }}</div>
+            <div style="font-size:11px;color:#999;margin-top:2px">{{ row.bucketExpr }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="计算分" width="90" align="center" sortable :sort-by="row => row.score">
+          <template #default="{ row }">
+            <span :style="{ fontWeight: 700, color: row.score === 0 ? '#f56c6c' : row.score >= 1 ? '#67c23a' : '#e6a23c' }">
+              {{ row.score != null ? row.score.toFixed(4) : '-' }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="Completion" width="110" align="center" sortable :sort-by="row => row.completion ?? -1">
+          <template #default="{ row }">
+            <span style="color:#999">{{ row.completion != null ? row.completion.toFixed(4) : '-' }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div style="margin-top:12px;font-size:13px;color:#666">
+        合计: {{ scoreDetailRows.length }} 个任务 ·
+        平均分(计算): {{ avgScoreDisplay }} ·
+        平均分(completion): {{ completionAvgDisplay }}
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -195,20 +238,51 @@ const evalTotalSamples = ref(0)
 const evalUploadedTrajs = ref(0)
 const taskScores = ref({})
 const taskCompleted = ref({})
+const taskEvalDetails = ref({})
+const scoreDetailVisible = ref(false)
 
 const evalCount = computed(() => Object.keys(taskScores.value).length)
 const taskCompletedCount = computed(() => Object.values(taskCompleted.value).filter(Boolean).length)
-const taskCompletedDisplay = computed(() => {
+const taskCompletedCountDisplay = computed(() => {
   const total = Object.keys(taskCompleted.value).length
   if (!total) return '-'
   const count = taskCompletedCount.value
-  const pct = ((count / total) * 100).toFixed(0)
-  return `${count}/${total} (${pct}%)`
+  return `${count}/${total}`
+})
+const taskCompletedRateDisplay = computed(() => {
+  const total = Object.keys(taskCompleted.value).length
+  if (!total) return '-'
+  const pct = ((taskCompletedCount.value / total) * 100).toFixed(1)
+  return `${pct}%`
 })
 const avgScoreDisplay = computed(() => {
   const scores = Object.values(taskScores.value)
   if (!scores.length) return '-'
   const avg = scores.reduce((a, b) => a + b, 0) / scores.length
+  return (avg * 100).toFixed(1) + '%'
+})
+
+const scoreDetailRows = computed(() => {
+  const details = taskEvalDetails.value
+  if (!details || !Object.keys(details).length) return []
+  return Object.entries(details)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([task, d]) => ({
+      task,
+      gate: d.gate,
+      gateExpr: d.gate_expr || '-',
+      gateStatus: d.gate_status || {},
+      bucketExpr: d.bucket_expr || '-',
+      bucketSum: d.bucket_sum,
+      score: d.score,
+      completion: d.completion,
+    }))
+})
+
+const completionAvgDisplay = computed(() => {
+  const rows = scoreDetailRows.value.filter(r => r.completion != null)
+  if (!rows.length) return '-'
+  const avg = rows.reduce((a, r) => a + r.completion, 0) / rows.length
   return (avg * 100).toFixed(1) + '%'
 })
 
@@ -249,6 +323,7 @@ async function loadEvalStats(refresh = false) {
     evalUploadedTrajs.value = res.uploaded_trajs || 0
     taskScores.value = res.task_scores || {}
     taskCompleted.value = res.task_completed || {}
+    taskEvalDetails.value = res.task_eval_details || {}
   } catch {
     evalAvailable.value = false
   } finally {
@@ -501,11 +576,18 @@ onMounted(async () => {
 .eval-two-col { display: flex; gap: 24px; align-items: stretch; }
 .eval-stat-grid {
   flex: 7;
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+  display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
   align-content: center;
 }
 .eval-stat-item { display: flex; flex-direction: column; align-items: center; padding: 8px 0; }
 .eval-stat-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
+.avg-score-link {
+  color: #f59e0b !important;
+  text-decoration: underline;
+  text-decoration-style: dashed;
+  text-underline-offset: 4px;
+}
+.avg-score-link:hover { text-decoration-style: solid; }
 .eval-stat-label { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 
 /* 柱状图 */

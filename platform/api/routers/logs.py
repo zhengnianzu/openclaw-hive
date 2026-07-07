@@ -585,7 +585,7 @@ def _get_obs_base_path(inst: dict) -> str:
 
 
 # 内存缓存
-_eval_stats_cache: dict[str, dict[str, float]] = {}  # instance_id -> {task: score}
+_eval_stats_cache: dict[str, dict[str, dict]] = {}  # instance_id -> {task: {score, completion, gate, ...}}
 _task_completed_cache: dict[str, dict[str, bool]] = {}  # instance_id -> {task: True/False}
 
 
@@ -611,8 +611,8 @@ async def _list_obs_dirs(obs_base: str) -> list[str]:
 
 
 async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
-                               semaphore: asyncio.Semaphore) -> tuple[str, float | None]:
-    """下载单个任务的 evaluator_use.log，取最后一行的 completion 分数。"""
+                               semaphore: asyncio.Semaphore) -> tuple[str, dict | None]:
+    """下载单个任务的 evaluator_use.log，提取评估明细并自行计算分数。"""
     async with semaphore:
         eval_path = f"{obs_base}{task_dir}/logs/evaluator_use.log"
         local_file = os.path.join(tmp_dir, f"eval_{task_dir}.log")
@@ -626,7 +626,7 @@ async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
             if not os.path.exists(local_file):
                 return (task_dir, None)
 
-            last_score = None
+            last_eval = None
             async with aiofiles.open(local_file, "r", errors="replace") as f:
                 async for line in f:
                     line = line.strip()
@@ -636,14 +636,51 @@ async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    evaluation = record.get("evaluation", {})
-                    completion = evaluation.get("completion")
-                    if completion is not None:
-                        try:
-                            last_score = float(completion)
-                        except (ValueError, TypeError):
-                            pass
-            return (task_dir, last_score)
+                    evaluation = record.get("evaluation")
+                    if evaluation and isinstance(evaluation, dict) and "completion" in evaluation:
+                        last_eval = evaluation
+
+            if last_eval is None:
+                return (task_dir, None)
+
+            gate_status = last_eval.get("gate_status", {})
+            bucket_scores = last_eval.get("bucket_scores", {})
+
+            gate_product = 1
+            gate_values = []
+            for gv in gate_status.values():
+                gate_product *= gv
+                gate_values.append(str(gv))
+            gate_expr = "×".join(gate_values) if gate_values else "-"
+
+            bucket_sum = 0.0
+            bucket_detail = []
+            for bk, bv in bucket_scores.items():
+                nw = bv.get("norm_weight", 0)
+                total = bv.get("total", 0)
+                passed = bv.get("passed", 0)
+                ratio = (passed / total) if total > 0 else 0
+                contrib = nw * ratio
+                bucket_sum += contrib
+                if total > 0:
+                    bucket_detail.append(f"{nw:.2g}*{passed}/{total}")
+
+            computed_score = gate_product * bucket_sum
+            completion = last_eval.get("completion")
+            try:
+                completion = float(completion) if completion is not None else None
+            except (ValueError, TypeError):
+                completion = None
+
+            return (task_dir, {
+                "score": round(computed_score, 4),
+                "completion": completion,
+                "gate": gate_product,
+                "gate_expr": gate_expr,
+                "gate_status": gate_status,
+                "bucket_expr": " + ".join(bucket_detail) if bucket_detail else "-",
+                "bucket_sum": round(bucket_sum, 4),
+            })
         except Exception:
             return (task_dir, None)
         finally:
@@ -733,10 +770,14 @@ async def get_eval_stats(
     all_completed = {**cached_completed, **new_completed}
     _task_completed_cache[instance_id] = all_completed
 
+    # task_scores: {task: float} 兼容旧前端；task_eval_details: {task: {...}} 明细
+    simple_scores = {k: v["score"] for k, v in all_scores.items()}
+
     return {
         "available": bool(all_scores) or bool(all_completed),
         "total_samples": inst.get("total_tasks", 0),
         "uploaded_trajs": len(task_dirs),
-        "task_scores": all_scores,
+        "task_scores": simple_scores,
+        "task_eval_details": all_scores,
         "task_completed": all_completed,
     }
