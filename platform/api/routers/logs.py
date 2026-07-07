@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -425,6 +427,88 @@ async def list_obs_logs(
     return {"obs_path": obs_path, "items": items}
 
 
+# 缓存: instance_id -> (timestamp, dirs)
+_obs_tree_cache: dict[str, tuple[float, list[str]]] = {}
+_OBS_TREE_TTL = 10  # 秒
+
+
+@router.get("/{instance_id}/obs-tree")
+async def list_obs_tree(
+    instance_id: str,
+    refresh: bool = Query(default=False),
+    user: dict = Depends(get_current_user),
+):
+    """用 obsutil ls -d 列出一级目录，返回目录名列表。结果缓存10秒。"""
+    now = time.time()
+    if not refresh and instance_id in _obs_tree_cache:
+        cached_time, cached_dirs = _obs_tree_cache[instance_id]
+        if now - cached_time < _OBS_TREE_TTL:
+            inst = _get_instance(instance_id)
+            obs_path = _get_obs_base_path(inst)
+            return {"obs_path": obs_path, "dirs": cached_dirs}
+
+    inst = _get_instance(instance_id)
+    obs_path = _get_obs_base_path(inst)
+
+    dirs = await _list_obs_dirs(obs_path)
+
+    _obs_tree_cache[instance_id] = (now, dirs)
+    return {"obs_path": obs_path, "dirs": dirs}
+
+
+# 缓存: (instance_id, subdir) -> (timestamp, items)
+_obs_subtree_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_OBS_SUBTREE_TTL = 30  # 秒
+
+
+@router.get("/{instance_id}/obs-subtree")
+async def list_obs_subtree(
+    instance_id: str,
+    subdir: str = Query(description="一级子目录名"),
+    refresh: bool = Query(default=False),
+    user: dict = Depends(get_current_user),
+):
+    """用 obsutil ls 列出某个子目录下所有文件，返回扁平路径列表。结果缓存30秒。"""
+    now = time.time()
+    cache_key = (instance_id, subdir)
+    if not refresh and cache_key in _obs_subtree_cache:
+        cached_time, cached_items = _obs_subtree_cache[cache_key]
+        if now - cached_time < _OBS_SUBTREE_TTL:
+            return {"items": cached_items}
+
+    inst = _get_instance(instance_id)
+    obs_path = _get_obs_base_path(inst)
+    subdir_path = f"{obs_path}{subdir}/"
+
+    proc = await asyncio.create_subprocess_exec(
+        settings.OBSUTIL_PATH, "ls", subdir_path, "-limit=5000",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+    items = []
+    for line in stdout.decode().splitlines():
+        line = line.strip()
+        if not line.startswith("obs://"):
+            continue
+        parts = line.split()
+        full_path = parts[0]
+        name = full_path.replace(subdir_path, "").strip("/")
+        if not name:
+            continue
+        is_dir = full_path.endswith("/")
+        if is_dir:
+            name = name.rstrip("/")
+        size = None
+        size_match = re.search(r'(\d+(?:\.\d+)?(?:B|KB|MB|GB|TB))', line)
+        if size_match:
+            size = size_match.group(1)
+        items.append({"name": name, "path": full_path, "is_dir": is_dir, "size": size})
+
+    _obs_subtree_cache[cache_key] = (now, items)
+    return {"items": items}
+
+
 @router.get("/{instance_id}/obs-download")
 async def download_obs_log(
     instance_id: str,
@@ -487,3 +571,172 @@ async def view_obs_log(
     total = len(all_lines)
     lines = all_lines[-tail:] if tail < total else all_lines
     return {"lines": [l.rstrip("\n") for l in lines], "total_lines": total, "file": filename}
+
+
+def _get_obs_base_path(inst: dict) -> str:
+    config_path = inst["config_path"]
+    if not os.path.exists(config_path):
+        raise HTTPException(status_code=404, detail="配置文件不存在")
+    from omegaconf import OmegaConf
+    cfg = OmegaConf.load(config_path)
+    traj_bucket = cfg.run_config.obs.traj_save_bucket
+    traj_path = cfg.run_config.obs.traj_save_path
+    return f"{traj_bucket}/{traj_path}/"
+
+
+# 内存缓存
+_eval_stats_cache: dict[str, dict[str, float]] = {}  # instance_id -> {task: score}
+_task_completed_cache: dict[str, dict[str, bool]] = {}  # instance_id -> {task: True/False}
+
+
+async def _list_obs_dirs(obs_base: str) -> list[str]:
+    """用 obsutil ls -d 列出 OBS 目录下所有子目录名。"""
+    proc = await asyncio.create_subprocess_exec(
+        settings.OBSUTIL_PATH, "ls", obs_base, "-d", "-limit=2000",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    dirs = []
+    for line in stdout.decode().splitlines():
+        line = line.strip()
+        if not line.startswith("obs://"):
+            continue
+        full_path = line.split()[0]
+        if not full_path.endswith("/"):
+            continue
+        name = full_path.replace(obs_base, "").strip("/")
+        if name and not name.startswith("."):
+            dirs.append(name)
+    return dirs
+
+
+async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
+                               semaphore: asyncio.Semaphore) -> tuple[str, float | None]:
+    """下载单个任务的 evaluator_use.log，取最后一行的 completion 分数。"""
+    async with semaphore:
+        eval_path = f"{obs_base}{task_dir}/logs/evaluator_use.log"
+        local_file = os.path.join(tmp_dir, f"eval_{task_dir}.log")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                settings.OBSUTIL_PATH, "cp", eval_path, local_file,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+
+            if not os.path.exists(local_file):
+                return (task_dir, None)
+
+            last_score = None
+            async with aiofiles.open(local_file, "r", errors="replace") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    evaluation = record.get("evaluation", {})
+                    completion = evaluation.get("completion")
+                    if completion is not None:
+                        try:
+                            last_score = float(completion)
+                        except (ValueError, TypeError):
+                            pass
+            return (task_dir, last_score)
+        except Exception:
+            return (task_dir, None)
+        finally:
+            try:
+                os.remove(local_file)
+            except OSError:
+                pass
+
+
+async def _check_run_completed(obs_base: str, task_dir: str, tmp_dir: str,
+                               semaphore: asyncio.Semaphore) -> tuple[str, bool]:
+    """下载 {task_dir}/workdir/run.log，检查是否包含 '所有任务执行完成!'。"""
+    async with semaphore:
+        run_path = f"{obs_base}{task_dir}/workdir/run.log"
+        local_file = os.path.join(tmp_dir, f"run_{task_dir}.log")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                settings.OBSUTIL_PATH, "cp", run_path, local_file,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+
+            if not os.path.exists(local_file):
+                return (task_dir, False)
+
+            async with aiofiles.open(local_file, "r", errors="replace") as f:
+                async for line in f:
+                    if "所有任务执行完成!" in line:
+                        return (task_dir, True)
+            return (task_dir, False)
+        except Exception:
+            return (task_dir, False)
+        finally:
+            try:
+                os.remove(local_file)
+            except OSError:
+                pass
+
+
+@router.get("/{instance_id}/eval-stats")
+async def get_eval_stats(
+    instance_id: str,
+    refresh: bool = Query(default=False, description="强制刷新全部缓存"),
+    user: dict = Depends(get_current_user),
+):
+    """扫描每个任务目录的 evaluator_use.log 和 run.log，返回 per-task 分数和完成状态。"""
+    inst = _get_instance(instance_id)
+    obs_base = _get_obs_base_path(inst)
+
+    if refresh:
+        _eval_stats_cache.pop(instance_id, None)
+        _task_completed_cache.pop(instance_id, None)
+    cached_scores = _eval_stats_cache.get(instance_id, {})
+    cached_completed = _task_completed_cache.get(instance_id, {})
+
+    all_dirs = await _list_obs_dirs(obs_base)
+    task_dirs = [d for d in all_dirs if d != "logs"]
+
+    new_dirs_scores = [d for d in task_dirs if d not in cached_scores]
+    new_dirs_completed = [d for d in task_dirs if d not in cached_completed]
+
+    tmp_dir = os.path.join(settings.HIVE_ROOT, "platform", "tmp", instance_id)
+    os.makedirs(tmp_dir, exist_ok=True)
+    semaphore = asyncio.Semaphore(10)
+
+    # 并发下载 evaluator_use.log 和 run.log
+    all_tasks = []
+    for d in new_dirs_scores:
+        all_tasks.append(_download_eval_score(obs_base, d, tmp_dir, semaphore))
+    for d in new_dirs_completed:
+        all_tasks.append(_check_run_completed(obs_base, d, tmp_dir, semaphore))
+
+    new_scores = {}
+    new_completed = {}
+    if all_tasks:
+        results = await asyncio.gather(*all_tasks)
+        score_count = len(new_dirs_scores)
+        for task_dir, val in results[:score_count]:
+            if val is not None:
+                new_scores[task_dir] = val
+        for task_dir, val in results[score_count:]:
+            new_completed[task_dir] = val
+
+    all_scores = {**cached_scores, **new_scores}
+    _eval_stats_cache[instance_id] = all_scores
+
+    all_completed = {**cached_completed, **new_completed}
+    _task_completed_cache[instance_id] = all_completed
+
+    return {
+        "available": bool(all_scores) or bool(all_completed),
+        "total_samples": inst.get("total_tasks", 0),
+        "uploaded_trajs": len(task_dirs),
+        "task_scores": all_scores,
+        "task_completed": all_completed,
+    }

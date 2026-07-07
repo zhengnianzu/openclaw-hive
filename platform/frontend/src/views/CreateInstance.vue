@@ -17,6 +17,7 @@
           <el-option label="OpenClaw" value="openclaw" />
           <el-option label="Hermes" value="hermes" />
           <el-option label="Claude Code" value="claude-code" />
+          <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
 
@@ -425,7 +426,18 @@ onMounted(async () => {
       form.value.total_num = reg.data_total || 0
       form.value.harness_type = reg.harness_type || 'openclaw'
       if (reg.model_name) form.value.model_id = reg.model_name
-      if (reg.eval_model_name) form.value.user_proxy_model_name = reg.eval_model_name
+      const agents = [{ name: 'user_simulator', model: reg.eval_model_name || '', provider: '', base_url: '', api_key: '', api: '' }]
+      if (reg.eval_config_model) {
+        agents.push({
+          name: 'evaluator',
+          model: reg.eval_config_model || '',
+          base_url: '',
+          api_key: '',
+          api: '',
+          provider: '',
+        })
+      }
+      form.value.agents = agents
       ElMessage.info('已从任务登记预填配置')
     } catch {
       ElMessage.warning('无法加载登记信息')

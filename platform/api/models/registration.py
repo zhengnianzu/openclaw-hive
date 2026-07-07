@@ -16,6 +16,10 @@ class RegistrationCreate(BaseModel):
     harness_type: str = "openclaw"
     base_url: str = ""
     api_key: str = ""
+    eval_config_model: str = ""
+    eval_config_base_url: str = ""
+    eval_config_api_key: str = ""
+    eval_config_api: str = ""
 
 
 class RegistrationUpdate(BaseModel):
@@ -34,6 +38,10 @@ class RegistrationUpdate(BaseModel):
     harness_type: Optional[str] = None
     base_url: Optional[str] = None
     api_key: Optional[str] = None
+    eval_config_model: Optional[str] = None
+    eval_config_base_url: Optional[str] = None
+    eval_config_api_key: Optional[str] = None
+    eval_config_api: Optional[str] = None
 
 
 class RegistrationInfo(BaseModel):
@@ -59,3 +67,7 @@ class RegistrationInfo(BaseModel):
     harness_type: str = "openclaw"
     base_url: str = ""
     api_key: str = ""
+    eval_config_model: str = ""
+    eval_config_base_url: str = ""
+    eval_config_api_key: str = ""
+    eval_config_api: str = ""

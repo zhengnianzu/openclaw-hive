@@ -15,7 +15,7 @@
       <el-table-column prop="created_by" label="登记人" width="100" resizable />
       <el-table-column prop="harness_type" label="Harness" width="100" resizable>
         <template #default="{row}">
-          <el-tag :type="row.harness_type === 'hermes' ? 'warning' : ''" size="small">{{ row.harness_type || 'openclaw' }}</el-tag>
+          <el-tag :type="harnessTagType(row.harness_type)" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="model_name" label="Harness模型" min-width="140" show-overflow-tooltip resizable />
@@ -59,10 +59,11 @@
         <el-descriptions-item label="任务名称">{{ currentReg.task_name }}</el-descriptions-item>
         <el-descriptions-item label="需求方">{{ currentReg.requester }}</el-descriptions-item>
         <el-descriptions-item label="Harness类型">
-          <el-tag :type="currentReg.harness_type === 'hermes' ? 'warning' : ''" size="small">{{ currentReg.harness_type || 'openclaw' }}</el-tag>
+          <el-tag :type="harnessTagType(currentReg.harness_type)" size="small">{{ harnessLabel(currentReg.harness_type) }}</el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="Harness模型">{{ currentReg.model_name }}</el-descriptions-item>
         <el-descriptions-item label="用户模拟模型">{{ currentReg.eval_model_name }}</el-descriptions-item>
+        <el-descriptions-item label="Evaluator模型">{{ currentReg.eval_config_model || '-' }}</el-descriptions-item>
         <el-descriptions-item label="任务供应商URL">{{ currentReg.base_url || '-' }}</el-descriptions-item>
         <el-descriptions-item label="任务供应商KEY">{{ currentReg.api_key || '-' }}</el-descriptions-item>
         <el-descriptions-item label="登记人">{{ currentReg.created_by }}</el-descriptions-item>
@@ -88,6 +89,8 @@
           <el-select v-model="editForm.harness_type" style="width:100%">
             <el-option label="Openclaw" value="openclaw" />
             <el-option label="Hermes" value="hermes" />
+            <el-option label="Claude Code" value="claude-code" />
+            <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
         <el-form-item label="Harness模型">
@@ -95,6 +98,21 @@
         </el-form-item>
         <el-form-item label="用户模拟模型">
           <el-input v-model="editForm.eval_model_name" />
+        </el-form-item>
+        <el-form-item label="Evaluator模型">
+          <el-input v-model="editForm.eval_config_model" placeholder="选填" />
+        </el-form-item>
+        <el-form-item label="任务路径OBS">
+          <el-input v-model="editForm.task_path_obs" />
+        </el-form-item>
+        <el-form-item label="技能目录OBS">
+          <el-input v-model="editForm.skill_dir_obs" />
+        </el-form-item>
+        <el-form-item label="Agent目录OBS">
+          <el-input v-model="editForm.agent_dir_obs" />
+        </el-form-item>
+        <el-form-item label="用户文件夹OBS">
+          <el-input v-model="editForm.user_folder_obs" />
         </el-form-item>
         <el-form-item label="任务供应商URL">
           <el-input v-model="editForm.base_url" placeholder="例如：http://192.168.30.95:8084" />
@@ -134,7 +152,7 @@ const detailVisible = ref(false)
 const currentReg = ref(null)
 
 const editVisible = ref(false)
-const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '' })
+const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', eval_config_model: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '', task_path_obs: '', skill_dir_obs: '', agent_dir_obs: '', user_folder_obs: '' })
 const editLoading = ref(false)
 let editingId = null
 
@@ -143,6 +161,12 @@ function statusType(s) {
 }
 function statusLabel(s) {
   return { pending: '待执行', executing: '执行中', completed: '已完成', cancelled: '已取消' }[s] || s
+}
+function harnessTagType(type) {
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', common: 'info' }[type] || ''
+}
+function harnessLabel(type) {
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', common: '通用' }[type] || type || 'openclaw'
 }
 
 async function loadRegistrations() {
@@ -166,10 +190,15 @@ function openEditDialog(row) {
     traj_path: row.traj_path || '',
     model_name: row.model_name || '',
     eval_model_name: row.eval_model_name || '',
+    eval_config_model: row.eval_config_model || '',
     user_proxy_model_name: row.user_proxy_model_name || '',
     harness_type: row.harness_type || 'openclaw',
     base_url: row.base_url || '',
     api_key: '',
+    task_path_obs: row.task_path_obs || '',
+    skill_dir_obs: row.skill_dir_obs || '',
+    agent_dir_obs: row.agent_dir_obs || '',
+    user_folder_obs: row.user_folder_obs || '',
   }
   editVisible.value = true
 }

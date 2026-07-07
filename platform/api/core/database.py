@@ -76,6 +76,10 @@ def init_db():
             "harness_type TEXT DEFAULT 'openclaw'",
             "base_url TEXT DEFAULT ''",
             "api_key TEXT DEFAULT ''",
+            "eval_config_model TEXT DEFAULT ''",
+            "eval_config_base_url TEXT DEFAULT ''",
+            "eval_config_api_key TEXT DEFAULT ''",
+            "eval_config_api TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(f"ALTER TABLE task_registrations ADD COLUMN {col}")

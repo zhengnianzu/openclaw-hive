@@ -36,6 +36,57 @@
         :color="[{color:'#6366f1',percentage:50},{color:'#8b5cf6',percentage:80},{color:'#10b981',percentage:100}]" />
     </div>
 
+    <!-- 统计面板 -->
+    <el-card style="margin-bottom:20px" v-loading="evalLoading">
+      <template #header>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span>评估统计</span>
+          <el-button size="small" @click="loadEvalStats" :loading="evalLoading">刷新</el-button>
+        </div>
+      </template>
+      <div v-if="evalStats.available">
+        <div class="eval-two-col">
+          <!-- 左列: 5个指标 -->
+          <div class="eval-stat-grid">
+            <div class="eval-stat-item">
+              <span class="eval-stat-num">{{ evalStats.total_samples }}</span>
+              <span class="eval-stat-label">总样本量</span>
+            </div>
+            <div class="eval-stat-item">
+              <span class="eval-stat-num" style="color:#6366f1">{{ evalStats.uploaded_trajs }}</span>
+              <span class="eval-stat-label">上传轨迹</span>
+            </div>
+            <div class="eval-stat-item">
+              <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedDisplay }}</span>
+              <span class="eval-stat-label">任务完成</span>
+            </div>
+            <div class="eval-stat-item">
+              <span class="eval-stat-num" style="color:#10b981">{{ evalCount }}</span>
+              <span class="eval-stat-label">已评估</span>
+            </div>
+            <div class="eval-stat-item">
+              <span class="eval-stat-num" style="color:#f59e0b">{{ evalAvgScore != null ? (evalAvgScore * 100).toFixed(1) + '%' : '-' }}</span>
+              <span class="eval-stat-label">平均分</span>
+            </div>
+          </div>
+          <!-- 右列: 柱状图 -->
+          <div v-if="evalCount > 0" class="score-chart">
+            <div class="score-chart-title">分数分布</div>
+            <div class="score-chart-body">
+              <div v-for="bucket in distributionBuckets" :key="bucket.label" class="score-chart-col">
+                <span class="score-chart-count">{{ bucket.count || '' }}</span>
+                <div class="score-chart-bar-wrap">
+                  <div class="score-chart-bar" :style="{height: bucket.pct + '%'}" />
+                </div>
+                <span class="score-chart-label">{{ bucket.label }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <el-empty v-else description="暂无评估数据（evaluator_use.log 不存在或为空）" :image-size="40" />
+    </el-card>
+
     <el-row :gutter="20">
       <el-col :span="12">
         <el-card header="实例信息">
@@ -91,6 +142,8 @@ const loading = ref(false)
 const inst = ref({})
 const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {} })
 const createParams = ref({})
+const evalLoading = ref(false)
+const evalStats = ref({ available: false, total_samples: 0, uploaded_trajs: 0, task_scores: {} })
 let timer = null
 
 const progressPct = computed(() => {
@@ -123,6 +176,51 @@ async function startInstance() { await api.post(`/instances/${id}/start`); ElMes
 async function stopInstance() { await ElMessageBox.confirm('确认停止？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadData() }
 async function retryFailed() { await api.post(`/instances/${id}/retry-failed`); ElMessage.success('重跑已启动'); loadData() }
 
+async function loadEvalStats() {
+  evalLoading.value = true
+  try { evalStats.value = await api.get(`/logs/${id}/eval-stats`) } catch { evalStats.value = { available: false, task_scores: {} } } finally { evalLoading.value = false }
+}
+
+const evalScores = computed(() => Object.values(evalStats.value.task_scores || {}))
+const evalCount = computed(() => evalScores.value.length)
+const evalAvgScore = computed(() => {
+  if (!evalScores.value.length) return null
+  return evalScores.value.reduce((a, b) => a + b, 0) / evalScores.value.length
+})
+const taskCompletedDisplay = computed(() => {
+  const completed = evalStats.value.task_completed || {}
+  const total = Object.keys(completed).length
+  if (!total) return '-'
+  const count = Object.values(completed).filter(Boolean).length
+  const pct = ((count / total) * 100).toFixed(0)
+  return `${count}/${total} (${pct}%)`
+})
+const evalScoreDistribution = computed(() => {
+  const dist = {}
+  for (const s of evalScores.value) {
+    const bucket = Math.min(Math.floor(s * 10), 10) * 10 + '%'
+    dist[bucket] = (dist[bucket] || 0) + 1
+  }
+  return dist
+})
+const distributionBuckets = computed(() => {
+  const dist = evalScoreDistribution.value
+  const total = evalScores.value.length || 1
+  const maxCount = Math.max(1, ...Object.values(dist))
+  const buckets = []
+  for (let i = 0; i <= 10; i++) {
+    const label = i * 10 + '%'
+    const count = dist[label] || 0
+    buckets.push({
+      label,
+      count,
+      pct: (count / maxCount) * 100,
+      ratio: total > 0 ? ((count / total) * 100).toFixed(0) : '0',
+    })
+  }
+  return buckets
+})
+
 const configFiles = ref([]); const configLoading = ref(false); const activeConfigTab = ref(''); const configContent = ref('')
 async function loadConfigFiles() {
   configLoading.value = true
@@ -130,7 +228,7 @@ async function loadConfigFiles() {
 }
 async function loadConfigContent(filename) { if (!filename) return; try { const res = await api.get(`/instances/${id}/configs/${filename}`); configContent.value = res.content } catch { configContent.value = '' } }
 
-onMounted(() => { loadData(); loadCreateParams(); loadConfigFiles(); timer = setInterval(loadData, 10000) })
+onMounted(() => { loadData(); loadCreateParams(); loadConfigFiles(); loadEvalStats(); timer = setInterval(loadData, 10000) })
 onUnmounted(() => clearInterval(timer))
 </script>
 
@@ -152,5 +250,46 @@ onUnmounted(() => clearInterval(timer))
   background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: var(--radius-sm);
   max-height: 500px; overflow: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
   white-space: pre-wrap; word-break: break-all;
+}
+/* 评估统计: 两列布局 7:3 */
+.eval-two-col { display: flex; gap: 24px; align-items: stretch; }
+.eval-stat-grid {
+  flex: 7;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+  align-content: center;
+}
+.eval-stat-item { display: flex; flex-direction: column; align-items: center; padding: 8px 0; }
+.eval-stat-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
+.eval-stat-label { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+
+/* 柱状图 */
+.score-chart { flex: 3; min-width: 0; }
+.score-chart-title { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; }
+.score-chart-body {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 120px; padding-bottom: 20px; position: relative;
+  border-bottom: 1px solid #e5e7eb;
+}
+.score-chart-col {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  height: 100%; position: relative;
+}
+.score-chart-count {
+  font-size: 10px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+  position: absolute; top: 0; white-space: nowrap;
+}
+.score-chart-bar-wrap {
+  flex: 1; width: 100%; display: flex; align-items: flex-end;
+  padding-top: 16px;
+}
+.score-chart-bar {
+  width: 100%; max-width: 32px; margin: 0 auto;
+  background: linear-gradient(180deg, #6366f1, #8b5cf6);
+  border-radius: 3px 3px 0 0; transition: height 0.3s ease;
+  min-height: 2px;
+}
+.score-chart-label {
+  font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums;
+  position: absolute; bottom: -18px; white-space: nowrap;
 }
 </style>

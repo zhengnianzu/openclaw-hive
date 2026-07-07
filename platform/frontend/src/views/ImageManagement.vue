@@ -9,8 +9,10 @@
 
     <div class="filter-bar">
       <el-select v-model="typeFilter" placeholder="Harness 类型" clearable size="default" style="width:160px">
+        <el-option label="通用" value="common" />
         <el-option label="OpenClaw" value="openclaw" />
         <el-option label="Hermes" value="hermes" />
+        <el-option label="Claude Code" value="claude-code" />
       </el-select>
     </div>
 
@@ -20,8 +22,8 @@
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
         <el-table-column prop="harness_type" label="Harness 类型" width="130" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.harness_type === 'hermes' ? 'warning' : 'primary'" size="small">
-              {{ row.harness_type }}
+            <el-tag :type="harnessTagType(row.harness_type)" size="small">
+              {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -36,7 +38,7 @@
     </div>
 
     <el-dialog v-model="dialogVisible" title="注册镜像" width="520px" destroy-on-close>
-      <el-form :model="form" label-width="100px">
+      <el-form :model="form" label-width="120px">
         <el-form-item label="镜像名称" required>
           <el-input v-model="form.name" placeholder="例如：hermes-0.16" />
         </el-form-item>
@@ -44,10 +46,12 @@
           <el-input v-model="form.address" placeholder="例如：swr.cn-southwest-2.myhuaweicloud.com/rl_team/hermes:0.16.0" />
         </el-form-item>
         <el-form-item label="Harness 类型" required>
-          <el-radio-group v-model="form.harness_type">
-            <el-radio-button value="openclaw">OpenClaw</el-radio-button>
-            <el-radio-button value="hermes">Hermes</el-radio-button>
-          </el-radio-group>
+          <el-select v-model="form.harness_type" style="width:100%">
+            <el-option label="通用" value="common" />
+            <el-option label="OpenClaw" value="openclaw" />
+            <el-option label="Hermes" value="hermes" />
+            <el-option label="Claude Code" value="claude-code" />
+          </el-select>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -72,6 +76,13 @@ const typeFilter = ref('')
 const images = ref([])
 
 const form = ref({ name: '', address: '', harness_type: 'openclaw' })
+
+function harnessTagType(type) {
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', common: 'info' }[type] || ''
+}
+function harnessLabel(type) {
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', common: '通用' }[type] || type
+}
 
 const filteredImages = computed(() => {
   if (!typeFilter.value) return images.value

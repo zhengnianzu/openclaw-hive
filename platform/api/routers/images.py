@@ -17,7 +17,7 @@ def list_images(
     with get_connection() as conn:
         if harness_type:
             rows = conn.execute(
-                "SELECT * FROM images WHERE harness_type = ? ORDER BY created_at DESC",
+                "SELECT * FROM images WHERE harness_type = ? OR harness_type = 'common' ORDER BY created_at DESC",
                 (harness_type,),
             ).fetchall()
         else:

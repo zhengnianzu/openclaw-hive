@@ -9,12 +9,14 @@ router = APIRouter(prefix="/api/registrations", tags=["registrations"])
 
 def _mask_api_key(info: dict, user: dict) -> dict:
     """Only admin and the creator can see the full api_key."""
-    if info.get("api_key") and user.get("role") != "admin" and user.get("username") != info.get("created_by"):
-        key = info["api_key"]
-        if len(key) > 8:
-            info["api_key"] = key[:4] + "****" + key[-4:]
-        else:
-            info["api_key"] = "****"
+    if user.get("role") != "admin" and user.get("username") != info.get("created_by"):
+        for field in ("api_key", "eval_config_api_key"):
+            key = info.get(field)
+            if key:
+                if len(key) > 8:
+                    info[field] = key[:4] + "****" + key[-4:]
+                else:
+                    info[field] = "****"
     return info
 
 
@@ -24,6 +26,10 @@ def _build_info(row, conn, user) -> RegistrationInfo:
     info.setdefault("failed_tasks", 0)
     info.setdefault("base_url", "")
     info.setdefault("api_key", "")
+    info.setdefault("eval_config_model", "")
+    info.setdefault("eval_config_base_url", "")
+    info.setdefault("eval_config_api_key", "")
+    info.setdefault("eval_config_api", "")
     if info.get("linked_instance_id"):
         inst = conn.execute(
             "SELECT completed_tasks, failed_tasks FROM task_instances WHERE id = ?",
@@ -51,12 +57,14 @@ def create_registration(req: RegistrationCreate, user: dict = Depends(get_curren
                (created_by, task_name, requester, task_path_obs, data_total,
                 skill_dir_obs, agent_dir_obs, user_folder_obs,
                 model_name, eval_model_name, user_proxy_model_name, harness_type,
-                base_url, api_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                base_url, api_key,
+                eval_config_model, eval_config_base_url, eval_config_api_key, eval_config_api)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user["username"], req.task_name, req.requester, req.task_path_obs,
              req.data_total, req.skill_dir_obs, req.agent_dir_obs, req.user_folder_obs,
              req.model_name, req.eval_model_name, req.user_proxy_model_name, req.harness_type,
-             req.base_url, req.api_key),
+             req.base_url, req.api_key,
+             req.eval_config_model, req.eval_config_base_url, req.eval_config_api_key, req.eval_config_api),
         )
         row = conn.execute("SELECT * FROM task_registrations WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return _build_info(row, conn, user)

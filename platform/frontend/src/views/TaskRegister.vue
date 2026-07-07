@@ -16,6 +16,8 @@
         <el-select v-model="form.harness_type" style="width:100%">
           <el-option label="Openclaw" value="openclaw" />
           <el-option label="Hermes" value="hermes" />
+          <el-option label="Claude Code" value="claude-code" />
+          <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
       <el-form-item label="Harness模型" required>
@@ -24,6 +26,11 @@
       <el-form-item label="用户模拟模型">
         <el-input v-model="form.eval_model_name" placeholder="对应模型ID" />
       </el-form-item>
+
+      <el-form-item label="Evaluator模型">
+        <el-input v-model="form.eval_config_model" placeholder="选填，例如：deepseek-v4-flash" />
+      </el-form-item>
+
       <el-form-item label="任务路径OBS">
         <el-input v-model="form.task_path_obs" placeholder="OBS路径，如 obs://rl-agentdata/path/">
           <template #append>
@@ -122,6 +129,10 @@ const form = ref({
   harness_type: 'openclaw',
   base_url: '',
   api_key: '',
+  eval_config_model: '',
+  eval_config_base_url: '',
+  eval_config_api_key: '',
+  eval_config_api: '',
 })
 
 async function handleSubmit() {
@@ -198,6 +209,10 @@ onMounted(async () => {
         harness_type: reg.harness_type || 'openclaw',
         base_url: reg.base_url || '',
         api_key: '',
+        eval_config_model: reg.eval_config_model || '',
+        eval_config_base_url: reg.eval_config_base_url || '',
+        eval_config_api_key: '',
+        eval_config_api: reg.eval_config_api || '',
       }
       ElMessage.info('已从已有登记复制，请修改后提交')
     } catch {
