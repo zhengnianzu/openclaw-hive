@@ -1,5 +1,15 @@
 {
-  "model": "gemini-3-flash-preview",
-  "api_key": "your-api-key",
-  "base_url": "http://192.168.30.95:8084"
+  "user_simulator": {
+    "model": "gemini-3-flash-preview",
+    "base_url": "http://192.168.30.95:8084",
+    "api_key": "sk-18842394415-api",
+    "api": "anthropic-messages"
+  },
+  "evaluator": {
+    "model": "deepseek-v4-flash",
+    "provider": "local-evaluator",
+    "base_url": "http://192.168.30.95:8084",
+    "api_key": "sk-1c4d370f",
+    "api": "openai-completions"
+  }
 }

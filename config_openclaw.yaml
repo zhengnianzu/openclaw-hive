@@ -49,29 +49,29 @@ env_make:
 run_config:
   start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
   total_num: 0      # 任务总数, 0表示不限制任务数量
-  concurrent_num: 2   # 并发数 claude 100~150
+  concurrent_num: 3   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
     harness_local_config_file: "uploads/openclaw.json"
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80
   task:
-    task_input_path: "uploads/0529_config_general_1136"  # 任务输入路径
+    task_input_path: /mnt/zengxiang/openclaw-task/task_configs
     task_output_path: "outputs"  # 任务输出路径
     task_complete_record: "complete.jsonl"
     task_failed_record: "failed.jsonl"
     task_download_path: "downloads"
     main_code_tar: "uploads/openclaw-task.tar"
-    main_code_dir: /mnt/zengxiang/openclaw-task-new/openclaw-task
-    main_python_file: "openclaw_automation.py"  # 不同agent的start脚本文件
+    main_code_dir: /mnt/zengxiang/openclaw-task
+    main_python_file: "harness_automation.py"  # 不同agent的start脚本文件
   obs:
     download_timeout: 1200
     upload_timeout: 900
     traj_save_bucket: "obs://rl-agentdata"
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
     traj_save_path: openclaw_trajs/traj_0626_mem_change_general_opus47
-    skill_download_path: skills/260325/skill_localize/skills_library
-    user_profile_download_path: task_data/260519/轨迹任务0519_1
+    skill_download_path:
+    user_profile_download_path: zengxiang/test7
     user_config_download_path:
-    agents_download_path: task_data/260604/0529记忆增删改_train_2160/0525_agent_general/agents
+    agents_download_path:
     default_skills:
