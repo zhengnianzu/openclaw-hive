@@ -78,7 +78,7 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.hermes/state.db"
         ]
     },
-    "claude code": {
+    "claude-code": {
         "harness_dir":            "/home/ma-user/.claude",
         "harness_local_config":   "uploads/settings.json",
         "harness_sandbox_config": "/home/ma-user/.claude/settings.json",
