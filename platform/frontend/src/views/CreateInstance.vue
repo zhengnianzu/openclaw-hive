@@ -9,7 +9,7 @@
       </el-form-item>
 
       <el-form-item label="任务标识 (user_id)" required>
-        <el-input v-model="form.task_name" placeholder="用于Pod命名和OBS路径，例如：zx0608_webtest" />
+        <el-input v-model="form.task_name" placeholder="用于Pod命名和OBS路径，例如：zx26070812300001" />
       </el-form-item>
 
       <el-form-item label="Harness 类型">
@@ -475,7 +475,7 @@ onMounted(async () => {
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(2, 12)
       const rand = String(Math.floor(Math.random() * 10000)).padStart(4, '0')
       form.value.name = `${reg.task_name}-${reg.requester || 'task'}`
-      form.value.task_name = `${authStore.username}_${ts}_${rand}`
+      form.value.task_name = `${authStore.username}${ts}${rand}`
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
       form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
