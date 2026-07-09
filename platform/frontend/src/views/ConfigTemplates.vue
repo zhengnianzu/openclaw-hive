@@ -63,6 +63,9 @@
                 <el-option label="OpenAI Completions" value="openai-completions" />
               </el-select>
             </el-form-item>
+            <el-form-item label="模型 ID">
+              <el-input v-model="form.model_id" placeholder="例如：claude-opus-4-7-thinking" />
+            </el-form-item>
           </el-tab-pane>
 
           <el-tab-pane label="用户模拟配置" name="agents">
@@ -94,6 +97,9 @@
                     <el-option label="OpenAI Completions" value="openai-completions" />
                     <el-option label="Anthropic Messages" value="anthropic-messages" />
                   </el-select>
+                </el-form-item>
+                <el-form-item label="模型 ID">
+                  <el-input v-model="ag.model" placeholder="例如：gemini-3-flash-preview" />
                 </el-form-item>
               </el-tab-pane>
             </el-tabs>

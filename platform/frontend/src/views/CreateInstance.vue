@@ -474,35 +474,40 @@ onMounted(async () => {
       const stripObsPrefix = p => (p || '').replace(/^obs:\/\/rl-agentdata\/?/, '')
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(2, 12)
       const rand = String(Math.floor(Math.random() * 10000)).padStart(4, '0')
+
+      // 1. 先加载配置模板（兜底）
+      const templateId = reg.config_template_id || route.query.template_id
+      if (templateId) {
+        try {
+          const tpl = await api.get(`/config-templates/${templateId}`)
+          if (tpl) applyTemplate(tpl)
+        } catch {}
+      }
+
+      // 2. 再用登记字段覆盖（登记优先级更高）
       form.value.name = `${reg.task_name}-${reg.requester || 'task'}`
       form.value.task_name = `${authStore.username}${ts}${rand}`
+      form.value.harness_type = reg.harness_type || 'openclaw'
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
       form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
       form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
       form.value.default_skills = reg.default_skills || ''
       form.value.total_num = reg.data_total || 0
-      form.value.harness_type = reg.harness_type || 'openclaw'
       if (reg.model_name) form.value.model_id = reg.model_name
+      if (reg.base_url) form.value.model_base_url = reg.base_url
 
-      // Load config template: registration-bound > URL query > none
-      const templateId = reg.config_template_id || route.query.template_id
-      if (templateId) {
-        try {
-          const tpl = await api.get(`/config-templates/${templateId}`)
-          if (tpl) {
-            applyTemplate(tpl)
-            if (reg.eval_model_name && form.value.agents.length > 0) {
-              form.value.agents[0].model = reg.eval_model_name
-            }
-            if (reg.eval_config_model) {
-              const hasEvaluator = form.value.agents.some(a => a.name === 'evaluator')
-              if (!hasEvaluator) {
-                form.value.agents.push({ name: 'evaluator', model: reg.eval_config_model, base_url: '', api_key: '', api: '', provider: '', invite_code: '' })
-              }
-            }
-          }
-        } catch {}
+      // 3. 用登记的 agent 信息覆盖模板中的 agents
+      if (reg.eval_model_name && form.value.agents.length > 0) {
+        form.value.agents[0].model = reg.eval_model_name
+      }
+      if (reg.eval_config_model) {
+        const evaluator = form.value.agents.find(a => a.name === 'evaluator')
+        if (evaluator) {
+          evaluator.model = reg.eval_config_model
+        } else {
+          form.value.agents.push({ name: 'evaluator', model: reg.eval_config_model, base_url: '', api_key: '', api: '', provider: '', invite_code: '' })
+        }
       }
 
       if (!form.value.agents || form.value.agents.length === 0) {
