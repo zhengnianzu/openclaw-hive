@@ -78,7 +78,7 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.hermes/state.db"
         ]
     },
-    "claudecode": {
+    "claude-code": {
         "harness_dir":            "/home/ma-user/.claude",
         "harness_local_config":   "uploads/settings.json",
         "harness_sandbox_config": "/home/ma-user/.claude/settings.json",
@@ -101,7 +101,7 @@ def set_agent_framework(name: str) -> None:
     name = (name or "").strip().lower()
     if name not in _FRAMEWORK_LAYOUTS:
         raise RuntimeError(
-            f"remote_server.project_id 必须是 'openclaw' 或 'hermes', got {name!r}"
+            f"remote_server.project_id 必须是 {_FRAMEWORK_LAYOUTS.keys()}, got {name!r}"
         )
     AGENT_FRAMEWORK = name
     _FW = _FRAMEWORK_LAYOUTS[name]

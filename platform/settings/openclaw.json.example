@@ -57,7 +57,12 @@
       "subagents": {
         "maxConcurrent": 8
       }
-    }
+    },
+    "list": [
+      {
+        "id": "main"
+      }
+    ]
   },
   "messages": {
     "ackReactionScope": "group-mentions"
