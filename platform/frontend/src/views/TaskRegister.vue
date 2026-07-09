@@ -48,6 +48,9 @@
           </template>
         </el-input>
       </el-form-item>
+      <el-form-item label="默认技能">
+        <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，可选）" />
+      </el-form-item>
       <el-form-item label="Agent目录OBS">
         <el-input v-model="form.agent_dir_obs" placeholder="OBS路径">
           <template #append>
@@ -61,6 +64,13 @@
             <el-button @click="openObsBrowser('user_folder_obs')">浏览</el-button>
           </template>
         </el-input>
+      </el-form-item>
+
+      <el-form-item label="配置模板">
+        <el-select v-model="form.config_template_id" placeholder="不绑定模板" clearable style="width:100%">
+          <el-option v-for="tpl in templateList" :key="tpl.id" :label="tpl.name + (tpl.is_default ? ' (默认)' : '')" :value="tpl.id" />
+        </el-select>
+        <div style="font-size:12px;color:#999;margin-top:4px">执行时自动加载模板中的 Harness 配置和 Agent 配置</div>
       </el-form-item>
 
       <el-collapse style="margin-bottom:20px">
@@ -114,6 +124,17 @@ const submitting = ref(false)
 const isCopy = computed(() => !!route.query.copy_from)
 
 const OBS_DEFAULT_PATH = 'obs://rl-agentdata/'
+const templateList = ref([])
+
+async function loadTemplates() {
+  try {
+    templateList.value = await api.get('/config-templates')
+    if (!route.query.copy_from) {
+      const defaultTpl = templateList.value.find(t => t.is_default)
+      if (defaultTpl) form.value.config_template_id = defaultTpl.id
+    }
+  } catch { templateList.value = [] }
+}
 
 const form = ref({
   task_name: '',
@@ -123,6 +144,7 @@ const form = ref({
   skill_dir_obs: '',
   agent_dir_obs: '',
   user_folder_obs: '',
+  default_skills: '',
   model_name: '',
   eval_model_name: '',
   user_proxy_model_name: '',
@@ -133,6 +155,7 @@ const form = ref({
   eval_config_base_url: '',
   eval_config_api_key: '',
   eval_config_api: '',
+  config_template_id: null,
 })
 
 async function handleSubmit() {
@@ -203,6 +226,7 @@ onMounted(async () => {
         skill_dir_obs: reg.skill_dir_obs || '',
         agent_dir_obs: reg.agent_dir_obs || '',
         user_folder_obs: reg.user_folder_obs || '',
+        default_skills: reg.default_skills || '',
         model_name: reg.model_name || '',
         eval_model_name: reg.eval_model_name || '',
         user_proxy_model_name: reg.user_proxy_model_name || '',
@@ -213,11 +237,13 @@ onMounted(async () => {
         eval_config_base_url: reg.eval_config_base_url || '',
         eval_config_api_key: '',
         eval_config_api: reg.eval_config_api || '',
+        config_template_id: reg.config_template_id || null,
       }
       ElMessage.info('已从已有登记复制，请修改后提交')
     } catch {
       ElMessage.warning('无法加载源登记信息')
     }
   }
+  loadTemplates()
 })
 </script>

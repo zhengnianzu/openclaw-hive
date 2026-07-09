@@ -1,0 +1,48 @@
+{
+  "config.yaml": {
+    "task_name": "remote_server.user_id",
+    "harness_type": "remote_server.project_id",
+    "concurrent_num": "run_config.concurrent_num",
+    "start_index": "run_config.start_index",
+    "total_num": "run_config.total_num",
+    "skill_dir": "run_config.obs.skill_download_path",
+    "default_skills": {"path": "run_config.obs.default_skills", "transform": "comma_to_list"},
+    "agent_dir": "run_config.obs.agents_download_path",
+    "user_profile_dir": "run_config.obs.user_profile_download_path",
+    "traj_save_path": "run_config.obs.traj_save_path",
+    "image_name": "env_make.image_name"
+  },
+  "openclaw": {
+    "model_api_key": "models.providers.local.apiKey",
+    "model_base_url": "models.providers.local.baseUrl",
+    "model_api_type": [
+      "models.providers.local.api",
+      "models.providers.local.models[0].api"
+    ],
+    "model_id": [
+      "models.providers.local.models[0].id",
+      "models.providers.local.models[0].name",
+      {"path": "agents.defaults.model.primary", "transform": "prefix_local"},
+      {"path": "agents.defaults.models", "transform": "model_map"}
+    ]
+  },
+  "hermes": {
+    "model_id": ["model.default", "model.model"],
+    "model_base_url": "model.base_url",
+    "model_api_key": "model.api_key"
+  },
+  "claude-code": {
+    "model_base_url": "env.ANTHROPIC_BASE_URL",
+    "model_api_key": "env.ANTHROPIC_AUTH_TOKEN",
+    "model_id": "env.ANTHROPIC_MODEL"
+  },
+  "user_proxy_model": {
+    "_note": "agents数组中每个agent以name为key，字段直接映射",
+    "agents[i].name": "顶层key",
+    "agents[i].model": "{name}.model",
+    "agents[i].provider": "{name}.provider",
+    "agents[i].base_url": "{name}.base_url",
+    "agents[i].api_key": "{name}.api_key",
+    "agents[i].api": "{name}.api"
+  }
+}

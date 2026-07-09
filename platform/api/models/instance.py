@@ -9,6 +9,7 @@ class AgentConfig(BaseModel):
     base_url: str = ""
     api_key: str = ""
     api: str = ""
+    invite_code: str = ""
 
 
 class InstanceCreate(BaseModel):
@@ -42,6 +43,10 @@ class InstanceCreate(BaseModel):
     harness_type: str = "openclaw"
 
     code_repo_id: Optional[int] = None
+
+    invite_code: str = ""
+
+    harness_config_id: Optional[int] = None
 
 
 class InstanceInfo(BaseModel):

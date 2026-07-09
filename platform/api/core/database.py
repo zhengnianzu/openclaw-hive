@@ -115,6 +115,64 @@ def init_db():
         except Exception:
             pass
 
+        # migrate: add default_skills to task_registrations
+        try:
+            conn.execute("ALTER TABLE task_registrations ADD COLUMN default_skills TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+        # migrate: add config_template_id to task_registrations
+        try:
+            conn.execute("ALTER TABLE task_registrations ADD COLUMN config_template_id INTEGER")
+        except Exception:
+            pass
+
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS config_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL DEFAULT '默认配置',
+                owner TEXT NOT NULL,
+                is_default INTEGER DEFAULT 0,
+                harness_type TEXT DEFAULT 'openclaw',
+                model_base_url TEXT DEFAULT '',
+                invite_code TEXT DEFAULT 'pangu',
+                model_api_type TEXT DEFAULT '',
+                model_id TEXT DEFAULT '',
+                agents_json TEXT DEFAULT '[]',
+                image_name TEXT DEFAULT '',
+                code_repo_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS harness_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                harness_type TEXT NOT NULL DEFAULT 'openclaw',
+                version TEXT NOT NULL DEFAULT 'v1',
+                description TEXT DEFAULT '',
+                config_files_json TEXT DEFAULT '[]',
+                is_default INTEGER DEFAULT 0,
+                obs_source_path TEXT DEFAULT '',
+                obs_harness_path TEXT DEFAULT '',
+                obs_task_path TEXT DEFAULT '',
+                obs_proxy_path TEXT DEFAULT '',
+                created_by TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        for col in [
+            "obs_harness_path TEXT DEFAULT ''",
+            "obs_task_path TEXT DEFAULT ''",
+            "obs_proxy_path TEXT DEFAULT ''",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE harness_configs ADD COLUMN {col}")
+            except Exception:
+                pass
+
 
 @contextmanager
 def get_connection():

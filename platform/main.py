@@ -13,7 +13,7 @@ from typing import Optional
 from api.core.config import settings
 from api.core.database import init_db, get_connection
 from api.core.security import get_current_user, get_password_hash
-from api.routers import auth, instances, obs, logs, registrations, images, code_repos
+from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
@@ -47,8 +47,11 @@ app.include_router(logs.router)
 app.include_router(registrations.router)
 app.include_router(images.router)
 app.include_router(code_repos.router)
+app.include_router(config_templates.router)
+app.include_router(harness_configs.router)
 
 init_db()
+harness_configs.ensure_defaults()
 
 with get_connection() as conn:
     existing = conn.execute("SELECT id FROM users WHERE username = ?", (settings.ADMIN_USERNAME,)).fetchone()

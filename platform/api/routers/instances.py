@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from omegaconf import OmegaConf
 
@@ -20,6 +21,15 @@ from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"}
+
+
+async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
+    api_url = base_url.rstrip("/") + f"/api/invite?invite_code={invite_code}&name={name}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(api_url)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("api_key", "")
 
 
 def _get_instance_dir(instance_id: str) -> str:
@@ -109,7 +119,7 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
 
 
 @router.post("", response_model=InstanceInfo)
-def create_instance(req: InstanceCreate, user: dict = Depends(require_operator)):
+async def create_instance(req: InstanceCreate, user: dict = Depends(require_operator)):
     timestamp = datetime.now().strftime("%y%m%d%H%M")
     short_id = uuid.uuid4().hex[:4]
     instance_id = f"{timestamp}-{req.task_name}-{short_id}"
@@ -117,7 +127,23 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     os.makedirs(instance_dir, exist_ok=True)
 
     # --- 1. 生成 config.yaml ---
-    template_path = settings.CONFIG_TEMPLATE
+    # Determine base settings directory: per-harness-config or default
+    if req.harness_config_id:
+        with get_connection() as conn:
+            hc_row = conn.execute("SELECT harness_type, version FROM harness_configs WHERE id = ?", (req.harness_config_id,)).fetchone()
+        if hc_row and hc_row["version"] != "默认":
+            harness_settings_dir = os.path.join(settings.SETTINGS_DIR, hc_row["harness_type"], hc_row["version"])
+            if not os.path.isdir(harness_settings_dir):
+                harness_settings_dir = settings.SETTINGS_DIR
+        else:
+            harness_settings_dir = settings.SETTINGS_DIR
+    else:
+        harness_settings_dir = settings.SETTINGS_DIR
+
+    config_template = os.path.join(harness_settings_dir, "config.yaml")
+    if not os.path.exists(config_template):
+        config_template = settings.CONFIG_TEMPLATE
+    template_path = config_template
     if not os.path.exists(template_path):
         raise HTTPException(status_code=500, detail=f"模板配置文件不存在: {template_path}")
 
@@ -246,7 +272,9 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
 
     # --- 2. 生成 harness 配置文件 ---
     if req.harness_type == "hermes":
-        hermes_template = os.path.join(settings.SETTINGS_DIR, "hermes_config.yaml")
+        hermes_template = os.path.join(harness_settings_dir, "hermes_config.yaml")
+        if not os.path.exists(hermes_template):
+            hermes_template = os.path.join(settings.SETTINGS_DIR, "hermes_config.yaml")
         hermes_omega = OmegaConf.load(hermes_template)
 
         if req.model_id:
@@ -259,7 +287,9 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
 
         OmegaConf.save(hermes_omega, hermes_config_path)
     elif req.harness_type == "claude-code":
-        cc_template = os.path.join(settings.SETTINGS_DIR, "cc_settings.json")
+        cc_template = os.path.join(harness_settings_dir, "cc_settings.json")
+        if not os.path.exists(cc_template):
+            cc_template = os.path.join(settings.SETTINGS_DIR, "cc_settings.json")
         with open(cc_template, "r", encoding="utf-8") as f:
             cc_cfg = json.load(f)
 
@@ -273,7 +303,9 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
         with open(cc_settings_path, "w", encoding="utf-8") as f:
             json.dump(cc_cfg, f, indent=2, ensure_ascii=False)
     else:
-        openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
+        openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
+        if not os.path.exists(openclaw_template):
+            openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
         with open(openclaw_template, "r", encoding="utf-8") as f:
             openclaw_cfg = json.load(f)
 
@@ -297,8 +329,34 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
         with open(openclaw_path, "w", encoding="utf-8") as f:
             json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
 
-    # --- 3. 生成 user_proxy_model.json ---
-    user_proxy_template = os.path.join(settings.SETTINGS_DIR, "user_proxy_model.json")
+    # --- 3. 自动申请 API Key (invite_code) ---
+    if req.invite_code and not req.model_api_key and req.model_base_url:
+        try:
+            key_name = f"{user['username']}_{datetime.now().strftime('%y%m%d%H%M')}_{req.name}"
+            req.model_api_key = await _request_api_key(req.model_base_url, req.invite_code, key_name)
+            if req.harness_type == "hermes" and os.path.exists(hermes_config_path):
+                hermes_omega = OmegaConf.load(hermes_config_path)
+                hermes_omega.model.api_key = req.model_api_key
+                OmegaConf.save(hermes_omega, hermes_config_path)
+            elif req.harness_type == "claude-code" and os.path.exists(cc_settings_path):
+                with open(cc_settings_path, "r", encoding="utf-8") as f:
+                    cc_cfg = json.load(f)
+                cc_cfg["env"]["ANTHROPIC_AUTH_TOKEN"] = req.model_api_key
+                with open(cc_settings_path, "w", encoding="utf-8") as f:
+                    json.dump(cc_cfg, f, indent=2, ensure_ascii=False)
+            elif os.path.exists(openclaw_path):
+                with open(openclaw_path, "r", encoding="utf-8") as f:
+                    openclaw_cfg = json.load(f)
+                openclaw_cfg["models"]["providers"]["local"]["apiKey"] = req.model_api_key
+                with open(openclaw_path, "w", encoding="utf-8") as f:
+                    json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # --- 4. 生成 user_proxy_model.json ---
+    user_proxy_template = os.path.join(harness_settings_dir, "user_proxy_model.json")
+    if not os.path.exists(user_proxy_template):
+        user_proxy_template = os.path.join(settings.SETTINGS_DIR, "user_proxy_model.json")
     with open(user_proxy_template, "r", encoding="utf-8") as f:
         user_proxy_cfg = json.load(f)
 
@@ -330,7 +388,7 @@ def create_instance(req: InstanceCreate, user: dict = Depends(require_operator))
     with open(user_proxy_path, "w", encoding="utf-8") as f:
         json.dump(user_proxy_cfg, f, indent=2, ensure_ascii=False)
 
-    # --- 4. 统计任务数并入库 ---
+    # --- 5. 统计任务数并入库 ---
     total_tasks = 0
     task_input = str(base.run_config.task.task_input_path)
     if os.path.isdir(task_input):

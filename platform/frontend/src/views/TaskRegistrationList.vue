@@ -2,9 +2,21 @@
   <div>
     <div class="header-row">
       <h2>任务登记列表</h2>
-      <el-button type="primary" @click="router.push('/task-register')">
-        <el-icon><Plus /></el-icon> 新建
-      </el-button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:13px;color:#606266;white-space:nowrap">高级配置</span>
+        <el-select v-model="selectedTemplateId" placeholder="选择配置模板" clearable style="width:200px" size="default">
+          <el-option v-for="tpl in templateList" :key="tpl.id"
+            :label="tpl.name + (tpl.is_default ? ' (默认)' : '')" :value="tpl.id" />
+          <template #footer>
+            <el-button text type="primary" style="width:100%" @click="router.push('/config-templates')">
+              <el-icon><Plus /></el-icon> 新增模板
+            </el-button>
+          </template>
+        </el-select>
+        <el-button type="primary" @click="router.push('/task-register')">
+          <el-icon><Plus /></el-icon> 新建
+        </el-button>
+      </div>
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
@@ -20,6 +32,11 @@
       </el-table-column>
       <el-table-column prop="model_name" label="Harness模型" min-width="140" show-overflow-tooltip resizable />
       <el-table-column prop="data_total" label="数据总量" width="90" align="center" resizable />
+      <el-table-column label="配置模板" width="120" resizable>
+        <template #default="{row}">
+          <span>{{ templateName(row.config_template_id) }}</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="status" label="状态" width="90" resizable>
         <template #default="{row}">
           <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
@@ -71,6 +88,7 @@
         <el-descriptions-item label="任务路径OBS">{{ currentReg.task_path_obs }}</el-descriptions-item>
         <el-descriptions-item label="数据总量">{{ currentReg.data_total }}</el-descriptions-item>
         <el-descriptions-item label="技能目录OBS">{{ currentReg.skill_dir_obs }}</el-descriptions-item>
+        <el-descriptions-item label="默认技能">{{ currentReg.default_skills || '-' }}</el-descriptions-item>
         <el-descriptions-item label="Agent目录OBS">{{ currentReg.agent_dir_obs }}</el-descriptions-item>
         <el-descriptions-item label="用户文件夹OBS">{{ currentReg.user_folder_obs }}</el-descriptions-item>
         <el-descriptions-item label="导出路径OBS">{{ currentReg.export_path_obs }}</el-descriptions-item>
@@ -79,6 +97,7 @@
           <el-tag :type="statusType(currentReg.status)">{{ statusLabel(currentReg.status) }}</el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="关联实例">{{ currentReg.linked_instance_id || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="配置模板">{{ templateName(currentReg.config_template_id) }}</el-descriptions-item>
       </el-descriptions>
     </el-dialog>
 
@@ -108,6 +127,9 @@
         <el-form-item label="技能目录OBS">
           <el-input v-model="editForm.skill_dir_obs" />
         </el-form-item>
+        <el-form-item label="默认技能">
+          <el-input v-model="editForm.default_skills" placeholder="逗号分隔" />
+        </el-form-item>
         <el-form-item label="Agent目录OBS">
           <el-input v-model="editForm.agent_dir_obs" />
         </el-form-item>
@@ -125,6 +147,11 @@
         </el-form-item>
         <el-form-item label="轨迹路径">
           <el-input v-model="editForm.traj_path" />
+        </el-form-item>
+        <el-form-item label="配置模板">
+          <el-select v-model="editForm.config_template_id" placeholder="不绑定模板" clearable style="width:100%">
+            <el-option v-for="tpl in templateList" :key="tpl.id" :label="tpl.name + (tpl.is_default ? ' (默认)' : '')" :value="tpl.id" />
+          </el-select>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -152,9 +179,11 @@ const detailVisible = ref(false)
 const currentReg = ref(null)
 
 const editVisible = ref(false)
-const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', eval_config_model: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '', task_path_obs: '', skill_dir_obs: '', agent_dir_obs: '', user_folder_obs: '' })
+const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', eval_config_model: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '', task_path_obs: '', skill_dir_obs: '', agent_dir_obs: '', user_folder_obs: '', default_skills: '', config_template_id: null })
 const editLoading = ref(false)
 let editingId = null
+const templateList = ref([])
+const selectedTemplateId = ref(null)
 
 function statusType(s) {
   return { pending: 'warning', executing: '', completed: 'success', cancelled: 'info' }[s] || ''
@@ -167,6 +196,11 @@ function harnessTagType(type) {
 }
 function harnessLabel(type) {
   return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', common: '通用' }[type] || type || 'openclaw'
+}
+function templateName(id) {
+  if (!id) return '-'
+  const tpl = templateList.value.find(t => t.id === id)
+  return tpl ? tpl.name : '-'
 }
 
 async function loadRegistrations() {
@@ -199,6 +233,8 @@ function openEditDialog(row) {
     skill_dir_obs: row.skill_dir_obs || '',
     agent_dir_obs: row.agent_dir_obs || '',
     user_folder_obs: row.user_folder_obs || '',
+    default_skills: row.default_skills || '',
+    config_template_id: row.config_template_id || null,
   }
   editVisible.value = true
 }
@@ -227,13 +263,26 @@ async function deleteReg(row) {
 function handleCommand(cmd, row) {
   const actions = {
     copy: () => router.push(`/task-register?copy_from=${row.id}`),
-    execute: () => router.push(`/create?from_registration=${row.id}`),
+    execute: () => {
+      let url = `/create?from_registration=${row.id}`
+      const tplId = row.config_template_id || selectedTemplateId.value
+      if (tplId) url += `&template_id=${tplId}`
+      router.push(url)
+    },
     delete: () => deleteReg(row),
   }
   actions[cmd]?.()
 }
 
-onMounted(loadRegistrations)
+async function loadTemplates() {
+  try {
+    templateList.value = await api.get('/config-templates')
+    const def = templateList.value.find(t => t.is_default)
+    if (def) selectedTemplateId.value = def.id
+  } catch { templateList.value = [] }
+}
+
+onMounted(() => { loadRegistrations(); loadTemplates() })
 </script>
 
 <style scoped>

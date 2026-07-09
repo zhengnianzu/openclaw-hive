@@ -20,6 +20,8 @@ class RegistrationCreate(BaseModel):
     eval_config_base_url: str = ""
     eval_config_api_key: str = ""
     eval_config_api: str = ""
+    default_skills: str = ""
+    config_template_id: Optional[int] = None
 
 
 class RegistrationUpdate(BaseModel):
@@ -42,6 +44,8 @@ class RegistrationUpdate(BaseModel):
     eval_config_base_url: Optional[str] = None
     eval_config_api_key: Optional[str] = None
     eval_config_api: Optional[str] = None
+    default_skills: Optional[str] = None
+    config_template_id: Optional[int] = None
 
 
 class RegistrationInfo(BaseModel):
@@ -71,3 +75,5 @@ class RegistrationInfo(BaseModel):
     eval_config_base_url: str = ""
     eval_config_api_key: str = ""
     eval_config_api: str = ""
+    default_skills: str = ""
+    config_template_id: Optional[int] = None

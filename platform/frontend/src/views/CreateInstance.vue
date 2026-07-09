@@ -21,6 +21,14 @@
         </el-select>
       </el-form-item>
 
+      <el-form-item label="Harness 配置">
+        <el-select v-model="form.harness_config_id" style="width:200px">
+          <el-option v-for="hc in harnessConfigList" :key="hc.id"
+            :label="hc.version + (hc.is_default ? ' (默认)' : '')"
+            :value="hc.id" />
+        </el-select>
+      </el-form-item>
+
       <el-form-item label="并发数">
         <el-input-number v-model="form.concurrent_num" :min="1" :max="500" />
       </el-form-item>
@@ -294,13 +302,15 @@ const form = ref({
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
   harness_type: 'openclaw',
   code_repo_id: null,
-  agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '' }],
+  invite_code: '',
+  harness_config_id: null,
+  agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }],
 })
 
 const activeAgentTab = ref('0')
 
 function addAgent() {
-  form.value.agents.push({ name: '', model: '', provider: '', base_url: '', api_key: '', api: '' })
+  form.value.agents.push({ name: '', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' })
   activeAgentTab.value = String(form.value.agents.length - 1)
 }
 
@@ -315,6 +325,47 @@ function removeAgentTab(tabName) {
 
 const imageList = ref([])
 const codeRepoList = ref([])
+const harnessConfigList = ref([])
+
+async function loadHarnessConfigs() {
+  try {
+    harnessConfigList.value = await api.get('/harness-configs', {
+      params: { harness_type: form.value.harness_type }
+    })
+    const def = harnessConfigList.value.find(h => h.is_default)
+    if (def) {
+      form.value.harness_config_id = def.id
+    } else if (harnessConfigList.value.length) {
+      form.value.harness_config_id = harnessConfigList.value[0].id
+    }
+  } catch { harnessConfigList.value = [] }
+}
+
+function applyTemplate(tpl) {
+  if (!tpl) return
+  form.value.model_base_url = tpl.model_base_url || ''
+  form.value.invite_code = tpl.invite_code || ''
+  form.value.model_api_type = tpl.model_api_type || ''
+  if (tpl.model_id) form.value.model_id = tpl.model_id
+  form.value.image_name = tpl.image_name || ''
+  form.value.code_repo_id = tpl.code_repo_id || null
+  form.value.model_api_key = ''
+  try {
+    const tplAgents = JSON.parse(tpl.agents_json || '[]')
+    if (tplAgents.length > 0) {
+      form.value.agents = tplAgents.map(a => ({
+        name: a.name || 'user_simulator',
+        model: a.model || '',
+        provider: a.provider || '',
+        base_url: a.base_url || '',
+        api_key: a.api_key || '',
+        api: a.api || '',
+        invite_code: a.invite_code || '',
+      }))
+    }
+  } catch {}
+  activeAgentTab.value = '0'
+}
 
 async function loadImages() {
   try {
@@ -330,7 +381,9 @@ async function loadCodeRepos() {
 
 function onHarnessChange() {
   form.value.image_name = ''
+  form.value.harness_config_id = null
   loadImages()
+  loadHarnessConfigs()
 }
 
 async function handleCreate() {
@@ -409,7 +462,7 @@ onMounted(async () => {
       form.value.name = params.name + '-copy'
       form.value.task_name = authStore.username || ''
       if (!form.value.agents || form.value.agents.length === 0) {
-        form.value.agents = [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '' }]
+        form.value.agents = [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }]
       }
       ElMessage.info('已从已有实例复制配置，请修改任务标识后创建')
     } catch {
@@ -418,26 +471,47 @@ onMounted(async () => {
   } else if (fromRegistration) {
     try {
       const reg = await api.get(`/registrations/${fromRegistration}`)
+      const stripObsPrefix = p => (p || '').replace(/^obs:\/\/rl-agentdata\/?/, '')
+      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(2, 12)
+      const rand = String(Math.floor(Math.random() * 10000)).padStart(4, '0')
       form.value.name = `${reg.task_name}-${reg.requester || 'task'}`
-      form.value.task_name = reg.task_name
-      form.value.user_config_dir = reg.task_path_obs
-      form.value.skill_dir = reg.skill_dir_obs
-      form.value.agent_dir = reg.agent_dir_obs
+      form.value.task_name = `${authStore.username}_${ts}_${rand}`
+      form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
+      form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
+      form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
+      form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
+      form.value.default_skills = reg.default_skills || ''
       form.value.total_num = reg.data_total || 0
       form.value.harness_type = reg.harness_type || 'openclaw'
       if (reg.model_name) form.value.model_id = reg.model_name
-      const agents = [{ name: 'user_simulator', model: reg.eval_model_name || '', provider: '', base_url: '', api_key: '', api: '' }]
-      if (reg.eval_config_model) {
-        agents.push({
-          name: 'evaluator',
-          model: reg.eval_config_model || '',
-          base_url: '',
-          api_key: '',
-          api: '',
-          provider: '',
-        })
+
+      // Load config template: registration-bound > URL query > none
+      const templateId = reg.config_template_id || route.query.template_id
+      if (templateId) {
+        try {
+          const tpl = await api.get(`/config-templates/${templateId}`)
+          if (tpl) {
+            applyTemplate(tpl)
+            if (reg.eval_model_name && form.value.agents.length > 0) {
+              form.value.agents[0].model = reg.eval_model_name
+            }
+            if (reg.eval_config_model) {
+              const hasEvaluator = form.value.agents.some(a => a.name === 'evaluator')
+              if (!hasEvaluator) {
+                form.value.agents.push({ name: 'evaluator', model: reg.eval_config_model, base_url: '', api_key: '', api: '', provider: '', invite_code: '' })
+              }
+            }
+          }
+        } catch {}
       }
-      form.value.agents = agents
+
+      if (!form.value.agents || form.value.agents.length === 0) {
+        const agents = [{ name: 'user_simulator', model: reg.eval_model_name || '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }]
+        if (reg.eval_config_model) {
+          agents.push({ name: 'evaluator', model: reg.eval_config_model, base_url: '', api_key: '', api: '', provider: '', invite_code: '' })
+        }
+        form.value.agents = agents
+      }
       ElMessage.info('已从任务登记预填配置')
     } catch {
       ElMessage.warning('无法加载登记信息')
@@ -445,6 +519,7 @@ onMounted(async () => {
   }
   loadImages()
   loadCodeRepos()
+  loadHarnessConfigs()
 })
 </script>
 

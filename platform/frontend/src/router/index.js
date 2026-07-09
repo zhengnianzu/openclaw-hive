@@ -18,6 +18,8 @@ const routes = [
       { path: 'users', name: 'UserManagement', component: () => import('../views/UserManagement.vue') },
       { path: 'images', name: 'ImageManagement', component: () => import('../views/ImageManagement.vue') },
       { path: 'code-repos', name: 'CodeManagement', component: () => import('../views/CodeManagement.vue') },
+      { path: 'config-templates', name: 'ConfigTemplates', component: () => import('../views/ConfigTemplates.vue') },
+      { path: 'harness-configs', name: 'HarnessConfigs', component: () => import('../views/HarnessConfigs.vue') },
     ],
   },
 ]
