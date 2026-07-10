@@ -64,8 +64,8 @@ _FRAMEWORK_LAYOUTS = {
         "harness_sandbox_config": "/home/ma-user/.openclaw/openclaw.json",
         "upload_paths": [
             "/home/ma-user/.openclaw/agents",
-            "/home/ma-user/.openclaw/workspace"
-        ]
+        ],
+        "workspace_base": "/home/ma-user/.openclaw/workspace",
     },
     "hermes": {
         "harness_dir":            "/home/ma-user/.hermes",
@@ -76,9 +76,11 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.hermes/sessions", 
             "/home/ma-user/.hermes/logs", 
             "/home/ma-user/.hermes/state.db"
-        ]
+        ],
+        # workspace 隔离在 profiles/<name>/ 里
+        "workspace_base": None,
     },
-    "claude-code": {
+    "claudecode": {
         "harness_dir":            "/home/ma-user/.claude",
         "harness_local_config":   "uploads/settings.json",
         "harness_sandbox_config": "/home/ma-user/.claude/settings.json",
@@ -87,8 +89,9 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.claude/todos",
             "/home/ma-user/.claude/debug",
             "/home/ma-user/.claude/session-env",
-            "/home/ma-user/.claude/workspace"
-        ]
+            "/home/ma-user/.claude/shell-snapshots",
+        ],
+        "workspace_base": "/home/ma-user/.claude/workspace",
     },
 }
 
@@ -677,22 +680,47 @@ class OpenClawDistillationTask:
             raise RuntimeError(f"Agents download failed: {result.msg}")
         self.logger.info(f"Downloaded agents in {time.time() - start_time:.1f}s")
 
+    def _derive_per_agent_workspaces(self, config_file: str) -> list[str]:
+        """按 task config 的 agents[].name 派生 per-agent workspace 绝对路径。"""
+        ws_base = _FW.get("workspace_base")
+        if not ws_base:
+            return []
+        data_cfg = parse_data_config(config_file)
+        agent_names = list({
+            agent.get("name", "").strip() for agent in data_cfg.agents if isinstance(agent, dict) and agent.get("name")
+        })
+
+        base = Path(ws_base)
+        return [
+            str(base if n == "main" else base.parent / f"{base.name}-{n}")
+            for n in agent_names
+        ]
+
     async def _upload_traj_to_obs(self, config_file: str) -> bool:
         """Upload execution traj (logs) to OBS."""
         sandbox_cfg = self.config.sandbox_config
         bucket_path = os.path.join(
             self.config.obs_config.traj_save_path, Path(config_file).stem,
         )
-        code_stem = Path(self.config.main_code_tar).stem
-        task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
-        upload_clauses = []
-        for src in [sandbox_cfg.result_workdir, task_logs] + list(_FW["upload_paths"]):
-            up_cmd = get_obsutil_uploader_command(
-                self.client_config.s3, 
-                local_folder_absolute_path=src,
-                bucket_path=bucket_path
-            )
-            upload_clauses.append(f"([ -e {src} ] && {up_cmd}) || true")
+        # 上传所有的worksapce-<agent-name>
+        up_cmd_template = get_obsutil_uploader_command(
+            self.client_config.s3,
+            local_folder_absolute_path="__PATH__",
+            bucket_path=bucket_path,
+        )
+        per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
+        all_patterns = (
+            [sandbox_cfg.result_workdir]
+            + list(_FW["upload_paths"])
+            + per_agent_workspaces
+        )
+        upload_clauses = [
+            f'for p in $(ls -d {pattern} 2>/dev/null); do '
+            f'{up_cmd_template.replace("__PATH__", "$p")} || true; '
+            f'done'
+            for pattern in all_patterns
+        ]
+
         exec_cmd = " && ".join(upload_clauses) if upload_clauses else "true"
 
         for retry in range(3, 0, -1):
