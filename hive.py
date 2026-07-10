@@ -89,7 +89,6 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.claude/todos",
             "/home/ma-user/.claude/debug",
             "/home/ma-user/.claude/session-env",
-            "/home/ma-user/.claude/shell-snapshots",
         ],
         "workspace_base": "/home/ma-user/.claude/workspace",
     },
@@ -702,6 +701,8 @@ class OpenClawDistillationTask:
         bucket_path = os.path.join(
             self.config.obs_config.traj_save_path, Path(config_file).stem,
         )
+        code_stem = Path(self.config.main_code_tar).stem
+        task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
         # 上传所有的worksapce-<agent-name>
         up_cmd_template = get_obsutil_uploader_command(
             self.client_config.s3,
@@ -710,7 +711,7 @@ class OpenClawDistillationTask:
         )
         per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
         all_patterns = (
-            [sandbox_cfg.result_workdir]
+            [sandbox_cfg.result_workdir, task_logs]
             + list(_FW["upload_paths"])
             + per_agent_workspaces
         )
