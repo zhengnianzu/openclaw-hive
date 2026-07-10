@@ -80,7 +80,7 @@ _FRAMEWORK_LAYOUTS = {
         # workspace 隔离在 profiles/<name>/ 里
         "workspace_base": None,
     },
-    "claudecode": {
+    "claude-code": {
         "harness_dir":            "/home/ma-user/.claude",
         "harness_local_config":   "uploads/settings.json",
         "harness_sandbox_config": "/home/ma-user/.claude/settings.json",
