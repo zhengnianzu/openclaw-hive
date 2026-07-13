@@ -3,8 +3,9 @@ Agent Distillation Task Runner
 
 A configuration-driven task orchestration system for running AI Agent tasks
 in remote sandboxed environments (k8s/docker). 
-- OpenClaw
-- Hermes
+- openclaw
+- hermes
+- claude-code
 """
 
 from __future__ import annotations
@@ -32,15 +33,15 @@ from omegaconf import OmegaConf, DictConfig
 
 from execution_client.client.client import ExecutionClient, make
 from execution_client.core.error_code import ErrorCode
-from execution_client.core.logging import ManageLogger
+from execution_client.core.logger import init_logger, get_logger
 from execution_client.core.utils import generate_random_port, get_obsutil_downloader_command, get_obsutil_uploader_command
 from execution_client.models.request import EnvMakeRequest, ExtendExecCommand, ExtendUploadFile
 from execution_client.models.response import Result
-from execution_client.core.rmq_client import get_rmq_client
 
+from env_sdk.compat.legacy_adapter import build_make_config   # 安装新版sdk, 新增导入该项
 
 # Module-level logger
-logger = ManageLogger(__name__).get_logger()
+logger = get_logger()
 
 # Async lock for file writes
 _file_lock = asyncio.Lock()
@@ -103,7 +104,7 @@ def set_agent_framework(name: str) -> None:
     name = (name or "").strip().lower()
     if name not in _FRAMEWORK_LAYOUTS:
         raise RuntimeError(
-            f"remote_server.project_id 必须是 {_FRAMEWORK_LAYOUTS.keys()}, got {name!r}"
+            f"harness_type 必须是 {_FRAMEWORK_LAYOUTS.keys()}, got {name!r}"
         )
     AGENT_FRAMEWORK = name
     _FW = _FRAMEWORK_LAYOUTS[name]
@@ -288,25 +289,17 @@ class OpenClawDistillationTask:
         self.failed_record_file: str = ""
 
         yaml_config = load_yaml_config(self.config.run_config_file)
-        self.rmq_client = get_rmq_client(yaml_config)
         self.client_config = self._init_config(yaml_config)
         self.execution_client: Optional[ExecutionClient] = None
 
     def _init_config(self, yaml_config: DictConfig) -> DictConfig:
         """Initialize and return the client config with runtime values."""
+        s3 = yaml_config.s3
+        sandbox_id_prefix = yaml_config.sandbox_id_prefix
         config = copy.deepcopy(yaml_config)
-        port = str(generate_random_port())
-
-        # Update ADAPTOR_PORT in environment variables
-        for env_dict in config.env_make.args.env:
-            if env_dict.get("name") == "ADAPTOR_PORT":
-                env_dict["value"] = port
-                break
-
-        config.env_make.env_id = uuid.uuid4().hex
-        # Remove rabbitmq config as it's handled separately
-        if "rabbitmq" in config.env_make:
-            del config.env_make.rabbitmq
+        config = build_make_config("x86_cpu", config=yaml_config)
+        config.s3 = s3
+        config.env_make.env_id = f"{sandbox_id_prefix}-{uuid.uuid4().hex}"
 
         # Ensure output directories exist
         self.complete_record_file = os.path.join(
@@ -773,10 +766,10 @@ class OpenClawDistillationTask:
         start_time = time.perf_counter()
 
         try:
-            request = EnvMakeRequest(**OmegaConf.to_container(self.client_config.env_make))
+            request = EnvMakeRequest(**OmegaConf.to_container(self.client_config.env_make, resolve=True))
             result = await make(
-                request, config=self.client_config, rmq_client=self.rmq_client
-            )
+                request, config=self.client_config
+            ) # 
             if isinstance(result, Result):
                 raise RuntimeError(f"Environment creation failed: {result.msg}")
             self.execution_client = result
@@ -923,9 +916,9 @@ async def run_tasks(
     # Trigger ManageLogger init FIRST so it configures level/stderr/filter,
     # then append our task_handler on top. If we getLogger() before ManageLogger
     # runs, it sees existing handlers and skips all configuration.
-    ec_logger = ManageLogger("ExecutionClient").get_logger()
+    ec_logger = get_logger()
     ec_logger.addHandler(task_handler)
-    make_logger = ManageLogger("execution_client.client.client").get_logger()
+    make_logger = get_logger()
     make_logger.addHandler(task_handler)
 
     # Auto-pack source directory if main_code_dir is set
@@ -1001,7 +994,7 @@ def main() -> None:
 
     config_obj = load_yaml_config(args.config)
     run_cfg = config_obj.run_config
-    set_agent_framework(config_obj.remote_server.project_id)
+    set_agent_framework(run_cfg.harness_type)
     print(f"  Framework: {AGENT_FRAMEWORK}")
 
     # Isolate output/download paths by config name to avoid cross-contamination

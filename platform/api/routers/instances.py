@@ -148,8 +148,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         raise HTTPException(status_code=500, detail=f"模板配置文件不存在: {template_path}")
 
     base = OmegaConf.load(template_path)
-    base.remote_server.user_id = req.task_name
-    base.remote_server.project_id = req.harness_type
+    base.sandbox_id_prefix = req.task_name
+    base.run_config.harness_type = req.harness_type
     base.run_config.concurrent_num = req.concurrent_num
     base.run_config.start_index = req.start_index
     base.run_config.total_num = req.total_num
@@ -205,7 +205,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
-        base.env_make.image_name = req.image_name.strip()
+        base.sandbox.x86_cpu.sandbox.image = req.image_name.strip()
 
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
