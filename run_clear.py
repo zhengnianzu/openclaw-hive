@@ -1,57 +1,38 @@
 import argparse
-import asyncio
 import subprocess
 from omegaconf import OmegaConf
 
-from env_sdk.compat.legacy_adapter import build_make_config   # 安装新版sdk, 新增导入该项
-from env_sdk.controlplane import attach_sandbox
-from execution_client.core.db import get_all_use_env_id, soft_delete_env_info
+from execution_client.client.client import delete_env, get_all_use_env_id
 
 """
-根据配置文件清理pods, sandbox_id_prefix 用来过滤相关pods
+根据配置文件清理pods, user_id 用来过滤相关pods
 清理pods, 手动 kill 脚本后，pods不会立马销毁，执行该脚本立即清理pods,释放k8s资源
 python run_clear.py --del_all 删除所有pods
 python run_clear.py --config config.yaml 删除指定沙箱
 """
 
-def get_sandbox_ids_from_k8s(sandbox_id_prefix):
-    prefix = f"sandbox-{sandbox_id_prefix}-"
+def get_env_ids_from_k8s(user_id):
+    """
+    通过 kubectl 获取属于指定 user_id 的所有 Pod，然后提取env_id 列表
+    """
+    prefix = f"sandbox-k8s-pod{user_id}"
     try:
         result = subprocess.run(
-            ["kubectl", "get", "pods", "-n", "omni-env-default-worker", "--no-headers"],
+            ["kubectl", "get", "pods", "--no-headers"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
             print(f"kubectl get pods 执行失败：{result.stderr.strip()}")
-        sandbox_ids = []
+        env_ids = []
         for line in result.stdout.strip().splitlines():
             pod_name = line.split()[0]
             if pod_name.startswith(prefix):
-                sandbox_ids.append(pod_name.removeprefix("sandbox-"))
-        return sandbox_ids
+                env_id = pod_name.removeprefix(prefix)
+                env_ids.append(env_id)
+        return env_ids
     except subprocess.TimeoutExpired:
         print("错误： kubectl 执行超时")
         return []
-
-
-async def close_sandboxes(sandbox_ids, config):
-    """按 sandbox_id 走新 controlplane 关沙箱: POST /api/v1/sandboxes/<id>/close。"""
-
-    async def close_one(sid):
-        try:
-            client = await attach_sandbox(sandbox_id=sid, config=config)
-            result = await client.close()
-            print(f"[close_ok] sandbox_id={sid} result={getattr(result, 'code', None)}")
-        except Exception as e:
-            print(f"[close_fail] sandbox_id={sid} error={e}")
-        finally:
-            # 无论成功失败, 都把本地 DB 标记为已删, 避免下次误清理
-            try:
-                soft_delete_env_info(sid)
-            except Exception:
-                pass
-
-    await asyncio.gather(*(close_one(sid) for sid in sandbox_ids))
 
 
 def main() -> None:
@@ -63,20 +44,19 @@ def main() -> None:
     if not args.config:
         raise ValueError("not found --config")
     config_dict = OmegaConf.load(args.config)
-    config = build_make_config("x86_cpu", path=args.config)
 
     if args.del_all:
-        sandbox_ids = get_all_use_env_id()
+        env_ids = get_all_use_env_id()
     else:
-        sandbox_id_prefix = config_dict.sandbox_id_prefix
-        sandbox_ids = get_sandbox_ids_from_k8s(sandbox_id_prefix)
-        if not sandbox_ids:
-            print(f"sandbox_id_prefix={sandbox_id_prefix} 下没有找到任何运行中的 Pod")
-            return
-        print(f"sandbox_id_prefix={sandbox_id_prefix} 找到 {len(sandbox_ids)}个 Pod")
-
-    asyncio.run(close_sandboxes(sandbox_ids, config))
-
+        user_id = config_dict.remote_server.user_id
+        env_ids = get_env_ids_from_k8s(user_id)
+        if not env_ids:
+            print(f"user_id={user_id} 下没有找到任何运行中的 Pod")
+        else:
+            print(f"user_id={user_id} 找到 {len(env_ids)}个 Pod")
+    delete_env(config_dict, env_ids=env_ids)
 
 if __name__ == "__main__":
     main()
+
+

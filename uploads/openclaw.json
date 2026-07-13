@@ -57,8 +57,7 @@
       "subagents": {
         "maxConcurrent": 8
       }
-    },
-    "list": []
+    }
   },
   "messages": {
     "ackReactionScope": "group-mentions"
@@ -72,9 +71,7 @@
     "mode": "local",
     "bind": "loopback",
     "controlUi": {
-      "allowedOrigins": [
-        "null"
-      ]
+      "allowedOrigins": ["null"]
     },
     "auth": {
       "mode": "token",
@@ -90,20 +87,14 @@
       "nodeManager": "npm"
     }
   },
-  "plugins": {
-    "entries": {
-      "microsoft": {
-        "enabled": false
-      },
-      "web-readability": {
-        "enabled": false
-      }
-    }
-  },
+  "plugins": {                                                                                                                                                                                                        
+      "entries": {                                                                                                                                                                                                      
+        "microsoft":       { "enabled": false },                                                                                                                                                                        
+        "web-readability": { "enabled": false }                                                                                                                                                                         
+      }                                                                                                                                                                                                                 
+  },   
   "tools": {
-    "deny": [
-      "web_search"
-    ],
+    "deny": ["web_search"],
     "web": {
       "search": {
         "enabled": true,
