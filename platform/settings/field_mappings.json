@@ -1,7 +1,7 @@
 {
   "config.yaml": {
-    "task_name": "remote_server.user_id",
-    "harness_type": "remote_server.project_id",
+    "task_name": "sandbox_id_prefix",
+    "harness_type": "run_config.harness_type",
     "concurrent_num": "run_config.concurrent_num",
     "start_index": "run_config.start_index",
     "total_num": "run_config.total_num",
@@ -10,7 +10,7 @@
     "agent_dir": "run_config.obs.agents_download_path",
     "user_profile_dir": "run_config.obs.user_profile_download_path",
     "traj_save_path": "run_config.obs.traj_save_path",
-    "image_name": "env_make.image_name"
+    "image_name": "sandbox.x86_cpu.sandbox.image"
   },
   "openclaw": {
     "model_api_key": "models.providers.local.apiKey",
