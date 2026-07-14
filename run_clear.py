@@ -63,7 +63,6 @@ def main() -> None:
     if not args.config:
         raise ValueError("not found --config")
     config_dict = OmegaConf.load(args.config)
-    config = build_make_config("x86_cpu", path=args.config)
 
     if args.del_all:
         sandbox_ids = get_all_use_env_id()
@@ -75,7 +74,7 @@ def main() -> None:
             return
         print(f"sandbox_id_prefix={sandbox_id_prefix} 找到 {len(sandbox_ids)}个 Pod")
 
-    asyncio.run(close_sandboxes(sandbox_ids, config))
+    asyncio.run(close_sandboxes(sandbox_ids, config_dict))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,22 @@
 # ==================== 全局配置 ====================
 global:
   # 控制面服务地址，SDK 通过此地址与控制面通信
-  controlplane_base_url: http://172.0.0.0:8080
+  controlplane_base_url: http://192.168.20.109:30081
   # API 认证密钥，用于 SDK 与控制面之间的身份校验
-  api_key: "default-key"
+  api_key: "default-api-key"
+  logger:
+    name: env_sdk_client
+    level: INFO
+    dir: logs
+    console: true
+    file: true
+    stream: stdout
+    max_backup_count: 14
+    encoding: utf-8
+    format: "%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+    when: midnight
+    interval: 1
 
 # ==================== 沙箱环境配置 ====================
 # 定义不同架构/加速器类型的沙箱配置，每种配置对应一种运行环境:x86 CPU\ARM CPU\NPU\windows
@@ -44,7 +57,6 @@ s3:
   bucket_name: "obs://rl-agentdata"
 
 sandbox_id_prefix: zx
-
 
 run_config:
   harness_type: openclaw
