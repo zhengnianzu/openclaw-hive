@@ -1,15 +1,54 @@
-remote_server:
-  schema: http
-  host: 127.0.0.1
-  port: 8080
-  project_id: openclaw
-  user_id: xxx
-  url_path: /v1/env/gem
-  http_client:
-    max_retry_count: 1
-    connect_timeout: 10.0
-    read_timeout: 180.0
-    write_timeout: 60.0
+# ==================== 全局配置 ====================
+global:
+  # 控制面服务地址，SDK 通过此地址与控制面通信
+  controlplane_base_url: http://192.168.20.109:30081
+  # API 认证密钥，用于 SDK 与控制面之间的身份校验
+  api_key: "default-api-key"
+  logger:
+    name: env_sdk_client
+    level: INFO
+    dir: logs
+    console: true
+    file: true
+    stream: stdout
+    max_backup_count: 14
+    encoding: utf-8
+    format: "%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+    when: midnight
+    interval: 1
+
+# ==================== 沙箱环境配置 ====================
+# 定义不同架构/加速器类型的沙箱配置，每种配置对应一种运行环境:x86 CPU\ARM CPU\NPU\windows
+sandbox:
+  # ---------- x86 CPU 沙箱 ----------
+  x86_cpu:
+    architecture: x86           # CPU 架构: x86 或 arm64
+    accelerator: null           # 加速器类型: null(无)/npu/gpu
+    ttl_seconds: 3600            # 沙箱生存时间（秒），超时后自动回收
+    wait_timeout_seconds: 300   # 等待沙箱就绪的超时时间（秒）
+    sandbox:
+      image: xxxxx
+      # 环境变量配置
+      env:
+        - name: PIP_INDEX_URL     # pip 镜像源地址
+          value: https://mirrors.tools.huawei.com/pypi/simple
+        - name: PIP_TRUSTED_HOST  # pip 信任的主机名
+          value: mirrors.tools.huawei.com
+        - name: ADAPTOR_NAME      # 适配器名称，用于沙箱内的服务注册
+          value: deep_diver
+        - name: ADAPTOR_PORT      # 适配器监听端口
+          value: "8008"
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: 0
+        - name: SERPER_API_KEY
+          value: xxxx
+      # 资源请求与限制
+      resources:
+        cpu_request: "1"          # CPU 请求量（核数）
+        cpu_limit: "1.5"          # CPU 上限（核数）
+        memory_request: "4Gi"     # 内存请求量
+        memory_limit: "4Gi"       # 内存上限
 
 
 s3:
@@ -17,61 +56,35 @@ s3:
   s3_download_script: /home/ma-user/obsutil/obsutil
   bucket_name: "obs://rl-agentdata"
 
-
-env_make:
-  image_name: xxxx
-  wait_for_ready: true
-  wait_timeout: 300
-  env_id: null
-  runtime_type: k8s  # 运行时类型: k8s | docker | local
-  rabbitmq:
-    is_use: false  # 是否使用rabbitmq进行make
-    url: "xxx"
-    queue: "xxx"
-    priority: 10
-  args:
-    resources:
-      cpu_request: "1"
-      cpu_limit: "2"
-      memory_request: "5Gi"
-      memory_limit: "8Gi"
-    env:
-      - name: PIP_INDEX_URL
-        value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
-      - name: PIP_TRUSTED_HOST
-        value: "mirrors.huaweicloud.com"
-      - name: NODE_TLS_REJECT_UNAUTHORIZED
-        value: "0"
-      - name: SERPER_API_KEY
-        value: your-api-key
-
+sandbox_id_prefix: zx
 
 run_config:
+  harness_type: openclaw
   start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
-  total_num: 0      # 任务总数, 0表示不限制任务数量
-  concurrent_num: 100   # 并发数 claude 100~150
+  total_num: 3      # 任务总数, 0表示不限制任务数量
+  concurrent_num: 2   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
     openclaw_local_config_file: "uploads/openclaw.json"
-    openclaw_api_key: sk-xxxxx-api
+    # openclaw_api_key: sk-18842394415-api
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:
-    task_input_path: "uploads/configs"  # 任务输入路径
+    task_input_path: "task_configs"  # 任务输入路径
     task_output_path: "outputs"  # 任务输出路径
     task_complete_record: "complete.jsonl"  # 完成任务记录文件
     task_failed_record: "failed.jsonl"  # 失败任务记录文件
     task_download_path: "downloads"
     main_code_tar: "uploads/openclaw-task.tar"
     main_code_dir: ""  # 源码目录路径，非空时自动打包替代 main_code_tar，如 "openclaw-task"
-    main_python_file: "openclaw_automation.py"  # start脚本文件
+    main_python_file: "harness_automation.py"  # start脚本文件
   obs:
     download_timeout: 1200
     upload_timeout: 900
-    traj_save_bucket: "obs://rl-agentdata"
+    traj_save_bucket: obs://rl-agentdata
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
-    traj_save_path: "openclaw_trajs/traj_0522_webconfig"
-    skill_download_path: "skills/260325/skill_localize/skills_library"
-    user_config_download_path: "task_data/260520/web_configs"
-    user_profile_download_path: 
-    agents_download_path: "task_data/260413_noenv/noenv_configs/agents"
+    traj_save_path: openclaw_trajs/traj_0713_test
+    skill_download_path:
+    user_config_download_path: zengxiang/task_configs
+    user_profile_download_path:
+    agents_download_path:

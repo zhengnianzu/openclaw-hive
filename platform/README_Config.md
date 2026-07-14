@@ -74,8 +74,8 @@ harness_configs:
 | 表单字段 | 写入文件 | 写入路径 | 说明 |
 |---------|---------|---------|------|
 | 实例名称 (name) | DB | task_instances.name | 仅展示 |
-| 任务标识 (task_name) | config.yaml | `remote_server.user_id` | 用于 Pod 命名和 OBS 路径 |
-| Harness 类型 | config.yaml | `remote_server.project_id` | 决定使用哪种 harness 文件 |
+| 任务标识 (task_name) | config.yaml | `sandbox_id_prefix` | 用于 Pod 命名和 OBS 路径 |
+| Harness 类型 | config.yaml | `run_config.harness_type` | 决定使用哪种 harness 文件 |
 | Harness 配置 | — | — | 选择 harness_config_id，决定模板文件来源目录 |
 | 并发数 | config.yaml | `run_config.concurrent_num` | |
 
@@ -118,7 +118,7 @@ harness_configs:
 |---------|---------|---------|
 | 起始索引 (start_index) | config.yaml | `run_config.start_index` |
 | 任务总数 (total_num) | config.yaml | `run_config.total_num` |
-| 镜像名称 (image_name) | config.yaml | `env_make.image_name` |
+| 镜像名称 (image_name) | config.yaml | `sandbox.x86_cpu.sandbox.image` |
 | 代码仓 (code_repo_id) | config.yaml | `run_config.task.main_code_tar` (下载打包后设路径) |
 
 ### 配置文件来源优先级
