@@ -177,7 +177,7 @@ class SandboxConfig:
     result_log: str = "run.log"
     data_config_path: str = f"{workspace}/config"
     harness_dir: str = field(default_factory=lambda: _FW["harness_dir"])
-    default_skill_path: str = f"{harness_dir}/skills"
+    default_skill_path: str = field(default_factory=lambda: f'{_FW["harness_dir"]}/skills')
     harness_sandbox_config_file: str = field(default_factory=lambda: _FW["harness_sandbox_config"])
     harness_local_config_file: str = field(default_factory=lambda: _FW["harness_local_config"])
     # openclaw用于启动gateway
