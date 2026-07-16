@@ -53,6 +53,12 @@ _current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
 
+class TaskReportedFailure(Exception):
+    """
+    主脚本 stdout 里出现 TASK_FAILED, 判为业务失败 (task_failed)。
+    执行任务失败的标识
+    """
+
 # ============================================================================
 # Agent framework — module-level switch
 # ============================================================================
@@ -341,7 +347,7 @@ class OpenClawDistillationTask:
         upload_request = ExtendUploadFile(upload_path=local_path, remote_path=remote_path)
         result = await self.execution_client.extend(args=upload_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0]:
-            msg = f"upload {file_info}: {local_path} -> {remote_path} failed: {result.msg}"
+            msg = f"upload {file_info}: {local_path} -> {remote_path} failed: {result=}"
             self.logger.error(msg)
             raise RuntimeError(msg)
 
@@ -439,7 +445,7 @@ class OpenClawDistillationTask:
         )
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            msg = f"extract code failed: {result.msg or result.data}"
+            msg = f"extract code failed: {result=}"
             self.logger.error(msg)
             raise RuntimeError(msg)
         self.logger.info("Code extracted successfully")
@@ -496,7 +502,9 @@ class OpenClawDistillationTask:
                 )
                 result = await self.execution_client.extend(args=exec_request.to_dict())
                 if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                    raise RuntimeError(f"Failed to update port: {result.msg}")
+                    msg = f"Failed to update port: {result=}"
+                    self.logger.error(msg)
+                    raise RuntimeError(msg)
 
             # Start gateway
             gateway_log_path = os.path.join(
@@ -515,7 +523,9 @@ class OpenClawDistillationTask:
             result = await self.execution_client.extend(args=exec_request.to_dict())
 
             if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                raise RuntimeError(f"Gateway start failed: {result.msg}")
+                msg = f"Gateway start failed: {result=}"
+                self.logger.error(msg)
+                raise RuntimeError(msg)
 
             stdout = result.data.get("stdout", "")
             if f"Port {port} is already in use" in stdout:
@@ -524,7 +534,9 @@ class OpenClawDistillationTask:
             elif f"listening on ws://127.0.0.1:{port}" in stdout or f"listening on http://127.0.0.1:{port}":
                 break
             else:
-                raise RuntimeError(f"Gateway start unexpected output: {result.data}")
+                msg = f"Gateway start unexpected output: {result.data}"
+                self.logger.error(msg)
+                raise RuntimeError(msg)
 
         self.logger.info(f"Gateway started on port {port}")
 
@@ -552,8 +564,15 @@ class OpenClawDistillationTask:
         )
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            raise RuntimeError(f"Script execution failed: {result.msg or result.data}")
-        self.logger.info(f"[{task_idx}] Script completed: {python_file}, {result=}")
+            msg = f"Script execution failed: {result=}"
+            self.logger.error(msg)
+            raise RuntimeError(msg)
+        stdout = (result.data or {}).get("stdout", "") or ""
+        if "【Task_Failed】" in stdout:
+            msg = f"Script reported 【Task_Failed】 in stdout"
+            self.logger.error(msg)
+            raise TaskReportedFailure(msg)
+        self.logger.info(f"Script completed: {python_file}")
 
     async def _download_s3_skills(self, data_config_file: str) -> None:
         """Download skills from S3 to sandbox."""
@@ -594,7 +613,9 @@ class OpenClawDistillationTask:
             )
             result = await self.execution_client.extend(args=exec_request.to_dict())
             if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                raise RuntimeError(f"Skill download failed: {result.msg}")
+                msg = f"Skill download failed: {result=}"
+                self.logger.error(msg)
+                raise RuntimeError(msg)
 
         start_time = time.time()
         tasks = []
@@ -652,7 +673,9 @@ class OpenClawDistillationTask:
         start_time = time.time()
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            raise RuntimeError(f"User profile download failed: {result.msg}")
+            msg = f"User profile download failed: {result=}"
+            self.logger.error(msg)
+            raise RuntimeError(msg)
         self.logger.info(f"Downloaded user profile in {time.time() - start_time:.1f}s")
 
     async def _download_s3_agents(self) -> None:
@@ -680,7 +703,9 @@ class OpenClawDistillationTask:
         start_time = time.time()
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            raise RuntimeError(f"Agents download failed: {result.msg}")
+            msg =f"Agents download failed: {result=}"
+            self.logger.error(msg)
+            raise RuntimeError(msg)
         self.logger.info(f"Downloaded agents in {time.time() - start_time:.1f}s")
 
     def _derive_per_agent_workspaces(self, config_file: str) -> list[str]:
@@ -700,47 +725,68 @@ class OpenClawDistillationTask:
         ]
 
     async def _upload_traj_to_obs(self, config_file: str) -> bool:
-        """Upload execution traj (logs) to OBS."""
-        sandbox_cfg = self.config.sandbox_config
-        bucket_path = os.path.join(
-            self.config.obs_config.traj_save_path, Path(config_file).stem,
-        )
-        code_stem = Path(self.config.main_code_tar).stem
-        task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
-        # 上传所有的worksapce-<agent-name>
-        up_cmd_template = get_obsutil_uploader_command(
-            self.client_config.s3,
-            local_folder_absolute_path="__PATH__",
-            bucket_path=bucket_path,
-        )
-        per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
-        all_patterns = (
-            [sandbox_cfg.result_workdir, task_logs]
-            + list(_FW["upload_paths"])
-            + per_agent_workspaces
-        )
-        upload_clauses = [
-            f'for p in $(ls -d {pattern} 2>/dev/null); do '
-            f'{up_cmd_template.replace("__PATH__", "$p")} || true; '
-            f'done'
-            for pattern in all_patterns
-        ]
-
-        exec_cmd = " && ".join(upload_clauses) if upload_clauses else "true"
-
-        for retry in range(3, 0, -1):
-            exec_request = ExtendExecCommand(
-                command=["/bin/bash", "-c", exec_cmd],
-                timeout=self.config.obs_config.upload_timeout,
+        """Upload execution traj (logs) to OBS.
+        兜底调用: 无论 pipeline 走到哪一步, 只要 execution_client 存活就应该被调用一次。
+        单次调用内做 3 次重试。任何异常都不会向外抛。
+        """
+        if self.execution_client is None:
+            self.logger.warning("[upload_traj] execution_client is None, skip")
+            return False
+        try:
+            sandbox_cfg = self.config.sandbox_config
+            bucket_path = os.path.join(
+                self.config.obs_config.traj_save_path, Path(config_file).stem,
             )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code == ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                self.logger.info(f"Uploaded traj to OBS: {config_file}")
-                return True
+            code_stem = Path(self.config.main_code_tar).stem
+            task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
+            # 上传所有的worksapce-<agent-name>
+            up_cmd_template = get_obsutil_uploader_command(
+                self.client_config.s3,
+                local_folder_absolute_path="__PATH__",
+                bucket_path=bucket_path,
+            )
+            per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
+            all_patterns = (
+                [sandbox_cfg.result_workdir, task_logs]
+                + list(_FW["upload_paths"])
+                + per_agent_workspaces
+            )
+            upload_clauses = [
+                f'for p in $(ls -d {pattern} 2>/dev/null); do '
+                f'{up_cmd_template.replace("__PATH__", "$p")} || true; '
+                f'done'
+                for pattern in all_patterns
+            ]
 
-            self.logger.warning(f"Upload failed, {retry} retries left: {result.msg}")
-            await asyncio.sleep(random.uniform(3, 10))
+            exec_cmd = " && ".join(upload_clauses) if upload_clauses else "true"
+        except Exception as e:
+            self.logger.error(f"[upload_traj] build cmd failed: {e}\n{traceback.format_exc()}")
+            return False
 
+        for attempt in range(1, 4):
+            try:
+                exec_request = ExtendExecCommand(
+                    command=["/bin/bash", "-c", exec_cmd],
+                    timeout=self.config.obs_config.upload_timeout,
+                )
+                result = await self.execution_client.extend(args=exec_request.to_dict())
+                if (result.code == ErrorCode.SUCCESS[0] and result.data["exit_code"] == 0):
+                    self.logger.info(
+                        f"[upload_traj] OK bucket={bucket_path} attempt={attempt}/3"
+                    )
+                    return True
+                self.logger.warning(
+                    f"[upload_traj] attempt={attempt}/3 failed: "
+                    f"code={result.code} exit={result.data["exit_code"]} data={result.data}"
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"[upload_traj] attempt={attempt}/3 exception: {e}\n{traceback.format_exc()}"
+                )
+            if attempt < 3:
+                await asyncio.sleep(random.uniform(3, 10))
+
+        self.logger.error(f"[upload_traj] FAILED after 3 attempts, config={config_file}")
         return False
 
     async def _execute_task(self, config_file: str, task_idx: int) -> None:
@@ -759,45 +805,106 @@ class OpenClawDistillationTask:
         await self._download_s3_agents()
         await self._upload_data_config(config_file)
         await self._upload_user_proxy_model_config()
-        if AGENT_FRAMEWORK.strip().lower() == "hermes":
-            await self._copy_agent_config()
-        else:
+        if AGENT_FRAMEWORK.strip().lower() == "openclaw":
             await self._start_openclaw_gateway(config_file)
-        await self._run_main_script(config_file, task_idx)
-
-        uploaded = await self._upload_traj_to_obs(config_file)
-        if uploaded:
-            await self._save_record(self.complete_record_file, config_file)
         else:
-            await self._save_record(self.failed_record_file, config_file)
+            await self._copy_agent_config()
+        await self._run_main_script(config_file, task_idx)
 
     async def run(self, config_file: str, task_idx: int = 0) -> None:
         """Run a single distillation task."""
         await asyncio.sleep(random.uniform(1, 10))
         start_time = time.perf_counter()
+        # 三态: TASK_DONE (成功) / TASK_FAILED (跑完了但 upload 失败) / TASK_EXCEPTION (中途报异常)
+        status: str = "TASK_FAILED"     # 默认最悲观
+        error_msg: str = ""
+        env_ready: bool = False
+        self.logger.info(
+            f"===== BEGIN config={os.path.basename(config_file)} "
+            f"framework={AGENT_FRAMEWORK} ====="
+        )
 
         try:
             init_logger(self.global_config["global"]["logger"])
             request = EnvMakeRequest(**OmegaConf.to_container(self.client_config.env_make, resolve=True))
             result = await make(
                 request, config=self.client_config
-            ) # 
+            )
             if isinstance(result, Result):
-                raise RuntimeError(f"Environment creation failed: {result.msg}")
+                msg = f"Environment creation failed: {result=}"
+                self.logger.error(msg)
+                raise RuntimeError(msg)
             self.execution_client = result
+            env_ready = True
             self.logger.info(
-                f">>>>>> Task {task_idx}: env={self.execution_client.get_env_id()} "
+                f">>>>>> Task {task_idx}: env_id={self.execution_client.get_env_id()} "
                 f"elapsed={time.perf_counter() - start_time:.1f}s <<<<<<"
             )
             await self._execute_task(config_file, task_idx)
+            status = "TASK_DONE"
+        
+        except TaskReportedFailure as e:
+            # 主脚本自己上报失败: 判为 task_failed (失败), 不是 exception
+            status = "TASK_FAILED"
+            self.logger.error(f"pipeline reported task_failed 【TASK_FAILED】")
+
         except Exception as e:
+            status = "TASK_EXCEPTION"
             self.logger.error(f"Task {task_idx} failed: {traceback.format_exc()}")
             await self._save_record(self.failed_record_file, config_file)
         finally:
-            if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
-                await self.execution_client.close()
-            self.logger.info(f"Task {task_idx} finished, elapsed={time.perf_counter() - start_time:.1f}s")
+            # ---- 兜底: 无论前面走到哪一步, 只要 env 起来了, 一律尝试 upload_traj ----
+            uploaded: bool = False
+            if env_ready:
+                try:
+                    self.logger.info("finalize=BEGIN name=upload_traj_to_obs")
+                    uploaded = await self._upload_traj_to_obs(config_file)
+                    self.logger.info(
+                        f"finalize=END   name=upload_traj_to_obs "
+                        f"result={'ok' if uploaded else 'FAIL'}"
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"upload_traj_to_obs raised despite internal try: "
+                        f"{e}\n{traceback.format_exc()}"
+                    )
+                    uploaded = False
+            else:
+                self.logger.warning("env never became ready, skip upload_traj_to_obs")
 
+            # 若 pipeline 成功但 upload 失败, 状态降级为"失败"
+            if status == "TASK_DONE" and not uploaded:
+                status = "TASK_FAILED"
+
+            # ---- 记录 complete/failed ----
+            try:
+                if status == "TASK_DONE":
+                    await self._save_record(self.complete_record_file, config_file)
+                else:
+                    await self._save_record(self.failed_record_file, config_file)
+            except Exception as e:
+                self.logger.error(f"save_record failed: {e}\n{traceback.format_exc()}")
+
+            # ---- 关闭 execution_client ----
+            if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
+                try:
+                    await self.execution_client.close()
+                except Exception as e:
+                    self.logger.error(
+                        f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
+                    )
+
+            # ---- task-<idx>.log 结尾: 打印任务执行状态 ----
+            elapsed = time.perf_counter() - start_time
+            self.logger.info(
+                f"===== 任务执行状态={status} "
+                f"upload_traj={'ok' if uploaded else 'FAIL'} "
+                f"env_ready={env_ready} "
+                f"elapsed={elapsed:.1f}s "
+                f"config={os.path.basename(config_file)}"
+                + (f" error=\"{error_msg}\"" if error_msg else "")
+                + " ====="
+            )
 
 # ============================================================================
 # Task Orchestration
