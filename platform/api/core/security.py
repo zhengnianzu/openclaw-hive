@@ -1,3 +1,4 @@
+import time
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -10,6 +11,9 @@ from .config import settings
 from .database import get_connection
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+_user_cache = {}
+_USER_CACHE_TTL = 60
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -27,6 +31,13 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
+def invalidate_user_cache(username: str = None):
+    if username:
+        _user_cache.pop(username, None)
+    else:
+        _user_cache.clear()
+
+
 def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -41,11 +52,19 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     except JWTError:
         raise credentials_exception
 
+    now = time.time()
+    cached = _user_cache.get(username)
+    if cached and (now - cached[1]) < _USER_CACHE_TTL:
+        return cached[0]
+
     with get_connection() as conn:
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if user is None:
         raise credentials_exception
-    return dict(user)
+
+    user_dict = dict(user)
+    _user_cache[username] = (user_dict, now)
+    return user_dict
 
 
 def require_role(*allowed_roles):

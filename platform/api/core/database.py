@@ -1,12 +1,79 @@
 import sqlite3
+import asyncio
 import os
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import settings
+
+_db_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="db")
 
 
 def get_db_path():
     return settings.DB_PATH
+
+
+def _configure_connection(conn):
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+@contextmanager
+def get_connection():
+    conn = sqlite3.connect(get_db_path())
+    _configure_connection(conn)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def async_execute(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_db_executor, func, *args)
+
+
+def _query(sql, params=None):
+    with get_connection() as conn:
+        rows = conn.execute(sql, params or ()).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _query_one(sql, params=None):
+    with get_connection() as conn:
+        row = conn.execute(sql, params or ()).fetchone()
+        return dict(row) if row else None
+
+
+def _execute(sql, params=None):
+    with get_connection() as conn:
+        conn.execute(sql, params or ())
+
+
+def _execute_returning(sql, params=None):
+    with get_connection() as conn:
+        cursor = conn.execute(sql, params or ())
+        return cursor.lastrowid
+
+
+async def async_query(sql, params=None):
+    return await async_execute(_query, sql, params)
+
+
+async def async_query_one(sql, params=None):
+    return await async_execute(_query_one, sql, params)
+
+
+async def async_db_execute(sql, params=None):
+    return await async_execute(_execute, sql, params)
+
+
+async def async_execute_returning(sql, params=None):
+    return await async_execute(_execute_returning, sql, params)
 
 
 def init_db():
@@ -172,14 +239,3 @@ def init_db():
                 conn.execute(f"ALTER TABLE harness_configs ADD COLUMN {col}")
             except Exception:
                 pass
-
-
-@contextmanager
-def get_connection():
-    conn = sqlite3.connect(get_db_path())
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()

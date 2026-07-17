@@ -1,9 +1,11 @@
+import asyncio
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,13 +16,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from omegaconf import OmegaConf
 
 from ..core.config import settings
-from ..core.database import get_connection
+from ..core.database import get_connection, async_execute
 from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"}
+
+_status_cache = {}
+_STATUS_CACHE_TTL = 5
+
+_analyze_cache = {}
+_ANALYZE_CACHE_TTL = 10
 
 
 async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
@@ -37,7 +45,6 @@ def _get_instance_dir(instance_id: str) -> str:
 
 
 def _get_output_dir(config_path: str) -> str:
-    """hive.py 会把 output_path 拼上 config basename，推导实际输出目录。"""
     config_basename = Path(config_path).stem
     instance_dir = str(Path(config_path).parent)
     return os.path.join(instance_dir, "outputs", config_basename)
@@ -46,8 +53,11 @@ def _get_output_dir(config_path: str) -> str:
 def _count_lines(file_path: str) -> int:
     if not os.path.exists(file_path):
         return 0
-    with open(file_path, "r") as f:
-        return sum(1 for line in f if line.strip())
+    count = 0
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            count += chunk.count(b"\n")
+    return count
 
 
 def _is_pid_running(pid: int) -> bool:
@@ -62,30 +72,43 @@ def _is_pid_running(pid: int) -> bool:
 
 def _sync_instance_status(instance: dict) -> dict:
     inst = dict(instance)
+
+    if inst["status"] != "running":
+        return inst
+
     output_dir = _get_output_dir(inst["config_path"])
+
+    now = time.time()
+    cache_key = inst["id"]
+    cached = _status_cache.get(cache_key)
+    if cached and (now - cached[1]) < _STATUS_CACHE_TTL:
+        inst["completed_tasks"] = cached[0]["completed_tasks"]
+        inst["failed_tasks"] = cached[0]["failed_tasks"]
+        inst["status"] = cached[0]["status"]
+        return inst
 
     completed = _count_lines(os.path.join(output_dir, "complete.jsonl"))
     failed = _count_lines(os.path.join(output_dir, "failed.jsonl"))
     inst["completed_tasks"] = completed
     inst["failed_tasks"] = failed
 
-    if inst["status"] == "running":
-        pid_alive = _is_pid_running(inst.get("pid"))
-        all_done = inst["total_tasks"] > 0 and (completed + failed) >= inst["total_tasks"]
-        if not pid_alive or all_done:
-            inst["status"] = "completed" if failed == 0 else "finished"
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
-                    (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
-                )
-        else:
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
-                    (completed, failed, inst["id"]),
-                )
+    pid_alive = _is_pid_running(inst.get("pid"))
+    all_done = inst["total_tasks"] > 0 and (completed + failed) >= inst["total_tasks"]
+    if not pid_alive or all_done:
+        inst["status"] = "completed" if failed == 0 else "finished"
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
+                (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
+            )
+    else:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
+                (completed, failed, inst["id"]),
+            )
 
+    _status_cache[cache_key] = ({"completed_tasks": completed, "failed_tasks": failed, "status": inst["status"]}, now)
     return inst
 
 
@@ -118,6 +141,22 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
     return InstanceInfo(**_with_harness_type(_sync_instance_status(dict(row))))
 
 
+async def _async_subprocess_run(cmd, *, cwd=None, timeout=600):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise HTTPException(status_code=500, detail=f"命令超时({timeout}s): {' '.join(cmd[:3])}")
+    return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
 @router.post("", response_model=InstanceInfo)
 async def create_instance(req: InstanceCreate, user: dict = Depends(require_operator)):
     timestamp = datetime.now().strftime("%y%m%d%H%M")
@@ -127,7 +166,6 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     os.makedirs(instance_dir, exist_ok=True)
 
     # --- 1. 生成 config.yaml ---
-    # Determine base settings directory: per-harness-config or default
     if req.harness_config_id:
         with get_connection() as conn:
             hc_row = conn.execute("SELECT harness_type, version FROM harness_configs WHERE id = ?", (req.harness_config_id,)).fetchone()
@@ -147,7 +185,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if not os.path.exists(template_path):
         raise HTTPException(status_code=500, detail=f"模板配置文件不存在: {template_path}")
 
-    base = OmegaConf.load(template_path)
+    base = await async_execute(OmegaConf.load, template_path)
     base.sandbox_id_prefix = req.task_name
     base.run_config.harness_type = req.harness_type
     base.run_config.concurrent_num = req.concurrent_num
@@ -166,13 +204,12 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         obs_src = f"{base.s3.bucket_name}/{req.user_config_dir}"
         if not obs_src.endswith("/"):
             obs_src += "/"
-        ret = subprocess.run(
+        returncode, _, stderr = await _async_subprocess_run(
             [settings.OBSUTIL_PATH, "cp", obs_src, configs_dir, "-r", "-f"],
-            capture_output=True, text=True, timeout=600,
+            timeout=600,
         )
-        if ret.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"OBS下载失败: {ret.stderr[:500]}")
-        # obsutil 会创建子目录（如 configs/demo_test/），找到实际包含文件的目录
+        if returncode != 0:
+            raise HTTPException(status_code=500, detail=f"OBS下载失败: {stderr[:500]}")
         actual_dir = configs_dir
         while True:
             entries = os.listdir(actual_dir)
@@ -182,7 +219,6 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 break
         base.run_config.task.task_input_path = actual_dir
         base.run_config.obs.user_config_download_path = ""
-        # 为每个 task config JSON 注入 harness_type
         for _root, _dirs, _files in os.walk(actual_dir):
             for _fname in _files:
                 if not _fname.endswith(".json"):
@@ -220,7 +256,6 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
 
-    # 输出和下载目录都放在实例目录下
     base.run_config.task.task_output_path = os.path.join(instance_dir, "outputs")
     base.run_config.task.task_download_path = os.path.join(instance_dir, "downloads")
 
@@ -235,32 +270,28 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             tar_path = os.path.join(code_tar_dir, "openclaw-task.tar")
 
             if not os.path.isfile(tar_path):
-                # Download from OBS if source not present
                 if not (os.path.isdir(code_src_dir) and os.listdir(code_src_dir)):
                     os.makedirs(code_src_dir, exist_ok=True)
                     obs_src = repo["obs_path"]
                     if not obs_src.endswith("/"):
                         obs_src += "/"
-                    ret = subprocess.run(
+                    returncode, _, stderr = await _async_subprocess_run(
                         [settings.OBSUTIL_PATH, "cp", obs_src, code_src_dir, "-r", "-f"],
-                        capture_output=True, text=True, timeout=600,
+                        timeout=600,
                     )
-                    if ret.returncode != 0:
-                        raise HTTPException(status_code=500, detail=f"代码仓下载失败: {ret.stderr[:500]}")
+                    if returncode != 0:
+                        raise HTTPException(status_code=500, detail=f"代码仓下载失败: {stderr[:500]}")
 
-                # obs_path 最后一级目录名即为 obsutil 下载后创建的子目录名
                 obs_dir_name = repo["obs_path"].rstrip("/").split("/")[-1]
-                actual_dir = os.path.join(code_src_dir, obs_dir_name)
 
-                # Package as tar
                 os.makedirs(code_tar_dir, exist_ok=True)
-                ret = subprocess.run(
+                returncode, _, stderr = await _async_subprocess_run(
                     ["tar", "cf", tar_path, obs_dir_name],
                     cwd=code_src_dir,
-                    capture_output=True, text=True, timeout=120,
+                    timeout=120,
                 )
-                if ret.returncode != 0:
-                    raise HTTPException(status_code=500, detail=f"打包失败: {ret.stderr[:500]}")
+                if returncode != 0:
+                    raise HTTPException(status_code=500, detail=f"打包失败: {stderr[:500]}")
 
             base.run_config.task.main_code_tar = tar_path
             base.run_config.task.main_code_dir = ""
@@ -268,14 +299,14 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 base.run_config.task.main_python_file = repo["main_python_file"]
 
     config_path = os.path.join(instance_dir, "config.yaml")
-    OmegaConf.save(base, config_path)
+    await async_execute(OmegaConf.save, base, config_path)
 
     # --- 2. 生成 harness 配置文件 ---
     if req.harness_type == "hermes":
         hermes_template = os.path.join(harness_settings_dir, "hermes_config.yaml")
         if not os.path.exists(hermes_template):
             hermes_template = os.path.join(settings.SETTINGS_DIR, "hermes_config.yaml")
-        hermes_omega = OmegaConf.load(hermes_template)
+        hermes_omega = await async_execute(OmegaConf.load, hermes_template)
 
         if req.model_id:
             hermes_omega.model.default = req.model_id
@@ -285,7 +316,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_api_key:
             hermes_omega.model.api_key = req.model_api_key
 
-        OmegaConf.save(hermes_omega, hermes_config_path)
+        await async_execute(OmegaConf.save, hermes_omega, hermes_config_path)
     elif req.harness_type == "claude-code":
         cc_template = os.path.join(harness_settings_dir, "cc_settings.json")
         if not os.path.exists(cc_template):
@@ -494,6 +525,8 @@ def start_instance(instance_id: str, user: dict = Depends(require_operator)):
             start_new_session=True,
         )
 
+    _status_cache.pop(instance_id, None)
+
     with get_connection() as conn:
         conn.execute(
             "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
@@ -523,6 +556,8 @@ def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
         ["python", os.path.join(settings.HIVE_ROOT, "run_clear.py"), "--config", config_path],
         cwd=settings.HIVE_ROOT,
     )
+
+    _status_cache.pop(instance_id, None)
 
     with get_connection() as conn:
         conn.execute(
@@ -573,6 +608,8 @@ def retry_failed(instance_id: str, user: dict = Depends(require_operator)):
             start_new_session=True,
         )
 
+    _status_cache.pop(instance_id, None)
+
     with get_connection() as conn:
         conn.execute(
             "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
@@ -602,7 +639,7 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
     pending = max(0, total - finished - running_pods)
     rate = (completed / finished * 100) if finished > 0 else 0.0
 
-    error_breakdown = _analyze_task_status(inst["config_path"], total)
+    error_breakdown = _analyze_task_status(inst["config_path"], total, inst["status"])
     time_est = _estimate_remaining_time(total, finished, inst.get("started_at"), inst["status"])
 
     elapsed_seconds = None
@@ -652,7 +689,18 @@ def _estimate_remaining_time(
     }
 
 
-def _analyze_task_status(config_path: str, total_tasks: int) -> dict:
+def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running") -> dict:
+    now = time.time()
+    cache_key = config_path
+    cached = _analyze_cache.get(cache_key)
+
+    if instance_status not in ("running",):
+        if cached:
+            return cached[0]
+
+    if cached and (now - cached[1]) < _ANALYZE_CACHE_TTL:
+        return cached[0]
+
     output_dir = _get_output_dir(config_path)
     logs_dir = os.path.join(output_dir, "logs")
 
@@ -673,6 +721,8 @@ def _analyze_task_status(config_path: str, total_tasks: int) -> dict:
                             has_success = True
                         if "[INFO] 任务失败" in line:
                             has_failed = True
+                        if has_success and has_failed:
+                            break
             except OSError:
                 continue
 
@@ -695,6 +745,8 @@ def _analyze_task_status(config_path: str, total_tasks: int) -> dict:
         result["异常退出"] = abnormal
     if not_executed:
         result["未执行"] = not_executed
+
+    _analyze_cache[cache_key] = (result, now)
     return result
 
 
@@ -712,6 +764,9 @@ def delete_instance(instance_id: str, user: dict = Depends(require_operator)):
     instance_dir = _get_instance_dir(instance_id)
     if os.path.isdir(instance_dir):
         shutil.rmtree(instance_dir)
+
+    _status_cache.pop(instance_id, None)
+    _analyze_cache.pop(inst.get("config_path"), None)
 
     with get_connection() as conn:
         conn.execute("DELETE FROM task_instances WHERE id=?", (instance_id,))

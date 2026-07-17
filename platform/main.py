@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import json    
+import json
 import os
 import shutil
 import sys
@@ -19,9 +19,6 @@ from api.routers import auth, instances, obs, logs, registrations, images, code_
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
 for name in SETTINGS_FILES:
     actual = os.path.join(settings.SETTINGS_DIR, name)
-    example = actual.rsplit(".", 1)
-    example = f"{actual}.example" if not actual.endswith(".yaml") else actual.replace(".yaml", ".yaml.example")
-    # config.yaml → config.yaml.example, openclaw.json → openclaw.json.example
     example = f"{actual}.example"
     if not os.path.exists(actual):
         if os.path.exists(example):
@@ -93,6 +90,7 @@ async def generate_api_key(
         raise HTTPException(status_code=502, detail=f"无法连接 API Key 服务: {str(e)[:200]}")
 
 
+# 静态文件 fallback（无 Nginx 时使用）
 static_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 if os.path.isdir(static_dir):
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")

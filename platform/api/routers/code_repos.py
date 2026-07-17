@@ -1,5 +1,5 @@
+import asyncio
 import os
-import subprocess
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -55,7 +55,7 @@ def delete_code_repo(repo_id: int, user: dict = Depends(require_operator)):
 
 
 @router.post("/{repo_id}/download")
-def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
+async def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (repo_id,)).fetchone()
     if not row:
@@ -75,25 +75,39 @@ def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
         obs_path = repo["obs_path"]
         if not obs_path.endswith("/"):
             obs_path += "/"
-        ret = subprocess.run(
-            [settings.OBSUTIL_PATH, "cp", obs_path, src_dir, "-r", "-f"],
-            capture_output=True, text=True, timeout=600,
+        proc = await asyncio.create_subprocess_exec(
+            settings.OBSUTIL_PATH, "cp", obs_path, src_dir, "-r", "-f",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if ret.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"OBS下载失败: {ret.stderr[:500]}")
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise HTTPException(status_code=500, detail="OBS下载超时(600s)")
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"OBS下载失败: {stderr.decode(errors='replace')[:500]}")
 
     dir_name = _obs_dir_name(repo["obs_path"])
     actual_dir = os.path.join(src_dir, dir_name)
 
     # Package as tar
     os.makedirs(tar_dir, exist_ok=True)
-    ret = subprocess.run(
-        ["tar", "cf", tar_path, dir_name],
+    proc = await asyncio.create_subprocess_exec(
+        "tar", "cf", tar_path, dir_name,
         cwd=src_dir,
-        capture_output=True, text=True, timeout=120,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if ret.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"打包失败: {ret.stderr[:500]}")
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise HTTPException(status_code=500, detail="打包超时(120s)")
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"打包失败: {stderr.decode(errors='replace')[:500]}")
 
     return {"message": "下载并打包成功", "tar_path": tar_path, "src_path": actual_dir, "already_exists": False}
 
@@ -106,7 +120,7 @@ def check_code_repo_status(repo_id: int, user: dict = Depends(get_current_user))
         raise HTTPException(status_code=404, detail="代码仓不存在")
 
     repo = dict(row)
-    tar_path = os.path.join(_get_code_dir(), "tar", repo["name"], repo["version"], "-task.tar")
+    tar_path = os.path.join(_get_code_dir(), "tar", repo["name"], repo["version"], "openclaw-task.tar")
     src_dir = os.path.join(_get_code_dir(), "src", repo["name"], repo["version"])
     dir_name = _obs_dir_name(repo["obs_path"])
     actual_dir = os.path.join(src_dir, dir_name)

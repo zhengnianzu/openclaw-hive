@@ -8,6 +8,7 @@ cd "$SCRIPT_DIR"
 ACTION="${1:-help}"
 HOST="${2:-0.0.0.0}"
 PORT="${3:-8087}"
+NGINX_PORT="${4:-80}"
 
 case "$ACTION" in
     install)
@@ -42,19 +43,47 @@ case "$ACTION" in
             echo "前端未构建，正在构建..."
             cd frontend && npm run build && cd ..
         fi
-        echo "服务地址: http://${HOST}:${PORT}"
-        nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 2 > platform.log 2>&1 &
+
+        echo "启动 uvicorn (workers=4)..."
+        echo "服务地址: http://${HOST}:${PORT} (API直连)"
+        nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
-        echo "已启动 (PID: $(cat platform.pid))"
+        echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
+
+        # 启动 Nginx（如果已安装）
+        if command -v nginx &> /dev/null; then
+            echo "配置并启动 Nginx..."
+            # 生成带正确路径的 nginx 配置
+            NGINX_CONF="$SCRIPT_DIR/nginx.conf"
+            if nginx -t -c "$NGINX_CONF" 2>/dev/null; then
+                nginx -c "$NGINX_CONF"
+                echo "Nginx 已启动，访问地址: http://${HOST}:${NGINX_PORT}"
+            else
+                echo "Nginx 配置检查失败，请手动配置:"
+                echo "  sudo cp $NGINX_CONF /etc/nginx/conf.d/platform.conf"
+                echo "  sudo nginx -t && sudo systemctl reload nginx"
+                echo ""
+                echo "或直接通过 uvicorn 访问: http://${HOST}:${PORT}"
+            fi
+        else
+            echo "未安装 Nginx，静态文件将通过 uvicorn 服务"
+            echo "建议安装 Nginx 以获得更好的性能: apt install nginx"
+            echo ""
+            echo "访问地址: http://${HOST}:${PORT}"
+        fi
         ;;
 
     stop)
         if [ -f platform.pid ]; then
             kill "$(cat platform.pid)" 2>/dev/null
             rm -f platform.pid
-            echo "已停止"
+            echo "Uvicorn 已停止"
         else
-            echo "未运行"
+            echo "Uvicorn 未运行"
+        fi
+        # 停止 Nginx（如果由我们启动）
+        if command -v nginx &> /dev/null; then
+            nginx -s stop 2>/dev/null && echo "Nginx 已停止"
         fi
         ;;
 
@@ -65,15 +94,31 @@ case "$ACTION" in
             rm -f platform.pid
             echo "已停止旧进程"
         fi
+        if command -v nginx &> /dev/null; then
+            nginx -s stop 2>/dev/null
+        fi
         sleep 1
         if [ ! -d "frontend/dist" ]; then
             echo "前端未构建，正在构建..."
             cd frontend && npm run build && cd ..
         fi
-        echo "服务地址: http://${HOST}:${PORT}"
-        nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 2 > platform.log 2>&1 &
+
+        echo "启动 uvicorn (workers=4)..."
+        nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
-        echo "已启动 (PID: $(cat platform.pid))"
+        echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
+
+        if command -v nginx &> /dev/null; then
+            NGINX_CONF="$SCRIPT_DIR/nginx.conf"
+            if nginx -t -c "$NGINX_CONF" 2>/dev/null; then
+                nginx -c "$NGINX_CONF"
+                echo "Nginx 已启动，访问地址: http://${HOST}:${NGINX_PORT}"
+            else
+                echo "访问地址: http://${HOST}:${PORT}"
+            fi
+        else
+            echo "访问地址: http://${HOST}:${PORT}"
+        fi
         ;;
 
     logs)
@@ -85,14 +130,16 @@ case "$ACTION" in
         ;;
 
     *)
-        echo "用法: $0 {install|build|dev|start|stop|restart|logs} [host] [port]"
+        echo "用法: $0 {install|build|dev|start|stop|restart|logs} [host] [port] [nginx_port]"
         echo ""
         echo "  install   安装依赖（后端 + 前端）"
         echo "  build     构建前端静态文件"
         echo "  dev       开发模式（后端热重载）"
-        echo "  start     生产模式启动"
+        echo "  start     生产模式启动（uvicorn + nginx）"
         echo "  stop      停止服务"
         echo "  restart   重启服务"
         echo "  logs      查看日志（实时）"
+        echo ""
+        echo "默认端口: uvicorn=${PORT}, nginx=${NGINX_PORT}"
         ;;
 esac
