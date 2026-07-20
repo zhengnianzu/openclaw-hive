@@ -1051,7 +1051,7 @@ class OpenClawDistillationTask:
 
             # 若 pipeline 成功但 upload 失败, 状态降级为"失败"
             if status == "任务成功" and not uploaded:
-                status = "任务失败"
+                status = "任务异常"
                 if not error_code:
                     error_code = "S009"
                     error_msg = ERROR_CATALOG["S009"]
