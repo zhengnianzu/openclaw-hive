@@ -84,6 +84,7 @@ ERROR_CATALOG: dict = {
     "T003": "连续3次未收到回复",
     "T004": "AgentExecutionError",
     "T005": "AssertionError",
+    "T006": "API call failed",
     "T010": "Uncategorized Traceback",
     # -- Unclassified --
     "X999": "unclassified exception",
@@ -672,8 +673,7 @@ class OpenClawDistillationTask:
             if f"Port {port} is already in use" in stdout:
                 self.logger.warning(f"Port {port} in use, retrying...")
                 await asyncio.sleep(2)
-            elif (f"listening on ws://127.0.0.1:{port}" in stdout
-                  or f"listening on http://127.0.0.1:{port}" in stdout):
+            elif "http server listening" in stdout:
                 # 成功时也把 gateway 启动详情打进 task-<idx>.log (main.log 里过滤掉)
                 _log_sandbox_detail(self.logger, f"gateway startup OK — port {port}", result)
                 break

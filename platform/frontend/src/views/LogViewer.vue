@@ -28,11 +28,14 @@
     </div>
 
     <div ref="logContainer" class="log-container">
-      <div v-for="(line, idx) in filteredLines" :key="idx"
-        :class="['log-line', lineClass(line)]">{{ line }}</div>
-      <div v-if="!filteredLines.length" style="color:#666;padding:20px;text-align:center">
-        暂无日志
-      </div>
+      <pre v-if="rawText !== null" class="log-raw">{{ rawText }}</pre>
+      <template v-else>
+        <div v-for="(line, idx) in filteredLines" :key="idx"
+          :class="['log-line', lineClass(line)]">{{ line }}</div>
+        <div v-if="!filteredLines.length" style="color:#666;padding:20px;text-align:center">
+          暂无日志
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -53,6 +56,7 @@ const selectedTask = ref('')
 const verboseMode = ref(false)
 const logSource = ref('main')
 const taskLogFiles = ref([])
+const rawText = ref(null)
 
 const filteredLines = computed(() => {
   let lines = logLines.value
@@ -97,15 +101,19 @@ async function loadLogs() {
     const mode = verboseMode.value ? 'verbose' : 'concise'
     let res
     if (logSource.value === 'main' || logSource.value === 'nohup') {
+      rawText.value = null
       const params = { tail: 1000, mode, source: logSource.value }
       if (selectedTask.value) params.task_filter = selectedTask.value
       res = await api.get(`/logs/${id}/main`, { params })
+      logLines.value = res.lines || []
     } else {
+      // task-N.log —— 1:1 原文，保留换行符与空行
       res = await api.get(`/logs/${id}/task-log/${logSource.value}`, {
-        params: { tail: 1000, mode }
+        params: { tail: 2000, raw: true }
       })
+      rawText.value = res.text ?? ''
+      logLines.value = []
     }
-    logLines.value = res.lines || []
     scrollToBottom()
   } catch { /* handled by interceptor */ }
 }
@@ -137,9 +145,17 @@ onUnmounted(() => {})
 .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 .log-container {
   background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: var(--radius-md);
-  height: calc(100vh - 260px); overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
+  height: calc(100vh - 260px); overflow-y: auto; overflow-x: auto;
+  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
 }
 .log-line { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.log-raw {
+  margin: 0; padding: 0;
+  color: inherit; background: transparent;
+  font: inherit;
+  white-space: pre;          /* 1:1: 保留所有空白与换行，不折行 */
+  tab-size: 4;
+}
 .log-error { color: #f87171; }
 .log-warn { color: #fbbf24; }
 .log-success { color: #34d399; }

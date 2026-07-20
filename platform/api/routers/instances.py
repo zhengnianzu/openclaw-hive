@@ -717,9 +717,9 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
             try:
                 with open(fpath, "r", errors="replace") as f:
                     for line in f:
-                        if "[INFO] 任务完成" in line:
-                            has_success = True
-                        if "[INFO] 任务失败" in line:
+                        if "[INFO] 任务完成" in line or "任务成功" in line:
+                            has_success = True                        
+                        if "[INFO] 任务失败" in line or "任务失败" in line:
                             has_failed = True
                         if has_success and has_failed:
                             break
