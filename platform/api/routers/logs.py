@@ -312,6 +312,7 @@ async def get_task_log(
     filename: str,
     tail: int = Query(default=200),
     mode: str = Query(default="verbose"),
+    raw: bool = Query(default=False, description="true 时返回原始文本，不切行、不改换行"),
     user: dict = Depends(get_current_user),
 ):
     if not re.match(r'^(task-\d+|main)\.log$', filename):
@@ -319,7 +320,20 @@ async def get_task_log(
     inst = _get_instance(instance_id)
     log_file = os.path.join(_get_output_dir(inst["config_path"]), "logs", filename)
     if not os.path.exists(log_file):
-        return {"lines": [], "total_lines": 0}
+        return {"text": "", "lines": [], "total_lines": 0}
+    if raw:
+        # 二进制读，避免文本模式对 \r\n 的规范化;完整保留换行符
+        async with aiofiles.open(log_file, "rb") as f:
+            data = await f.read()
+        text = data.decode("utf-8", errors="replace")
+        if tail and tail > 0:
+            all_lines = text.splitlines(keepends=True)
+            total = len(all_lines)
+            if tail < total:
+                text = "".join(all_lines[-tail:])
+            return {"text": text, "total_lines": total}
+        total = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+        return {"text": text, "total_lines": total}
 
     async with aiofiles.open(log_file, "r", errors="replace") as f:
         all_lines = await f.readlines()
