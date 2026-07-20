@@ -53,11 +53,76 @@ _current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
 
-class TaskReportedFailure(Exception):
+# ============================================================================
+# Error Catalog
+# ============================================================================
+# 错误码前缀 = 错误来源, 一眼可辨:
+#   C0xx  Client 侧    — hive.py 自身流程 / 本地文件 / 配置解析
+#   S0xx  Server 侧    — 沙箱远端执行失败 / 网络 / OBS / gateway
+#   T0xx  Task/业务侧  — 主脚本自报失败
+# ============================================================================
+
+ERROR_CATALOG: dict = {
+    # -- Client-side (C0xx) --
+    "C001": "extract code failed",
+    "C002": "upload file failed",
+    "C003": "environment creation failed",
+    "C004": "agent config write failed",
+    # -- Server / sandbox-side (S0xx) --
+    "S001": "gateway start failed",
+    "S002": "gateway startup timeout",
+    "S003": "gateway unexpected output",
+    "S004": "sandbox port-update failed",
+    "S005": "skill download failed",
+    "S006": "user profile download failed",
+    "S007": "agents download failed",
+    "S008": "script execution failed",
+    "S009": "upload traj to OBS failed",
+    # -- Task / business-side (T0xx) --
+    "T001": "【Task_Failed】",
+    "T002": "达到最大轮次",
+    "T003": "连续3次未收到回复",
+    "T004": "AgentExecutionError",
+    "T005": "AssertionError",
+    "T010": "Uncategorized Traceback",
+    # -- Unclassified --
+    "X999": "unclassified exception",
+}
+
+
+def _classify_task_stdout(stdout: str) -> tuple[str, str]:
     """
-    主脚本 stdout 里出现 TASK_FAILED, 判为业务失败 (task_failed)。
-    执行任务失败的标识
+    从主脚本 stdout 里推断更具体的错误码。"""
+    if not stdout:
+        return "", ""
+
+    for code, phrase in ERROR_CATALOG.items():
+        if not code.startswith("T") or code == "T010":
+            continue
+        if phrase and phrase in stdout:
+            return code, phrase
+    if "Traceback" in stdout:
+        return "T010", "Traceback"
+
+    return "", ""
+
+class HiveError(Exception):
     """
+    带错误码的流水线异常。
+    code:      C001 / S001 / T001 ...
+    detail:    简短单行原因
+    sandbox_result: 若为 sandbox 端失败, 附上原始 Result 便于详情落盘
+    """
+
+    def __init__(self, code: str, detail: str = "", sandbox_result=None):
+        self.code = code
+        self.short = ERROR_CATALOG.get(code, ERROR_CATALOG["X999"])
+        self.detail = detail or ""
+        self.sandbox_result = sandbox_result
+        super().__init__(f"[{code}] {self.short}"
+                         + (f": {self.detail}" if self.detail else ""))
+
+
 
 # ============================================================================
 # Agent framework — module-level switch
@@ -153,6 +218,76 @@ class TaskFileHandler(logging.Handler):
             f.close()
         self._files.clear()
         super().close()
+
+
+class DropSandboxDetailFilter(logging.Filter):
+    """
+    过滤器: 丢掉带 record.sandbox_detail=True 的记录。
+    应用在 main.log 的 handler 上——沙箱执行 stdout/stderr 详情只写 task-<idx>.log,
+    不污染 main.log。
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "sandbox_detail", False)
+
+
+def _fmt_sandbox_block(title: str, result) -> str:
+    """
+    把 sandbox 返回的 Result 对象格式化成美观的多行块, 供 task-<idx>.log 展示。
+    只格式化, 不打印。返回值末尾无换行。
+    """
+    def _boxed(text: str) -> str:
+        bar = "─" * 78
+        return f"┌{bar}┐\n{text}\n└{bar}┘"
+
+    def _dedupe_pip_noise(lines: list[str]) -> list[str]:
+        """折叠 'Requirement already satisfied:' 行, 保留其它内容原样。"""
+        out: list[str] = []
+        skipped: int = 0
+        for ln in lines:
+            #   "Requirement already satisfied: openclaw-sdk==2.1.0 in /home/ma-user/..."
+            if ln.lstrip().startswith("Requirement already satisfied:"):
+                skipped += 1
+                continue
+            out.append(ln)
+        if skipped:
+            out.append(f"[… {skipped} 'Requirement already satisfied' lines suppressed]")
+        return out
+
+    try:
+        code = getattr(result, "code", None)
+        msg  = getattr(result, "msg", "") or ""
+        data = getattr(result, "data", None) or {}
+        exit_code = data.get("exit_code") if isinstance(data, dict) else None
+        stdout    = (data.get("stdout") if isinstance(data, dict) else "") or ""
+        stderr    = (data.get("stderr") if isinstance(data, dict) else "") or ""
+    except Exception as e:
+        return _boxed(f" ▎{title}\n ▎<failed to format Result: {e}>")
+
+    header = (
+        f" ▎{title}\n"
+        f" ▎ code={code}  exit_code={exit_code}  msg={msg!r}"
+    )
+    parts = [header]
+    if stdout:
+        parts.append(" ▎── stdout ────────────────────────────────────")
+        for line in _dedupe_pip_noise(stdout.rstrip().splitlines()):
+            parts.append(f" │ {line}")
+    if stderr:
+        parts.append(" ▎── stderr ────────────────────────────────────")
+        for line in _dedupe_pip_noise(stderr.rstrip().splitlines()):
+            parts.append(f" │ {line}")
+    if not stdout and not stderr:
+        parts.append(" ▎ <no stdout/stderr captured>")
+    return _boxed("\n".join(parts))
+
+
+def _log_sandbox_detail(log: logging.Logger, title: str, result, level: int = logging.INFO) -> None:
+    """
+    将 sandbox Result 的 stdout/stderr 详情 **只写入 task-<idx>.log**,
+    main.log 通过 DropSandboxDetailFilter 过滤掉。
+    """
+    block = _fmt_sandbox_block(title, result)
+    log.log(level, "sandbox_detail:\n" + block, extra={"sandbox_detail": True})
 
 
 # ============================================================================
@@ -347,9 +482,11 @@ class OpenClawDistillationTask:
         upload_request = ExtendUploadFile(upload_path=local_path, remote_path=remote_path)
         result = await self.execution_client.extend(args=upload_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0]:
-            msg = f"upload {file_info}: {local_path} -> {remote_path} failed: {result=}"
-            self.logger.error(msg)
-            raise RuntimeError(msg)
+            detail = f"{file_info}: {local_path} -> {remote_path}"
+            self.logger.error(f"[C002] upload failed: {detail}")
+            _log_sandbox_detail(self.logger, f"upload_file failed — {detail}",
+                                result, level=logging.ERROR)
+            raise HiveError("C002", detail=detail, sandbox_result=result)
 
     async def _copy_agent_config(self) -> None:
         """Copy main agent configuration to sandbox."""
@@ -445,9 +582,11 @@ class OpenClawDistillationTask:
         )
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            msg = f"extract code failed: {result=}"
-            self.logger.error(msg)
-            raise RuntimeError(msg)
+            self.logger.error("[C001] extract code failed")
+            _log_sandbox_detail(self.logger, "extract code failed",
+                                result, level=logging.ERROR)
+            raise HiveError("C001", detail=os.path.basename(tar_basename),
+                            sandbox_result=result)
         self.logger.info("Code extracted successfully")
 
     async def _upload_data_config(self, config_file: str) -> None:
@@ -482,8 +621,8 @@ class OpenClawDistillationTask:
         while True:
             elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > max_wait:
-                self.logger.error(f"Gateway startup timeout ({max_wait}s)")
-                raise RuntimeError(f"Gateway startup timeout for {config_file}")
+                self.logger.error(f"[S002] gateway startup timeout ({max_wait}s)")
+                raise HiveError("S002", detail=f"{max_wait}s / config={os.path.basename(config_file)}")
 
             port = str(generate_random_port())
             remote_config_path = os.path.join(
@@ -502,9 +641,10 @@ class OpenClawDistillationTask:
                 )
                 result = await self.execution_client.extend(args=exec_request.to_dict())
                 if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                    msg = f"Failed to update port: {result=}"
-                    self.logger.error(msg)
-                    raise RuntimeError(msg)
+                    self.logger.error(f"[S004] port-update failed on {remote_file}")
+                    _log_sandbox_detail(self.logger, f"sed port update failed — {remote_file}",
+                                        result, level=logging.ERROR)
+                    raise HiveError("S004", detail=remote_file, sandbox_result=result)
 
             # Start gateway
             gateway_log_path = os.path.join(
@@ -523,20 +663,25 @@ class OpenClawDistillationTask:
             result = await self.execution_client.extend(args=exec_request.to_dict())
 
             if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                msg = f"Gateway start failed: {result=}"
-                self.logger.error(msg)
-                raise RuntimeError(msg)
+                self.logger.error(f"[S001] gateway start failed on port {port}")
+                _log_sandbox_detail(self.logger, f"gateway start failed — port {port}",
+                                    result, level=logging.ERROR)
+                raise HiveError("S001", detail=f"port={port}", sandbox_result=result)
 
             stdout = result.data.get("stdout", "")
             if f"Port {port} is already in use" in stdout:
                 self.logger.warning(f"Port {port} in use, retrying...")
                 await asyncio.sleep(2)
-            elif f"listening on ws://127.0.0.1:{port}" in stdout or f"listening on http://127.0.0.1:{port}":
+            elif (f"listening on ws://127.0.0.1:{port}" in stdout
+                  or f"listening on http://127.0.0.1:{port}" in stdout):
+                # 成功时也把 gateway 启动详情打进 task-<idx>.log (main.log 里过滤掉)
+                _log_sandbox_detail(self.logger, f"gateway startup OK — port {port}", result)
                 break
             else:
-                msg = f"Gateway start unexpected output: {result.data}"
-                self.logger.error(msg)
-                raise RuntimeError(msg)
+                self.logger.error(f"[S003] gateway unexpected output on port {port}")
+                _log_sandbox_detail(self.logger, f"gateway unexpected output — port {port}",
+                                    result, level=logging.ERROR)
+                raise HiveError("S003", detail=f"port={port}", sandbox_result=result)
 
         self.logger.info(f"Gateway started on port {port}")
 
@@ -560,18 +705,33 @@ class OpenClawDistillationTask:
         exec_request = ExtendExecCommand(
             command=["/bin/bash", "-c", command],
             timeout=self.config.main_python_timeout,
-            mode="stream",
+            # mode="stream",
         )
         result = await self.execution_client.extend(args=exec_request.to_dict())
-        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            msg = f"Script execution failed: {result=}"
-            self.logger.error(msg)
-            raise RuntimeError(msg)
-        stdout = (result.data or {}).get("stdout", "") or ""
-        if "【Task_Failed】" in stdout:
-            msg = f"Script reported 【Task_Failed】 in stdout"
-            self.logger.error(msg)
-            raise TaskReportedFailure(msg)
+        stdout = ((result.data or {}).get("stdout") or "") if (result and result.data) else ""
+        sandbox_failed = (result.code != ErrorCode.SUCCESS[0]
+                         or result.data["exit_code"] != 0)
+
+        # 无论成功/失败, 沙箱执行详情都进 task-<idx>.log (main.log 已过滤掉)
+        title = ("script execution failed" if sandbox_failed else "script execution OK")
+        _log_sandbox_detail(self.logger, f"{title} — {python_file}", result,
+                            level=(logging.ERROR if sandbox_failed else logging.INFO))
+
+        # ---- 分类优先级: 具体 T-code > T010 (Traceback 兜底) > S008 (沙箱兜底) ----
+        t_code, phrase = _classify_task_stdout(stdout)
+
+        if t_code:
+            self.logger.error(
+                f"[{t_code}] task failure — {ERROR_CATALOG[t_code]}"
+                + (f" — matched: {phrase!r}" if phrase else "")
+            )
+            raise HiveError(t_code, detail=phrase or python_file,
+                            sandbox_result=result)
+
+        if sandbox_failed:
+            # 非零退出但 stdout 里没有可识别的业务失败线索 → 真·沙箱层故障
+            self.logger.error(f"[S008] script execution failed: {python_file}")
+            raise HiveError("S008", detail=python_file, sandbox_result=result)
         self.logger.info(f"Script completed: {python_file}")
 
     async def _download_s3_skills(self, data_config_file: str) -> None:
@@ -613,9 +773,10 @@ class OpenClawDistillationTask:
             )
             result = await self.execution_client.extend(args=exec_request.to_dict())
             if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                msg = f"Skill download failed: {result=}"
-                self.logger.error(msg)
-                raise RuntimeError(msg)
+                self.logger.error(f"[S005] skill download failed: {skill_path}")
+                _log_sandbox_detail(self.logger, f"skill download failed — {skill_path}",
+                                    result, level=logging.ERROR)
+                raise HiveError("S005", detail=skill_path, sandbox_result=result)
 
         start_time = time.time()
         tasks = []
@@ -673,9 +834,10 @@ class OpenClawDistillationTask:
         start_time = time.time()
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            msg = f"User profile download failed: {result=}"
-            self.logger.error(msg)
-            raise RuntimeError(msg)
+            self.logger.error(f"[S006] user profile download failed: {user_profile_path}")
+            _log_sandbox_detail(self.logger, "user profile download failed",
+                                result, level=logging.ERROR)
+            raise HiveError("S006", detail=user_profile_path, sandbox_result=result)
         self.logger.info(f"Downloaded user profile in {time.time() - start_time:.1f}s")
 
     async def _download_s3_agents(self) -> None:
@@ -703,9 +865,10 @@ class OpenClawDistillationTask:
         start_time = time.time()
         result = await self.execution_client.extend(args=exec_request.to_dict())
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            msg =f"Agents download failed: {result=}"
-            self.logger.error(msg)
-            raise RuntimeError(msg)
+            self.logger.error(f"[S007] agents download failed: {bucket_path}")
+            _log_sandbox_detail(self.logger, "agents download failed",
+                                result, level=logging.ERROR)
+            raise HiveError("S007", detail=bucket_path, sandbox_result=result)
         self.logger.info(f"Downloaded agents in {time.time() - start_time:.1f}s")
 
     def _derive_per_agent_workspaces(self, config_file: str) -> list[str]:
@@ -777,7 +940,7 @@ class OpenClawDistillationTask:
                     return True
                 self.logger.warning(
                     f"[upload_traj] attempt={attempt}/3 failed: "
-                    f"code={result.code} exit={result.data["exit_code"]} data={result.data}"
+                    f"result={result}"
                 )
             except Exception as e:
                 self.logger.error(
@@ -812,12 +975,17 @@ class OpenClawDistillationTask:
         await self._run_main_script(config_file, task_idx)
 
     async def run(self, config_file: str, task_idx: int = 0) -> None:
-        """Run a single distillation task."""
+        """Run a single distillation task.
+
+        Returns a dict {status, error_code, config, elapsed}
+        for the orchestrator to aggregate per-run stats.
+        """
         await asyncio.sleep(random.uniform(1, 10))
         start_time = time.perf_counter()
-        # 三态: TASK_DONE (成功) / TASK_FAILED (跑完了但 upload 失败) / TASK_EXCEPTION (中途报异常)
-        status: str = "TASK_FAILED"     # 默认最悲观
+        # 三态: 任务成功 / 任务失败 (跑完了但 upload 失败) / 任务异常
+        status: str = "任务失败"     # 默认最悲观
         error_msg: str = ""
+        error_code: str = ""        # 具体错误码 (C001 / S001 / T001 / X999)
         env_ready: bool = False
         self.logger.info(
             f"===== BEGIN config={os.path.basename(config_file)} "
@@ -831,9 +999,12 @@ class OpenClawDistillationTask:
                 request, config=self.client_config
             )
             if isinstance(result, Result):
-                msg = f"Environment creation failed: {result=}"
-                self.logger.error(msg)
-                raise RuntimeError(msg)
+                self.logger.error(f"[C003] environment creation failed: {getattr(result, 'msg', '')}")
+                _log_sandbox_detail(self.logger, "environment creation failed",
+                                    result, level=logging.ERROR)
+                raise HiveError("C003",
+                                detail=getattr(result, "msg", "") or "",
+                                sandbox_result=result)
             self.execution_client = result
             env_ready = True
             self.logger.info(
@@ -841,17 +1012,23 @@ class OpenClawDistillationTask:
                 f"elapsed={time.perf_counter() - start_time:.1f}s <<<<<<"
             )
             await self._execute_task(config_file, task_idx)
-            status = "TASK_DONE"
-        
-        except TaskReportedFailure as e:
-            # 主脚本自己上报失败: 判为 task_failed (失败), 不是 exception
-            status = "TASK_FAILED"
-            self.logger.error(f"pipeline reported task_failed 【TASK_FAILED】")
+            status = "任务成功"
+
+        except HiveError as e:
+            # 已分类的 pipeline 异常 (C/S/T)
+            status = "任务异常"
+            error_code = e.code
+            error_msg = e.short + (f": {e.detail}" if e.detail else "")
+            self.logger.error(
+                f"[{e.code}] Task {task_idx} failed: {e}\n{traceback.format_exc()}"
+            )
 
         except Exception as e:
-            status = "TASK_EXCEPTION"
-            self.logger.error(f"Task {task_idx} failed: {traceback.format_exc()}")
-            await self._save_record(self.failed_record_file, config_file)
+            # 未分类的意外异常
+            status = "任务异常"
+            error_code = "X999"
+            error_msg = f"{type(e).__name__}: {e}"
+            self.logger.error(f"[X999] Task {task_idx} failed: {traceback.format_exc()}")
         finally:
             # ---- 兜底: 无论前面走到哪一步, 只要 env 起来了, 一律尝试 upload_traj ----
             uploaded: bool = False
@@ -873,12 +1050,15 @@ class OpenClawDistillationTask:
                 self.logger.warning("env never became ready, skip upload_traj_to_obs")
 
             # 若 pipeline 成功但 upload 失败, 状态降级为"失败"
-            if status == "TASK_DONE" and not uploaded:
-                status = "TASK_FAILED"
+            if status == "任务成功" and not uploaded:
+                status = "任务异常"
+                if not error_code:
+                    error_code = "S009"
+                    error_msg = ERROR_CATALOG["S009"]
 
             # ---- 记录 complete/failed ----
             try:
-                if status == "TASK_DONE":
+                if status == "任务成功":
                     await self._save_record(self.complete_record_file, config_file)
                 else:
                     await self._save_record(self.failed_record_file, config_file)
@@ -898,11 +1078,12 @@ class OpenClawDistillationTask:
             elapsed = time.perf_counter() - start_time
             self.logger.info(
                 f"===== 任务执行状态={status} "
+                f"error_code={error_code or '-'} "
                 f"upload_traj={'ok' if uploaded else 'FAIL'} "
                 f"env_ready={env_ready} "
                 f"elapsed={elapsed:.1f}s "
                 f"config={os.path.basename(config_file)}"
-                + (f" error=\"{error_msg}\"" if error_msg else "")
+                + (f' error="{error_msg}"' if error_msg else "")
                 + " ====="
             )
 
@@ -1026,11 +1207,17 @@ async def run_tasks(
 
     main_handler = logging.FileHandler(os.path.join(logs_dir, "main.log"), encoding='utf-8')
     main_handler.setFormatter(fmt)
+    main_handler.addFilter(DropSandboxDetailFilter())  # sandbox 详情不进 main.log
     logger.addHandler(main_handler)
 
     task_handler = TaskFileHandler(logs_dir)
     task_handler.setFormatter(fmt)
     logger.addHandler(task_handler)
+
+    # 控制台 handler (StreamHandler) 也过滤掉沙箱详情, 避免 stderr 刷屏
+    for h in logger.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            h.addFilter(DropSandboxDetailFilter())
 
     # Trigger ManageLogger init FIRST so it configures level/stderr/filter,
     # then append our task_handler on top. If we getLogger() before ManageLogger
