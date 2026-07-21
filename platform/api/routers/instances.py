@@ -703,36 +703,46 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
 
     output_dir = _get_output_dir(config_path)
     logs_dir = os.path.join(output_dir, "logs")
+    status_re = re.compile(
+        r"任务执行状态=(?P<status>任务成功|任务失败|任务异常)\s+error_code=(?P<code>\S+)"
+    )
 
     succeeded = 0
     failed = 0
-    abnormal = 0
+    abnormal_by_prefix = {"C": 0, "S": 0, "T": 0, "X": 0}
+    unfinished = 0
 
     if os.path.isdir(logs_dir):
         task_files = [f for f in os.listdir(logs_dir) if f.startswith("task-") and f.endswith(".log")]
         for fname in task_files:
             fpath = os.path.join(logs_dir, fname)
-            has_success = False
-            has_failed = False
+            last_status = None
+            last_code = None
             try:
                 with open(fpath, "r", errors="replace") as f:
                     for line in f:
-                        if "[INFO] 任务完成" in line or "任务成功" in line:
-                            has_success = True                        
-                        if "[INFO] 任务失败" in line or "任务失败" in line:
-                            has_failed = True
-                        if has_success and has_failed:
-                            break
+                        m = status_re.search(line)
+                        if m:
+                            last_status = m.group("status")
+                            last_code = m.group("code")
             except OSError:
                 continue
 
-            if has_failed:
-                failed += 1
-            elif has_success:
+            if last_status == "任务成功":
                 succeeded += 1
+            elif last_status == "任务失败":
+                failed += 1
+            elif last_status == "任务异常":
+                prefix = (last_code or "")[:1]
+                if prefix in abnormal_by_prefix:
+                    abnormal_by_prefix[prefix] += 1
+                else:
+                    # 未知前缀归入 X 未分类桶
+                    abnormal_by_prefix["X"] += 1
             else:
-                abnormal += 1
+                unfinished += 1
 
+    abnormal = sum(abnormal_by_prefix.values())
     executed = succeeded + failed + abnormal
     not_executed = max(0, total_tasks - executed)
 
@@ -742,7 +752,16 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
     if failed:
         result["任务失败"] = failed
     if abnormal:
-        result["异常退出"] = abnormal
+        result["任务异常"] = abnormal
+        prefix_label = {
+            "C": "└ C 客户端",
+            "S": "└ S 服务端",
+            "T": "└ T 任务侧",
+            "X": "└ X 未分类",
+        }
+        for p in ("C", "S", "T", "X"):
+            if abnormal_by_prefix[p]:
+                result[prefix_label[p]] = abnormal_by_prefix[p]
     if not_executed:
         result["未执行"] = not_executed
 

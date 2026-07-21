@@ -6,29 +6,21 @@
 
     <div class="toolbar">
       <el-select v-model="logSource" placeholder="日志源" style="width:180px" @change="onLogSourceChange">
-        <el-option label="主进程日志" value="main" />
-        <el-option label="完整日志 (nohup)" value="nohup" />
+        <el-option label="主进程日志" value="main.log" />
+        <el-option label="完整日志(nohup)" value="nohup.log" />
         <el-option v-for="f in taskLogFiles" :key="f"
           :label="f.replace('.log', '')" :value="f" />
-      </el-select>
-
-      <el-select v-if="logSource === 'main' || logSource === 'nohup'" v-model="selectedTask"
-        placeholder="按任务过滤" clearable style="width:280px"
-        @change="onTaskFilterChange" filterable>
-        <el-option v-for="t in taskList" :key="t.task_idx"
-          :label="`Task ${t.task_idx} - ${t.config_name || t.env_id}`"
-          :value="t.env_id || t.config_name" />
       </el-select>
 
       <el-input v-model="filterKeyword" placeholder="过滤关键词..." clearable style="width:200px" />
 
       <el-button @click="scrollToBottom">滚到底部</el-button>
+      <el-button @click="loadLogs" :loading="loading">刷新</el-button>
       <el-button @click="clearLogs">清屏</el-button>
-      <el-switch v-model="verboseMode" active-text="详细日志" inactive-text="简洁" style="margin-left:4px" />
     </div>
 
     <div ref="logContainer" class="log-container">
-      <pre v-if="rawText !== null" class="log-raw">{{ rawText }}</pre>
+      <pre v-if="rawText !== null" class="log-raw">{{ displayRawText }}</pre>
       <template v-else>
         <div v-for="(line, idx) in filteredLines" :key="idx"
           :class="['log-line', lineClass(line)]">{{ line }}</div>
@@ -41,7 +33,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
 
@@ -51,10 +43,8 @@ const inst = ref({})
 const filterKeyword = ref('')
 const logLines = ref([])
 const logContainer = ref(null)
-const taskList = ref([])
-const selectedTask = ref('')
-const verboseMode = ref(false)
-const logSource = ref('main')
+const loading = ref(false)
+const logSource = ref('main.log')
 const taskLogFiles = ref([])
 const rawText = ref(null)
 
@@ -67,18 +57,20 @@ const filteredLines = computed(() => {
   return lines
 })
 
-function onTaskFilterChange() {
-  loadLogs()
-}
+// raw 模式下按关键字过滤保留原换行
+const displayRawText = computed(() => {
+  if (rawText.value === null) return ''
+  if (!filterKeyword.value) return rawText.value
+  const kw = filterKeyword.value.toLowerCase()
+  return rawText.value
+    .split('\n')
+    .filter(l => l.toLowerCase().includes(kw))
+    .join('\n')
+})
 
 function onLogSourceChange() {
-  selectedTask.value = ''
   loadLogs()
 }
-
-watch(verboseMode, () => {
-  loadLogs()
-})
 
 function lineClass(line) {
   if (/^\[STDERR\]/i.test(line)) return 'log-error'
@@ -94,35 +86,20 @@ function scrollToBottom() {
   })
 }
 
-function clearLogs() { logLines.value = [] }
+function clearLogs() { logLines.value = []; rawText.value = '' }
 
 async function loadLogs() {
+  loading.value = true
   try {
-    const mode = verboseMode.value ? 'verbose' : 'concise'
-    let res
-    if (logSource.value === 'main' || logSource.value === 'nohup') {
-      rawText.value = null
-      const params = { tail: 1000, mode, source: logSource.value }
-      if (selectedTask.value) params.task_filter = selectedTask.value
-      res = await api.get(`/logs/${id}/main`, { params })
-      logLines.value = res.lines || []
-    } else {
-      // task-N.log —— 1:1 原文，保留换行符与空行
-      res = await api.get(`/logs/${id}/task-log/${logSource.value}`, {
-        params: { tail: 2000, raw: true }
-      })
-      rawText.value = res.text ?? ''
-      logLines.value = []
-    }
+    // 所有日志源(main.log / nohup.log / task-N.log)统一走 raw 模式，1:1 展示本地日志
+    const res = await api.get(`/logs/${id}/task-log/${logSource.value}`, {
+      params: { tail: 5000, raw: true }
+    })
+    rawText.value = res.text ?? ''
+    logLines.value = []
     scrollToBottom()
   } catch { /* handled by interceptor */ }
-}
-
-async function loadTaskList() {
-  try {
-    const res = await api.get(`/logs/${id}/tasks`)
-    taskList.value = res.tasks || []
-  } catch { /* ignore */ }
+  finally { loading.value = false }
 }
 
 async function loadTaskLogFiles() {
@@ -134,7 +111,6 @@ async function loadTaskLogFiles() {
 
 onMounted(async () => {
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
-  loadTaskList()
   loadTaskLogFiles()
   loadLogs()
 })
