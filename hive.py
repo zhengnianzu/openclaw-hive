@@ -94,7 +94,7 @@ ERROR_CATALOG: dict = {
 def _classify_task_stdout(stdout: str) -> tuple[str, str]:
     """
     从主脚本 stdout 里推断更具体的错误码。"""
-    if not stdout:
+    if not stdout or "任务完成【Task_Done】" in stdout:
         return "", ""
 
     for code, phrase in ERROR_CATALOG.items():
