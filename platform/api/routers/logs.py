@@ -315,10 +315,14 @@ async def get_task_log(
     raw: bool = Query(default=False, description="true 时返回原始文本，不切行、不改换行"),
     user: dict = Depends(get_current_user),
 ):
-    if not re.match(r'^(task-\d+|main)\.log$', filename):
+    if not re.match(r'^(task-\d+|main|nohup)\.log$', filename):
         raise HTTPException(status_code=400, detail="无效的日志文件名")
     inst = _get_instance(instance_id)
-    log_file = os.path.join(_get_output_dir(inst["config_path"]), "logs", filename)
+    output_dir = _get_output_dir(inst["config_path"])
+    if filename == "nohup.log":
+        log_file = os.path.join(output_dir, filename)
+    else:
+        log_file = os.path.join(output_dir, "logs", filename)
     if not os.path.exists(log_file):
         return {"text": "", "lines": [], "total_lines": 0}
     if raw:
@@ -424,7 +428,7 @@ async def list_obs_logs(
     obs_path = f"{traj_bucket}/{traj_path}/"
 
     proc = await asyncio.create_subprocess_exec(
-        settings.OBSUTIL_PATH, "ls", obs_path, "-limit=500",
+        settings.OBSUTIL_PATH, "ls", obs_path, "-limit=0",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
@@ -495,7 +499,7 @@ async def list_obs_subtree(
     subdir_path = f"{obs_path}{subdir}/"
 
     proc = await asyncio.create_subprocess_exec(
-        settings.OBSUTIL_PATH, "ls", subdir_path, "-limit=5000",
+        settings.OBSUTIL_PATH, "ls", subdir_path, "-limit=0",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -605,7 +609,7 @@ _task_completed_cache: dict[str, dict[str, bool]] = {}  # instance_id -> {task: 
 async def _list_obs_dirs(obs_base: str) -> list[str]:
     """用 obsutil ls -d 列出 OBS 目录下所有子目录名。"""
     proc = await asyncio.create_subprocess_exec(
-        settings.OBSUTIL_PATH, "ls", obs_base, "-d", "-limit=2000",
+        settings.OBSUTIL_PATH, "ls", obs_base, "-d", "-limit=0",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)

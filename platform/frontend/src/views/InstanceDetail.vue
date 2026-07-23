@@ -110,7 +110,8 @@
       <el-col :span="12">
         <el-card header="任务执行情况">
           <div v-if="Object.keys(overview.error_breakdown || {}).length">
-            <div v-for="(count, category) in overview.error_breakdown" :key="category" class="breakdown-row">
+            <div v-for="(count, category) in overview.error_breakdown" :key="category"
+              :class="['breakdown-row', category.startsWith('└') ? 'breakdown-sub' : '']">
               <span>{{ category }}</span>
               <el-tag :type="taskTagType(category)" size="small">{{ count }}</el-tag>
             </div>
@@ -202,7 +203,19 @@ const progressStatus = computed(() => {
 
 function statusColor(s) { return { running: 'success', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
 function statusText(s) { return { running: '运行中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
-function taskTagType(category) { return { '任务成功': 'success', '任务失败': 'danger', '异常退出': 'warning', '未执行': 'info' }[category] || '' }
+function taskTagType(category) {
+  const map = {
+    '任务成功': 'success',
+    '任务失败': 'danger',
+    '任务异常': 'warning',
+    '└ C 客户端': 'warning',
+    '└ S 服务端': 'warning',
+    '└ T 任务侧': 'warning',
+    '└ X 未分类': 'warning',
+    '未执行': 'info',
+  }
+  return map[category] || ''
+}
 function formatDuration(seconds) {
   if (seconds == null) return ''
   const s = Math.round(seconds)
@@ -320,6 +333,12 @@ onUnmounted(() => clearInterval(timer))
 .time-info strong { color: var(--text-primary); }
 .breakdown-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); }
 .breakdown-row:last-child { border-bottom: none; }
+.breakdown-sub {
+  padding: 4px 0 4px 16px;
+  border-bottom: none;
+  font-size: 12px;
+  color: var(--text-muted);
+}
 .config-preview {
   background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: var(--radius-sm);
   max-height: 500px; overflow: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
