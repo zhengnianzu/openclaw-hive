@@ -73,7 +73,10 @@ def _is_pid_running(pid: int) -> bool:
 def _sync_instance_status(instance: dict) -> dict:
     inst = dict(instance)
 
-    if inst["status"] != "running":
+    if inst["status"] not in ("running", "preparing"):
+        return inst
+
+    if inst["status"] == "preparing":
         return inst
 
     output_dir = _get_output_dir(inst["config_path"])
@@ -159,6 +162,7 @@ async def _async_subprocess_run(cmd, *, cwd=None, timeout=600):
 
 @router.post("", response_model=InstanceInfo)
 async def create_instance(req: InstanceCreate, user: dict = Depends(require_operator)):
+    """创建实例：只生成配置文件并入库，不做 OBS 下载，秒级返回。"""
     timestamp = datetime.now().strftime("%y%m%d%H%M")
     short_id = uuid.uuid4().hex[:4]
     instance_id = f"{timestamp}-{req.task_name}-{short_id}"
@@ -185,7 +189,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if not os.path.exists(template_path):
         raise HTTPException(status_code=500, detail=f"模板配置文件不存在: {template_path}")
 
-    base = await async_execute(OmegaConf.load, template_path)
+    base = OmegaConf.load(template_path)
     base.sandbox_id_prefix = req.task_name
     base.run_config.harness_type = req.harness_type
     base.run_config.concurrent_num = req.concurrent_num
@@ -199,39 +203,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.agent_dir:
         base.run_config.obs.agents_download_path = req.agent_dir
     if req.user_config_dir:
-        configs_dir = os.path.join(instance_dir, "configs")
-        os.makedirs(configs_dir, exist_ok=True)
-        obs_src = f"{base.s3.bucket_name}/{req.user_config_dir}"
-        if not obs_src.endswith("/"):
-            obs_src += "/"
-        returncode, _, stderr = await _async_subprocess_run(
-            [settings.OBSUTIL_PATH, "cp", obs_src, configs_dir, "-r", "-f"],
-            timeout=600,
-        )
-        if returncode != 0:
-            raise HTTPException(status_code=500, detail=f"OBS下载失败: {stderr[:500]}")
-        actual_dir = configs_dir
-        while True:
-            entries = os.listdir(actual_dir)
-            if len(entries) == 1 and os.path.isdir(os.path.join(actual_dir, entries[0])):
-                actual_dir = os.path.join(actual_dir, entries[0])
-            else:
-                break
-        base.run_config.task.task_input_path = actual_dir
-        base.run_config.obs.user_config_download_path = ""
-        for _root, _dirs, _files in os.walk(actual_dir):
-            for _fname in _files:
-                if not _fname.endswith(".json"):
-                    continue
-                _fpath = os.path.join(_root, _fname)
-                try:
-                    with open(_fpath, "r", encoding="utf-8") as _f:
-                        _cfg = json.load(_f)
-                    _cfg["harness_type"] = req.harness_type
-                    with open(_fpath, "w", encoding="utf-8") as _f:
-                        json.dump(_cfg, _f, indent=2, ensure_ascii=False)
-                except (json.JSONDecodeError, OSError):
-                    pass
+        base.run_config.obs.user_config_download_path = req.user_config_dir
     if req.user_profile_dir:
         base.run_config.obs.user_profile_download_path = req.user_profile_dir
     if req.traj_save_path:
@@ -259,54 +231,28 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     base.run_config.task.task_output_path = os.path.join(instance_dir, "outputs")
     base.run_config.task.task_download_path = os.path.join(instance_dir, "downloads")
 
-    # --- 代码仓处理 ---
+    # 代码仓：只记录到配置，不做下载
     if req.code_repo_id:
         with get_connection() as conn:
             repo_row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (req.code_repo_id,)).fetchone()
         if repo_row:
             repo = dict(repo_row)
-            code_src_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "src", repo["name"], repo["version"])
             code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar", repo["name"], repo["version"])
             tar_path = os.path.join(code_tar_dir, "openclaw-task.tar")
-
-            if not os.path.isfile(tar_path):
-                if not (os.path.isdir(code_src_dir) and os.listdir(code_src_dir)):
-                    os.makedirs(code_src_dir, exist_ok=True)
-                    obs_src = repo["obs_path"]
-                    if not obs_src.endswith("/"):
-                        obs_src += "/"
-                    returncode, _, stderr = await _async_subprocess_run(
-                        [settings.OBSUTIL_PATH, "cp", obs_src, code_src_dir, "-r", "-f"],
-                        timeout=600,
-                    )
-                    if returncode != 0:
-                        raise HTTPException(status_code=500, detail=f"代码仓下载失败: {stderr[:500]}")
-
-                obs_dir_name = repo["obs_path"].rstrip("/").split("/")[-1]
-
-                os.makedirs(code_tar_dir, exist_ok=True)
-                returncode, _, stderr = await _async_subprocess_run(
-                    ["tar", "cf", tar_path, obs_dir_name],
-                    cwd=code_src_dir,
-                    timeout=120,
-                )
-                if returncode != 0:
-                    raise HTTPException(status_code=500, detail=f"打包失败: {stderr[:500]}")
-
             base.run_config.task.main_code_tar = tar_path
             base.run_config.task.main_code_dir = ""
             if repo.get("main_python_file"):
                 base.run_config.task.main_python_file = repo["main_python_file"]
 
     config_path = os.path.join(instance_dir, "config.yaml")
-    await async_execute(OmegaConf.save, base, config_path)
+    OmegaConf.save(base, config_path)
 
     # --- 2. 生成 harness 配置文件 ---
     if req.harness_type == "hermes":
         hermes_template = os.path.join(harness_settings_dir, "hermes_config.yaml")
         if not os.path.exists(hermes_template):
             hermes_template = os.path.join(settings.SETTINGS_DIR, "hermes_config.yaml")
-        hermes_omega = await async_execute(OmegaConf.load, hermes_template)
+        hermes_omega = OmegaConf.load(hermes_template)
 
         if req.model_id:
             hermes_omega.model.default = req.model_id
@@ -316,7 +262,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_api_key:
             hermes_omega.model.api_key = req.model_api_key
 
-        await async_execute(OmegaConf.save, hermes_omega, hermes_config_path)
+        OmegaConf.save(hermes_omega, hermes_config_path)
     elif req.harness_type == "claude-code":
         cc_template = os.path.join(harness_settings_dir, "cc_settings.json")
         if not os.path.exists(cc_template):
@@ -419,21 +365,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     with open(user_proxy_path, "w", encoding="utf-8") as f:
         json.dump(user_proxy_cfg, f, indent=2, ensure_ascii=False)
 
-    # --- 5. 统计任务数并入库 ---
-    total_tasks = 0
-    task_input = str(base.run_config.task.task_input_path)
-    if os.path.isdir(task_input):
-        file_count = len([f for f in os.listdir(task_input) if os.path.isfile(os.path.join(task_input, f))])
-        actual_start = min(req.start_index, file_count)
-        available = file_count - actual_start
-        total_tasks = min(req.total_num, available) if req.total_num > 0 else available
-
+    # --- 5. 入库（不统计任务数，留到启动时统计） ---
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO task_instances
                (id, name, config_path, status, created_by, total_tasks, concurrent_num, config_snapshot, create_params, created_at)
                VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)""",
-            (instance_id, req.name, config_path, user["username"], total_tasks,
+            (instance_id, req.name, config_path, user["username"], 0,
              req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json(),
              datetime.now().isoformat()),
         )
@@ -492,11 +430,124 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
 
 
 # ============================================================================
+# 启动准备：OBS 下载、打包、任务数统计
+# ============================================================================
+
+async def _prepare_instance(instance_id: str, inst: dict):
+    """启动前的准备工作：下载用户配置、下载代码仓、打包、统计任务数。"""
+    config_path = inst["config_path"]
+    instance_dir = str(Path(config_path).parent)
+    base = OmegaConf.load(config_path)
+
+    create_params = json.loads(inst["create_params"]) if inst.get("create_params") else {}
+    harness_type = create_params.get("harness_type", "openclaw")
+
+    # --- 下载用户配置 ---
+    user_config_dir = create_params.get("user_config_dir", "")
+    if user_config_dir:
+        configs_dir = os.path.join(instance_dir, "configs")
+        if not os.path.isdir(configs_dir) or not os.listdir(configs_dir):
+            os.makedirs(configs_dir, exist_ok=True)
+            obs_src = f"{base.s3.bucket_name}/{user_config_dir}"
+            if not obs_src.endswith("/"):
+                obs_src += "/"
+            returncode, _, stderr = await _async_subprocess_run(
+                [settings.OBSUTIL_PATH, "cp", obs_src, configs_dir, "-r", "-f"],
+                timeout=600,
+            )
+            if returncode != 0:
+                raise HTTPException(status_code=500, detail=f"OBS下载用户配置失败: {stderr[:500]}")
+
+            # 找到实际目录
+            actual_dir = configs_dir
+            while True:
+                entries = os.listdir(actual_dir)
+                if len(entries) == 1 and os.path.isdir(os.path.join(actual_dir, entries[0])):
+                    actual_dir = os.path.join(actual_dir, entries[0])
+                else:
+                    break
+
+            # 注入 harness_type 到每个 JSON
+            for _root, _dirs, _files in os.walk(actual_dir):
+                for _fname in _files:
+                    if not _fname.endswith(".json"):
+                        continue
+                    _fpath = os.path.join(_root, _fname)
+                    try:
+                        with open(_fpath, "r", encoding="utf-8") as _f:
+                            _cfg = json.load(_f)
+                        _cfg["harness_type"] = harness_type
+                        with open(_fpath, "w", encoding="utf-8") as _f:
+                            json.dump(_cfg, _f, indent=2, ensure_ascii=False)
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+            # 更新配置中的 task_input_path
+            base.run_config.task.task_input_path = actual_dir
+            base.run_config.obs.user_config_download_path = ""
+            OmegaConf.save(base, config_path)
+
+    # --- 下载代码仓并打包 ---
+    code_repo_id = create_params.get("code_repo_id")
+    if code_repo_id:
+        with get_connection() as conn:
+            repo_row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (code_repo_id,)).fetchone()
+        if repo_row:
+            repo = dict(repo_row)
+            code_src_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "src", repo["name"], repo["version"])
+            code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar", repo["name"], repo["version"])
+            tar_path = os.path.join(code_tar_dir, "openclaw-task.tar")
+
+            if not os.path.isfile(tar_path):
+                if not (os.path.isdir(code_src_dir) and os.listdir(code_src_dir)):
+                    os.makedirs(code_src_dir, exist_ok=True)
+                    obs_src = repo["obs_path"]
+                    if not obs_src.endswith("/"):
+                        obs_src += "/"
+                    returncode, _, stderr = await _async_subprocess_run(
+                        [settings.OBSUTIL_PATH, "cp", obs_src, code_src_dir, "-r", "-f"],
+                        timeout=600,
+                    )
+                    if returncode != 0:
+                        raise HTTPException(status_code=500, detail=f"代码仓下载失败: {stderr[:500]}")
+
+                obs_dir_name = repo["obs_path"].rstrip("/").split("/")[-1]
+                os.makedirs(code_tar_dir, exist_ok=True)
+                returncode, _, stderr = await _async_subprocess_run(
+                    ["tar", "cf", tar_path, obs_dir_name],
+                    cwd=code_src_dir,
+                    timeout=120,
+                )
+                if returncode != 0:
+                    raise HTTPException(status_code=500, detail=f"打包失败: {stderr[:500]}")
+
+    # --- 统计任务数 ---
+    base = OmegaConf.load(config_path)
+    task_input = str(base.run_config.task.task_input_path)
+    total_tasks = 0
+    if os.path.isdir(task_input):
+        file_count = len([f for f in os.listdir(task_input) if os.path.isfile(os.path.join(task_input, f))])
+        start_index = int(base.run_config.start_index) if hasattr(base.run_config, 'start_index') else 0
+        total_num = int(base.run_config.total_num) if hasattr(base.run_config, 'total_num') else 0
+        actual_start = min(start_index, file_count)
+        available = file_count - actual_start
+        total_tasks = min(total_num, available) if total_num > 0 else available
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE task_instances SET total_tasks=? WHERE id=?",
+            (total_tasks, instance_id),
+        )
+
+    return total_tasks
+
+
+# ============================================================================
 # 启动 / 停止 / 重跑
 # ============================================================================
 
 @router.post("/{instance_id}/start")
-def start_instance(instance_id: str, user: dict = Depends(require_operator)):
+async def start_instance(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
@@ -505,7 +556,26 @@ def start_instance(instance_id: str, user: dict = Depends(require_operator)):
     inst = dict(row)
     if inst["status"] == "running" and _is_pid_running(inst.get("pid")):
         raise HTTPException(status_code=400, detail="实例正在运行中")
+    if inst["status"] == "preparing":
+        raise HTTPException(status_code=400, detail="实例正在准备中，请稍候")
 
+    # 标记为 preparing 状态
+    with get_connection() as conn:
+        conn.execute("UPDATE task_instances SET status='preparing' WHERE id=?", (instance_id,))
+    _status_cache.pop(instance_id, None)
+
+    # 执行准备工作（OBS下载、打包、统计任务数）
+    try:
+        await _prepare_instance(instance_id, inst)
+    except Exception as e:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET status='created', error_summary=? WHERE id=?",
+                (str(e)[:500], instance_id),
+            )
+        raise
+
+    # 启动 hive
     config_path = inst["config_path"]
     output_dir = _get_output_dir(config_path)
     os.makedirs(output_dir, exist_ok=True)
@@ -524,8 +594,6 @@ def start_instance(instance_id: str, user: dict = Depends(require_operator)):
             env=env,
             start_new_session=True,
         )
-
-    _status_cache.pop(instance_id, None)
 
     with get_connection() as conn:
         conn.execute(
@@ -569,7 +637,7 @@ def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
 
 
 @router.post("/{instance_id}/retry-failed")
-def retry_failed(instance_id: str, user: dict = Depends(require_operator)):
+async def retry_failed(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
@@ -737,7 +805,6 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
                 if prefix in abnormal_by_prefix:
                     abnormal_by_prefix[prefix] += 1
                 else:
-                    # 未知前缀归入 X 未分类桶
                     abnormal_by_prefix["X"] += 1
             else:
                 unfinished += 1

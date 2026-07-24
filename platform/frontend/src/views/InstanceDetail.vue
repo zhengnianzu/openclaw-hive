@@ -7,9 +7,9 @@
       <div style="display:flex;gap:8px">
         <el-button @click="$router.push(`/logs/${inst.id}`)">查看日志</el-button>
         <el-button @click="$router.push(`/outputs/${inst.id}`)">查看输出</el-button>
-        <el-button type="success" v-if="authStore.isOperator && inst.status !== 'running'" @click="startInstance">启动</el-button>
+        <el-button type="success" v-if="authStore.isOperator && !['running','preparing'].includes(inst.status)" @click="startInstance">启动</el-button>
         <el-button type="danger" v-if="authStore.isOperator && inst.status === 'running'" @click="stopInstance">停止</el-button>
-        <el-button type="warning" v-if="authStore.isOperator && inst.failed_tasks > 0 && inst.status !== 'running'" @click="retryFailed">重跑失败</el-button>
+        <el-button type="warning" v-if="authStore.isOperator && inst.failed_tasks > 0 && !['running','preparing'].includes(inst.status)" @click="retryFailed">重跑失败</el-button>
       </div>
     </div>
 
@@ -201,8 +201,8 @@ const progressStatus = computed(() => {
   return ''
 })
 
-function statusColor(s) { return { running: 'success', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
-function statusText(s) { return { running: '运行中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
+function statusColor(s) { return { running: 'success', preparing: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
+function statusText(s) { return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
 function taskTagType(category) {
   const map = {
     '任务成功': 'success',

@@ -48,6 +48,7 @@
     <div class="filter-bar">
       <el-select v-model="statusFilter" placeholder="状态筛选" clearable size="default" style="width:140px">
         <el-option label="运行中" value="running" />
+        <el-option label="准备中" value="preparing" />
         <el-option label="已完成" value="completed" />
         <el-option label="已结束" value="finished" />
         <el-option label="已停止" value="stopped" />
@@ -115,10 +116,10 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="copy">复制</el-dropdown-item>
-                    <el-dropdown-item v-if="row.status !== 'running'" command="start">启动</el-dropdown-item>
+                    <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="start">启动</el-dropdown-item>
                     <el-dropdown-item v-if="row.status === 'running'" command="stop">停止</el-dropdown-item>
-                    <el-dropdown-item v-if="row.failed_tasks > 0 && row.status !== 'running'" command="retry">重跑失败</el-dropdown-item>
-                    <el-dropdown-item v-if="row.status !== 'running'" command="delete" divided>删除</el-dropdown-item>
+                    <el-dropdown-item v-if="row.failed_tasks > 0 && !['running','preparing'].includes(row.status)" command="retry">重跑失败</el-dropdown-item>
+                    <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="delete" divided>删除</el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -199,10 +200,10 @@ function formatDuration(seconds) {
 }
 
 function statusColor(s) {
-  return { running: 'success', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || ''
+  return { running: 'success', preparing: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || ''
 }
 function statusText(s) {
-  return { running: '运行中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+  return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
 }
 function progress(row) {
   if (!row.total_tasks) return 0
