@@ -30,7 +30,7 @@
       </el-form-item>
 
       <el-form-item label="并发数">
-        <el-input-number v-model="form.concurrent_num" :min="1" :max="500" />
+        <el-input-number v-model="form.concurrent_num" :min="1" />
       </el-form-item>
 
       <el-tabs v-model="activeTab" style="margin-top:8px">
