@@ -442,50 +442,73 @@ async def _prepare_instance(instance_id: str, inst: dict):
     create_params = json.loads(inst["create_params"]) if inst.get("create_params") else {}
     harness_type = create_params.get("harness_type", "openclaw")
 
-    # --- 下载用户配置 ---
+    # --- 下载用户配置（全局缓存，相同路径不重复下载） ---
     user_config_dir = create_params.get("user_config_dir", "")
     if user_config_dir:
+        # 使用全局共享目录缓存 OBS 下载，路径作为 key
+        cache_key_path = user_config_dir.strip("/").replace("/", "__")
+        global_configs_cache = os.path.join(settings.HIVE_ROOT, "platform", "downloads", "configs", cache_key_path)
         configs_dir = os.path.join(instance_dir, "configs")
-        if not os.path.isdir(configs_dir) or not os.listdir(configs_dir):
-            os.makedirs(configs_dir, exist_ok=True)
+
+        if os.path.isdir(global_configs_cache) and os.listdir(global_configs_cache):
+            # 已有缓存，直接软链接到实例目录
+            if os.path.exists(configs_dir):
+                if os.path.islink(configs_dir):
+                    os.unlink(configs_dir)
+                else:
+                    shutil.rmtree(configs_dir)
+            os.symlink(global_configs_cache, configs_dir)
+        else:
+            # 首次下载到全局缓存目录
+            os.makedirs(global_configs_cache, exist_ok=True)
             obs_src = f"{base.s3.bucket_name}/{user_config_dir}"
             if not obs_src.endswith("/"):
                 obs_src += "/"
             returncode, _, stderr = await _async_subprocess_run(
-                [settings.OBSUTIL_PATH, "cp", obs_src, configs_dir, "-r", "-f"],
+                [settings.OBSUTIL_PATH, "cp", obs_src, global_configs_cache, "-r", "-f"],
                 timeout=600,
             )
             if returncode != 0:
+                shutil.rmtree(global_configs_cache, ignore_errors=True)
                 raise HTTPException(status_code=500, detail=f"OBS下载用户配置失败: {stderr[:500]}")
 
-            # 找到实际目录
-            actual_dir = configs_dir
-            while True:
-                entries = os.listdir(actual_dir)
-                if len(entries) == 1 and os.path.isdir(os.path.join(actual_dir, entries[0])):
-                    actual_dir = os.path.join(actual_dir, entries[0])
+            # 软链接到实例目录
+            if os.path.exists(configs_dir):
+                if os.path.islink(configs_dir):
+                    os.unlink(configs_dir)
                 else:
-                    break
+                    shutil.rmtree(configs_dir)
+            os.symlink(global_configs_cache, configs_dir)
 
-            # 注入 harness_type 到每个 JSON
-            for _root, _dirs, _files in os.walk(actual_dir):
-                for _fname in _files:
-                    if not _fname.endswith(".json"):
-                        continue
-                    _fpath = os.path.join(_root, _fname)
-                    try:
-                        with open(_fpath, "r", encoding="utf-8") as _f:
-                            _cfg = json.load(_f)
+        # 找到实际目录（穿透单层嵌套）
+        actual_dir = configs_dir
+        while True:
+            entries = os.listdir(actual_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(actual_dir, entries[0])):
+                actual_dir = os.path.join(actual_dir, entries[0])
+            else:
+                break
+
+        # 注入 harness_type 到每个 JSON（幂等操作）
+        for _root, _dirs, _files in os.walk(actual_dir):
+            for _fname in _files:
+                if not _fname.endswith(".json"):
+                    continue
+                _fpath = os.path.join(_root, _fname)
+                try:
+                    with open(_fpath, "r", encoding="utf-8") as _f:
+                        _cfg = json.load(_f)
+                    if _cfg.get("harness_type") != harness_type:
                         _cfg["harness_type"] = harness_type
                         with open(_fpath, "w", encoding="utf-8") as _f:
                             json.dump(_cfg, _f, indent=2, ensure_ascii=False)
-                    except (json.JSONDecodeError, OSError):
-                        pass
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-            # 更新配置中的 task_input_path
-            base.run_config.task.task_input_path = actual_dir
-            base.run_config.obs.user_config_download_path = ""
-            OmegaConf.save(base, config_path)
+        # 更新配置中的 task_input_path
+        base.run_config.task.task_input_path = actual_dir
+        base.run_config.obs.user_config_download_path = ""
+        OmegaConf.save(base, config_path)
 
     # --- 下载代码仓并打包 ---
     code_repo_id = create_params.get("code_repo_id")

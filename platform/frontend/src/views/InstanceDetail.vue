@@ -49,7 +49,6 @@
             <el-descriptions-item label="创建时间">{{ inst.created_at }}</el-descriptions-item>
             <el-descriptions-item label="启动时间">{{ inst.started_at || '-' }}</el-descriptions-item>
             <el-descriptions-item label="创建者">{{ inst.created_by }}</el-descriptions-item>
-            <el-descriptions-item label="模型 API Key">{{ createParams.model_api_key || '默认值' }}</el-descriptions-item>
           </el-descriptions>
         </el-card>
       </el-col>
@@ -66,6 +65,75 @@
         </el-card>
       </el-col>
     </el-row>
+
+    <el-card header="创建参数" style="margin-top:20px" v-if="Object.keys(createParams).length">
+      <el-collapse v-model="expandedPanels">
+        <el-collapse-item title="基本配置" name="basic">
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="Harness类型">
+              <el-tag size="small" :type="createParams.harness_type === 'hermes' ? 'warning' : createParams.harness_type === 'claude-code' ? 'success' : 'primary'">
+                {{ createParams.harness_type || 'openclaw' }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="Invite Code">{{ createParams.invite_code || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="Harness配置ID">{{ createParams.harness_config_id || '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-collapse-item>
+
+        <el-collapse-item title="OBS配置" name="obs">
+          <el-descriptions :column="1" border size="small">
+            <el-descriptions-item label="技能目录">{{ createParams.skill_dir || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="默认技能">{{ createParams.default_skills || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="Agent目录">{{ createParams.agent_dir || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="用户Config目录">{{ createParams.user_config_dir || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="用户Profile目录">{{ createParams.user_profile_dir || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="轨迹保存路径">{{ createParams.traj_save_path || '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-collapse-item>
+
+        <el-collapse-item title="模型配置" name="model">
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item label="Base URL">{{ createParams.model_base_url || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="API Key">{{ maskKey(createParams.model_api_key) }}</el-descriptions-item>
+            <el-descriptions-item label="API类型">{{ createParams.model_api_type || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="模型ID">{{ createParams.model_id || '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-collapse-item>
+
+        <el-collapse-item title="用户模拟配置" name="agents">
+          <template v-if="createParams.agents && createParams.agents.length">
+            <div v-for="(ag, idx) in createParams.agents" :key="idx" :style="idx > 0 ? 'margin-top:12px' : ''">
+              <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Agent {{ idx + 1 }}: {{ ag.name || '-' }}</div>
+              <el-descriptions :column="2" border size="small">
+                <el-descriptions-item label="Provider">{{ ag.provider || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="Base URL">{{ ag.base_url || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="API Key">{{ maskKey(ag.api_key) }}</el-descriptions-item>
+                <el-descriptions-item label="API类型">{{ ag.api || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="模型ID">{{ ag.model || '-' }}</el-descriptions-item>
+              </el-descriptions>
+            </div>
+          </template>
+          <template v-else-if="createParams.user_proxy_model_name || createParams.user_proxy_base_url">
+            <el-descriptions :column="2" border size="small">
+              <el-descriptions-item label="模型名称">{{ createParams.user_proxy_model_name || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="Base URL">{{ createParams.user_proxy_base_url || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="API Key">{{ maskKey(createParams.user_proxy_api_key) }}</el-descriptions-item>
+            </el-descriptions>
+          </template>
+          <el-empty v-else description="未配置" :image-size="40" />
+        </el-collapse-item>
+
+        <el-collapse-item title="高级配置" name="advanced">
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item label="起始索引">{{ createParams.start_index ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="任务总数">{{ createParams.total_num ? createParams.total_num : '不限' }}</el-descriptions-item>
+            <el-descriptions-item label="镜像名称">{{ createParams.image_name || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="代码仓ID">{{ createParams.code_repo_id || '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-collapse-item>
+      </el-collapse>
+    </el-card>
 
     <el-card header="配置文件" style="margin-top:20px">
       <el-tabs v-model="activeConfigTab" @tab-change="loadConfigContent">
@@ -94,6 +162,7 @@ const loading = ref(false)
 const inst = ref({})
 const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {} })
 const createParams = ref({})
+const expandedPanels = ref([])
 let timer = null
 
 const progressPct = computed(() => {
@@ -128,6 +197,10 @@ function formatDuration(seconds) {
   const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60)
   if (h > 0) return `${h}h${m}m`
   return `${m}min`
+}
+function maskKey(key) {
+  if (!key || key.length <= 8) return key || '-'
+  return key.slice(0, 4) + '***' + key.slice(-4)
 }
 
 async function loadData() {
