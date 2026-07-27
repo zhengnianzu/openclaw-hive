@@ -39,7 +39,7 @@
           <el-input v-model="createForm.version" placeholder="例如：v1" />
         </el-form-item>
         <el-form-item label="OBS路径" required>
-          <el-input v-model="createForm.obs_path" placeholder="例如：obs://rl-agentdata/code/openclaw-task/v1/openclaw-task/">
+          <el-input v-model="createForm.obs_path" :placeholder="`例如：${joinBucket('code')}openclaw-task/v1/openclaw-task/`">
             <template #append>
               <el-button @click="openObsBrowser('obs_path')">浏览</el-button>
             </template>
@@ -91,6 +91,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { obsBucket, joinBucket } from '../api/obsConfig'
 
 const authStore = useAuthStore()
 const repos = ref([])
@@ -175,7 +176,7 @@ async function deleteRepo(row) {
 const obsVisible = ref(false)
 const obsLoading = ref(false)
 const obsItems = ref([])
-const obsCurrentPath = ref('obs://rl-agentdata/code/')
+const obsCurrentPath = ref(joinBucket('code'))
 const obsMode = ref('obs_path')
 
 const filteredObsItems = computed(() => {
@@ -191,11 +192,7 @@ const filteredObsItems = computed(() => {
 
 function openObsBrowser(mode) {
   obsMode.value = mode
-  if (mode === 'main_python_file') {
-    obsCurrentPath.value = createForm.value.obs_path || 'obs://rl-agentdata/code/'
-  } else {
-    obsCurrentPath.value = createForm.value.obs_path || 'obs://rl-agentdata/code/'
-  }
+  obsCurrentPath.value = createForm.value.obs_path || joinBucket('code')
   obsItems.value = []
   obsVisible.value = true
   loadObsDir()

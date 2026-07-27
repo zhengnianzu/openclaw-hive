@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import api from '../api'
+import { loadObsConfig } from '../api/obsConfig'
 
 export const useAuthStore = defineStore('auth', () => {
   const token = ref(localStorage.getItem('token') || '')
@@ -17,6 +18,7 @@ export const useAuthStore = defineStore('auth', () => {
     localStorage.setItem('token', data.access_token)
     localStorage.setItem('username', data.username)
     localStorage.setItem('role', data.role)
+    loadObsConfig()
   }
 
   function clearAuth() {

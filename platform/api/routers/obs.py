@@ -11,6 +11,17 @@ from ..models.instance import ObsItem, ObsListResponse
 router = APIRouter(prefix="/api/obs", tags=["obs"])
 
 
+def _bucket_root() -> str:
+    """归一化后的桶根路径，始终以 / 结尾。"""
+    return settings.OBS_BUCKET.rstrip("/") + "/"
+
+
+@router.get("/config")
+async def get_obs_config(user: dict = Depends(get_current_user)):
+    """暴露 OBS 桶配置给前端，避免前端硬编码桶名。"""
+    return {"bucket": _bucket_root()}
+
+
 async def _run_obsutil(args: list[str], timeout: int = 30) -> str:
     cmd = [settings.OBSUTIL_PATH] + args
     proc = await asyncio.create_subprocess_exec(
@@ -68,10 +79,12 @@ def _parse_obsutil_ls(output: str, base_path: str) -> list[ObsItem]:
 
 @router.get("/list", response_model=ObsListResponse)
 async def list_obs_dir(
-    path: str = Query(default="obs://rl-agentdata/", description="OBS路径"),
+    path: Optional[str] = Query(default=None, description="OBS路径，缺省为桶根"),
     show_files: bool = Query(default=False, description="是否同时显示文件"),
     user: dict = Depends(get_current_user),
 ):
+    if not path:
+        path = _bucket_root()
     if not path.endswith("/"):
         path += "/"
 

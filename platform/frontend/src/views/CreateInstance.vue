@@ -208,7 +208,7 @@
         <el-breadcrumb separator="/">
           <el-breadcrumb-item v-for="(seg, idx) in pathSegments" :key="idx"
             @click="navigateTo(idx)" style="cursor:pointer">
-            {{ seg || 'obs://rl-agentdata' }}
+            {{ seg || obsBucket().replace(/\/$/, '') }}
           </el-breadcrumb-item>
         </el-breadcrumb>
       </div>
@@ -236,6 +236,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { obsBucket, stripBucket, joinBucket } from '../api/obsConfig'
 
 const router = useRouter()
 const route = useRoute()
@@ -409,17 +410,17 @@ async function handleCreate() {
 const obsVisible = ref(false)
 const obsLoading = ref(false)
 const obsItems = ref([])
-const obsCurrentPath = ref('obs://rl-agentdata/')
+const obsCurrentPath = ref(obsBucket())
 let obsTargetField = ''
 
 const pathSegments = computed(() => {
-  const p = obsCurrentPath.value.replace('obs://rl-agentdata/', '')
+  const p = stripBucket(obsCurrentPath.value)
   return ['', ...p.split('/').filter(Boolean)]
 })
 
 function openObsBrowser(field) {
   obsTargetField = field
-  obsCurrentPath.value = 'obs://rl-agentdata/'
+  obsCurrentPath.value = obsBucket()
   obsVisible.value = true
   loadObsDir()
 }
@@ -442,12 +443,12 @@ function handleObsClick(row) {
 
 function navigateTo(idx) {
   const segs = pathSegments.value.slice(1, idx + 1)
-  obsCurrentPath.value = 'obs://rl-agentdata/' + (segs.length ? segs.join('/') + '/' : '')
+  obsCurrentPath.value = joinBucket(segs.join('/'))
   loadObsDir()
 }
 
 function confirmObsSelect() {
-  const relative = obsCurrentPath.value.replace('obs://rl-agentdata/', '').replace(/\/$/, '')
+  const relative = stripBucket(obsCurrentPath.value)
   form.value[obsTargetField] = relative
   obsVisible.value = false
 }
@@ -471,7 +472,7 @@ onMounted(async () => {
   } else if (fromRegistration) {
     try {
       const reg = await api.get(`/registrations/${fromRegistration}`)
-      const stripObsPrefix = p => (p || '').replace(/^obs:\/\/rl-agentdata\/?/, '')
+      const stripObsPrefix = p => stripBucket(p)
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(2, 12)
       const rand = String(Math.floor(Math.random() * 10000)).padStart(4, '0')
 

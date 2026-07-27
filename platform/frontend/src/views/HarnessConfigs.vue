@@ -74,13 +74,13 @@
         <el-divider content-position="left">OBS 来源路径</el-divider>
 
         <el-form-item :label="harnessFileLabel(editForm.harness_type)">
-          <el-input v-model="editForm.obs_harness_path" placeholder="obs://rl-agentdata/configs/xxx/openclaw.json" />
+          <el-input v-model="editForm.obs_harness_path" :placeholder="`${joinBucket('configs')}xxx/openclaw.json`" />
         </el-form-item>
         <el-form-item label="任务配置 (config.yaml)">
-          <el-input v-model="editForm.obs_task_path" placeholder="obs://rl-agentdata/configs/xxx/config.yaml" />
+          <el-input v-model="editForm.obs_task_path" :placeholder="`${joinBucket('configs')}xxx/config.yaml`" />
         </el-form-item>
         <el-form-item label="模拟配置 (user_proxy)">
-          <el-input v-model="editForm.obs_proxy_path" placeholder="obs://rl-agentdata/configs/xxx/user_proxy_model.json" />
+          <el-input v-model="editForm.obs_proxy_path" :placeholder="`${joinBucket('configs')}xxx/user_proxy_model.json`" />
         </el-form-item>
         <div style="font-size:12px;color:#999;padding:0 0 8px 140px">填写后创建时自动从 OBS 拉取；也可以创建后在文件管理中手动拉取或从模板初始化</div>
       </el-form>
@@ -146,6 +146,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { joinBucket } from '../api/obsConfig'
 
 const authStore = useAuthStore()
 const configs = ref([])

@@ -5,6 +5,12 @@ import 'element-plus/dist/index.css'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import App from './App.vue'
 import router from './router'
+import { loadObsConfig } from './api/obsConfig'
+
+// 运行时加载 OBS 桶配置（失败自动回退，不阻塞启动）
+if (localStorage.getItem('token')) {
+  loadObsConfig()
+}
 
 const app = createApp(App)
 app.use(createPinia())

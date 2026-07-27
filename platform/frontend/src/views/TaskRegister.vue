@@ -32,7 +32,7 @@
       </el-form-item>
 
       <el-form-item label="任务路径OBS">
-        <el-input v-model="form.task_path_obs" placeholder="OBS路径，如 obs://rl-agentdata/path/">
+        <el-input v-model="form.task_path_obs" :placeholder="`OBS路径，如 ${obsBucket()}path/`">
           <template #append>
             <el-button @click="openObsBrowser('task_path_obs')">浏览</el-button>
           </template>
@@ -117,13 +117,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
+import { obsBucket } from '../api/obsConfig'
 
 const router = useRouter()
 const route = useRoute()
 const submitting = ref(false)
 const isCopy = computed(() => !!route.query.copy_from)
 
-const OBS_DEFAULT_PATH = 'obs://rl-agentdata/'
 const templateList = ref([])
 
 async function loadTemplates() {
@@ -185,7 +185,7 @@ let obsTargetField = ''
 
 function openObsBrowser(field) {
   obsTargetField = field
-  obsCurrentPath.value = form.value[field] || OBS_DEFAULT_PATH
+  obsCurrentPath.value = form.value[field] || obsBucket()
   obsItems.value = []
   obsDialogVisible.value = true
   loadObsItems()
