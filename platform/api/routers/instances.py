@@ -22,6 +22,9 @@ from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
+# 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
+key_router = APIRouter(prefix="/api", tags=["api-key"])
+
 ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"}
 
 _status_cache = {}
@@ -53,16 +56,19 @@ def _load_key_gen_config() -> dict:
 def _resolve_key_gen_rule(base_url: str, cfg: dict) -> dict:
     """
     根据传入 base_url 解析出实际使用的申请规则。
-    返回 {base_url, endpoint, params, response_key_field}。
+    返回 {base_url, method, endpoint, params, response_key_field}。
 
     规则匹配：
-    - 传入 base_url 命中 endpoints 里某条 match 前缀 -> 用该条的 endpoint/params，base_url 用传入的
-    - 传入 base_url 但未命中任何 match          -> 用传入 base_url + default 的 endpoint/params
+    - 传入 base_url 命中 endpoints 里某条 match 前缀 -> 用该条的 method/endpoint/params，base_url 用传入的
+    - 传入 base_url 但未命中任何 match          -> 用传入 base_url + default 的 method/endpoint/params
     - 未传 base_url                             -> 用 default.base_url（若为 "*" 则视为未指定，由上层报错）
     """
     default = cfg.get("default") or {}
     endpoints = cfg.get("endpoints") or []
     incoming = (base_url or "").strip()
+
+    def _method(rule):
+        return str(rule.get("method") or default.get("method") or "GET").upper()
 
     if incoming:
         for rule in endpoints:
@@ -70,7 +76,8 @@ def _resolve_key_gen_rule(base_url: str, cfg: dict) -> dict:
             if match and match in incoming:
                 return {
                     "base_url": incoming,
-                    "endpoint": rule.get("endpoint") or default.get("endpoint") or "/invite",
+                    "method": _method(rule),
+                    "endpoint": rule.get("endpoint") or default.get("endpoint") or "/api/invite",
                     "params": rule.get("params") or {},
                     "response_key_field": rule.get("response_key_field")
                         or default.get("response_key_field") or "api_key",
@@ -78,7 +85,8 @@ def _resolve_key_gen_rule(base_url: str, cfg: dict) -> dict:
         # 未命中：用传入 base_url + default 的其余设置（default.base_url 为 "*" 即沿用传入）
         return {
             "base_url": incoming,
-            "endpoint": default.get("endpoint") or "/invite",
+            "method": str(default.get("method") or "GET").upper(),
+            "endpoint": default.get("endpoint") or "/api/invite",
             "params": default.get("params") or {},
             "response_key_field": default.get("response_key_field") or "api_key",
         }
@@ -89,7 +97,8 @@ def _resolve_key_gen_rule(base_url: str, cfg: dict) -> dict:
         default_base = ""
     return {
         "base_url": default_base,
-        "endpoint": default.get("endpoint") or "/invite",
+        "method": str(default.get("method") or "GET").upper(),
+        "endpoint": default.get("endpoint") or "/api/invite",
         "params": default.get("params") or {},
         "response_key_field": default.get("response_key_field") or "api_key",
     }
@@ -104,23 +113,65 @@ async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
         raise ValueError("未配置 key 申请的 base_url（key_gen.yaml.default.base_url 或传入 model_base_url）")
 
     api_url = effective_base.rstrip("/") + "/" + str(rule["endpoint"]).lstrip("/")
+    method = rule["method"]
 
-    # 查询参数：invite_code + name + 规则里的额外固定参数（如 token）
-    query_params = {"invite_code": invite_code, "name": name}
+    # invite_code + name + 规则里的额外固定参数（如 token）
+    payload = {"invite_code": invite_code, "name": name}
     extra = rule["params"]
     if isinstance(extra, dict):
         for k, v in extra.items():
             if v is not None and str(v) != "":
-                query_params[str(k)] = v
+                payload[str(k)] = v
 
     key_field = str(rule["response_key_field"]) or "api_key"
     timeout = cfg.get("timeout", 15)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(api_url, params=query_params)
+        if method == "POST":
+            # 部分服务要求带 X-Requested-With 才返回 JSON
+            resp = await client.post(
+                api_url, json=payload,
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+        else:
+            resp = await client.get(api_url, params=payload)
         resp.raise_for_status()
         data = resp.json()
         return data.get(key_field, "")
+
+
+@key_router.post("/generate-api-key")
+async def generate_api_key(
+    invite_code: str,
+    name: str,
+    base_url: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    独立的 API Key 申请接口（供前端"新建KEY"按钮调用）。
+    复用 _request_api_key：按 key_gen.yaml 依据 base_url 匹配对应服务，
+    命中的服务会自动附带其配置的固定参数（如 8082 的 token）。
+    """
+    if not invite_code:
+        raise HTTPException(status_code=400, detail="invite_code 不能为空")
+    try:
+        api_key = await _request_api_key(base_url or "", invite_code, name)
+    except httpx.HTTPStatusError as e:
+        # 把上游服务的真实报错透出来（如 "Token not provided"）
+        detail = ""
+        try:
+            detail = e.response.json().get("message") or e.response.text
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=502, detail=f"申请 key 失败：{detail}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"申请 key 失败：{e}")
+
+    if not api_key:
+        raise HTTPException(status_code=502, detail="上游服务未返回 api_key")
+    return {"api_key": api_key}
 
 
 def _get_instance_dir(instance_id: str) -> str:

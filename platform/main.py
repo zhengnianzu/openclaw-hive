@@ -39,6 +39,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(instances.router)
+app.include_router(instances.key_router)
 app.include_router(obs.router)
 app.include_router(logs.router)
 app.include_router(registrations.router)

@@ -28,3 +28,21 @@ platform/settings/user_proxy_model.json
 # 通用
 .env
 *.log
+
+
+logs/
+outputs/
+platform/code/
+platform/downloads/
+platform/obsutil_linux_amd64.tar.gz
+platform/platform.db.bak.20260724193028
+platform/platform.db.bak.20260724193942
+platform/platform.db.bak.20260725195617
+platform/session_cc.sh
+platform/settings/cc_settings.json
+platform/settings/claude-code/
+platform/settings/hermes_config.yaml
+platform/settings/openclaw/
+platform/settings/key_gen.yaml
+
+
