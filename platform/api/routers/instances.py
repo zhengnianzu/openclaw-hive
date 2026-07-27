@@ -30,14 +30,97 @@ _STATUS_CACHE_TTL = 5
 _analyze_cache = {}
 _ANALYZE_CACHE_TTL = 10
 
+# 增量扫描状态: config_path -> {fname: (mtime, size, status, code)}
+# 只重读 mtime/size 变化过的 task 日志，避免每次全量遍历上万文件
+_analyze_file_state = {}
+
+# 后台预热开关：为 True 时请求线程只读缓存（哪怕已过期），扫描交给后台任务，
+# 避免同步端点在请求线程里做重扫把 anyio 线程池打满
+_bg_refresh_active = False
+
+
+def _load_key_gen_config() -> dict:
+    """加载 key 申请配置 settings/key_gen.yaml，文件不存在或解析失败时返回空配置。"""
+    cfg_path = os.path.join(settings.SETTINGS_DIR, "key_gen.yaml")
+    if not os.path.exists(cfg_path):
+        return {}
+    try:
+        return OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_key_gen_rule(base_url: str, cfg: dict) -> dict:
+    """
+    根据传入 base_url 解析出实际使用的申请规则。
+    返回 {base_url, endpoint, params, response_key_field}。
+
+    规则匹配：
+    - 传入 base_url 命中 endpoints 里某条 match 前缀 -> 用该条的 endpoint/params，base_url 用传入的
+    - 传入 base_url 但未命中任何 match          -> 用传入 base_url + default 的 endpoint/params
+    - 未传 base_url                             -> 用 default.base_url（若为 "*" 则视为未指定，由上层报错）
+    """
+    default = cfg.get("default") or {}
+    endpoints = cfg.get("endpoints") or []
+    incoming = (base_url or "").strip()
+
+    if incoming:
+        for rule in endpoints:
+            match = str(rule.get("match", "")).strip()
+            if match and match in incoming:
+                return {
+                    "base_url": incoming,
+                    "endpoint": rule.get("endpoint") or default.get("endpoint") or "/invite",
+                    "params": rule.get("params") or {},
+                    "response_key_field": rule.get("response_key_field")
+                        or default.get("response_key_field") or "api_key",
+                }
+        # 未命中：用传入 base_url + default 的其余设置（default.base_url 为 "*" 即沿用传入）
+        return {
+            "base_url": incoming,
+            "endpoint": default.get("endpoint") or "/invite",
+            "params": default.get("params") or {},
+            "response_key_field": default.get("response_key_field") or "api_key",
+        }
+
+    # 未传 base_url：走 default；若 default.base_url 是通配 "*" 则无从确定，返回空由上层报错
+    default_base = str(default.get("base_url", "")).strip()
+    if default_base == "*":
+        default_base = ""
+    return {
+        "base_url": default_base,
+        "endpoint": default.get("endpoint") or "/invite",
+        "params": default.get("params") or {},
+        "response_key_field": default.get("response_key_field") or "api_key",
+    }
+
 
 async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
-    api_url = base_url.rstrip("/") + f"/api/invite?invite_code={invite_code}&name={name}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(api_url)
+    cfg = _load_key_gen_config()
+    rule = _resolve_key_gen_rule(base_url, cfg)
+
+    effective_base = rule["base_url"]
+    if not effective_base:
+        raise ValueError("未配置 key 申请的 base_url（key_gen.yaml.default.base_url 或传入 model_base_url）")
+
+    api_url = effective_base.rstrip("/") + "/" + str(rule["endpoint"]).lstrip("/")
+
+    # 查询参数：invite_code + name + 规则里的额外固定参数（如 token）
+    query_params = {"invite_code": invite_code, "name": name}
+    extra = rule["params"]
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if v is not None and str(v) != "":
+                query_params[str(k)] = v
+
+    key_field = str(rule["response_key_field"]) or "api_key"
+    timeout = cfg.get("timeout", 15)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(api_url, params=query_params)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("api_key", "")
+        return data.get(key_field, "")
 
 
 def _get_instance_dir(instance_id: str) -> str:
@@ -307,10 +390,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
 
     # --- 3. 自动申请 API Key (invite_code) ---
-    if req.invite_code and not req.model_api_key and req.model_base_url:
+    # base_url 可来自 req.model_base_url，或回退到 key_gen.yaml 的默认配置
+    if req.invite_code and not req.model_api_key:
         try:
             key_name = f"{user['username']}_{datetime.now().strftime('%y%m%d%H%M')}_{req.name}"
-            req.model_api_key = await _request_api_key(req.model_base_url, req.invite_code, key_name)
+            req.model_api_key = await _request_api_key(req.model_base_url or "", req.invite_code, key_name)
+            if not req.model_api_key:
+                raise ValueError("申请接口未返回 api_key，请检查 key_gen.yaml 配置与响应字段")
             if req.harness_type == "hermes" and os.path.exists(hermes_config_path):
                 hermes_omega = OmegaConf.load(hermes_config_path)
                 hermes_omega.model.api_key = req.model_api_key
@@ -327,8 +413,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 openclaw_cfg["models"]["providers"]["local"]["apiKey"] = req.model_api_key
                 with open(openclaw_path, "w", encoding="utf-8") as f:
                     json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            # 申请失败不阻断实例创建，但记录原因，避免像以前那样被静默吞掉
+            print(f"[api_key] 自动申请失败 (instance name={req.name}): {e}")
 
     # --- 4. 生成 user_proxy_model.json ---
     user_proxy_template = os.path.join(harness_settings_dir, "user_proxy_model.json")
@@ -780,57 +867,79 @@ def _estimate_remaining_time(
     }
 
 
-def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running") -> dict:
-    now = time.time()
-    cache_key = config_path
-    cached = _analyze_cache.get(cache_key)
+_STATUS_RE = re.compile(
+    r"任务执行状态=(?P<status>任务成功|任务失败|任务异常)\s+error_code=(?P<code>\S+)"
+)
 
-    if instance_status not in ("running",):
-        if cached:
-            return cached[0]
 
-    if cached and (now - cached[1]) < _ANALYZE_CACHE_TTL:
-        return cached[0]
+def _scan_task_file(fpath: str):
+    """读取单个 task 日志，返回 (last_status, last_code)；异常返回 (None, None)。"""
+    last_status = None
+    last_code = None
+    try:
+        with open(fpath, "r", errors="replace") as f:
+            for line in f:
+                m = _STATUS_RE.search(line)
+                if m:
+                    last_status = m.group("status")
+                    last_code = m.group("code")
+    except OSError:
+        return None, None
+    return last_status, last_code
 
+
+def _compute_analyze(config_path: str, total_tasks: int) -> dict:
+    """
+    增量扫描：只重读 mtime/size 变化过的 task 日志。
+    已完成的任务日志不再变化，后续轮询直接复用上次结果，
+    使耗时正比于「本轮新增/变化的文件数」而非日志总数。
+    """
     output_dir = _get_output_dir(config_path)
     logs_dir = os.path.join(output_dir, "logs")
-    status_re = re.compile(
-        r"任务执行状态=(?P<status>任务成功|任务失败|任务异常)\s+error_code=(?P<code>\S+)"
-    )
+
+    prev_state = _analyze_file_state.get(config_path, {})
+    new_state = {}
+
+    if os.path.isdir(logs_dir):
+        try:
+            entries = os.scandir(logs_dir)
+        except OSError:
+            entries = []
+        for entry in entries:
+            fname = entry.name
+            if not (fname.startswith("task-") and fname.endswith(".log")):
+                continue
+            try:
+                st = entry.stat()
+                sig = (st.st_mtime, st.st_size)
+            except OSError:
+                continue
+
+            cached = prev_state.get(fname)
+            if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+                # 文件未变化，复用上次解析结果，跳过读取
+                new_state[fname] = cached
+            else:
+                status, code = _scan_task_file(entry.path)
+                new_state[fname] = (sig[0], sig[1], status, code)
+
+    _analyze_file_state[config_path] = new_state
 
     succeeded = 0
     failed = 0
     abnormal_by_prefix = {"C": 0, "S": 0, "T": 0, "X": 0}
-    unfinished = 0
 
-    if os.path.isdir(logs_dir):
-        task_files = [f for f in os.listdir(logs_dir) if f.startswith("task-") and f.endswith(".log")]
-        for fname in task_files:
-            fpath = os.path.join(logs_dir, fname)
-            last_status = None
-            last_code = None
-            try:
-                with open(fpath, "r", errors="replace") as f:
-                    for line in f:
-                        m = status_re.search(line)
-                        if m:
-                            last_status = m.group("status")
-                            last_code = m.group("code")
-            except OSError:
-                continue
-
-            if last_status == "任务成功":
-                succeeded += 1
-            elif last_status == "任务失败":
-                failed += 1
-            elif last_status == "任务异常":
-                prefix = (last_code or "")[:1]
-                if prefix in abnormal_by_prefix:
-                    abnormal_by_prefix[prefix] += 1
-                else:
-                    abnormal_by_prefix["X"] += 1
+    for _mtime, _size, last_status, last_code in new_state.values():
+        if last_status == "任务成功":
+            succeeded += 1
+        elif last_status == "任务失败":
+            failed += 1
+        elif last_status == "任务异常":
+            prefix = (last_code or "")[:1]
+            if prefix in abnormal_by_prefix:
+                abnormal_by_prefix[prefix] += 1
             else:
-                unfinished += 1
+                abnormal_by_prefix["X"] += 1
 
     abnormal = sum(abnormal_by_prefix.values())
     executed = succeeded + failed + abnormal
@@ -855,8 +964,69 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
     if not_executed:
         result["未执行"] = not_executed
 
-    _analyze_cache[cache_key] = (result, now)
+    _analyze_cache[config_path] = (result, time.time())
     return result
+
+
+def _refresh_running_once():
+    """后台线程：预热 running/preparing 实例的状态与分析缓存。"""
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_instances WHERE status IN ('running','preparing')"
+            ).fetchall()
+    except Exception:
+        return
+
+    for row in rows:
+        inst = dict(row)
+        try:
+            inst = _sync_instance_status(inst)
+            if inst["status"] == "running":
+                _compute_analyze(inst["config_path"], inst["total_tasks"])
+        except Exception:
+            continue
+
+
+async def background_cache_refresher(interval: float = 8.0):
+    """
+    周期性在线程池里刷新缓存，使 overview/list 请求线程只读缓存、永不触发扫描，
+    从根本上避免多客户端并发把 anyio 同步线程池打满。
+    """
+    global _bg_refresh_active
+    # 先同步预热一轮，再开启「请求只读缓存」模式，避免首轮请求撞冷扫描
+    try:
+        await async_execute(_refresh_running_once)
+    except Exception:
+        pass
+    _bg_refresh_active = True
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await async_execute(_refresh_running_once)
+        except Exception:
+            pass
+
+
+def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running") -> dict:
+    now = time.time()
+    cache_key = config_path
+    cached = _analyze_cache.get(cache_key)
+
+    # 非 running：状态已定，命中缓存直接返回，永不重扫
+    if instance_status not in ("running",):
+        if cached:
+            return cached[0]
+
+    if cached and (now - cached[1]) < _ANALYZE_CACHE_TTL:
+        return cached[0]
+
+    # 后台预热启用时，请求线程只读缓存（哪怕已过期），把扫描留给后台任务，
+    # 避免多客户端并发把 anyio 同步线程池打满
+    if _bg_refresh_active and cached:
+        return cached[0]
+
+    return _compute_analyze(config_path, total_tasks)
 
 
 @router.delete("/{instance_id}")

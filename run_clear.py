@@ -14,11 +14,11 @@ python run_clear.py --del_all 删除所有pods
 python run_clear.py --config config.yaml 删除指定沙箱
 """
 
-def get_sandbox_ids_from_k8s(sandbox_id_prefix):
+def get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace):
     prefix = f"sandbox-{sandbox_id_prefix}-"
     try:
         result = subprocess.run(
-            ["kubectl", "get", "pods", "-n", "omni-env-default-worker", "--no-headers"],
+            ["kubectl", "get", "pods", "-n", sandbox_namespace, "--no-headers"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -68,7 +68,8 @@ def main() -> None:
         sandbox_ids = get_all_use_env_id()
     else:
         sandbox_id_prefix = config_dict.sandbox_id_prefix
-        sandbox_ids = get_sandbox_ids_from_k8s(sandbox_id_prefix)
+        sandbox_namespace = config_dict.sandbox_namespace
+        sandbox_ids = get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace)
         if not sandbox_ids:
             print(f"sandbox_id_prefix={sandbox_id_prefix} 下没有找到任何运行中的 Pod")
             return

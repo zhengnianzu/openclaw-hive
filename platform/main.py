@@ -66,6 +66,12 @@ def health():
     return {"status": "ok", "project": settings.PROJECT_NAME}
 
 
+@app.on_event("startup")
+async def _start_background_tasks():
+    import asyncio
+    asyncio.create_task(instances.background_cache_refresher())
+
+
 @app.post("/api/generate-api-key")
 async def generate_api_key(
     base_url: Optional[str] = None,

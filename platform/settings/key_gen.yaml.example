@@ -1,0 +1,32 @@
+# API Key 自动申请配置
+# 创建实例时，若填写了 invite_code 且未手动指定 api_key，会调用此处配置的接口自动申请。
+#
+# 支持多个申请服务：按传入的 base_url 匹配 endpoints 里的某一条规则，
+# 不同服务可有不同的 endpoint 路径和是否携带 token。
+# 传入的 base_url 命中某条规则的 match 前缀时用该规则；都不命中时用 default。
+
+# 各申请服务的规则。match 为 base_url 的匹配前缀（host:port 或完整前缀均可）。
+endpoints:
+  # 新服务 8082：/api/invite，需要 token
+  - match: "1.95.199.64:8082"
+    endpoint: "/api/invite"
+    params:
+      token: "IhH"
+    response_key_field: "api_key"
+
+  # 旧服务 8084：/invite，不需要 token
+  - match: "1.95.199.64:8084"
+    endpoint: "/invite"
+    params: {}
+    response_key_field: "api_key"
+
+# 兜底规则：传入的 base_url 未命中上面任何 match 时使用。
+# base_url: "*" 表示沿用调用方传入的 base_url；endpoint 用中性的 /invite、不带 token。
+default:
+  base_url: "*"
+  endpoint: "/invite"
+  params: {}
+  response_key_field: "api_key"
+
+# 请求超时（秒）
+timeout: 15
