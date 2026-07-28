@@ -1,0 +1,34 @@
+{
+  "_comment": "openjiuwen 全局配置。模型解析优先级: simulator_config[agent] > agents.<name> > default。",
+
+  "default": {
+    "_comment": "tokenfly 网关走 anthropic-messages 协议(/v1/messages),provider 必须是 Anthropic,不能回退 OpenAI。model 用网关的完整 id(带斜杠)。",
+    "model": "tokenfly-01/claude-opus-4.8",
+    "provider": "Anthropic",
+    "base_url": "http://1.95.199.64:8084/",
+    "api_key": "xxxxx"
+  },
+
+  "agents": {
+    "_comment": "按 agent_name 覆盖 default,例如 \"main\": {\"model\":\"...\",\"provider\":\"Anthropic\",\"base_url\":\"...\",\"api_key\":\"...\"}"
+  },
+
+  "agent_defaults": {
+    "_comment": "所有 agent 的通用行为默认值,对齐 ppt_agent 的 AGENT_LANGUAGE / MAX_ITERATIONS",
+    "language": "cn",
+    "max_iterations": 40
+  },
+
+  "embedding": {
+    "_comment": "三项都配才启用 MemoryRail(向量记忆);任一缺失自动跳过,不报错",
+    "model_name": "",
+    "base_url": "",
+    "api_key": ""
+  },
+
+  "web_search": {
+    "_comment": "bocha_api_key 配了才有付费搜索;ddg_enabled 控制免费 DuckDuckGo 搜索兜底",
+    "bocha_api_key": "",
+    "ddg_enabled": true
+  }
+}

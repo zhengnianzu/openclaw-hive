@@ -145,10 +145,10 @@ _FRAMEWORK_LAYOUTS = {
         "harness_local_config":   "uploads/config.yaml",
         "harness_sandbox_config": "/home/ma-user/.hermes/config.yaml",
         "upload_paths": [
-            "/home/ma-user/.hermes/profiles",
-            "/home/ma-user/.hermes/sessions", 
-            "/home/ma-user/.hermes/logs", 
-            "/home/ma-user/.hermes/state.db"
+            # 每个 profile (<agent-name>) 只保存 sessions / logs / workspace
+            "/home/ma-user/.hermes/profiles/*/sessions",
+            "/home/ma-user/.hermes/profiles/*/logs",
+            "/home/ma-user/.hermes/profiles/*/workspace",
         ],
         # workspace 隔离在 profiles/<name>/ 里
         "workspace_base": None,
@@ -160,11 +160,20 @@ _FRAMEWORK_LAYOUTS = {
         "upload_paths": [
             "/home/ma-user/.claude/projects",
             "/home/ma-user/.claude/todos",
-            "/home/ma-user/.claude/debug",
             "/home/ma-user/.claude/session-env",
         ],
         "workspace_base": "/home/ma-user/.claude/workspace",
     },
+    "openjiuwen": {
+        "harness_dir":            "/home/ma-user/.openjiuwen",
+        "harness_local_config":   "uploads/openjiuwen.json",
+        "harness_sandbox_config": "/home/ma-user/.openjiuwen/openjiuwen.json",
+        "upload_paths": [
+           
+        ],
+        "workspace_base": "/home/ma-user/.openjiuwen/workspace",
+    },
+
 }
 
 AGENT_FRAMEWORK: str = "openclaw"  # 占位默认, main() 会覆盖
@@ -698,7 +707,7 @@ class OpenClawDistillationTask:
             f"cd {self.config.sandbox_config.workspace} && "
             f"mkdir -p {log_path} && cd {code_stem} && "
             f"pip install -r requirements.txt && "
-            f"python {python_file} --config {config_path} 2>&1 | "
+            f"python {python_file} --config {config_path} --harness {AGENT_FRAMEWORK} 2>&1 | "
             f"tee {log_path}/{self.config.sandbox_config.result_log}"
         )
 
@@ -735,57 +744,72 @@ class OpenClawDistillationTask:
         self.logger.info(f"Script completed: {python_file}")
 
     async def _download_s3_skills(self, data_config_file: str) -> None:
-        """Download skills from S3 to sandbox."""
+        """Fetch task/default skills into the sandbox.
+
+        skill_download_path 以 "/" 开头 → 视为沙箱本地路径, 否则视为 OBS bucket 前缀
+        """
         data_cfg = parse_data_config(data_config_file)
 
-        task_skills = []
-        if data_cfg.agents and data_cfg.agents[0].get("skills"):
-            task_skills = data_cfg.agents[0]["skills"]
+        code_stem = Path(self.config.main_code_tar).stem
+        project_dir = os.path.join(self.config.sandbox_config.workspace, code_stem)
+        skill_src = self.config.obs_config.skill_download_path
+        skill_dir = (data_cfg.input_dir or {}).get("skill_dir", "skills")
+        if not isinstance(skill_dir, str):
+            skill_dir = "skills"
+        # task_skills → workspace/<project>/<skill_dir>; default_skills → default_skill_path
+        task_target_path = os.path.join(project_dir, skill_dir)
+        default_target_path = self.config.sandbox_config.default_skill_path
 
+        # 按需选取: task config 指定的 task_skills + 配置的 default_skills
+        task_skills = [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]]
         default_skills = self.config.obs_config.default_skills or []
-
         if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
             return
 
-        # task_skills 下载到 workspace/<project>/{skill_dir}
-        code_stem = Path(self.config.main_code_tar).stem
-        skill_dir = (data_cfg.input_dir or {}).get("skill_dir", "skills")
-        task_target_path = os.path.join(
-            self.config.sandbox_config.workspace, code_stem, skill_dir
-        )
-        # default_skills 下载到 default_skill_path:
-        default_target_path = f"{self.config.sandbox_config.default_skill_path}"
+        # skill_src 以 "/" 开头 → 沙箱本地路径, 逐个 cp; 否则 → OBS 前缀, 逐个 obsutil
+        is_local = skill_src.startswith("/")
 
         async def download_skill(skill_path: str, target_path: str) -> None:
-            bucket_path = os.path.join(
-                self.config.obs_config.skill_download_path, skill_path
-            ) + "/"
-            command = get_obsutil_downloader_command(
-                self.client_config.s3,
-                objects_storage_path=target_path,
-                bucket_path=bucket_path,
-            )
-            exec_request = ExtendExecCommand(
-                command=["/bin/bash", "-c", f"mkdir -p {target_path} && {command}"],
-                timeout=self.config.obs_config.download_timeout,
-                mode="stream",
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                self.logger.error(f"[S005] skill download failed: {skill_path}")
-                _log_sandbox_detail(self.logger, f"skill download failed — {skill_path}",
-                                    result, level=logging.ERROR)
-                raise HiveError("S005", detail=skill_path, sandbox_result=result)
+            if is_local:
+                # 只 cp 需要的单个 skill; 先删旧的同名目录避免残留 / 嵌套
+                src = os.path.join(skill_src.rstrip("/"), skill_path)
+                dest = os.path.join(target_path, skill_path)
+                inner = (f"rm -rf {dest} && mkdir -p {target_path} "
+                         f"&& cp -r {src} {target_path}/")
+            else:
+                bucket_path = os.path.join(skill_src, skill_path) + "/"
+                obs_cmd = get_obsutil_downloader_command(
+                    self.client_config.s3,
+                    objects_storage_path=target_path,
+                    bucket_path=bucket_path,
+                )
+                inner = f"mkdir -p {target_path} && {obs_cmd}"
+            await self._run_skill_cmd(inner, detail=skill_path)
 
         start_time = time.time()
-        tasks = []
-        for s in set(task_skills):
-            tasks.append(download_skill(s, task_target_path))
-        for s in set(default_skills):
-            tasks.append(download_skill(s, default_target_path))
+        tasks = [download_skill(s, task_target_path) for s in set(task_skills)]
+        tasks += [download_skill(s, default_target_path) for s in set(default_skills)]
         await asyncio.gather(*tasks)
-        self.logger.info(f"Downloaded skills (task={len(task_skills)}, default={len(default_skills)}) in {time.time() - start_time:.1f}s")
+        mode = "local-cp" if is_local else "obsutil"
+        self.logger.info(
+            f"Downloaded skills ({mode}: task={len(set(task_skills))}, "
+            f"default={len(set(default_skills))}) in {time.time() - start_time:.1f}s"
+        )
+
+    async def _run_skill_cmd(self, bash: str, *, detail: str) -> None:
+        """在沙箱里执行 skill 相关命令, 统一 [S005] 错误处理。"""
+        exec_request = ExtendExecCommand(
+            command=["/bin/bash", "-c", bash],
+            timeout=self.config.obs_config.download_timeout,
+            mode="stream",
+        )
+        result = await self.execution_client.extend(args=exec_request.to_dict())
+        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+            self.logger.error(f"[S005] skill fetch failed: {detail}")
+            _log_sandbox_detail(self.logger, f"skill fetch failed — {detail}",
+                                result, level=logging.ERROR)
+            raise HiveError("S005", detail=detail, sandbox_result=result)
 
     async def _download_s3_user_profile(self, data_config_file: str) -> None:
         """Download user profile from S3 to sandbox."""
@@ -909,6 +933,10 @@ class OpenClawDistillationTask:
                 bucket_path=bucket_path,
             )
             per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
+            purge_clauses = [
+                f'rm -rf {os.path.join(ws, "skills")}'
+                for ws in per_agent_workspaces
+            ]
             all_patterns = (
                 [sandbox_cfg.result_workdir, task_logs]
                 + list(_FW["upload_paths"])
@@ -921,7 +949,7 @@ class OpenClawDistillationTask:
                 for pattern in all_patterns
             ]
 
-            exec_cmd = " && ".join(upload_clauses) if upload_clauses else "true"
+            exec_cmd = " && ".join(purge_clauses + upload_clauses) if upload_clauses else "true"
         except Exception as e:
             self.logger.error(f"[upload_traj] build cmd failed: {e}\n{traceback.format_exc()}")
             return False
@@ -1091,6 +1119,33 @@ class OpenClawDistillationTask:
 # Task Orchestration
 # ============================================================================
 
+async def _upload_records_to_obs(config: TaskConfig) -> None:
+    """把本次运行的 complete.jsonl / failed.jsonl 上传到 OBS traj_save_path 下。"""
+    traj_path = config.obs_config.traj_save_path
+    obsutil_bin = config.obs_config.s3_download_script or "obsutil"
+    dest = check_bucket_path(f"{config.obs_config.traj_save_bucket}/{traj_path}")
+
+    for record_name in (config.task_complete_record, config.task_failed_record):
+        local_path = os.path.join(config.task_output_path, record_name)
+        if not os.path.exists(local_path):
+            logger.info(f"[upload_records] {local_path} not found, skip")
+            continue
+        cmd = [obsutil_bin, "cp", local_path, dest, "-f"]
+        try:
+            rc = await asyncio.to_thread(
+                run_cmd_stream, cmd, timeout=config.obs_config.upload_timeout
+            )
+            if rc == 0:
+                logger.info(f"[upload_records] uploaded {local_path} -> {dest}")
+            else:
+                logger.error(f"[upload_records] upload failed rc={rc}: {local_path}")
+        except Exception as e:
+            logger.error(
+                f"[upload_records] exception uploading {local_path}: "
+                f"{e}\n{traceback.format_exc()}"
+            )
+
+
 async def _worker(
     worker_id: int,
     task_queue: asyncio.Queue,
@@ -1256,6 +1311,9 @@ async def run_tasks(
     if workers:
         await asyncio.gather(*workers)
 
+    # Upload this run's complete/failed records to OBS
+    await _upload_records_to_obs(config)
+
     # Cleanup per-task handlers
     logger.removeHandler(main_handler)
     logger.removeHandler(task_handler)
@@ -1340,4 +1398,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
