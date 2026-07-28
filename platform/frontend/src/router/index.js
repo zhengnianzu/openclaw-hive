@@ -11,8 +11,9 @@ const routes = [
       { path: 'dashboard', name: 'Dashboard', component: () => import('../views/Dashboard.vue') },
       { path: 'create', name: 'Create', component: () => import('../views/CreateInstance.vue') },
       { path: 'instance/:id', name: 'InstanceDetail', component: () => import('../views/InstanceDetail.vue') },
-      { path: 'logs/:id', name: 'LogViewer', component: () => import('../views/LogViewer.vue') },
-      { path: 'outputs/:id', name: 'OutputViewer', component: () => import('../views/OutputViewer.vue') },
+      // 日志/输出已合并进 InstanceDetail 的 tab，旧链接重定向过去
+      { path: 'logs/:id', redirect: to => ({ path: `/instance/${to.params.id}`, query: { tab: 'logs' } }) },
+      { path: 'outputs/:id', redirect: to => ({ path: `/instance/${to.params.id}`, query: { tab: 'outputs' } }) },
       { path: 'registrations', name: 'Registrations', component: () => import('../views/TaskRegistrationList.vue') },
       { path: 'task-register', name: 'TaskRegister', component: () => import('../views/TaskRegister.vue') },
       { path: 'users', name: 'UserManagement', component: () => import('../views/UserManagement.vue') },

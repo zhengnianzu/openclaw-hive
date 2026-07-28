@@ -16,38 +16,40 @@
         </div>
       </template>
       <div v-if="evalAvailable">
-        <div class="eval-two-col">
-          <!-- 左列: 6个指标 (flex:7) -->
-          <div class="eval-stat-grid">
-            <div class="eval-stat-item">
-              <span class="eval-stat-num">{{ evalTotalSamples }}</span>
-              <span class="eval-stat-label">总样本量</span>
-            </div>
-            <div class="eval-stat-item">
-              <span class="eval-stat-num" style="color:#6366f1">{{ evalUploadedTrajs }}</span>
-              <span class="eval-stat-label">上传轨迹</span>
-            </div>
-            <div class="eval-stat-item">
-              <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedCountDisplay }}</span>
-              <span class="eval-stat-label">任务完成数</span>
-            </div>
-            <div class="eval-stat-item">
-              <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedRateDisplay }}</span>
-              <span class="eval-stat-label">任务完成率</span>
-            </div>
-            <div class="eval-stat-item">
-              <span class="eval-stat-num" style="color:#10b981">{{ evalCount }}</span>
-              <span class="eval-stat-label">已评估</span>
-            </div>
-            <div class="eval-stat-item" style="cursor:pointer" @click="scoreDetailVisible = true">
-              <span class="eval-stat-num avg-score-link">{{ avgScoreDisplay }}</span>
-              <span class="eval-stat-label">平均分</span>
-            </div>
+        <!-- 顶部: 指标 -->
+        <div class="eval-stat-grid">
+          <div class="eval-stat-item">
+            <span class="eval-stat-num">{{ evalTotalSamples }}</span>
+            <span class="eval-stat-label">总样本量</span>
           </div>
-          <!-- 右列: 柱状图 (flex:3) -->
-          <div v-if="evalCount > 0" class="score-chart">
-            <div class="score-chart-title">分数分布</div>
-            <div class="score-chart-body">
+          <div class="eval-stat-item">
+            <span class="eval-stat-num" style="color:#6366f1">{{ evalUploadedTrajs }}</span>
+            <span class="eval-stat-label">上传轨迹</span>
+          </div>
+          <div class="eval-stat-item">
+            <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedCountDisplay }}</span>
+            <span class="eval-stat-label">任务完成数</span>
+          </div>
+          <div class="eval-stat-item">
+            <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedRateDisplay }}</span>
+            <span class="eval-stat-label">任务完成率</span>
+          </div>
+          <div class="eval-stat-item">
+            <span class="eval-stat-num" style="color:#10b981">{{ evalCount }}</span>
+            <span class="eval-stat-label">已评估</span>
+          </div>
+          <div class="eval-stat-item" style="cursor:pointer" @click="scoreDetailVisible = true">
+            <span class="eval-stat-num avg-score-link">{{ avgScoreDisplay }}</span>
+            <span class="eval-stat-label">平均分</span>
+          </div>
+        </div>
+
+        <!-- 底部: 两图并排 -->
+        <div class="eval-charts-row">
+          <!-- 分数分布 -->
+          <div class="chart-box">
+            <div class="chart-title">分数分布</div>
+            <div v-if="evalCount > 0" class="score-chart-body">
               <div v-for="bucket in distributionBuckets" :key="bucket.label" class="score-chart-col">
                 <span class="score-chart-count">{{ bucket.count || '' }}</span>
                 <div class="score-chart-bar-wrap">
@@ -56,6 +58,30 @@
                 <span class="score-chart-label">{{ bucket.label }}</span>
               </div>
             </div>
+            <el-empty v-else description="暂无分数" :image-size="30" />
+          </div>
+
+          <!-- 轨迹分级 -->
+          <div class="chart-box" v-loading="trajLoading">
+            <div class="chart-title-row">
+              <span class="chart-title">
+                轨迹分级<span v-if="trajGradedTrajs" style="color:var(--text-muted)"> · 已分级 {{ trajGradedTrajs }}</span>
+              </span>
+              <span>
+                <el-button size="small" @click="loadTrajStats(false)" :loading="trajLoading">增量刷新</el-button>
+                <el-button size="small" type="warning" @click="loadTrajStats(true)" :loading="trajLoading">全量刷新</el-button>
+              </span>
+            </div>
+            <div v-if="trajAvailable" class="score-chart-body">
+              <div v-for="bucket in trajBuckets" :key="bucket.label" class="score-chart-col">
+                <span class="score-chart-count">{{ bucket.count || '' }}</span>
+                <div class="score-chart-bar-wrap">
+                  <div class="score-chart-bar traj-bar" :style="{height: bucket.pct + '%', background: bucket.color}" />
+                </div>
+                <span class="score-chart-label">{{ bucket.label }}</span>
+              </div>
+            </div>
+            <el-empty v-else description="暂无轨迹分级数据（点刷新抓取）" :image-size="30" />
           </div>
         </div>
       </div>
@@ -330,6 +356,52 @@ async function loadEvalStats(refresh = false) {
   }
 }
 
+// ============ 轨迹分级 (L0–L3) ============
+
+const trajLoading = ref(false)
+const trajAvailable = ref(false)
+const trajGradedTrajs = ref(0)
+const trajLevelDist = ref({})
+
+// x 轴档位顺序 + 配色（none 灰 / L0-L3 冷到暖渐进）
+const TRAJ_LEVEL_ORDER = ['none', 'L0', 'L1', 'L1.5', 'L2', 'L3']
+const TRAJ_LEVEL_COLOR = {
+  none: '#909399',
+  L0: '#94a3b8',
+  L1: '#38bdf8',
+  'L1.5': '#818cf8',
+  L2: '#a78bfa',
+  L3: '#10b981',
+}
+
+const trajBuckets = computed(() => {
+  const dist = trajLevelDist.value
+  const maxCount = Math.max(1, ...TRAJ_LEVEL_ORDER.map(l => dist[l] || 0))
+  return TRAJ_LEVEL_ORDER.map(label => {
+    const count = dist[label] || 0
+    return {
+      label,
+      count,
+      pct: (count / maxCount) * 100,
+      color: TRAJ_LEVEL_COLOR[label] || '#909399',
+    }
+  })
+})
+
+async function loadTrajStats(refresh = false, cacheOnly = false) {
+  trajLoading.value = true
+  try {
+    const res = await api.get(`/logs/${id}/traj-stats`, { params: { refresh, cache_only: cacheOnly } })
+    trajAvailable.value = res.available
+    trajGradedTrajs.value = res.graded_trajs || 0
+    trajLevelDist.value = res.level_dist || {}
+  } catch {
+    trajAvailable.value = false
+  } finally {
+    trajLoading.value = false
+  }
+}
+
 // ============ 文件树（两级加载） ============
 
 const treeProps = {
@@ -550,6 +622,7 @@ onMounted(async () => {
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
   loadTopDirs()
   loadEvalStats()
+  loadTrajStats(false, true)   // 只读本地缓存，无缓存时为空、由按钮触发 OBS 抓取
 })
 </script>
 
@@ -572,12 +645,21 @@ onMounted(async () => {
 }
 
 /* 评估统计: 两列布局 7:3 */
-.eval-two-col { display: flex; gap: 24px; align-items: stretch; }
 .eval-stat-grid {
-  flex: 7;
   display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
   align-content: center;
+  padding-bottom: 16px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border-color, #e5e7eb);
 }
+.eval-charts-row { display: flex; gap: 32px; align-items: stretch; }
+.chart-box { flex: 1; min-width: 0; }
+.chart-title { font-size: 13px; color: var(--text-muted); }
+.chart-title-row {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px; min-height: 24px;
+}
+.chart-box > .chart-title { display: block; margin-bottom: 8px; }
+.traj-bar { max-width: 40px; }
 .eval-stat-item { display: flex; flex-direction: column; align-items: center; padding: 8px 0; }
 .eval-stat-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
 .avg-score-link {

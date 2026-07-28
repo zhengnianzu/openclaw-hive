@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from omegaconf import OmegaConf
 
 from ..core.config import settings
-from ..core.database import get_connection, async_execute
+from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 
@@ -571,6 +571,24 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
 # 启动准备：OBS 下载、打包、任务数统计
 # ============================================================================
 
+def _inject_harness_type(actual_dir: str, harness_type: str):
+    """遍历目录下所有 JSON，注入 harness_type（幂等）。同步阻塞操作，应在线程中调用。"""
+    for _root, _dirs, _files in os.walk(actual_dir):
+        for _fname in _files:
+            if not _fname.endswith(".json"):
+                continue
+            _fpath = os.path.join(_root, _fname)
+            try:
+                with open(_fpath, "r", encoding="utf-8") as _f:
+                    _cfg = json.load(_f)
+                if _cfg.get("harness_type") != harness_type:
+                    _cfg["harness_type"] = harness_type
+                    with open(_fpath, "w", encoding="utf-8") as _f:
+                        json.dump(_cfg, _f, indent=2, ensure_ascii=False)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+
 async def _prepare_instance(instance_id: str, inst: dict):
     """启动前的准备工作：下载用户配置、下载代码仓、打包、统计任务数。"""
     config_path = inst["config_path"]
@@ -627,21 +645,9 @@ async def _prepare_instance(instance_id: str, inst: dict):
             else:
                 break
 
-        # 注入 harness_type 到每个 JSON（幂等操作）
-        for _root, _dirs, _files in os.walk(actual_dir):
-            for _fname in _files:
-                if not _fname.endswith(".json"):
-                    continue
-                _fpath = os.path.join(_root, _fname)
-                try:
-                    with open(_fpath, "r", encoding="utf-8") as _f:
-                        _cfg = json.load(_f)
-                    if _cfg.get("harness_type") != harness_type:
-                        _cfg["harness_type"] = harness_type
-                        with open(_fpath, "w", encoding="utf-8") as _f:
-                            json.dump(_cfg, _f, indent=2, ensure_ascii=False)
-                except (json.JSONDecodeError, OSError):
-                    pass
+        # 注入 harness_type 到每个 JSON（幂等操作）；
+        # 大目录（可能上千个文件、数百 MB）的同步遍历放到线程里，避免阻塞事件循环
+        await asyncio.to_thread(_inject_harness_type, actual_dir, harness_type)
 
         # 更新配置中的 task_input_path
         base.run_config.task.task_input_path = actual_dir
@@ -725,7 +731,15 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
         conn.execute("UPDATE task_instances SET status='preparing' WHERE id=?", (instance_id,))
     _status_cache.pop(instance_id, None)
 
-    # 执行准备工作（OBS下载、打包、统计任务数）
+    # 准备（OBS下载、打包、统计任务数）+ 启动，全部放到后台执行，
+    # 立即返回，避免大目录下载/处理长时间占用 worker 阻塞其他请求。
+    asyncio.create_task(_prepare_and_launch(instance_id, inst))
+
+    return {"message": "实例准备中，正在后台下载配置并启动", "status": "preparing"}
+
+
+async def _prepare_and_launch(instance_id: str, inst: dict):
+    """后台执行准备与启动。失败时回写 created 状态和错误信息。"""
     try:
         await _prepare_instance(instance_id, inst)
     except Exception as e:
@@ -734,35 +748,45 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
                 "UPDATE task_instances SET status='created', error_summary=? WHERE id=?",
                 (str(e)[:500], instance_id),
             )
-        raise
+        _status_cache.pop(instance_id, None)
+        print(f"[start] 实例 {instance_id} 准备失败: {e}")
+        return
 
     # 启动 hive
-    config_path = inst["config_path"]
-    output_dir = _get_output_dir(config_path)
-    os.makedirs(output_dir, exist_ok=True)
-    log_file = os.path.join(output_dir, "nohup.log")
-    clean_log_file = os.path.join(output_dir, "nohup_clean.log")
+    try:
+        config_path = inst["config_path"]
+        output_dir = _get_output_dir(config_path)
+        os.makedirs(output_dir, exist_ok=True)
+        log_file = os.path.join(output_dir, "nohup.log")
+        clean_log_file = os.path.join(output_dir, "nohup_clean.log")
 
-    hive_py = os.path.join(settings.HIVE_ROOT, "hive.py")
-    env = os.environ.copy()
-    env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
+        hive_py = os.path.join(settings.HIVE_ROOT, "hive.py")
+        env = os.environ.copy()
+        env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
 
-    with open(log_file, "a") as lf:
-        proc = subprocess.Popen(
-            ["python", hive_py, "--config", config_path],
-            stdout=lf, stderr=lf,
-            cwd=settings.HIVE_ROOT,
-            env=env,
-            start_new_session=True,
-        )
+        with open(log_file, "a") as lf:
+            proc = subprocess.Popen(
+                ["python", hive_py, "--config", config_path],
+                stdout=lf, stderr=lf,
+                cwd=settings.HIVE_ROOT,
+                env=env,
+                start_new_session=True,
+            )
 
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
-            (proc.pid, datetime.now().isoformat(), instance_id),
-        )
-
-    return {"message": "实例已启动", "pid": proc.pid}
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
+                (proc.pid, datetime.now().isoformat(), instance_id),
+            )
+        _status_cache.pop(instance_id, None)
+    except Exception as e:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET status='created', error_summary=? WHERE id=?",
+                (str(e)[:500], instance_id),
+            )
+        _status_cache.pop(instance_id, None)
+        print(f"[start] 实例 {instance_id} 启动失败: {e}")
 
 
 @router.post("/{instance_id}/stop")
@@ -921,12 +945,15 @@ def _estimate_remaining_time(
 _STATUS_RE = re.compile(
     r"任务执行状态=(?P<status>任务成功|任务失败|任务异常)\s+error_code=(?P<code>\S+)"
 )
+# 状态行里的 config=<文件名> 字段，用于把 task_idx 映射到具体配置名（进而查 eval 缓存）
+_CONFIG_RE = re.compile(r"config=(?P<config>\S+)")
 
 
 def _scan_task_file(fpath: str):
-    """读取单个 task 日志，返回 (last_status, last_code)；异常返回 (None, None)。"""
+    """读取单个 task 日志，返回 (last_status, last_code, last_config)；异常返回 (None, None, None)。"""
     last_status = None
     last_code = None
+    last_config = None
     try:
         with open(fpath, "r", errors="replace") as f:
             for line in f:
@@ -934,9 +961,12 @@ def _scan_task_file(fpath: str):
                 if m:
                     last_status = m.group("status")
                     last_code = m.group("code")
+                    mc = _CONFIG_RE.search(line)
+                    if mc:
+                        last_config = mc.group("config")
     except OSError:
-        return None, None
-    return last_status, last_code
+        return None, None, None
+    return last_status, last_code, last_config
 
 
 def _compute_analyze(config_path: str, total_tasks: int) -> dict:
@@ -971,8 +1001,8 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
                 # 文件未变化，复用上次解析结果，跳过读取
                 new_state[fname] = cached
             else:
-                status, code = _scan_task_file(entry.path)
-                new_state[fname] = (sig[0], sig[1], status, code)
+                status, code, cfg = _scan_task_file(entry.path)
+                new_state[fname] = (sig[0], sig[1], status, code, cfg)
 
     _analyze_file_state[config_path] = new_state
 
@@ -980,7 +1010,7 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     failed = 0
     abnormal_by_prefix = {"C": 0, "S": 0, "T": 0, "X": 0}
 
-    for _mtime, _size, last_status, last_code in new_state.values():
+    for _mtime, _size, last_status, last_code, _cfg in new_state.values():
         if last_status == "任务成功":
             succeeded += 1
         elif last_status == "任务失败":
@@ -1019,6 +1049,98 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     return result
 
 
+# ---- per-task 明细：把增量扫描结果 + evaluator 评分聚合进 task_records 表 ----
+
+def _compute_task_rows(config_path: str) -> list[dict]:
+    """基于 _analyze_file_state 的增量扫描结果，产出每任务行（不额外读盘）。
+    依赖调用前 _compute_analyze 已刷新过该 config_path 的 file_state。"""
+    state = _analyze_file_state.get(config_path, {})
+    rows = []
+    for fname, tup in state.items():
+        # tup = (mtime, size, status, code, config_name)
+        _mtime, _size, status, code, config_name = tup
+        m = re.search(r"task-(\d+)\.log", fname)
+        task_idx = int(m.group(1)) if m else None
+        # 无 config= 字段时回退用日志文件名（stem 仍可用于展示，只是查不到 eval）
+        if not config_name:
+            config_name = fname
+        category = None
+        if status == "任务异常":
+            prefix = (code or "")[:1]
+            category = prefix if prefix in ("C", "S", "T") else "X"
+        rows.append({
+            "task_idx": task_idx,
+            "config_name": config_name,
+            "status": status,
+            "error_code": code,
+            "error_category": category,
+        })
+    return rows
+
+
+def _load_eval_cache(instance_id: str) -> dict:
+    """读取 instances/<id>/_eval_score.json（键为 config stem）；不存在返回 {}。不触发 OBS 下载。"""
+    cache_file = os.path.join(_get_instance_dir(instance_id), "_eval_score.json")
+    if not os.path.exists(cache_file):
+        return {}
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_traj_cache(instance_id: str) -> dict:
+    """读取 instances/<id>/_traj_score.json（键为 config stem / OBS task_dir）；不存在返回 {}。不触发 OBS 下载。"""
+    cache_file = os.path.join(_get_instance_dir(instance_id), "_traj_score.json")
+    if not os.path.exists(cache_file):
+        return {}
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _sync_task_records(instance_id: str, config_path: str) -> None:
+    """把 per-task 扫描结果 + eval / traj 缓存 UPSERT 进 task_records（跑在执行器线程里，off-event-loop）。
+    eval/traj 各列用 COALESCE：本地缓存尚未刷新时保留上次已写入的值。"""
+    rows = _compute_task_rows(config_path)
+    if not rows:
+        return
+    eval_map = _load_eval_cache(instance_id)
+    traj_map = _load_traj_cache(instance_id)
+    with get_connection() as conn:
+        for r in rows:
+            stem = Path(r["config_name"]).stem
+            ev = eval_map.get(stem) or {}
+            tj = traj_map.get(stem) or {}
+            conn.execute(
+                """
+                INSERT INTO task_records
+                    (instance_id, task_idx, config_name, status, error_code, error_category,
+                     eval_score, eval_completion, gate, traj_level, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(instance_id, config_name) DO UPDATE SET
+                    task_idx        = excluded.task_idx,
+                    status          = excluded.status,
+                    error_code      = excluded.error_code,
+                    error_category  = excluded.error_category,
+                    eval_score      = COALESCE(excluded.eval_score, task_records.eval_score),
+                    eval_completion = COALESCE(excluded.eval_completion, task_records.eval_completion),
+                    gate            = COALESCE(excluded.gate, task_records.gate),
+                    traj_level      = COALESCE(excluded.traj_level, task_records.traj_level),
+                    updated_at      = CURRENT_TIMESTAMP
+                """,
+                (
+                    instance_id, r["task_idx"], r["config_name"], r["status"],
+                    r["error_code"], r["error_category"],
+                    ev.get("score"), ev.get("completion"), ev.get("gate"),
+                    tj.get("level"),
+                ),
+            )
+
+
 def _refresh_running_once():
     """后台线程：预热 running/preparing 实例的状态与分析缓存。"""
     try:
@@ -1035,6 +1157,11 @@ def _refresh_running_once():
             inst = _sync_instance_status(inst)
             if inst["status"] == "running":
                 _compute_analyze(inst["config_path"], inst["total_tasks"])
+                # 复用刚刷新的 file_state，把 per-task 明细写进 task_records
+                try:
+                    _sync_task_records(inst["id"], inst["config_path"])
+                except Exception:
+                    pass
         except Exception:
             continue
 
@@ -1078,6 +1205,122 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
         return cached[0]
 
     return _compute_analyze(config_path, total_tasks)
+
+
+# task_records 允许的排序列白名单（防 SQL 注入）
+_TASK_RECORDS_SORT = {
+    "task_idx", "config_name", "status", "error_code",
+    "error_category", "eval_score", "eval_completion", "gate", "updated_at",
+}
+
+
+@router.get("/{instance_id}/task-records")
+async def list_task_records(
+    instance_id: str,
+    category: str | None = Query(None, description="C/S/T/X 或 success"),
+    status: str | None = Query(None, description="任务成功/任务失败/任务异常"),
+    min_score: float | None = Query(None, description="eval_score 下限"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    sort_by: str = Query("task_idx"),
+    sort_dir: str = Query("asc"),
+    user: dict = Depends(get_current_user),
+):
+    """按实例查询 per-task 明细，支持按错误分类/状态/分数筛选、分页、排序。"""
+    row = await async_query_one(
+        "SELECT * FROM task_instances WHERE id=?", (instance_id,)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    config_path = row["config_path"]
+
+    # 确保 task_records 已填充（running 刷新 / 老实例 0 行兜底）
+    await _ensure_task_records(instance_id, config_path, row["status"], row["total_tasks"])
+
+    # 组装筛选条件
+    where = ["instance_id = ?"]
+    params: list = [instance_id]
+    if category:
+        if category == "success":
+            where.append("status = ?")
+            params.append("任务成功")
+        else:
+            where.append("error_category = ?")
+            params.append(category)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if min_score is not None:
+        where.append("eval_score >= ?")
+        params.append(min_score)
+    where_sql = " AND ".join(where)
+
+    # 排序：列白名单 + 方向白名单
+    col = sort_by if sort_by in _TASK_RECORDS_SORT else "task_idx"
+    direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+
+    total_row = await async_query_one(
+        f"SELECT COUNT(*) AS n FROM task_records WHERE {where_sql}", tuple(params)
+    )
+    total = total_row["n"] if total_row else 0
+
+    offset = (page - 1) * page_size
+    tasks = await async_query(
+        f"SELECT task_idx, config_name, status, error_code, error_category, "
+        f"eval_score, eval_completion, gate, traj_level "
+        f"FROM task_records WHERE {where_sql} "
+        f"ORDER BY {col} {direction} LIMIT ? OFFSET ?",
+        tuple(params) + (page_size, offset),
+    )
+
+    return {"total": total, "page": page, "page_size": page_size, "tasks": tasks}
+
+
+async def _ensure_task_records(instance_id: str, config_path: str, status: str, total_tasks: int):
+    """确保 task_records 已填充：running 每次刷新；非 running 且 0 行时兜底同步一次。"""
+    if status == "running":
+        try:
+            await async_execute(_sync_task_records, instance_id, config_path)
+        except Exception:
+            pass
+        return
+    existing = await async_query_one(
+        "SELECT COUNT(*) AS n FROM task_records WHERE instance_id=?", (instance_id,)
+    )
+    if not existing or existing["n"] == 0:
+        try:
+            await async_execute(_compute_analyze, config_path, total_tasks)
+            await async_execute(_sync_task_records, instance_id, config_path)
+        except Exception:
+            pass
+
+
+@router.get("/{instance_id}/task-status-map")
+async def task_status_map(instance_id: str, user: dict = Depends(get_current_user)):
+    """返回全量 {task_idx: {status, category, code}}，供日志页下拉框着色（精简、无分页）。"""
+    row = await async_query_one(
+        "SELECT * FROM task_instances WHERE id=?", (instance_id,)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    await _ensure_task_records(instance_id, row["config_path"], row["status"], row["total_tasks"])
+
+    rows = await async_query(
+        "SELECT task_idx, status, error_code, error_category "
+        "FROM task_records WHERE instance_id=? AND task_idx IS NOT NULL",
+        (instance_id,),
+    )
+    mapping = {
+        r["task_idx"]: {
+            "status": r["status"],
+            "category": r["error_category"],
+            "code": r["error_code"],
+        }
+        for r in rows
+    }
+    return {"map": mapping}
 
 
 @router.delete("/{instance_id}")

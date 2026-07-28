@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSock
 from fastapi.responses import FileResponse
 
 from ..core.config import settings
-from ..core.database import get_connection
+from ..core.database import get_connection, async_execute
 from ..core.security import get_current_user
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
@@ -306,6 +306,38 @@ async def list_task_logs(
     return {"files": files}
 
 
+def _tail_bytes(log_file: str, tail: int, chunk_size: int = 65536, end: int = -1) -> tuple[str, int, int]:
+    """从文件里取「结束于字节 end 之前的最后 tail 行」，反向分块读，读取量与 tail 成正比、与文件总大小无关。
+    end<0 表示从文件末尾（EOF）起。返回 (text, 返回的行数, start_offset)，
+    其中 start_offset = 返回窗口首字节在文件中的偏移，是上一页翻页的下一个 end；start_offset==0 表示已到文件头。"""
+    with open(log_file, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        end_pos = file_size if end is None or end < 0 else min(end, file_size)
+        blocks = []
+        newlines = 0
+        pos = end_pos
+        # 需要 tail 行 -> 累积到 tail 个换行符即可覆盖 end_pos 之前的最后 tail 行（含末行）
+        while pos > 0 and newlines <= tail:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            block = f.read(read_size)
+            blocks.append(block)
+            newlines += block.count(b"\n")
+        data = b"".join(reversed(blocks))  # data 覆盖文件区间 [pos, end_pos)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    if len(lines) > tail:
+        dropped = "".join(lines[:-tail])
+        # 丢弃的前缀字节数即返回窗口相对 pos 的偏移；用同样的 replace 解码保证字节数自洽
+        start_offset = pos + len(dropped.encode("utf-8", "replace"))
+        lines = lines[-tail:]
+    else:
+        start_offset = pos  # 已读到文件头
+    return "".join(lines), len(lines), start_offset
+
+
 @router.get("/{instance_id}/task-log/{filename}")
 async def get_task_log(
     instance_id: str,
@@ -313,6 +345,7 @@ async def get_task_log(
     tail: int = Query(default=200),
     mode: str = Query(default="verbose"),
     raw: bool = Query(default=False, description="true 时返回原始文本，不切行、不改换行"),
+    end: int = Query(default=-1, description="raw+tail>0 时的字节游标：取结束于该字节之前的最后 tail 行；<0 表示从 EOF 起"),
     user: dict = Depends(get_current_user),
 ):
     if not re.match(r'^(task-\d+|main|nohup)\.log$', filename):
@@ -326,16 +359,14 @@ async def get_task_log(
     if not os.path.exists(log_file):
         return {"text": "", "lines": [], "total_lines": 0}
     if raw:
-        # 二进制读，避免文本模式对 \r\n 的规范化;完整保留换行符
+        if tail and tail > 0:
+            # 只反向读取尾部（可带字节游标 end 向上翻页），避免把整个大文件读进内存
+            text, cnt, start_offset = await asyncio.to_thread(_tail_bytes, log_file, tail, 65536, end)
+            return {"text": text, "total_lines": cnt, "start_offset": start_offset, "has_more": start_offset > 0}
+        # tail<=0：确实要全量，才整文件读
         async with aiofiles.open(log_file, "rb") as f:
             data = await f.read()
         text = data.decode("utf-8", errors="replace")
-        if tail and tail > 0:
-            all_lines = text.splitlines(keepends=True)
-            total = len(all_lines)
-            if tail < total:
-                text = "".join(all_lines[-tail:])
-            return {"text": text, "total_lines": total}
         total = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
         return {"text": text, "total_lines": total}
 
@@ -628,6 +659,7 @@ async def _list_obs_dirs(obs_base: str) -> list[str]:
 
 
 _EVAL_SCORE_FILE = "_eval_score.json"
+_TRAJ_SCORE_FILE = "_traj_score.json"
 
 
 async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
@@ -803,6 +835,12 @@ async def get_eval_stats(
                 await f.write(json.dumps(all_scores, ensure_ascii=False, indent=2))
         except Exception:
             pass
+        # 新评分落盘后，即时并入 task_records（延迟导入避免模块级循环依赖）
+        try:
+            from .instances import _sync_task_records
+            await async_execute(_sync_task_records, instance_id, inst["config_path"])
+        except Exception:
+            pass
 
     all_completed = {**cached_completed, **new_completed}
     _task_completed_cache[instance_id] = all_completed
@@ -816,4 +854,132 @@ async def get_eval_stats(
         "task_scores": simple_scores,
         "task_eval_details": all_scores,
         "task_completed": all_completed,
+    }
+
+
+async def _download_traj_level(obs_base: str, task_dir: str, tmp_dir: str,
+                               semaphore: asyncio.Semaphore) -> tuple[str, dict | None]:
+    """下载单个任务的 traj_stats_result.json，提取轨迹分级 task_level。"""
+    async with semaphore:
+        traj_path = f"{obs_base}{task_dir}/logs/traj_stats_result.json"
+        local_file = os.path.join(tmp_dir, f"traj_{task_dir}.json")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                settings.OBSUTIL_PATH, "cp", traj_path, local_file,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+
+            if not os.path.exists(local_file):
+                return (task_dir, None)
+
+            async with aiofiles.open(local_file, "r", errors="replace") as f:
+                raw = await f.read()
+            data = json.loads(raw)
+
+            level = data.get("task_level")
+            if not level:
+                return (task_dir, None)
+
+            completion = data.get("best_completion")
+            try:
+                completion = float(completion) if completion is not None else None
+            except (ValueError, TypeError):
+                completion = None
+
+            return (task_dir, {"level": str(level), "completion": completion})
+        except Exception:
+            return (task_dir, None)
+        finally:
+            try:
+                os.remove(local_file)
+            except OSError:
+                pass
+
+
+# 轨迹分级的固定档位（x 轴顺序）
+_TRAJ_LEVELS = ["none", "L0", "L1", "L1.5", "L2", "L3"]
+
+
+@router.get("/{instance_id}/traj-stats")
+async def get_traj_stats(
+    instance_id: str,
+    refresh: bool = Query(default=False, description="强制刷新全部缓存"),
+    cache_only: bool = Query(default=False, description="只读本地缓存，不触发 OBS 下载（页面加载用）"),
+    user: dict = Depends(get_current_user),
+):
+    """扫描每个任务目录的 traj_stats_result.json，返回 L0–L3 轨迹分级分布。"""
+    inst = _get_instance(instance_id)
+
+    inst_dir = str(Path(inst["config_path"]).parent)
+    local_cache_file = os.path.join(inst_dir, _TRAJ_SCORE_FILE)
+
+    # 1) 读本地缓存（非全量刷新时）
+    cached_levels: dict[str, dict] = {}
+    if not refresh and os.path.exists(local_cache_file):
+        try:
+            async with aiofiles.open(local_cache_file, "r") as f:
+                cached_levels = json.loads(await f.read())
+        except Exception:
+            cached_levels = {}
+
+    # cache_only：仅返回缓存，不列 OBS、不下载（页面加载路径，避免昂贵扫描）
+    if cache_only:
+        return _aggregate_traj_dist(inst, cached_levels)
+
+    obs_base = _get_obs_base_path(inst)
+    all_dirs = await _list_obs_dirs(obs_base)
+    task_dirs = [d for d in all_dirs if d != "logs"]
+
+    new_dirs = [d for d in task_dirs if d not in cached_levels]
+
+    tmp_dir = os.path.join(settings.HIVE_ROOT, "platform", "tmp", instance_id)
+    os.makedirs(tmp_dir, exist_ok=True)
+    semaphore = asyncio.Semaphore(10)
+
+    new_levels: dict[str, dict] = {}
+    if new_dirs:
+        results = await asyncio.gather(
+            *[_download_traj_level(obs_base, d, tmp_dir, semaphore) for d in new_dirs]
+        )
+        for task_dir, val in results:
+            if val is not None:
+                new_levels[task_dir] = val
+
+    all_levels = {**cached_levels, **new_levels}
+
+    # 2) 有新数据时写回本地缓存，并即时并入 task_records
+    if new_levels:
+        try:
+            async with aiofiles.open(local_cache_file, "w") as f:
+                await f.write(json.dumps(all_levels, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+        try:
+            from .instances import _sync_task_records
+            await async_execute(_sync_task_records, instance_id, inst["config_path"])
+        except Exception:
+            pass
+
+    # 3) 聚合分布
+    return _aggregate_traj_dist(inst, all_levels)
+
+
+def _aggregate_traj_dist(inst: dict, all_levels: dict) -> dict:
+    """把 {task_dir: {level, completion}} 聚合成固定六档分布，未知档位归到 none。"""
+    level_dist = {lv: 0 for lv in _TRAJ_LEVELS}
+    task_levels = {}
+    for task_dir, v in all_levels.items():
+        lv = (v or {}).get("level") or "none"
+        if lv not in level_dist:
+            lv = "none"
+        level_dist[lv] += 1
+        task_levels[task_dir] = lv
+
+    return {
+        "available": bool(all_levels),
+        "total_samples": inst.get("total_tasks", 0),
+        "graded_trajs": len(all_levels),
+        "level_dist": level_dist,
+        "task_levels": task_levels,
     }

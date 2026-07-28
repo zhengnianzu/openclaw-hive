@@ -59,6 +59,12 @@
         <el-option label="Hermes" value="hermes" />
         <el-option label="Claude Code" value="claude-code" />
       </el-select>
+      <el-select v-model="userFilter" placeholder="创建者筛选" clearable filterable size="default" style="width:160px">
+        <el-option v-for="u in userOptions" :key="u" :label="u" :value="u" />
+      </el-select>
+      <el-date-picker v-model="dateRange" type="daterange" range-separator="~"
+        start-placeholder="开始" end-placeholder="结束" value-format="YYYY-MM-DD"
+        size="default" style="width:220px" clearable />
       <el-input v-model="nameSearch" placeholder="搜索任务名称" clearable size="default" style="width:260px" prefix-icon="Search" />
     </div>
 
@@ -104,13 +110,14 @@
         <el-table-column prop="concurrent_num" label="并发" width="70" align="center" resizable>
           <template #default="{row}"><span class="mono-num">{{ row.concurrent_num }}</span></template>
         </el-table-column>
+        <el-table-column prop="created_by" label="创建者" width="120" show-overflow-tooltip resizable />
         <el-table-column prop="created_at" label="创建时间" width="180" resizable />
         <el-table-column label="操作" width="280">
           <template #default="{row}">
             <div style="display:flex;align-items:center;gap:4px">
               <el-button size="small" @click="router.push(`/instance/${row.id}`)">详情</el-button>
-              <el-button size="small" type="primary" @click="router.push(`/logs/${row.id}`)">日志</el-button>
-              <el-button size="small" @click="router.push(`/outputs/${row.id}`)">输出</el-button>
+              <el-button size="small" type="primary" @click="router.push(`/instance/${row.id}?tab=logs`)">日志</el-button>
+              <el-button size="small" @click="router.push(`/instance/${row.id}?tab=outputs`)">输出</el-button>
               <el-dropdown v-if="authStore.isOperator" trigger="click" @command="cmd => handleCommand(cmd, row)">
                 <el-button size="small">更多<el-icon style="margin-left:4px"><ArrowDown /></el-icon></el-button>
                 <template #dropdown>
@@ -145,6 +152,8 @@ const loading = ref(false)
 const timeEstimates = ref({})
 const statusFilter = ref('')
 const harnessFilter = ref('')
+const userFilter = ref('')
+const dateRange = ref(null)
 const nameSearch = ref('')
 const router = useRouter()
 let timer = null
@@ -157,10 +166,24 @@ const progressColor = [
 
 const runningInstances = computed(() => instances.value.filter(i => i.status === 'running'))
 
+const userOptions = computed(() => {
+  const set = new Set()
+  instances.value.forEach(i => { if (i.created_by) set.add(i.created_by) })
+  return Array.from(set).sort()
+})
+
 const filteredInstances = computed(() => {
   let list = instances.value
   if (statusFilter.value) list = list.filter(i => i.status === statusFilter.value)
   if (harnessFilter.value) list = list.filter(i => (i.harness_type || 'openclaw') === harnessFilter.value)
+  if (userFilter.value) list = list.filter(i => i.created_by === userFilter.value)
+  if (dateRange.value && dateRange.value.length === 2) {
+    const [start, end] = dateRange.value
+    list = list.filter(i => {
+      const d = (i.created_at || '').slice(0, 10)
+      return d && d >= start && d <= end
+    })
+  }
   if (nameSearch.value) {
     const keyword = nameSearch.value.toLowerCase()
     list = list.filter(i => i.name.toLowerCase().includes(keyword))

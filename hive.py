@@ -160,7 +160,6 @@ _FRAMEWORK_LAYOUTS = {
         "upload_paths": [
             "/home/ma-user/.claude/projects",
             "/home/ma-user/.claude/todos",
-            "/home/ma-user/.claude/debug",
             "/home/ma-user/.claude/session-env",
         ],
         "workspace_base": "/home/ma-user/.claude/workspace",
@@ -745,14 +744,14 @@ class OpenClawDistillationTask:
         project_dir = os.path.join(self.config.sandbox_config.workspace, code_stem)
         skill_src = self.config.obs_config.skill_download_path
         skill_dir = (data_cfg.input_dir or {}).get("skill_dir", "skills")
+        if not isinstance(skill_dir, str):
+            skill_dir = "skills"
         # task_skills → workspace/<project>/<skill_dir>; default_skills → default_skill_path
         task_target_path = os.path.join(project_dir, skill_dir)
         default_target_path = self.config.sandbox_config.default_skill_path
 
         # 按需选取: task config 指定的 task_skills + 配置的 default_skills
-        task_skills = []
-        if data_cfg.agents and data_cfg.agents[0].get("skills"):
-            task_skills = data_cfg.agents[0]["skills"]
+        task_skills = [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]]
         default_skills = self.config.obs_config.default_skills or []
         if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
@@ -924,6 +923,10 @@ class OpenClawDistillationTask:
                 bucket_path=bucket_path,
             )
             per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
+            purge_clauses = [
+                f'rm -rf {os.path.join(ws, "skills")}'
+                for ws in per_agent_workspaces
+            ]
             all_patterns = (
                 [sandbox_cfg.result_workdir, task_logs]
                 + list(_FW["upload_paths"])
@@ -936,7 +939,7 @@ class OpenClawDistillationTask:
                 for pattern in all_patterns
             ]
 
-            exec_cmd = " && ".join(upload_clauses) if upload_clauses else "true"
+            exec_cmd = " && ".join(purge_clauses + upload_clauses) if upload_clauses else "true"
         except Exception as e:
             self.logger.error(f"[upload_traj] build cmd failed: {e}\n{traceback.format_exc()}")
             return False

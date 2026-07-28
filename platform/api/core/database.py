@@ -239,3 +239,42 @@ def init_db():
                 conn.execute(f"ALTER TABLE harness_configs ADD COLUMN {col}")
             except Exception:
                 pass
+
+        # 每任务明细表：把散落在文件系统里的 per-task 状态/评分聚合进 DB，便于筛选与将来着色
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS task_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,           -- 对应 task_instances.id
+                task_idx INTEGER,                    -- task-<idx>.log 的 idx，可空
+                config_name TEXT NOT NULL,           -- 完整配置文件名，如 018399_fin_..._q1.json
+                status TEXT,                         -- 任务成功 / 任务失败 / 任务异常 / NULL(未执行)
+                error_code TEXT,                     -- C001 / S001 / T001 ... 可空
+                error_category TEXT,                 -- C / S / T / X（派生自 error_code 前缀），可空
+                eval_score REAL,                     -- 评估计算分，可空
+                eval_completion REAL,                -- completion，可空
+                gate INTEGER,                        -- gate 乘积，可空
+                traj_level TEXT,                     -- 预留：未来 L0/L1/L1.5/L2/L3，本次不填充
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(instance_id, config_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_task_records_inst ON task_records(instance_id);
+            CREATE INDEX IF NOT EXISTS idx_task_records_cat  ON task_records(instance_id, error_category);
+        """)
+
+        # migrate: 为已存在的 task_records 补列（IF NOT EXISTS 不会加列），风格同上
+        for col in [
+            "task_idx INTEGER",
+            "status TEXT",
+            "error_code TEXT",
+            "error_category TEXT",
+            "eval_score REAL",
+            "eval_completion REAL",
+            "gate INTEGER",
+            "traj_level TEXT",
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE task_records ADD COLUMN {col}")
+            except Exception:
+                pass
