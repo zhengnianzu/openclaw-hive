@@ -356,12 +356,18 @@
               <el-icon class="is-loading" :size="24"><Loading /></el-icon>
               <p style="color:#999;margin-top:8px">加载中...</p>
             </div>
-            <div v-else-if="previewContent !== null">
-              <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1e293b;border-radius:var(--radius-sm) var(--radius-sm) 0 0">
-                <span style="color:#ccc;font-size:13px">{{ selectedFile?.label || selectedFile?.name }} ({{ previewTotalLines }} 行)</span>
+            <div v-else-if="previewContent !== null" class="preview-wrap">
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1e293b;border-radius:var(--radius-sm) var(--radius-sm) 0 0;flex-shrink:0">
+                <span style="color:#ccc;font-size:13px">
+                  {{ selectedFile?.label || selectedFile?.name }}
+                  (已加载 {{ previewOffset }} / {{ previewTotalChars }} 字符，共 {{ previewTotalLines }} 行)
+                </span>
                 <el-button size="small" text style="color:#ccc" @click="downloadFile(selectedFile)">下载</el-button>
               </div>
-              <pre class="preview-content">{{ previewContent }}</pre>
+              <pre ref="previewContainer" class="preview-content" @scroll="onPreviewScroll">{{ previewContent }}</pre>
+              <div v-if="previewLoadingMore" style="padding:6px;text-align:center;color:#94a3b8;font-size:12px;background:#0f172a">
+                <el-icon class="is-loading"><Loading /></el-icon> 加载更多...
+              </div>
             </div>
             <el-empty v-else description="点击左侧文件预览内容" :image-size="80" />
           </div>
@@ -824,6 +830,12 @@ const treeData = ref([])
 const treeRef = ref(null)
 const selectedFile = ref(null)
 const previewContent = ref(null)
+const previewOffset = ref(0)
+const previewHasMore = ref(false)
+const previewLoadingMore = ref(false)
+const previewContainer = ref(null)
+const previewTotalChars = ref(0)
+const PREVIEW_PAGE = 200000
 const previewTotalLines = ref(0)
 const previewLoading = ref(false)
 const obsBasePath = ref('')
@@ -1010,13 +1022,42 @@ async function previewFile(file) {
   selectedFile.value = file
   previewLoading.value = true
   previewContent.value = null
+  previewOffset.value = 0
+  previewHasMore.value = false
+  previewTotalChars.value = 0
   try {
-    const res = await api.get(`/logs/${id}/obs-view`, { params: { file_path: file.path, tail: 1000 } })
-    previewContent.value = (res.lines || []).join('\n')
+    const res = await api.get(`/logs/${id}/obs-view`,
+      { params: { file_path: file.path, offset: 0, limit: PREVIEW_PAGE } })
+    previewContent.value = res.content || ''
+    previewOffset.value = res.next_offset || 0
     previewTotalLines.value = res.total_lines || 0
+    previewTotalChars.value = res.total_chars || 0
+    previewHasMore.value = !!res.has_more
+    if (previewContainer.value) previewContainer.value.scrollTop = 0
   } catch {
     previewContent.value = '文件加载失败'
+    previewHasMore.value = false
   } finally { previewLoading.value = false }
+}
+
+async function loadMorePreview() {
+  if (previewLoadingMore.value || !previewHasMore.value || !selectedFile.value) return
+  previewLoadingMore.value = true
+  try {
+    const res = await api.get(`/logs/${id}/obs-view`,
+      { params: { file_path: selectedFile.value.path, offset: previewOffset.value, limit: PREVIEW_PAGE } })
+    previewContent.value = (previewContent.value || '') + (res.content || '')
+    previewOffset.value = res.next_offset || previewOffset.value
+    previewHasMore.value = !!res.has_more
+  } catch {
+    previewHasMore.value = false
+  } finally { previewLoadingMore.value = false }
+}
+
+function onPreviewScroll() {
+  const el = previewContainer.value
+  if (!el || !previewHasMore.value || previewLoadingMore.value) return
+  if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) loadMorePreview()
 }
 
 function downloadFile(file) {
@@ -1119,8 +1160,10 @@ onUnmounted(() => {
 .file-preview { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .tree-node { display: flex; align-items: center; font-size: 13px; }
 .tree-size { margin-left: 6px; font-size: 11px; color: #999; }
+.preview-wrap { height: 100%; display: flex; flex-direction: column; min-height: 0; }
 .preview-content {
   background: #1e293b; color: #e2e8f0; padding: 12px; margin: 0;
+  min-height: 0;
   border-radius: 0 0 var(--radius-sm) var(--radius-sm); flex: 1; overflow: auto;
   font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
   white-space: pre-wrap; word-break: break-all;

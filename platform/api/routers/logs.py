@@ -591,10 +591,18 @@ async def download_obs_log(
 async def view_obs_log(
     instance_id: str,
     file_path: str = Query(description="OBS上的文件路径"),
-    tail: int = Query(default=500),
+    offset: int = Query(default=0, ge=0, description="从第几个字符开始（0-based），按字符从头分页"),
+    limit: int = Query(default=200000, ge=1, le=2000000, description="本页返回的字符数"),
+    tail: int = Query(default=0, ge=0, description="兼容旧调用：>0 时返回末尾N行，忽略 offset/limit"),
     user: dict = Depends(get_current_user),
 ):
-    """View log content from OBS without downloading."""
+    """View log content from OBS without downloading.
+
+    文件整体下载到本地 tmp，再按【字符】offset/limit 从头分页返回，配合前端「滚到底加载更多」。
+    按字符（而非行）分页，是因为 trajectory.jsonl / models.json 这类文件常常行数很少但
+    单行长达十几万字符，按行分页无法拆分、前端渲染整坨超长单行会卡死。
+    传 tail>0 时保持旧的「返回末尾N行」语义（兼容未合并的旧页面）。
+    """
     inst = _get_instance(instance_id)
 
     if not file_path.startswith("obs://"):
@@ -615,11 +623,31 @@ async def view_obs_log(
         raise HTTPException(status_code=404, detail="文件下载失败")
 
     async with aiofiles.open(local_path, "r", errors="replace") as f:
-        all_lines = await f.readlines()
+        text = await f.read()
 
-    total = len(all_lines)
-    lines = all_lines[-tail:] if tail < total else all_lines
-    return {"lines": [l.rstrip("\n") for l in lines], "total_lines": total, "file": filename}
+    total_chars = len(text)
+    total_lines = text.count("\n") + 1 if text else 0
+
+    if tail > 0:
+        # 旧语义：末尾 N 行
+        all_lines = text.splitlines(keepends=True)
+        window = all_lines[-tail:] if tail < len(all_lines) else all_lines
+        return {
+            "lines": [l.rstrip("\n") for l in window],
+            "total_lines": len(all_lines),
+            "file": filename,
+        }
+
+    # 全量返回整个文件内容（不分页）
+    return {
+        "content": text,
+        "offset": 0,
+        "next_offset": total_chars,
+        "has_more": False,
+        "total_chars": total_chars,
+        "total_lines": total_lines,
+        "file": filename,
+    }
 
 
 def _get_obs_base_path(inst: dict) -> str:
