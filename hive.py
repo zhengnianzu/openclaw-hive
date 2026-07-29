@@ -522,6 +522,7 @@ class OpenClawDistillationTask:
                     "baseUrl": cfg["base_url"],
                     "apiKey": cfg["api_key"],
                     "api": api_kind,
+                    "timeoutSeconds": 300000,
                     "models": [
                         {
                             "id": cfg["model"],

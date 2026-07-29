@@ -204,7 +204,13 @@ def _is_pid_running(pid: int) -> bool:
         return False
 
 
-def _sync_instance_status(instance: dict) -> dict:
+def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
+    """同步 running 实例的 completed/failed 计数与状态。
+
+    persist=False（默认，所有 GET 请求路径）：只算内存计数 + 读写内存缓存，**绝不写库**，
+    避免读请求在 GET 路径里争用 SQLite 写锁（这是 "database is locked" 的根因）。
+    persist=True（仅后台刷新任务 _refresh_running_once）：把最新计数/状态 UPDATE 落库。
+    """
     inst = dict(instance)
 
     if inst["status"] not in ("running", "preparing"):
@@ -224,6 +230,14 @@ def _sync_instance_status(instance: dict) -> dict:
         inst["status"] = cached[0]["status"]
         return inst
 
+    # 后台预热启用时，请求线程只读缓存（哪怕已过期），把扫描/写库都留给后台任务，
+    # 从根本上避免读请求触发文件扫描与写锁争用
+    if not persist and _bg_refresh_active and cached:
+        inst["completed_tasks"] = cached[0]["completed_tasks"]
+        inst["failed_tasks"] = cached[0]["failed_tasks"]
+        inst["status"] = cached[0]["status"]
+        return inst
+
     completed = _count_lines(os.path.join(output_dir, "complete.jsonl"))
     failed = _count_lines(os.path.join(output_dir, "failed.jsonl"))
     inst["completed_tasks"] = completed
@@ -233,17 +247,21 @@ def _sync_instance_status(instance: dict) -> dict:
     all_done = inst["total_tasks"] > 0 and (completed + failed) >= inst["total_tasks"]
     if not pid_alive or all_done:
         inst["status"] = "completed" if failed == 0 else "finished"
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
-                (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
-            )
-    else:
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
-                (completed, failed, inst["id"]),
-            )
+
+    # 只有后台刷新任务才写库；请求线程仅更新内存缓存，避免写锁争用
+    if persist:
+        if not pid_alive or all_done:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
+                    (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
+                )
+        else:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
+                    (completed, failed, inst["id"]),
+                )
 
     _status_cache[cache_key] = ({"completed_tasks": completed, "failed_tasks": failed, "status": inst["status"]}, now)
     return inst
@@ -912,6 +930,52 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
     )
 
 
+def _count_config_files(root: str) -> int:
+    """数已下载的 config 文件数：穿透单层嵌套目录后，统计其中的普通文件。
+    下载中文件实时落盘，据此可给出「已下载 N 个」的准备进度。"""
+    if not root or not os.path.isdir(root):
+        return 0
+    actual = root
+    # 穿透单层嵌套（与 _prepare_instance 的 actual_dir 逻辑一致）
+    for _ in range(5):
+        try:
+            entries = os.listdir(actual)
+        except OSError:
+            return 0
+        if len(entries) == 1 and os.path.isdir(os.path.join(actual, entries[0])):
+            actual = os.path.join(actual, entries[0])
+        else:
+            break
+    try:
+        with os.scandir(actual) as it:
+            return sum(1 for e in it if e.is_file())
+    except OSError:
+        return 0
+
+
+@router.get("/{instance_id}/prepare-progress")
+def get_prepare_progress(instance_id: str, user: dict = Depends(get_current_user)):
+    """准备中实例的下载进度：返回已下载到实例 configs 目录的 config 文件数。
+
+    obsutil 整目录下载不逐文件回报，但文件会实时落到磁盘，据此数出「已下载 N 个」。
+    下载完成前无法预知总数，故只报已下载数（单调递增）；实例非 preparing 时 downloading=false。
+    只读文件系统、不写库，多 worker 安全。
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT status, total_tasks FROM task_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    configs_dir = os.path.join(_get_instance_dir(instance_id), "configs")
+    downloaded = _count_config_files(configs_dir)
+    return {
+        "status": row["status"],
+        "downloading": row["status"] == "preparing",
+        "downloaded_configs": downloaded,
+        "total_tasks": row["total_tasks"] or 0,
+    }
 
 
 def _estimate_remaining_time(
@@ -1141,6 +1205,37 @@ def _sync_task_records(instance_id: str, config_path: str) -> None:
             )
 
 
+def recover_orphan_preparing() -> int:
+    """启动时回收「孤儿 preparing」实例。
+
+    _prepare_and_launch 是挂在事件循环上的后台协程；若后端在「准备中」重启，
+    该协程随旧进程一起消失，实例会永远卡在 preparing（pid/started_at 均为空）。
+    这里在 startup 时把这些孤儿一律退回 created，让用户重新点启动（配置已就绪，
+    重启动会重新数 task 数并拉起进程）。
+
+    仅回退 pid 与 started_at 均为空的 preparing 实例——正在正常准备中、
+    或已经拿到 pid 的实例不动，避免误伤。返回回退的实例数。
+    幂等：多 worker 各调用一次也安全（第二次已无匹配行）。
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE task_instances
+                   SET status='created',
+                       error_summary='准备中后端重启被中断，已自动退回 created，可重新启动'
+                 WHERE status='preparing' AND pid IS NULL AND started_at IS NULL
+                """
+            )
+            n = cur.rowcount or 0
+        if n:
+            print(f"[startup] 回收孤儿 preparing 实例 {n} 个 -> created")
+        return n
+    except Exception as e:
+        print(f"[startup] 回收孤儿 preparing 失败: {e}")
+        return 0
+
+
 def _refresh_running_once():
     """后台线程：预热 running/preparing 实例的状态与分析缓存。"""
     try:
@@ -1154,7 +1249,7 @@ def _refresh_running_once():
     for row in rows:
         inst = dict(row)
         try:
-            inst = _sync_instance_status(inst)
+            inst = _sync_instance_status(inst, persist=True)
             if inst["status"] == "running":
                 _compute_analyze(inst["config_path"], inst["total_tasks"])
                 # 复用刚刷新的 file_state，把 per-task 明细写进 task_records

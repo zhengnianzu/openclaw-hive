@@ -70,6 +70,11 @@ def health():
 @app.on_event("startup")
 async def _start_background_tasks():
     import asyncio
+    # 回收「准备中被重启中断」的孤儿实例，退回 created 供重新启动（幂等，多 worker 安全）
+    try:
+        instances.recover_orphan_preparing()
+    except Exception as e:
+        print(f"[startup] recover_orphan_preparing error: {e}")
     asyncio.create_task(instances.background_cache_refresher())
 
 

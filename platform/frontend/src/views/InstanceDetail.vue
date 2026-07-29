@@ -16,6 +16,12 @@
         :color="[{color:'#6366f1',percentage:50},{color:'#8b5cf6',percentage:80},{color:'#10b981',percentage:100}]" />
     </div>
 
+    <div v-if="inst.status === 'preparing'" class="glass-card" style="padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:10px">
+      <el-icon class="is-loading" :size="18" style="color:#e6a23c"><Loading /></el-icon>
+      <span style="color:#e6a23c">准备中：正在下载配置</span>
+      <span class="mono-num" style="color:#e6a23c">已下载 {{ prepareInfo.downloaded_configs ?? 0 }} 个 config</span>
+    </div>
+
     <el-tabs v-model="activeTab" class="detail-tabs">
       <!-- ================= 配置信息 ================= -->
       <el-tab-pane label="配置信息" name="config">
@@ -457,6 +463,7 @@ function ensureTabLoaded(tab) {
 
 // ============ 配置信息 tab ============
 const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {} })
+const prepareInfo = ref({ downloaded_configs: 0 })
 const createParams = ref({})
 const expandedPanels = ref([])
 let timer = null
@@ -501,6 +508,10 @@ function maskKey(key) {
 
 async function loadData() {
   try { const [i, o] = await Promise.all([api.get(`/instances/${id}`), api.get(`/instances/${id}/overview`)]); inst.value = i; overview.value = o } catch {}
+  // 准备中：拉下载进度（已下载多少个 config）
+  if (inst.value.status === 'preparing') {
+    try { prepareInfo.value = await api.get(`/instances/${id}/prepare-progress`) } catch {}
+  }
 }
 async function loadCreateParams() { try { createParams.value = await api.get(`/instances/${id}/create-params`) } catch {} }
 async function startInstance() { await api.post(`/instances/${id}/start`); ElMessage.success('已启动'); loadData() }

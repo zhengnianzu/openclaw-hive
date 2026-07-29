@@ -94,7 +94,10 @@
         </el-table-column>
         <el-table-column label="数字进度" width="130" align="center" resizable>
           <template #default="{row}">
-            <span class="mono-num">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
+            <span v-if="row.status === 'preparing'" class="mono-num" style="color:#e6a23c">
+              下载 {{ prepareProgress[row.id]?.downloaded_configs ?? 0 }} 个
+            </span>
+            <span v-else class="mono-num">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="completed_tasks" label="成功" width="80" align="center" resizable>
@@ -150,6 +153,7 @@ const authStore = useAuthStore()
 const instances = ref([])
 const loading = ref(false)
 const timeEstimates = ref({})
+const prepareProgress = ref({})
 const statusFilter = ref('')
 const harnessFilter = ref('')
 const userFilter = ref('')
@@ -199,6 +203,7 @@ async function loadInstances() {
   try {
     instances.value = await api.get('/instances')
     loadTimeEstimates()
+    loadPrepareProgress()
   } finally { if (isFirstLoad) loading.value = false }
 }
 
@@ -209,6 +214,18 @@ async function loadTimeEstimates() {
     if (r.status === 'fulfilled' && r.value.estimated_remaining_seconds != null) {
       timeEstimates.value[running[idx].id] = r.value
     }
+  })
+}
+
+async function loadPrepareProgress() {
+  const preparing = instances.value.filter(i => i.status === 'preparing')
+  // 清掉已不在准备中的旧进度
+  Object.keys(prepareProgress.value).forEach(id => {
+    if (!preparing.some(i => i.id === id)) delete prepareProgress.value[id]
+  })
+  const results = await Promise.allSettled(preparing.map(inst => api.get(`/instances/${inst.id}/prepare-progress`)))
+  results.forEach((r, idx) => {
+    if (r.status === 'fulfilled') prepareProgress.value[preparing[idx].id] = r.value
   })
 }
 
