@@ -164,6 +164,16 @@ _FRAMEWORK_LAYOUTS = {
         ],
         "workspace_base": "/home/ma-user/.claude/workspace",
     },
+    "openjiuwen": {
+        "harness_dir":            "/home/ma-user/.openjiuwen",
+        "harness_local_config":   "uploads/openjiuwen.json",
+        "harness_sandbox_config": "/home/ma-user/.openjiuwen/openjiuwen.json",
+        "upload_paths": [
+           
+        ],
+        "workspace_base": "/home/ma-user/.openjiuwen/workspace",
+    },
+
 }
 
 AGENT_FRAMEWORK: str = "openclaw"  # 占位默认, main() 会覆盖
@@ -698,7 +708,7 @@ class OpenClawDistillationTask:
             f"cd {self.config.sandbox_config.workspace} && "
             f"mkdir -p {log_path} && cd {code_stem} && "
             f"pip install -r requirements.txt && "
-            f"python {python_file} --config {config_path} 2>&1 | "
+            f"python {python_file} --config {config_path} --harness {AGENT_FRAMEWORK} 2>&1 | "
             f"tee {log_path}/{self.config.sandbox_config.result_log}"
         )
 
@@ -1110,6 +1120,33 @@ class OpenClawDistillationTask:
 # Task Orchestration
 # ============================================================================
 
+async def _upload_records_to_obs(config: TaskConfig) -> None:
+    """把本次运行的 complete.jsonl / failed.jsonl 上传到 OBS traj_save_path 下。"""
+    traj_path = config.obs_config.traj_save_path
+    obsutil_bin = config.obs_config.s3_download_script or "obsutil"
+    dest = check_bucket_path(f"{config.obs_config.traj_save_bucket}/{traj_path}")
+
+    for record_name in (config.task_complete_record, config.task_failed_record):
+        local_path = os.path.join(config.task_output_path, record_name)
+        if not os.path.exists(local_path):
+            logger.info(f"[upload_records] {local_path} not found, skip")
+            continue
+        cmd = [obsutil_bin, "cp", local_path, dest, "-f"]
+        try:
+            rc = await asyncio.to_thread(
+                run_cmd_stream, cmd, timeout=config.obs_config.upload_timeout
+            )
+            if rc == 0:
+                logger.info(f"[upload_records] uploaded {local_path} -> {dest}")
+            else:
+                logger.error(f"[upload_records] upload failed rc={rc}: {local_path}")
+        except Exception as e:
+            logger.error(
+                f"[upload_records] exception uploading {local_path}: "
+                f"{e}\n{traceback.format_exc()}"
+            )
+
+
 async def _worker(
     worker_id: int,
     task_queue: asyncio.Queue,
@@ -1274,6 +1311,9 @@ async def run_tasks(
     ]
     if workers:
         await asyncio.gather(*workers)
+
+    # Upload this run's complete/failed records to OBS
+    await _upload_records_to_obs(config)
 
     # Cleanup per-task handlers
     logger.removeHandler(main_handler)
