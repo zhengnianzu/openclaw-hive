@@ -896,20 +896,24 @@ class OpenClawDistillationTask:
             raise HiveError("S007", detail=bucket_path, sandbox_result=result)
         self.logger.info(f"Downloaded agents in {time.time() - start_time:.1f}s")
 
+    def _derive_agent_names(self, config_file: str) -> list[str]:
+        """从 task config 的 agents[].name 提取去重后的 agent 名列表。"""
+        data_cfg = parse_data_config(config_file)
+        return list({
+            agent.get("name", "").strip()
+            for agent in data_cfg.agents
+            if isinstance(agent, dict) and agent.get("name")
+        })
+
     def _derive_per_agent_workspaces(self, config_file: str) -> list[str]:
         """按 task config 的 agents[].name 派生 per-agent workspace 绝对路径。"""
         ws_base = _FW.get("workspace_base")
         if not ws_base:
             return []
-        data_cfg = parse_data_config(config_file)
-        agent_names = list({
-            agent.get("name", "").strip() for agent in data_cfg.agents if isinstance(agent, dict) and agent.get("name")
-        })
-
         base = Path(ws_base)
         return [
             str(base if n == "main" else base.parent / f"{base.name}-{n}")
-            for n in agent_names
+            for n in self._derive_agent_names(config_file)
         ]
 
     async def _upload_traj_to_obs(self, config_file: str) -> bool:
@@ -938,9 +942,18 @@ class OpenClawDistillationTask:
                 f'rm -rf {os.path.join(ws, "skills")}'
                 for ws in per_agent_workspaces
             ]
+            # upload_paths 里 hermes 的 profiles/*/ 通配，* 即 agent-name，
+            agent_names = self._derive_agent_names(config_file)
+            expanded_upload_paths = []
+            for pattern in _FW["upload_paths"]:
+                if "*" in pattern:
+                    expanded_upload_paths += [pattern.replace("*", n) for n in agent_names]
+                else:
+                    expanded_upload_paths.append(pattern)
+
             all_patterns = (
                 [sandbox_cfg.result_workdir, task_logs]
-                + list(_FW["upload_paths"])
+                + expanded_upload_paths
                 + per_agent_workspaces
             )
             upload_clauses = [
