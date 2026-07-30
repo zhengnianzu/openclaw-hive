@@ -62,11 +62,31 @@
           <el-col :span="12">
             <el-card header="任务执行情况">
               <div v-if="Object.keys(overview.error_breakdown || {}).length">
-                <div v-for="(count, category) in overview.error_breakdown" :key="category"
-                  :class="['breakdown-row', category.startsWith('└') ? 'breakdown-sub' : '']">
+                <!-- 顶层汇总：成功/失败/任务异常总数/未执行（不含 └ 前缀子行） -->
+                <div v-for="(count, category) in summaryBreakdown" :key="category" class="breakdown-row">
                   <span>{{ category }}</span>
                   <el-tag :type="taskTagType(category)" size="small">{{ count }}</el-tag>
                 </div>
+                <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
+                <el-collapse v-if="overview.error_tree && overview.error_tree.length"
+                  v-model="expandedErrorGroups" class="error-tree">
+                  <el-collapse-item v-for="grp in overview.error_tree" :key="grp.prefix" :name="grp.prefix">
+                    <template #title>
+                      <span class="err-grp-title">
+                        <el-tag size="small" type="warning" effect="plain">{{ grp.prefix }}</el-tag>
+                        <span class="err-grp-name">{{ grp.label }}</span>
+                        <span class="err-grp-count">{{ grp.count }}</span>
+                      </span>
+                    </template>
+                    <div v-for="c in grp.codes" :key="c.code" class="breakdown-row breakdown-sub">
+                      <span>
+                        <code class="err-code">{{ c.code }}</code>
+                        <span class="err-desc" v-if="c.desc">{{ c.desc }}</span>
+                      </span>
+                      <el-tag type="info" size="small">{{ c.count }}</el-tag>
+                    </div>
+                  </el-collapse-item>
+                </el-collapse>
               </div>
               <el-empty v-else description="暂无数据" :image-size="60" />
             </el-card>
@@ -462,11 +482,21 @@ function ensureTabLoaded(tab) {
 }
 
 // ============ 配置信息 tab ============
-const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {} })
+const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {}, error_tree: [] })
 const prepareInfo = ref({ downloaded_configs: 0 })
 const createParams = ref({})
 const expandedPanels = ref([])
+const expandedErrorGroups = ref([])
 let timer = null
+
+// 顶层汇总：过滤掉后端返回的 └ 前缀子行（这些已移入折叠树展示）
+const summaryBreakdown = computed(() => {
+  const out = {}
+  for (const [k, v] of Object.entries(overview.value.error_breakdown || {})) {
+    if (!k.startsWith('└')) out[k] = v
+  }
+  return out
+})
 
 const progressPct = computed(() => {
   if (!overview.value.total) return 0
@@ -1128,6 +1158,19 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--text-muted);
 }
+/* 异常明细折叠树 */
+.error-tree { margin-top: 6px; border-top: 1px solid var(--border-color); }
+.error-tree :deep(.el-collapse-item__header) { height: 40px; line-height: 40px; font-size: 14px; }
+.error-tree :deep(.el-collapse-item__content) { padding-bottom: 6px; }
+.err-grp-title { display: flex; align-items: center; gap: 8px; width: 100%; }
+.err-grp-name { flex: 1; color: var(--text-secondary); }
+.err-grp-count { color: var(--text-muted); font-size: 13px; margin-right: 8px; }
+.err-code {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  background: var(--fill-color, #f4f4f5); padding: 1px 6px; border-radius: 3px;
+  font-size: 12px; color: var(--text-secondary);
+}
+.err-desc { color: var(--text-muted); font-size: 12px; margin-left: 8px; }
 .config-preview {
   background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: var(--radius-sm);
   max-height: 500px; overflow: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;

@@ -33,6 +33,27 @@ _STATUS_CACHE_TTL = 5
 _analyze_cache = {}
 _ANALYZE_CACHE_TTL = 10
 
+# 与 _analyze_cache 同一时刻写入：config_path -> error_tree(list)
+# 携带异常的一级分类(C/S/T/X)汇总 + 具体错误码明细，供前端折叠展示
+_analyze_tree_cache = {}
+
+# 一级分类中文名
+_PREFIX_LABEL = {"C": "客户端", "S": "服务端", "T": "任务侧", "X": "未分类"}
+# 错误码 -> 描述（镜像 hive.py 的 ERROR_CATALOG；此处复制以免为一处展示拉起 hive 依赖）
+_ERROR_CODE_DESC = {
+    "C001": "extract code failed", "C002": "upload file failed",
+    "C003": "environment creation failed", "C004": "agent config write failed",
+    "S001": "gateway start failed", "S002": "gateway startup timeout",
+    "S003": "gateway unexpected output", "S004": "sandbox port-update failed",
+    "S005": "skill download failed", "S006": "user profile download failed",
+    "S007": "agents download failed", "S008": "script execution failed",
+    "S009": "upload traj to OBS failed",
+    "T001": "Task_Failed", "T002": "达到最大轮次", "T003": "连续3次未收到回复",
+    "T004": "AgentExecutionError", "T005": "AssertionError",
+    "T006": "API call failed", "T010": "Uncategorized Traceback",
+    "X999": "unclassified exception",
+}
+
 # 增量扫描状态: config_path -> {fname: (mtime, size, status, code)}
 # 只重读 mtime/size 变化过的 task 日志，避免每次全量遍历上万文件
 _analyze_file_state = {}
@@ -911,6 +932,8 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
     rate = (completed / finished * 100) if finished > 0 else 0.0
 
     error_breakdown = _analyze_task_status(inst["config_path"], total, inst["status"])
+    # error_tree 与 error_breakdown 在 _compute_analyze 中同刻写入，缓存生命周期一致
+    error_tree = _analyze_tree_cache.get(inst["config_path"], [])
     time_est = _estimate_remaining_time(total, finished, inst.get("started_at"), inst["status"])
 
     elapsed_seconds = None
@@ -925,6 +948,7 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
         total=total, completed=completed, failed=failed,
         running=running_pods, pending=pending,
         success_rate=round(rate, 1), error_breakdown=error_breakdown,
+        error_tree=error_tree,
         elapsed_seconds=elapsed_seconds,
         **time_est,
     )
@@ -1073,6 +1097,8 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     succeeded = 0
     failed = 0
     abnormal_by_prefix = {"C": 0, "S": 0, "T": 0, "X": 0}
+    # 具体错误码计数：{prefix: {code: count}}
+    abnormal_by_code = {"C": {}, "S": {}, "T": {}, "X": {}}
 
     for _mtime, _size, last_status, last_code, _cfg in new_state.values():
         if last_status == "任务成功":
@@ -1080,11 +1106,13 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
         elif last_status == "任务失败":
             failed += 1
         elif last_status == "任务异常":
-            prefix = (last_code or "")[:1]
-            if prefix in abnormal_by_prefix:
-                abnormal_by_prefix[prefix] += 1
-            else:
-                abnormal_by_prefix["X"] += 1
+            code = last_code or ""
+            prefix = code[:1]
+            if prefix not in abnormal_by_prefix:
+                prefix = "X"
+                code = code or "X999"
+            abnormal_by_prefix[prefix] += 1
+            abnormal_by_code[prefix][code] = abnormal_by_code[prefix].get(code, 0) + 1
 
     abnormal = sum(abnormal_by_prefix.values())
     executed = succeeded + failed + abnormal
@@ -1109,7 +1137,26 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     if not_executed:
         result["未执行"] = not_executed
 
+    # 构建折叠树：一级分类汇总 + 具体错误码明细（按码计数降序）
+    error_tree = []
+    for p in ("C", "S", "T", "X"):
+        if not abnormal_by_prefix[p]:
+            continue
+        codes = [
+            {"code": code, "desc": _ERROR_CODE_DESC.get(code, ""), "count": cnt}
+            for code, cnt in sorted(
+                abnormal_by_code[p].items(), key=lambda kv: (-kv[1], kv[0])
+            )
+        ]
+        error_tree.append({
+            "prefix": p,
+            "label": _PREFIX_LABEL[p],
+            "count": abnormal_by_prefix[p],
+            "codes": codes,
+        })
+
     _analyze_cache[config_path] = (result, time.time())
+    _analyze_tree_cache[config_path] = error_tree
     return result
 
 
@@ -1435,6 +1482,7 @@ def delete_instance(instance_id: str, user: dict = Depends(require_operator)):
 
     _status_cache.pop(instance_id, None)
     _analyze_cache.pop(inst.get("config_path"), None)
+    _analyze_tree_cache.pop(inst.get("config_path"), None)
 
     with get_connection() as conn:
         conn.execute("DELETE FROM task_instances WHERE id=?", (instance_id,))
