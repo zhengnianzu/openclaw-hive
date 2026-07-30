@@ -74,6 +74,7 @@ class InstanceOverview(BaseModel):
     pending: int
     success_rate: float
     error_breakdown: dict = {}
+    error_tree: list = []
     elapsed_seconds: Optional[float] = None
     avg_task_seconds: Optional[float] = None
     estimated_remaining_seconds: Optional[float] = None
