@@ -17,6 +17,7 @@
           <el-option label="OpenClaw" value="openclaw" />
           <el-option label="Hermes" value="hermes" />
           <el-option label="Claude Code" value="claude-code" />
+          <el-option label="Jiuwen Claw" value="openjiuwen" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -96,6 +97,14 @@
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
             </el-select>
+          </el-form-item>
+
+          <el-form-item v-if="form.harness_type === 'openjiuwen'" label="Provider">
+            <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值 (Anthropic)" clearable style="width:100%">
+              <el-option label="Anthropic" value="Anthropic" />
+              <el-option label="OpenAI" value="OpenAI" />
+            </el-select>
+            <div style="font-size:12px;color:#999;margin-top:4px">tokenfly 网关走 anthropic-messages 协议，一般选 Anthropic</div>
           </el-form-item>
 
           <el-form-item label="模型 ID">

@@ -36,6 +36,12 @@
     "model_api_key": "env.ANTHROPIC_AUTH_TOKEN",
     "model_id": "env.ANTHROPIC_MODEL"
   },
+  "openjiuwen": {
+    "model_id": "default.model",
+    "model_base_url": "default.base_url",
+    "model_api_key": "default.api_key",
+    "model_api_type": "default.provider"
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",

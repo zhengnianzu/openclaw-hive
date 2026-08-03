@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/instances", tags=["instances"])
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json"}
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -382,7 +382,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs"}
+        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs"}
         traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
@@ -391,12 +391,15 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
     cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
+    openjiuwen_path = os.path.join(instance_dir, "openjiuwen.json")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
         base.run_config.sandbox.harness_local_config_file = hermes_config_path
     elif req.harness_type == "claude-code":
         base.run_config.sandbox.harness_local_config_file = cc_settings_path
+    elif req.harness_type == "openjiuwen":
+        base.run_config.sandbox.harness_local_config_file = openjiuwen_path
     else:
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -452,6 +455,25 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         with open(cc_settings_path, "w", encoding="utf-8") as f:
             json.dump(cc_cfg, f, indent=2, ensure_ascii=False)
+    elif req.harness_type == "openjiuwen":
+        openjiuwen_template = os.path.join(harness_settings_dir, "openjiuwen.json")
+        if not os.path.exists(openjiuwen_template):
+            openjiuwen_template = os.path.join(settings.SETTINGS_DIR, "openjiuwen.json")
+        with open(openjiuwen_template, "r", encoding="utf-8") as f:
+            openjiuwen_cfg = json.load(f)
+
+        openjiuwen_cfg.setdefault("default", {})
+        if req.model_id:
+            openjiuwen_cfg["default"]["model"] = req.model_id
+        if req.model_base_url:
+            openjiuwen_cfg["default"]["base_url"] = req.model_base_url
+        if req.model_api_key:
+            openjiuwen_cfg["default"]["api_key"] = req.model_api_key
+        # provider 复用 model_api_type 传入；tokenfly 网关走 anthropic-messages，默认 Anthropic，不能回退 OpenAI
+        openjiuwen_cfg["default"]["provider"] = req.model_api_type or openjiuwen_cfg["default"].get("provider") or "Anthropic"
+
+        with open(openjiuwen_path, "w", encoding="utf-8") as f:
+            json.dump(openjiuwen_cfg, f, indent=2, ensure_ascii=False)
     else:
         openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
         if not os.path.exists(openclaw_template):
@@ -497,6 +519,12 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 cc_cfg["env"]["ANTHROPIC_AUTH_TOKEN"] = req.model_api_key
                 with open(cc_settings_path, "w", encoding="utf-8") as f:
                     json.dump(cc_cfg, f, indent=2, ensure_ascii=False)
+            elif req.harness_type == "openjiuwen" and os.path.exists(openjiuwen_path):
+                with open(openjiuwen_path, "r", encoding="utf-8") as f:
+                    openjiuwen_cfg = json.load(f)
+                openjiuwen_cfg.setdefault("default", {})["api_key"] = req.model_api_key
+                with open(openjiuwen_path, "w", encoding="utf-8") as f:
+                    json.dump(openjiuwen_cfg, f, indent=2, ensure_ascii=False)
             elif os.path.exists(openclaw_path):
                 with open(openclaw_path, "r", encoding="utf-8") as f:
                     openclaw_cfg = json.load(f)
