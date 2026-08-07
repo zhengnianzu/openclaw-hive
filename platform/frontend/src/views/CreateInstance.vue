@@ -8,7 +8,7 @@
         <el-input v-model="form.name" placeholder="例如：web_skill_test_0608" />
       </el-form-item>
 
-      <el-form-item label="任务标识 (user_id)" required>
+      <el-form-item label="任务标识 (sandbox-id)" required>
         <el-input v-model="form.task_name" placeholder="用于Pod命名和OBS路径，例如：zx26070812300001" />
       </el-form-item>
 

@@ -85,6 +85,7 @@ ERROR_CATALOG: dict = {
     "T004": "AgentExecutionError",
     "T005": "AssertionError",
     "T006": "API call failed",
+    "T007": "TimeoutError",
     "T010": "Uncategorized Traceback",
     # -- Unclassified --
     "X999": "unclassified exception",
@@ -504,6 +505,15 @@ class OpenClawDistillationTask:
         local_path = self.config.sandbox_config.harness_local_config_file
         local_model_path = self.config.sandbox_config.user_proxy_model_local_file
         # 根据不同的harness更新文件
+        if AGENT_FRAMEWORK == "openjiuwen":
+            data = json.loads(Path(local_path).read_text(encoding="utf-8"))
+            if data["default"]["provider"] == "anthropic-messages":
+                data["default"]["provider"] == "Anthropic"
+            Path(local_path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
         if AGENT_FRAMEWORK == "openclaw":
             data = json.loads(Path(local_path).read_text(encoding="utf-8"))
             model_cfg = json.loads(Path(local_model_path).read_text(encoding="utf-8"))
@@ -610,6 +620,16 @@ class OpenClawDistillationTask:
 
     async def _upload_user_proxy_model_config(self) -> None:
         local_path = self.config.sandbox_config.user_proxy_model_local_file
+        if AGENT_FRAMEWORK == "openjiuwen":
+            data = json.loads(Path(local_path).read_text(encoding="utf-8"))
+            for agent in data.values():
+                if agent.get("api") == "anthropic-messages":
+                    agent["api"] = "Anthropic"
+            Path(local_path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
         code_stem = Path(self.config.main_code_tar).stem
         remote_path = os.path.join(
             self.config.sandbox_config.workspace,
@@ -931,36 +951,34 @@ class OpenClawDistillationTask:
             )
             code_stem = Path(self.config.main_code_tar).stem
             task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
-            # 上传所有的worksapce-<agent-name>
-            up_cmd_template = get_obsutil_uploader_command(
-                self.client_config.s3,
-                local_folder_absolute_path="__PATH__",
-                bucket_path=bucket_path,
-            )
             per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
             purge_clauses = [
                 f'rm -rf {os.path.join(ws, "skills")}'
                 for ws in per_agent_workspaces
             ]
-            # upload_paths 里 hermes 的 profiles/*/ 通配，* 即 agent-name，
-            agent_names = self._derive_agent_names(config_file)
-            expanded_upload_paths = []
-            for pattern in _FW["upload_paths"]:
-                if "*" in pattern:
-                    expanded_upload_paths += [pattern.replace("*", n) for n in agent_names]
-                else:
-                    expanded_upload_paths.append(pattern)
 
-            all_patterns = (
-                [sandbox_cfg.result_workdir, task_logs]
-                + expanded_upload_paths
-                + per_agent_workspaces
-            )
+            # 固定路径直接落到 bucket_path 下（workdir / logs / per-agent workspace）。
+            uploads = [
+                (sandbox_cfg.result_workdir, bucket_path),
+                (task_logs, bucket_path),
+            ]
+            uploads += [(ws, bucket_path) for ws in per_agent_workspaces]
+
+            if AGENT_FRAMEWORK == "hermes":
+                # hermes 每个 profile(<agent-name>) 下都有同名 sessions/logs/workspace，保留 profiles/<name>/ 层
+                for pattern in _FW["upload_paths"]:
+                    for n in self._derive_agent_names(config_file):
+                        src = pattern.replace("*", n)
+                        dst = os.path.join(bucket_path, "profiles", n)
+                        uploads.append((src, dst))
+            else:
+                uploads += [(p, bucket_path) for p in _FW["upload_paths"]]
+
             upload_clauses = [
-                f'for p in $(ls -d {pattern} 2>/dev/null); do '
-                f'{up_cmd_template.replace("__PATH__", "$p")} || true; '
+                f'for p in $(ls -d {src} 2>/dev/null); do '
+                f'{get_obsutil_uploader_command(self.client_config.s3, "$p", dst)} || true; '
                 f'done'
-                for pattern in all_patterns
+                for src, dst in uploads
             ]
 
             exec_cmd = " && ".join(purge_clauses + upload_clauses) if upload_clauses else "true"

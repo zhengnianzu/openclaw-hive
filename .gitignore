@@ -45,4 +45,7 @@ platform/settings/hermes_config.yaml
 platform/settings/openclaw/
 platform/settings/key_gen.yaml
 
+# 实际配置文件，含密钥
+configs/hive_*.yaml
+
 

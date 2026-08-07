@@ -50,8 +50,8 @@ _ERROR_CODE_DESC = {
     "S009": "upload traj to OBS failed",
     "T001": "Task_Failed", "T002": "达到最大轮次", "T003": "连续3次未收到回复",
     "T004": "AgentExecutionError", "T005": "AssertionError",
-    "T006": "API call failed", "T010": "Uncategorized Traceback",
-    "X999": "unclassified exception",
+    "T006": "API call failed", "T007": "TimeoutError",
+    "T010": "Uncategorized Traceback", "X999": "unclassified exception",
 }
 
 # 增量扫描状态: config_path -> {fname: (mtime, size, status, code)}
