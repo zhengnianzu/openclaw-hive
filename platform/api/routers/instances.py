@@ -58,6 +58,11 @@ _ERROR_CODE_DESC = {
 # 只重读 mtime/size 变化过的 task 日志，避免每次全量遍历上万文件
 _analyze_file_state = {}
 
+# 本轮 _compute_analyze 中「实际重读过」（签名变化）的 fname 集合: config_path -> set(fname)
+# 供 _sync_task_records 只 UPSERT 变化过的任务行，避免每 8s 全量重写整表。
+# None（键不存在）表示该 config 还没被扫过 → 写库需走全量兜底。
+_analyze_changed = {}
+
 # 后台预热开关：为 True 时请求线程只读缓存（哪怕已过期），扫描交给后台任务，
 # 避免同步端点在请求线程里做重扫把 anyio 线程池打满
 _bg_refresh_active = False
@@ -1096,6 +1101,7 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
 
     prev_state = _analyze_file_state.get(config_path, {})
     new_state = {}
+    changed = set()  # 本轮实际重读过（签名变化 / 新增）的 fname，供增量写库
 
     if os.path.isdir(logs_dir):
         try:
@@ -1119,8 +1125,10 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
             else:
                 status, code, cfg = _scan_task_file(entry.path)
                 new_state[fname] = (sig[0], sig[1], status, code, cfg)
+                changed.add(fname)
 
     _analyze_file_state[config_path] = new_state
+    _analyze_changed[config_path] = changed
 
     succeeded = 0
     failed = 0
@@ -1190,19 +1198,26 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
 
 # ---- per-task 明细：把增量扫描结果 + evaluator 评分聚合进 task_records 表 ----
 
-def _compute_task_rows(config_path: str) -> list[dict]:
+def _compute_task_rows(config_path: str, only_fnames=None) -> list[dict]:
     """基于 _analyze_file_state 的增量扫描结果，产出每任务行（不额外读盘）。
-    依赖调用前 _compute_analyze 已刷新过该 config_path 的 file_state。"""
+    依赖调用前 _compute_analyze 已刷新过该 config_path 的 file_state。
+    only_fnames 非 None 时只产出这些 fname 对应的行（增量写库用）；None 则全量。
+    config= 尚未解析出（config_name 为 None）的任务直接跳过——其 status 也为 None、
+    不贡献任何状态，若用文件名兜底会与后续真实 config_name 形成两行（phantom）。"""
     state = _analyze_file_state.get(config_path, {})
+    if only_fnames is not None:
+        items = ((f, state[f]) for f in only_fnames if f in state)
+    else:
+        items = state.items()
     rows = []
-    for fname, tup in state.items():
+    for fname, tup in items:
         # tup = (mtime, size, status, code, config_name)
         _mtime, _size, status, code, config_name = tup
+        if not config_name:
+            # config= 未解析出：跳过，避免用文件名兜底制造 phantom 行
+            continue
         m = re.search(r"task-(\d+)\.log", fname)
         task_idx = int(m.group(1)) if m else None
-        # 无 config= 字段时回退用日志文件名（stem 仍可用于展示，只是查不到 eval）
-        if not config_name:
-            config_name = fname
         category = None
         if status == "任务异常":
             prefix = (code or "")[:1]
@@ -1241,10 +1256,22 @@ def _load_traj_cache(instance_id: str) -> dict:
         return {}
 
 
-def _sync_task_records(instance_id: str, config_path: str) -> None:
+def _sync_task_records(instance_id: str, config_path: str, full: bool = False) -> None:
     """把 per-task 扫描结果 + eval / traj 缓存 UPSERT 进 task_records（跑在执行器线程里，off-event-loop）。
-    eval/traj 各列用 COALESCE：本地缓存尚未刷新时保留上次已写入的值。"""
-    rows = _compute_task_rows(config_path)
+    eval/traj 各列用 COALESCE：本地缓存尚未刷新时保留上次已写入的值。
+
+    增量：默认只 UPSERT 本轮 _compute_analyze 中签名变化过的任务行（_analyze_changed），
+    避免每 8s 对整个实例的数万行整表重写。full=True 或该 config 尚未被扫过时走全量。
+    """
+    changed = _analyze_changed.get(config_path)
+    if full or changed is None:
+        only_fnames = None  # 全量：首次填充 / eval 分数刷新 / 兜底
+    elif not changed:
+        return  # 本轮无文件变化，零写入
+    else:
+        only_fnames = changed
+
+    rows = _compute_task_rows(config_path, only_fnames=only_fnames)
     if not rows:
         return
     eval_map = _load_eval_cache(instance_id)
@@ -1461,7 +1488,8 @@ async def _ensure_task_records(instance_id: str, config_path: str, status: str, 
     if not existing or existing["n"] == 0:
         try:
             await async_execute(_compute_analyze, config_path, total_tasks)
-            await async_execute(_sync_task_records, instance_id, config_path)
+            # 兜底填充：非 running 且 0 行，需全量写入（此时 changed 可能为空集）
+            await async_execute(_sync_task_records, instance_id, config_path, True)
         except Exception:
             pass
 
@@ -1511,8 +1539,11 @@ def delete_instance(instance_id: str, user: dict = Depends(require_operator)):
     _status_cache.pop(instance_id, None)
     _analyze_cache.pop(inst.get("config_path"), None)
     _analyze_tree_cache.pop(inst.get("config_path"), None)
+    _analyze_file_state.pop(inst.get("config_path"), None)
+    _analyze_changed.pop(inst.get("config_path"), None)
 
     with get_connection() as conn:
+        conn.execute("DELETE FROM task_records WHERE instance_id=?", (instance_id,))
         conn.execute("DELETE FROM task_instances WHERE id=?", (instance_id,))
 
     return {"message": "实例已删除"}

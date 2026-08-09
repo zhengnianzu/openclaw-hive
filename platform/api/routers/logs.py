@@ -866,7 +866,8 @@ async def get_eval_stats(
         # 新评分落盘后，即时并入 task_records（延迟导入避免模块级循环依赖）
         try:
             from .instances import _sync_task_records
-            await async_execute(_sync_task_records, instance_id, inst["config_path"])
+            # 新评分刚落盘，需全量刷回 task_records 对应行（eval/traj 列）
+            await async_execute(_sync_task_records, instance_id, inst["config_path"], True)
         except Exception:
             pass
 
@@ -985,7 +986,8 @@ async def get_traj_stats(
             pass
         try:
             from .instances import _sync_task_records
-            await async_execute(_sync_task_records, instance_id, inst["config_path"])
+            # 新评分刚落盘，需全量刷回 task_records 对应行（eval/traj 列）
+            await async_execute(_sync_task_records, instance_id, inst["config_path"], True)
         except Exception:
             pass
 
