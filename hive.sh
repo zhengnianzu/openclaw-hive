@@ -109,6 +109,43 @@ do_stop() {
     fi
     # 清理 pods
     python run_clear.py --config "$CONFIG_FILE"
+    # 上传记录
+    echo "Uploading records to OBS..."
+    python3 << 'PYEOF'
+import os
+import yaml
+import subprocess
+
+config_path = '$CONFIG_FILE'
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+obs_config = config.get('obs_config', {})
+traj_save_bucket = obs_config.get('traj_save_bucket')
+traj_save_path = obs_config.get('traj_save_path')
+obsutil_bin = obs_config.get('s3_download_script', 'obsutil')
+task_output_path = config.get('task_output_path', '')
+task_complete_record = config.get('task_complete_record', 'complete.jsonl')
+task_failed_record = config.get('task_failed_record', 'failed.jsonl')
+upload_timeout = obs_config.get('upload_timeout', 300)
+dest = f'{traj_save_bucket}/{traj_save_path}'
+
+
+for record_name in (task_complete_record, task_failed_record):
+    local_path = os.path.join(task_output_path, record_name)
+    if not os.path.exists(local_path):
+        print(f"[upload_records] {local_path} not found, skip")
+        continue
+    cmd = [obsutil_bin, "cp", local_path, dest, "-f"]
+    try:
+        result = subprocess.run(cmd, timeout=upload_timeout, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f'Uploaded {local_path} -> {dest}')
+        else:
+            print(f'Upload failed (rc={result.returncode}): {local_path}\n{result.stderr}')
+    except Exception as e:
+        print(f'Exception uploading {local_path}: {e}')
+PYEOF
 }
 
 do_restart() {

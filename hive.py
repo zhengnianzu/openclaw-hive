@@ -94,15 +94,30 @@ ERROR_CATALOG: dict = {
 
 def _classify_task_stdout(stdout: str) -> tuple[str, str]:
     """
-    从主脚本 stdout 里推断更具体的错误码。"""
-    if not stdout or "任务完成【Task_Done】" in stdout:
+    从主脚本 stdout 里推断更具体的错误码（优先匹配最后出现的错误信息）。
+    """
+    if not stdout or "【Task_Done】" in stdout:
         return "", ""
 
+    best_pos = -1
+    best_code = ""
+    best_phrase = ""
+
+    # 遍历错误目录，但仅处理以 'T' 开头且不等于 'T010' 的条目
     for code, phrase in ERROR_CATALOG.items():
         if not code.startswith("T") or code == "T010":
             continue
-        if phrase and phrase in stdout:
-            return code, phrase
+        if phrase:
+            pos = stdout.rfind(phrase)          # 从后往前查找该短语的最后出现位置
+            if pos > best_pos:                  # 取位置最靠后的（即最后出现的）
+                best_pos = pos
+                best_code = code
+                best_phrase = phrase
+
+    if best_pos != -1:
+        return best_code, best_phrase
+
+    # 若未匹配到任何 T 类错误，再检查是否含有 Traceback
     if "Traceback" in stdout:
         return "T010", "Traceback"
 
@@ -193,12 +208,12 @@ def set_agent_framework(name: str) -> None:
 
 
 def get_obsutil_downloader_command(s3_config, objects_storage_path, bucket_path):
-    command = f"{s3_config.s3_download_script} cp {s3_config.bucket_name}/{bucket_path} {objects_storage_path} -r -f"
+    command = f"{s3_config.s3_download_script} cp '{s3_config.bucket_name}/{bucket_path}' '{objects_storage_path}' -r -f"
     return command
 
 
 def get_obsutil_uploader_command(s3_config, local_folder_absolute_path, bucket_path):
-    command = f"{s3_config.s3_download_script} cp {local_folder_absolute_path} {s3_config.bucket_name}/{bucket_path} -r -f"
+    command = f"{s3_config.s3_download_script} cp '{local_folder_absolute_path}' '{s3_config.bucket_name}/{bucket_path}' -r -f"
     return command
 
 
@@ -1128,6 +1143,7 @@ class OpenClawDistillationTask:
             # ---- 关闭 execution_client ----
             if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
                 try:
+                    await self._kill_user_processes_in_sandbox()
                     await self.execution_client.close()
                 except Exception as e:
                     self.logger.error(
@@ -1146,6 +1162,26 @@ class OpenClawDistillationTask:
                 + (f' error="{error_msg}"' if error_msg else "")
                 + " ====="
             )
+
+    async def _kill_user_processes_in_sandbox(self) -> None:
+        """在沙箱内杀掉当前用户的所有进程, 避免残留 gateway/主脚本进程占着端口。"""
+
+        cmd = "/bin/bash -c 'whoami && pkill -u $(whoami)'"
+        exec_request = ExtendExecCommand(
+            command=["/bin/bash", "-c", cmd],
+            timeout=self.config.simple_bash_timeout,
+        )
+
+        try:
+            result = await self.execution_client.extend(args=exec_request.to_dict())
+        except Exception as e:
+            self.logger.warning(f"pkill in sandbox raised: {e}")
+            return
+        if result.code == ErrorCode.SUCCESS[0]:
+            self.logger.info(f"pkill -u $(whoami) executed, exit_code={result.data.get('exit_code')}")
+        else:
+            self.logger.warning(f"pkill in sandbox returned code={result.code}: {result}")
+
 
 # ============================================================================
 # Task Orchestration
