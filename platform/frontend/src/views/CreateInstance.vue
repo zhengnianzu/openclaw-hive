@@ -3,12 +3,12 @@
     <h2 class="page-title">新建任务实例</h2>
 
     <div class="glass-card" style="max-width:800px">
-    <el-form :model="form" label-width="140px">
+    <el-form :model="form" label-width="160px">
       <el-form-item label="实例名称" required>
         <el-input v-model="form.name" placeholder="例如：web_skill_test_0608" />
       </el-form-item>
 
-      <el-form-item label="任务标识 (sandbox-id)" required>
+      <el-form-item label="任务标识(sandbox-id)" required>
         <el-input v-model="form.task_name" placeholder="用于Pod命名和OBS路径，例如：zx26070812300001" />
       </el-form-item>
 
@@ -304,8 +304,21 @@ async function generateApiKey() {
   }
 }
 
+// 任务标识默认值: 用户名 + 本地时间 YYMMDDHHMM (例如 zx2608102022)
+function genTaskId() {
+  const now = new Date()
+  const ts = [
+    String(now.getFullYear()).slice(2),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+  ].join('')
+  return `${authStore.username || ''}${ts}`
+}
+
 const form = ref({
-  name: '', task_name: authStore.username || '', concurrent_num: 100,
+  name: '', task_name: genTaskId(), concurrent_num: 100,
   skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
@@ -470,7 +483,7 @@ onMounted(async () => {
       const params = await api.get(`/instances/${copyFrom}/create-params`)
       Object.assign(form.value, params)
       form.value.name = params.name + '-copy'
-      form.value.task_name = authStore.username || ''
+      form.value.task_name = genTaskId()
       if (!form.value.agents || form.value.agents.length === 0) {
         form.value.agents = [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }]
       }
@@ -482,7 +495,6 @@ onMounted(async () => {
     try {
       const reg = await api.get(`/registrations/${fromRegistration}`)
       const stripObsPrefix = p => stripBucket(p)
-      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(2, 12)
       const rand = String(Math.floor(Math.random() * 10000)).padStart(4, '0')
 
       // 1. 先加载配置模板（兜底）
@@ -496,7 +508,7 @@ onMounted(async () => {
 
       // 2. 再用登记字段覆盖（登记优先级更高）
       form.value.name = `${reg.task_name}-${reg.requester || 'task'}`
-      form.value.task_name = `${authStore.username}${ts}${rand}`
+      form.value.task_name = `${genTaskId()}${rand}`
       form.value.harness_type = reg.harness_type || 'openclaw'
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
@@ -548,5 +560,9 @@ onMounted(async () => {
 .agent-tabs-header {
   float: right;
   margin-top: 2px;
+}
+/* 任务标识等较长的表单标签不换行, 保持一行显示 */
+:deep(.el-form-item__label) {
+  white-space: nowrap;
 }
 </style>
