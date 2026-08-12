@@ -17,6 +17,7 @@ import copy
 import json
 import logging
 import os
+import re
 import random
 import shutil
 import subprocess
@@ -208,12 +209,12 @@ def set_agent_framework(name: str) -> None:
 
 
 def get_obsutil_downloader_command(s3_config, objects_storage_path, bucket_path):
-    command = f"{s3_config.s3_download_script} cp '{s3_config.bucket_name}/{bucket_path}' '{objects_storage_path}' -r -f"
+    command = f"{s3_config.s3_download_script} cp {s3_config.bucket_name}/{bucket_path} {objects_storage_path} -r -f"
     return command
 
 
 def get_obsutil_uploader_command(s3_config, local_folder_absolute_path, bucket_path):
-    command = f"{s3_config.s3_download_script} cp '{local_folder_absolute_path}' '{s3_config.bucket_name}/{bucket_path}' -r -f"
+    command = f"{s3_config.s3_download_script} cp {local_folder_absolute_path} {s3_config.bucket_name}/{bucket_path} -r -f"
     return command
 
 
@@ -333,6 +334,12 @@ class ObsBucketConfig:
     user_config_download_path: str = ""
     agents_download_path: str = ""
     default_skills: list = field(default_factory=list)
+
+    def __post_init__(self):
+        for field_name, field_value in self.__dataclass_fields__.items():
+            value = getattr(self, field_name)
+            if isinstance(value, str):
+                setattr(self, field_name, re.sub(r'\s+', '', value))
 
 
 @dataclass
@@ -522,8 +529,8 @@ class OpenClawDistillationTask:
         # 根据不同的harness更新文件
         if AGENT_FRAMEWORK == "openjiuwen":
             data = json.loads(Path(local_path).read_text(encoding="utf-8"))
-            if data["default"]["provider"] == "anthropic-messages":
-                data["default"]["provider"] == "Anthropic"
+            if "anthropic" in data["default"]["provider"]:
+                data["default"]["provider"] = "Anthropic"
             Path(local_path).write_text(
                 json.dumps(data, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
@@ -638,7 +645,7 @@ class OpenClawDistillationTask:
         if AGENT_FRAMEWORK == "openjiuwen":
             data = json.loads(Path(local_path).read_text(encoding="utf-8"))
             for agent in data.values():
-                if agent.get("api") == "anthropic-messages":
+                if "anthropic" in agent.get("api", ""):
                     agent["api"] = "Anthropic"
             Path(local_path).write_text(
                 json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -954,78 +961,66 @@ class OpenClawDistillationTask:
     async def _upload_traj_to_obs(self, config_file: str) -> bool:
         """Upload execution traj (logs) to OBS.
         兜底调用: 无论 pipeline 走到哪一步, 只要 execution_client 存活就应该被调用一次。
-        单次调用内做 3 次重试。任何异常都不会向外抛。
         """
         if self.execution_client is None:
             self.logger.warning("[upload_traj] execution_client is None, skip")
             return False
+
+        sandbox_cfg = self.config.sandbox_config
+        bucket_path = os.path.join(
+            self.config.obs_config.traj_save_path, Path(config_file).stem,
+        )
+        code_stem = Path(self.config.main_code_tar).stem
+        task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
+        per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
+        purge_clauses = [
+            f'rm -rf {os.path.join(ws, "skills")}'
+            for ws in per_agent_workspaces
+        ]
+
+        # 固定路径直接落到 bucket_path 下（workdir / logs / per-agent workspace）。
+        uploads = [
+            (sandbox_cfg.result_workdir, bucket_path),
+            (task_logs, bucket_path),
+        ]
+        uploads += [(ws, bucket_path) for ws in per_agent_workspaces]
+
+        if AGENT_FRAMEWORK == "hermes":
+            # hermes 每个 profile(<agent-name>) 下都有同名 sessions/logs/workspace，保留 profiles/<name>/ 层
+            for pattern in _FW["upload_paths"]:
+                for n in self._derive_agent_names(config_file):
+                    src = pattern.replace("*", n)
+                    dst = os.path.join(bucket_path, "profiles", n)
+                    uploads.append((src, dst))
+        else:
+            uploads += [(p, bucket_path) for p in _FW["upload_paths"]]
+
+        upload_clauses = [
+            f'for p in $(ls -d {src} 2>/dev/null); do '
+            f'{get_obsutil_uploader_command(self.client_config.s3, "$p", dst)}; '
+            f'done'
+            for src, dst in uploads
+        ]
+        exec_cmd = " && ".join(purge_clauses + upload_clauses) if upload_clauses else "true"
+
         try:
-            sandbox_cfg = self.config.sandbox_config
-            bucket_path = os.path.join(
-                self.config.obs_config.traj_save_path, Path(config_file).stem,
+            exec_request = ExtendExecCommand(
+                command=["/bin/bash", "-c", exec_cmd],
+                timeout=self.config.obs_config.upload_timeout,
             )
-            code_stem = Path(self.config.main_code_tar).stem
-            task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
-            per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
-            purge_clauses = [
-                f'rm -rf {os.path.join(ws, "skills")}'
-                for ws in per_agent_workspaces
-            ]
-
-            # 固定路径直接落到 bucket_path 下（workdir / logs / per-agent workspace）。
-            uploads = [
-                (sandbox_cfg.result_workdir, bucket_path),
-                (task_logs, bucket_path),
-            ]
-            uploads += [(ws, bucket_path) for ws in per_agent_workspaces]
-
-            if AGENT_FRAMEWORK == "hermes":
-                # hermes 每个 profile(<agent-name>) 下都有同名 sessions/logs/workspace，保留 profiles/<name>/ 层
-                for pattern in _FW["upload_paths"]:
-                    for n in self._derive_agent_names(config_file):
-                        src = pattern.replace("*", n)
-                        dst = os.path.join(bucket_path, "profiles", n)
-                        uploads.append((src, dst))
-            else:
-                uploads += [(p, bucket_path) for p in _FW["upload_paths"]]
-
-            upload_clauses = [
-                f'for p in $(ls -d {src} 2>/dev/null); do '
-                f'{get_obsutil_uploader_command(self.client_config.s3, "$p", dst)} || true; '
-                f'done'
-                for src, dst in uploads
-            ]
-
-            exec_cmd = " && ".join(purge_clauses + upload_clauses) if upload_clauses else "true"
+            result = await self.execution_client.extend(args=exec_request.to_dict())
         except Exception as e:
-            self.logger.error(f"[upload_traj] build cmd failed: {e}\n{traceback.format_exc()}")
-            return False
+            self.logger.error(
+                f"[upload_traj] exception: {e}\n{traceback.format_exc()}"
+            )
+            raise HiveError("S009", detail=f"{type(e).__name__}: {e}") from e
 
-        for attempt in range(1, 4):
-            try:
-                exec_request = ExtendExecCommand(
-                    command=["/bin/bash", "-c", exec_cmd],
-                    timeout=self.config.obs_config.upload_timeout,
-                )
-                result = await self.execution_client.extend(args=exec_request.to_dict())
-                if (result.code == ErrorCode.SUCCESS[0] and result.data["exit_code"] == 0):
-                    self.logger.info(
-                        f"[upload_traj] OK bucket={bucket_path} attempt={attempt}/3"
-                    )
-                    return True
-                self.logger.warning(
-                    f"[upload_traj] attempt={attempt}/3 failed: "
-                    f"result={result}"
-                )
-            except Exception as e:
-                self.logger.error(
-                    f"[upload_traj] attempt={attempt}/3 exception: {e}\n{traceback.format_exc()}"
-                )
-            if attempt < 3:
-                await asyncio.sleep(random.uniform(3, 10))
+        if result.code == ErrorCode.SUCCESS[0] and result.data["exit_code"] == 0:
+            self.logger.info(f"[upload_traj] OK bucket={bucket_path}")
+            return True
 
-        self.logger.error(f"[upload_traj] FAILED after 3 attempts, config={config_file}")
-        return False
+        self.logger.error(f"[upload_traj] FAILED bucket={bucket_path} result={result.data["exit_code"]}")
+        raise HiveError("S009", detail=f"bucket={bucket_path}", sandbox_result=result)
 
     async def _execute_task(self, config_file: str, task_idx: int) -> None:
         """Execute the full task pipeline.
@@ -1135,6 +1130,7 @@ class OpenClawDistillationTask:
             try:
                 if status == "任务成功":
                     await self._save_record(self.complete_record_file, config_file)
+                    await self._kill_user_processes_in_sandbox()
                 else:
                     await self._save_record(self.failed_record_file, config_file)
             except Exception as e:
@@ -1143,7 +1139,6 @@ class OpenClawDistillationTask:
             # ---- 关闭 execution_client ----
             if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
                 try:
-                    await self._kill_user_processes_in_sandbox()
                     await self.execution_client.close()
                 except Exception as e:
                     self.logger.error(
