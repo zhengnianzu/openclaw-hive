@@ -109,12 +109,12 @@
 
             <el-collapse-item title="OBS配置" name="obs">
               <el-descriptions :column="1" border size="small">
-                <el-descriptions-item label="技能目录">{{ createParams.skill_dir || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="技能目录">{{ obsPath(createParams.skill_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="默认技能">{{ createParams.default_skills || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="Agent目录">{{ createParams.agent_dir || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="用户Config目录">{{ createParams.user_config_dir || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="用户Profile目录">{{ createParams.user_profile_dir || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="轨迹保存路径">{{ createParams.traj_save_path || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="Agent目录">{{ obsPath(createParams.agent_dir) }}</el-descriptions-item>
+                <el-descriptions-item label="用户Config目录">{{ obsPath(createParams.user_config_dir) }}</el-descriptions-item>
+                <el-descriptions-item label="用户Profile目录">{{ obsPath(createParams.user_profile_dir) }}</el-descriptions-item>
+                <el-descriptions-item label="轨迹保存路径">{{ obsPath(createParams.traj_save_path) }}</el-descriptions-item>
               </el-descriptions>
             </el-collapse-item>
 
@@ -534,6 +534,15 @@ function formatDuration(seconds) {
 function maskKey(key) {
   if (!key || key.length <= 8) return key || '-'
   return key.slice(0, 4) + '***' + key.slice(-4)
+}
+
+// 把 OBS 目录（相对桶路径）拼上桶名展示；已是 obs:// 绝对路径或缺桶名则原样返回。
+function obsPath(dir) {
+  if (!dir) return '-'
+  if (dir.startsWith('obs://')) return dir
+  const bucket = createParams.value.obs_bucket
+  if (!bucket) return dir
+  return `${bucket.replace(/\/$/, '')}/${dir.replace(/^\//, '')}`
 }
 
 async function loadData() {
@@ -1101,10 +1110,26 @@ function onPreviewScroll() {
   if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) loadMorePreview()
 }
 
-function downloadFile(file) {
+async function downloadFile(file) {
   if (!file) return
-  const token = localStorage.getItem('token')
-  window.open(`/api/logs/${id}/obs-download?file_path=${encodeURIComponent(file.path)}&token=${token}`, '_blank')
+  try {
+    // 用 axios 拉取（请求拦截器会带上 Authorization: Bearer），
+    // 直接 window.open 无法携带该头,后端 OAuth2 鉴权会 401 → 下载无效。
+    const blob = await api.get(`/logs/${id}/obs-download`, {
+      params: { file_path: file.path },
+      responseType: 'blob',
+    })
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = file.name || file.path.split('/').pop()
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.URL.revokeObjectURL(url)
+  } catch {
+    ElMessage.error('文件下载失败')
+  }
 }
 
 function handleShortcut(cmd) {
