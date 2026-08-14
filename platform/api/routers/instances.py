@@ -631,12 +631,24 @@ def get_instance_config(instance_id: str, filename: str, user: dict = Depends(ge
 @router.get("/{instance_id}/create-params")
 def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
     with get_connection() as conn:
-        row = conn.execute("SELECT create_params FROM task_instances WHERE id=?", (instance_id,)).fetchone()
+        row = conn.execute(
+            "SELECT create_params, config_snapshot FROM task_instances WHERE id=?",
+            (instance_id,),
+        ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="实例不存在")
     if not row["create_params"]:
         raise HTTPException(status_code=404, detail="该实例无创建参数记录")
-    return json.loads(row["create_params"])
+    params = json.loads(row["create_params"])
+    # OBS 桶名不在 create_params 里，从 config_snapshot(s3.bucket_name) 取出，
+    # 供前端把各 OBS 目录字段拼成完整 obs:// 路径展示。
+    if row["config_snapshot"]:
+        try:
+            snap = OmegaConf.create(row["config_snapshot"])
+            params["obs_bucket"] = OmegaConf.select(snap, "s3.bucket_name")
+        except Exception:
+            pass
+    return params
 
 
 # ============================================================================

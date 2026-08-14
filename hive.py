@@ -157,6 +157,7 @@ _FRAMEWORK_LAYOUTS = {
         ],
         "workspace_base": "/home/ma-user/.openclaw/workspace",
     },
+    # 不支持TOOL.md
     "hermes": {
         "harness_dir":            "/home/ma-user/.hermes",
         "harness_local_config":   "uploads/config.yaml",
@@ -170,6 +171,7 @@ _FRAMEWORK_LAYOUTS = {
         # workspace 隔离在 profiles/<name>/ 里
         "workspace_base": None,
     },
+    # 只支持CLAUDE.md
     "claude-code": {
         "harness_dir":            "/home/ma-user/.claude",
         "harness_local_config":   "uploads/settings.json",
@@ -189,6 +191,16 @@ _FRAMEWORK_LAYOUTS = {
            
         ],
         "workspace_base": "/home/ma-user/.openjiuwen/workspace",
+    },
+    # agent路径：~/.config/opencode/agents/*.md
+    "opencode": {
+        "harness_dir":            "/home/ma-user/.config/opencode",
+        "harness_local_config":   "uploads/opencode.json",
+        "harness_sandbox_config": "/home/ma-user/.config/opencode/opencode.json",
+        "upload_paths": [
+           "/home/ma-user/.config/opencode"
+        ],
+        "workspace_base": "/home/ma-user/.config/opencode"
     },
 
 }
@@ -376,6 +388,7 @@ class TaskConfig:
     main_python_timeout: int = 7200
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
+    kill_process_timeout: int = 30
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
@@ -1164,7 +1177,7 @@ class OpenClawDistillationTask:
         cmd = "/bin/bash -c 'whoami && pkill -u $(whoami)'"
         exec_request = ExtendExecCommand(
             command=["/bin/bash", "-c", cmd],
-            timeout=self.config.simple_bash_timeout,
+            timeout=self.config.kill_process_timeout,
         )
 
         try:

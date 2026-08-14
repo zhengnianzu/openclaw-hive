@@ -602,10 +602,26 @@ async function previewFile(file) {
   } finally { previewLoading.value = false }
 }
 
-function downloadFile(file) {
+async function downloadFile(file) {
   if (!file) return
-  const token = localStorage.getItem('token')
-  window.open(`/api/logs/${id}/obs-download?file_path=${encodeURIComponent(file.path)}&token=${token}`, '_blank')
+  try {
+    // 用 axios 拉取（请求拦截器会带上 Authorization: Bearer），
+    // 直接 window.open 无法携带该头,后端 OAuth2 鉴权会 401 → 下载无效。
+    const blob = await api.get(`/logs/${id}/obs-download`, {
+      params: { file_path: file.path },
+      responseType: 'blob',
+    })
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = file.name || file.path.split('/').pop()
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.URL.revokeObjectURL(url)
+  } catch {
+    ElMessage.error('文件下载失败')
+  }
 }
 
 function handleShortcut(cmd) {
