@@ -156,6 +156,7 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.openclaw/agents",
         ],
         "workspace_base": "/home/ma-user/.openclaw/workspace",
+        "skill_subdir": "skills",
     },
     # 不支持TOOL.md
     "hermes": {
@@ -170,6 +171,7 @@ _FRAMEWORK_LAYOUTS = {
         ],
         # workspace 隔离在 profiles/<name>/ 里
         "workspace_base": None,
+        "skill_subdir": "skills",
     },
     # 只支持CLAUDE.md
     "claude-code": {
@@ -182,6 +184,7 @@ _FRAMEWORK_LAYOUTS = {
             "/home/ma-user/.claude/session-env",
         ],
         "workspace_base": "/home/ma-user/.claude/workspace",
+        "skill_subdir": ".claude/skills",
     },
     "openjiuwen": {
         "harness_dir":            "/home/ma-user/.openjiuwen",
@@ -191,6 +194,7 @@ _FRAMEWORK_LAYOUTS = {
            "/home/ma-user/.openjiuwen"
         ],
         "workspace_base": "/home/ma-user/.openjiuwen/workspace",
+        "skill_subdir": "skills",
     },
     # agent路径：~/.config/opencode/agents/*.md
     "opencode": {
@@ -200,7 +204,8 @@ _FRAMEWORK_LAYOUTS = {
         "upload_paths": [
            "/home/ma-user/.local/share/opencode/"
         ],
-        "workspace_base": "/home/ma-user/.config/opencode/workspace"
+        "workspace_base": "/home/ma-user/.config/opencode/workspace",
+        "skill_subdir": ".opencode/skills",
     },
 
 }
@@ -904,6 +909,9 @@ class OpenClawDistillationTask:
             return
 
         # skill_src 以 "/" 开头 → 沙箱本地路径, 逐个 cp; 否则 → OBS 前缀, 逐个 obsutil
+        if not skill_src:
+            self.logger.warning("skill_download_path is empty, skipping skill download")
+            return
         is_local = skill_src.startswith("/")
 
         async def download_skill(skill_path: str, target_path: str) -> None:
@@ -1066,8 +1074,10 @@ class OpenClawDistillationTask:
         code_stem = Path(self.config.main_code_tar).stem
         task_logs = os.path.join(sandbox_cfg.workspace, code_stem, "logs")
         per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
+        # 按 _FRAMEWORK_LAYOUTS 中定义的 skill_subdir 清理旧 skills（各 harness 的 skills 目录不同）
+        skill_subdir = _FW.get("skill_subdir", "skills")
         purge_clauses = [
-            f'rm -rf {os.path.join(ws, "skills")}'
+            f'rm -rf {os.path.join(ws, skill_subdir)}'
             for ws in per_agent_workspaces
         ]
 
