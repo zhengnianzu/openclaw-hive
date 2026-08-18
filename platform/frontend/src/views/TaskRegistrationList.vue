@@ -109,6 +109,8 @@
             <el-option label="Openclaw" value="openclaw" />
             <el-option label="Hermes" value="hermes" />
             <el-option label="Claude Code" value="claude-code" />
+            <el-option label="Jiuwen Claw" value="openjiuwen" />
+            <el-option label="OpenCode" value="opencode" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -192,10 +194,10 @@ function statusLabel(s) {
   return { pending: '待执行', executing: '执行中', completed: '已完成', cancelled: '已取消' }[s] || s
 }
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[type] || ''
 }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', common: '通用' }[type] || type || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[type] || type || 'openclaw'
 }
 function templateName(id) {
   if (!id) return '-'

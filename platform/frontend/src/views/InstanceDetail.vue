@@ -98,8 +98,8 @@
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="Harness类型">
-                  <el-tag size="small" :type="createParams.harness_type === 'hermes' ? 'warning' : createParams.harness_type === 'claude-code' ? 'success' : 'primary'">
-                    {{ createParams.harness_type || 'openclaw' }}
+                  <el-tag size="small" :type="harnessTagType(createParams.harness_type)">
+                    {{ harnessLabel(createParams.harness_type) }}
                   </el-tag>
                 </el-descriptions-item>
                 <el-descriptions-item label="Invite Code">{{ createParams.invite_code || '-' }}</el-descriptions-item>
@@ -510,6 +510,12 @@ const progressStatus = computed(() => {
 
 function statusColor(s) { return { running: 'success', preparing: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
 function statusText(s) { return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
+function harnessTagType(t) {
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[t] || ''
+}
+function harnessLabel(t) {
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[t] || t || 'openclaw'
+}
 function taskTagType(category) {
   const map = {
     '任务成功': 'success',

@@ -45,6 +45,8 @@
             <el-option label="OpenClaw" value="openclaw" />
             <el-option label="Hermes" value="hermes" />
             <el-option label="Claude Code" value="claude-code" />
+            <el-option label="Jiuwen Claw" value="openjiuwen" />
+            <el-option label="OpenCode" value="opencode" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -209,10 +211,10 @@ const form = ref(defaultForm())
 const agents = ref([{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }])
 
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[type] || ''
 }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', common: '通用' }[type] || type
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[type] || type
 }
 
 function addAgent() {

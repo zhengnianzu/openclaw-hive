@@ -63,13 +63,13 @@ s3:
 
 
 run_config:
-  harness_type: openjiuwen
+  harness_type: opencode
   start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
   total_num: 0      # 任务总数, 0表示不限制任务数量
   concurrent_num: 6   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
-    openclaw_local_config_file: "uploads/openjiuwen.json"
+    openclaw_local_config_file: "uploads/opencode.json"
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:
@@ -86,7 +86,7 @@ run_config:
     upload_timeout: 900
     traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
-    traj_save_path: openjiuwen_trajs/simple_tests
+    traj_save_path: opencode_trajs/simple_tests
     skill_download_path:
     user_config_download_path: zengxiang/task_configs/
     user_profile_download_path:

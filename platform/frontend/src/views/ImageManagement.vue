@@ -13,6 +13,8 @@
         <el-option label="OpenClaw" value="openclaw" />
         <el-option label="Hermes" value="hermes" />
         <el-option label="Claude Code" value="claude-code" />
+        <el-option label="Jiuwen Claw" value="openjiuwen" />
+        <el-option label="OpenCode" value="opencode" />
       </el-select>
     </div>
 
@@ -51,6 +53,8 @@
             <el-option label="OpenClaw" value="openclaw" />
             <el-option label="Hermes" value="hermes" />
             <el-option label="Claude Code" value="claude-code" />
+            <el-option label="Jiuwen Claw" value="openjiuwen" />
+            <el-option label="OpenCode" value="opencode" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -78,10 +82,10 @@ const images = ref([])
 const form = ref({ name: '', address: '', harness_type: 'openclaw' })
 
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[type] || ''
 }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', common: '通用' }[type] || type
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[type] || type
 }
 
 const filteredImages = computed(() => {

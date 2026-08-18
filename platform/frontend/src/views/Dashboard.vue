@@ -58,6 +58,8 @@
         <el-option label="Openclaw" value="openclaw" />
         <el-option label="Hermes" value="hermes" />
         <el-option label="Claude Code" value="claude-code" />
+        <el-option label="Jiuwen Claw" value="openjiuwen" />
+        <el-option label="OpenCode" value="opencode" />
       </el-select>
       <el-select v-model="userFilter" placeholder="创建者筛选" clearable filterable size="default" style="width:160px">
         <el-option v-for="u in userOptions" :key="u" :label="u" :value="u" />
@@ -71,10 +73,10 @@
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="filteredInstances" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
-        <el-table-column prop="harness_type" label="Harness" width="100" align="center" resizable>
+        <el-table-column prop="harness_type" label="Harness" width="120" align="center" resizable>
           <template #default="{row}">
-            <el-tag :type="row.harness_type === 'hermes' ? 'warning' : row.harness_type === 'claude-code' ? 'success' : 'primary'" size="small">
-              {{ row.harness_type || 'openclaw' }}
+            <el-tag :type="harnessTagType(row.harness_type)" size="small">
+              {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -244,6 +246,12 @@ function statusColor(s) {
 }
 function statusText(s) {
   return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+}
+function harnessTagType(t) {
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[t] || ''
+}
+function harnessLabel(t) {
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[t] || t || 'openclaw'
 }
 function progress(row) {
   if (!row.total_tasks) return 0

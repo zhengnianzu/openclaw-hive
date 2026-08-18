@@ -87,7 +87,7 @@ run_config:
     traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
     traj_save_path: hermes_trajs/simple_tests
-    skill_download_path: /home/ma-user/skills_library
+    skill_download_path:
     user_config_download_path: zengxiang/task_configs/
     user_profile_download_path:
     agents_download_path:

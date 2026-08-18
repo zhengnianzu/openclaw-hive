@@ -18,6 +18,7 @@
           <el-option label="Hermes" value="hermes" />
           <el-option label="Claude Code" value="claude-code" />
           <el-option label="Jiuwen Claw" value="openjiuwen" />
+          <el-option label="OpenCode" value="opencode" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>

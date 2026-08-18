@@ -18,6 +18,7 @@
           <el-option label="Hermes" value="hermes" />
           <el-option label="Claude Code" value="claude-code" />
           <el-option label="Jiuwen Claw" value="openjiuwen" />
+          <el-option label="OpenCode" value="opencode" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -79,7 +80,7 @@
 
         <el-tab-pane label="Harness配置" name="model">
           <el-form-item label="模型 Base URL">
-            <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
+            <el-input v-model="form.model_base_url" :placeholder="form.harness_type === 'opencode' ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
           </el-form-item>
 
           <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">
@@ -92,11 +93,12 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="form.harness_type === 'openclaw'" label="API 类型">
+          <el-form-item v-if="form.harness_type === 'openclaw' || form.harness_type === 'opencode'" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
             </el-select>
+            <div v-if="form.harness_type === 'opencode'" style="font-size:12px;color:#999;margin-top:4px">决定 provider 的 npm 包：anthropic 用 @ai-sdk/anthropic，openai 用 @ai-sdk/openai-compatible</div>
           </el-form-item>
 
           <el-form-item v-if="form.harness_type === 'openjiuwen'" label="Provider">

@@ -42,6 +42,15 @@
     "model_api_key": "default.api_key",
     "model_api_type": "default.provider"
   },
+  "opencode": {
+    "model_api_key": "provider.local-provider.options.apiKey",
+    "model_base_url": "provider.local-provider.options.baseURL",
+    "model_api_type": "provider.local-provider.npm",
+    "model_id": [
+      "provider.local-provider.models.{model_id}.name",
+      "agent.main.model"
+    ]
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local-provider": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "local-provider",
+      "options": {
+        "baseURL": "http://115.120.62.121:8082/v1",
+        "apiKey": "sk-xxxxx"
+      },
+      "models": {
+        "claude-opus-4-6": {
+          "name": "claude-opus-4-6"
+        }
+      }
+    }
+  },
+  "agent": {
+    "main": {
+      "description": "main actor",
+      "mode": "primary",
+      "model": "local-provider/tkfly_deepseek-v4-flash",
+      "prompt": "",
+      "tools": {
+        "write": true,
+        "edit": true
+      }
+    }
+  }
+}

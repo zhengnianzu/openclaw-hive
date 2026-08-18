@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/instances", tags=["instances"])
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json"}
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -387,7 +387,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs"}
+        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs"}
         traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
@@ -397,6 +397,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
     cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
     openjiuwen_path = os.path.join(instance_dir, "openjiuwen.json")
+    opencode_path = os.path.join(instance_dir, "opencode.json")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
@@ -405,6 +406,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         base.run_config.sandbox.harness_local_config_file = cc_settings_path
     elif req.harness_type == "openjiuwen":
         base.run_config.sandbox.harness_local_config_file = openjiuwen_path
+    elif req.harness_type == "opencode":
+        base.run_config.sandbox.harness_local_config_file = opencode_path
     else:
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -479,6 +482,57 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         with open(openjiuwen_path, "w", encoding="utf-8") as f:
             json.dump(openjiuwen_cfg, f, indent=2, ensure_ascii=False)
+    elif req.harness_type == "opencode":
+        opencode_template = os.path.join(harness_settings_dir, "opencode.json")
+        if not os.path.exists(opencode_template):
+            opencode_template = os.path.join(settings.SETTINGS_DIR, "opencode.json")
+        with open(opencode_template, "r", encoding="utf-8") as f:
+            opencode_cfg = json.load(f)
+
+        # opencode.json 结构: provider.<name>.{npm,options.{baseURL,apiKey},models} + agent.main.model
+        # provider key 固定为 "local-provider"（与模板一致），npm 根据 API 类型选择:
+        #   anthropic-messages -> @ai-sdk/anthropic
+        #   openai-completions -> @ai-sdk/openai-compatible
+        providers = opencode_cfg.setdefault("provider", {})
+        main_provider_key = "local-provider"
+        # 根据 model_api_type 决定 npm 包名；缺省时保留模板中的值
+        if req.model_api_type == "anthropic-messages":
+            npm_pkg = "@ai-sdk/anthropic"
+        elif req.model_api_type == "openai-completions":
+            npm_pkg = "@ai-sdk/openai-compatible"
+        else:
+            npm_pkg = None  # 保留模板原有值
+
+        if main_provider_key not in providers:
+            providers[main_provider_key] = {
+                "name": main_provider_key,
+                "npm": npm_pkg or "@ai-sdk/anthropic",
+                "options": {"baseURL": "", "apiKey": ""},
+                "models": {},
+            }
+        elif npm_pkg:
+            providers[main_provider_key]["npm"] = npm_pkg
+
+        main_opts = providers[main_provider_key].setdefault("options", {})
+        if req.model_base_url:
+            # opencode 要求 baseURL 带 /v1 后缀
+            base_url = req.model_base_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            main_opts["baseURL"] = base_url
+        if req.model_api_key:
+            main_opts["apiKey"] = req.model_api_key
+
+        # model_id 注入: 写入 provider.models 并更新 agent.main.model
+        if req.model_id:
+            models_map = providers[main_provider_key].setdefault("models", {})
+            models_map[req.model_id] = {"name": req.model_id}
+            agents_section = opencode_cfg.setdefault("agent", {})
+            main_agent = agents_section.setdefault("main", {})
+            main_agent["model"] = f"{main_provider_key}/{req.model_id}"
+
+        with open(opencode_path, "w", encoding="utf-8") as f:
+            json.dump(opencode_cfg, f, indent=2, ensure_ascii=False)
     else:
         openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
         if not os.path.exists(openclaw_template):
@@ -530,6 +584,12 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 openjiuwen_cfg.setdefault("default", {})["api_key"] = req.model_api_key
                 with open(openjiuwen_path, "w", encoding="utf-8") as f:
                     json.dump(openjiuwen_cfg, f, indent=2, ensure_ascii=False)
+            elif req.harness_type == "opencode" and os.path.exists(opencode_path):
+                with open(opencode_path, "r", encoding="utf-8") as f:
+                    opencode_cfg = json.load(f)
+                opencode_cfg.setdefault("provider", {}).setdefault("local-provider", {}).setdefault("options", {})["apiKey"] = req.model_api_key
+                with open(opencode_path, "w", encoding="utf-8") as f:
+                    json.dump(opencode_cfg, f, indent=2, ensure_ascii=False)
             elif os.path.exists(openclaw_path):
                 with open(openclaw_path, "r", encoding="utf-8") as f:
                     openclaw_cfg = json.load(f)
