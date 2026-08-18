@@ -188,7 +188,7 @@ _FRAMEWORK_LAYOUTS = {
         "harness_local_config":   "uploads/openjiuwen.json",
         "harness_sandbox_config": "/home/ma-user/.openjiuwen/openjiuwen.json",
         "upload_paths": [
-           
+           "/home/ma-user/.openjiuwen"
         ],
         "workspace_base": "/home/ma-user/.openjiuwen/workspace",
     },
@@ -198,9 +198,9 @@ _FRAMEWORK_LAYOUTS = {
         "harness_local_config":   "uploads/opencode.json",
         "harness_sandbox_config": "/home/ma-user/.config/opencode/opencode.json",
         "upload_paths": [
-           "/home/ma-user/.config/opencode"
+           "/home/ma-user/.local/share/opencode/"
         ],
-        "workspace_base": "/home/ma-user/.config/opencode"
+        "workspace_base": "/home/ma-user/.config/opencode/workspace"
     },
 
 }
@@ -388,7 +388,6 @@ class TaskConfig:
     main_python_timeout: int = 7200
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
-    kill_process_timeout: int = 30
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
@@ -534,7 +533,7 @@ class OpenClawDistillationTask:
                                 result, level=logging.ERROR)
             raise HiveError("C002", detail=detail, sandbox_result=result)
 
-    async def _copy_agent_config(self) -> None:
+    async def _copy_agent_config(self, data_config_file) -> None:
         """Copy main agent configuration to sandbox."""
         remote_path = self.config.sandbox_config.harness_sandbox_config_file
         local_path = self.config.sandbox_config.harness_local_config_file
@@ -548,6 +547,87 @@ class OpenClawDistillationTask:
                 json.dumps(data, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
+        if AGENT_FRAMEWORK == "opencode":
+            # agents.system_prompt和agent:evaluator注入
+            data = json.loads(Path(local_path).read_text(encoding="utf-8"))
+            model_cfg = json.loads(Path(local_model_path).read_text(encoding="utf-8"))
+            providers = data.setdefault("provider", {})
+            agents = data.setdefault("agent", {})
+
+            # 加载 data_cfg，构建 agent_name -> system_prompt 映射
+            data_cfg = parse_data_config(data_config_file)
+            agent_sp = {agent.get('name', ''): agent.get('system_prompt', '') for agent in data_cfg.agents}
+
+            # 更新provider和agent
+            for agent_name, cfg in model_cfg.items():
+                if agent_name == "user_simulator":
+                    continue
+                if not (cfg.get("model") and cfg.get("base_url")
+                        and cfg.get("api_key") and cfg.get("provider")):
+                    self.logger.warning(
+                        f"agent {agent_name} missing model/base_url/api_key/provider, skip"
+                    )
+                    continue
+
+                provider_key = cfg["provider"]          
+                model_name = cfg["model"]                      
+                api_key = cfg["api_key"]           
+                api_kind = cfg.get("api", "openai-completions")  # 决定使用哪个 npm
+                base_url = cfg["base_url"].rstrip('/')
+                if not base_url.endswith('/v1'):
+                    base_url = base_url + "/v1"     
+
+                # ---- 1. 注入 Provider ----
+                if provider_key not in providers:
+                    # 根据 api_kind 选择 npm 包
+                    if "openai" in api_kind.lower():
+                        npm_pkg = "@ai-sdk/openai-compatible"
+                    else:
+                        npm_pkg = "@ai-sdk/anthropic"   # 默认 fallback
+
+                    providers[provider_key] = {
+                        "name": provider_key,
+                        "npm": npm_pkg,
+                        "options": {
+                            "baseURL": base_url,
+                            "apiKey": api_key
+                        },
+                        "models": {
+                            model_name: {"name": model_name}
+                        }
+                    }
+                    self.logger.info(f"Added provider: {provider_key}")
+                else:
+                    # 如果 provider 已存在，可选择性更新 baseURL/apiKey（可选）
+                    # 这里仅更新 models 中可能缺失的项，避免覆盖已有内容
+                    existing_models = providers[provider_key].setdefault("models", {})
+                    if model_name not in existing_models:
+                        existing_models[model_name] = {"name": model_name}
+                        self.logger.info(f"Added model {model_name} to existing provider {provider_key}")
+
+                # ---- 2. 注入 Agent----
+                model_ref = f"{provider_key}/{model_name}"
+                if agent_name in agents:
+                    # 更新agent
+                    agents[agent_name]["model"] = model_ref
+                    if agent_name in agent_sp:
+                        agents[agent_name]["prompt"] = agent_sp.get(agent_name) or ""
+                    self.logger.info(f"Updated agent {agent_name} with model {model_ref}")
+                else:
+                    # 新建agent
+                    agents[agent_name] = {
+                        "model": model_ref,
+                        "prompt": agent_sp.get(agent_name) or ""
+                    }
+                    self.logger.info(f"Added new agent {agent_name} with model {model_ref}")
+
+            # 写回文件
+            Path(local_path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            self.logger.info(f"Updated opencode.json with provider/agent from {local_model_path}")
+
 
         if AGENT_FRAMEWORK == "openclaw":
             data = json.loads(Path(local_path).read_text(encoding="utf-8"))
@@ -696,7 +776,7 @@ class OpenClawDistillationTask:
             )
 
             # Re-copy original config before sed (needed because config may have been modified in previous retry)
-            await self._copy_agent_config()
+            await self._copy_agent_config(config_file)
 
             # Update port in remote config files
             for remote_file in [self.config.sandbox_config.harness_sandbox_config_file, remote_config_path]:
@@ -1054,7 +1134,7 @@ class OpenClawDistillationTask:
         if AGENT_FRAMEWORK.strip().lower() == "openclaw":
             await self._start_openclaw_gateway(config_file)
         else:
-            await self._copy_agent_config()
+            await self._copy_agent_config(config_file)
         await self._run_main_script(config_file, task_idx)
 
     async def run(self, config_file: str, task_idx: int = 0) -> None:
@@ -1143,7 +1223,6 @@ class OpenClawDistillationTask:
             try:
                 if status == "任务成功":
                     await self._save_record(self.complete_record_file, config_file)
-                    await self._kill_user_processes_in_sandbox()
                 else:
                     await self._save_record(self.failed_record_file, config_file)
             except Exception as e:
@@ -1170,25 +1249,6 @@ class OpenClawDistillationTask:
                 + (f' error="{error_msg}"' if error_msg else "")
                 + " ====="
             )
-
-    async def _kill_user_processes_in_sandbox(self) -> None:
-        """在沙箱内杀掉当前用户的所有进程, 避免残留 gateway/主脚本进程占着端口。"""
-
-        cmd = "/bin/bash -c 'whoami && pkill -u $(whoami)'"
-        exec_request = ExtendExecCommand(
-            command=["/bin/bash", "-c", cmd],
-            timeout=self.config.kill_process_timeout,
-        )
-
-        try:
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-        except Exception as e:
-            self.logger.warning(f"pkill in sandbox raised: {e}")
-            return
-        if result.code == ErrorCode.SUCCESS[0]:
-            self.logger.info(f"pkill -u $(whoami) executed, exit_code={result.data.get('exit_code')}")
-        else:
-            self.logger.warning(f"pkill in sandbox returned code={result.code}: {result}")
 
 
 # ============================================================================

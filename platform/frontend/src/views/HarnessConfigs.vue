@@ -13,6 +13,7 @@
         <el-option label="Hermes" value="hermes" />
         <el-option label="Claude Code" value="claude-code" />
         <el-option label="Jiuwen Claw" value="openjiuwen" />
+        <el-option label="OpenCode" value="opencode" />
         <el-option label="通用" value="common" />
       </el-select>
     </div>
@@ -60,6 +61,7 @@
             <el-option label="Hermes" value="hermes" />
             <el-option label="Claude Code" value="claude-code" />
             <el-option label="Jiuwen Claw" value="openjiuwen" />
+            <el-option label="OpenCode" value="opencode" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -178,6 +180,7 @@ const HARNESS_FILE_LABELS = {
   hermes: 'Harness (hermes_config)',
   'claude-code': 'Harness (cc_settings)',
   openjiuwen: 'Harness (openjiuwen.json)',
+  opencode: 'Harness (opencode.json)',
   common: 'Harness 配置',
 }
 
@@ -186,10 +189,10 @@ function harnessFileLabel(t) {
 }
 
 function tagType(t) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', common: 'info' }[t] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[t] || ''
 }
 function typeLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', common: '通用' }[t] || t
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[t] || t
 }
 function fileCount(row) {
   try { return JSON.parse(row.config_files_json || '[]').length } catch { return 0 }
@@ -205,6 +208,7 @@ function computeMappingHints() {
   if (fname === 'config.yaml') section = fieldMappings.value['config.yaml']
   else if (fname === 'openjiuwen.json') section = fieldMappings.value['openjiuwen']
   else if (fname === 'openclaw.json') section = fieldMappings.value['openclaw']
+  else if (fname === 'opencode.json') section = fieldMappings.value['opencode']
   else if (fname.includes('hermes')) section = fieldMappings.value['hermes']
   else if (fname.includes('cc_settings')) section = fieldMappings.value['claude-code']
   else if (fname.includes('user_proxy')) section = fieldMappings.value['user_proxy_model']

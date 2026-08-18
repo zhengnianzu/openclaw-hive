@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local-provider": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "local-provider",
+      "options": {
+        "baseURL": "http://your-gateway-host:8082/v1",
+        "apiKey": "your-api-key"
+      },
+      "models": {
+        "model-id-here": {
+          "name": "model-id-here"
+        }
+      }
+    }
+  },
+  "agent": {
+    "main": {
+      "description": "main actor",
+      "mode": "primary",
+      "model": "local-provider/model-id-here",
+      "prompt": "",
+      "tools": {
+        "write": true,
+        "edit": true
+      }
+    }
+  }
+}
