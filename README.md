@@ -363,7 +363,10 @@ python run_clear.py --config config.yaml --delete
 | openclaw:0.0.8   | 2026.4.26         | Gateway 启动较慢，`openclaw_start_timeout` 建议 ≥60 |
 | openclaw:26.6.6  | 2026.6.6          | 按照发布日期打镜像名 |
 | hermes:0.17.0    | 2026.6.19         | hermes镜像 |
-- 镜像地址：swr.cn-southwest-2.myhuaweicloud.com/rl_team/
+| multiharness:26.7.9| - | 包含openclaw、hermes、claude-code|
+| multiharness:26.8.3| - | 新增jiuwenclaw|
+| multiharness:26.8.18| - | 新增opencode、codex、pi-agent|
+- 镜像地址：swr.cn-east-4.myhuaweicloud.com/rl_team/
 ---
 
 ## 环境要求

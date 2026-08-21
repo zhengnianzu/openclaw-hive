@@ -218,227 +218,242 @@
       </el-tab-pane>
       <!-- ================= 输出 ================= -->
       <el-tab-pane label="输出" name="outputs">
-        <!-- 统计面板 -->
-        <el-card style="margin-bottom:16px" v-loading="evalLoading">
+        <!-- 统计面板（浅层漏斗） -->
+        <el-card style="margin-bottom:16px" v-loading="shallowLoading">
           <template #header>
             <div style="display:flex;justify-content:space-between;align-items:center">
-              <span>评估统计</span>
+              <span>会话漏斗</span>
               <div>
-                <el-button size="small" @click="loadEvalStats(false)" :loading="evalLoading">增量刷新</el-button>
-                <el-button size="small" type="warning" @click="loadEvalStats(true)" :loading="evalLoading">全量刷新</el-button>
+                <el-button v-if="authStore.isOperator" size="small" type="warning"
+                  :loading="requeuing" @click="requeueShallow">重新排队</el-button>
+                <el-button size="small" @click="loadShallow(false)">刷新</el-button>
               </div>
             </div>
           </template>
-          <div v-if="evalAvailable">
-            <!-- 顶部: 指标 -->
-            <div class="eval-stat-grid">
-              <div class="eval-stat-item">
-                <span class="eval-stat-num">{{ evalTotalSamples }}</span>
-                <span class="eval-stat-label">总样本量</span>
-              </div>
-              <div class="eval-stat-item">
-                <span class="eval-stat-num" style="color:#6366f1">{{ evalUploadedTrajs }}</span>
-                <span class="eval-stat-label">上传轨迹</span>
-              </div>
-              <div class="eval-stat-item">
-                <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedCountDisplay }}</span>
-                <span class="eval-stat-label">任务完成数</span>
-              </div>
-              <div class="eval-stat-item">
-                <span class="eval-stat-num" style="color:#10b981">{{ taskCompletedRateDisplay }}</span>
-                <span class="eval-stat-label">任务完成率</span>
-              </div>
-              <div class="eval-stat-item">
-                <span class="eval-stat-num" style="color:#10b981">{{ evalCount }}</span>
-                <span class="eval-stat-label">已评估</span>
-              </div>
-              <div class="eval-stat-item" style="cursor:pointer" @click="scoreDetailVisible = true">
-                <span class="eval-stat-num avg-score-link">{{ avgScoreDisplay }}</span>
-                <span class="eval-stat-label">平均分</span>
-              </div>
-            </div>
-
-            <!-- 底部: 两图并排 -->
-            <div class="eval-charts-row">
-              <!-- 分数分布 -->
-              <div class="chart-box">
-                <div class="chart-title">分数分布</div>
-                <div v-if="evalCount > 0" class="score-chart-body">
-                  <div v-for="bucket in distributionBuckets" :key="bucket.label" class="score-chart-col">
-                    <span class="score-chart-count">{{ bucket.count || '' }}</span>
-                    <div class="score-chart-bar-wrap">
-                      <div class="score-chart-bar" :style="{height: bucket.pct + '%'}" />
-                    </div>
-                    <span class="score-chart-label">{{ bucket.label }}</span>
-                  </div>
+          <div v-if="shallowSummary.total > 0">
+            <!-- 漏斗柱状图: L0→L3 -->
+            <div class="funnel-bar-row">
+              <div v-for="b in funnelBuckets" :key="b.label" class="funnel-bar-col">
+                <span class="funnel-bar-count">{{ b.count || '' }}</span>
+                <div class="funnel-bar-track">
+                  <div class="funnel-bar" :style="{ height: b.pct + '%', background: b.color }" />
                 </div>
-                <el-empty v-else description="暂无分数" :image-size="30" />
+                <span class="funnel-bar-label">{{ b.label }}</span>
               </div>
-
-              <!-- 轨迹分级 -->
-              <div class="chart-box" v-loading="trajLoading">
-                <div class="chart-title-row">
-                  <span class="chart-title">
-                    轨迹分级<span v-if="trajGradedTrajs" style="color:var(--text-muted)"> · 已分级 {{ trajGradedTrajs }}</span>
-                  </span>
-                  <span>
-                    <el-button size="small" @click="loadTrajStats(false)" :loading="trajLoading">增量刷新</el-button>
-                    <el-button size="small" type="warning" @click="loadTrajStats(true)" :loading="trajLoading">全量刷新</el-button>
-                  </span>
+              <!-- 未评估(排队中) -->
+              <div class="funnel-bar-col">
+                <span class="funnel-bar-count">{{ shallowSummary.unevaluated }}</span>
+                <div class="funnel-bar-track">
+                  <div class="funnel-bar uneval-bar"
+                    :style="{ height: unevaluatedPct + '%' }" />
                 </div>
-                <div v-if="trajAvailable" class="score-chart-body">
-                  <div v-for="bucket in trajBuckets" :key="bucket.label" class="score-chart-col">
-                    <span class="score-chart-count">{{ bucket.count || '' }}</span>
-                    <div class="score-chart-bar-wrap">
-                      <div class="score-chart-bar traj-bar" :style="{height: bucket.pct + '%', background: bucket.color}" />
-                    </div>
-                    <span class="score-chart-label">{{ bucket.label }}</span>
-                  </div>
-                </div>
-                <el-empty v-else description="暂无轨迹分级数据（点刷新抓取）" :image-size="30" />
+                <span class="funnel-bar-label">未评估</span>
               </div>
             </div>
           </div>
-          <el-empty v-else description="暂无评估数据" :image-size="40" />
+          <el-empty v-else description="暂无会话数据（运行中会自动采集）" :image-size="40" />
         </el-card>
 
-        <div class="toolbar">
-          <el-button @click="loadTopDirs(true)" :loading="fileLoading">刷新</el-button>
-          <el-checkbox v-model="showHidden" style="margin-left:12px" @change="onFilterChange">显示隐藏文件</el-checkbox>
-          <el-breadcrumb separator="/" style="margin-left:12px">
-            <el-breadcrumb-item>{{ obsBasePath || '...' }}</el-breadcrumb-item>
-          </el-breadcrumb>
-          <div style="flex:1" />
-          <el-input v-model="searchKeyword" placeholder="搜索文件..." clearable size="small"
-            style="width:220px;margin-right:8px" @input="onSearchInput" @clear="onSearchClear">
-            <template #prefix><el-icon><Search /></el-icon></template>
-          </el-input>
-          <el-dropdown trigger="click" @command="handleShortcut">
-            <el-button size="small" type="primary">快捷查看<el-icon style="margin-left:4px"><ArrowDown /></el-icon></el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="run">任务日志</el-dropdown-item>
-                <el-dropdown-item command="gateway">harness 日志</el-dropdown-item>
-                <el-dropdown-item command="evaluator">评估日志</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-        </div>
-
-        <div class="split-layout">
-          <!-- 左侧：文件树 -->
-          <div class="file-list">
-            <el-tree
-              v-if="!isSearchMode"
-              ref="treeRef"
-              :data="treeData"
-              :props="treeProps"
-              node-key="path"
-              highlight-current
-              @node-click="handleNodeClick"
-              @node-expand="handleNodeExpand"
-              v-loading="fileLoading"
-            >
-              <template #default="{ node, data }">
-                <span class="tree-node">
-                  <el-icon v-if="data.is_dir" style="color:#e6a23c"><Folder /></el-icon>
-                  <el-icon v-else style="color:#909399"><Document /></el-icon>
-                  <span style="margin-left:4px">{{ data.label }}</span>
-                  <span v-if="data.size && !data.is_dir" class="tree-size">{{ data.size }}</span>
-                  <el-button v-if="!data.is_dir" size="small" text type="primary"
-                    style="margin-left:8px" @click.stop="downloadFile(data)">下载</el-button>
-                </span>
-              </template>
-            </el-tree>
-            <!-- 搜索模式：静态树 -->
-            <el-tree
-              v-else
-              :data="searchTreeData"
-              :props="treeProps"
-              node-key="path"
-              default-expand-all
-              highlight-current
-              @node-click="handleNodeClick"
-              v-loading="searchLoading"
-            >
-              <template #default="{ node, data }">
-                <span class="tree-node">
-                  <el-icon v-if="data.is_dir" style="color:#e6a23c"><Folder /></el-icon>
-                  <el-icon v-else style="color:#909399"><Document /></el-icon>
-                  <span style="margin-left:4px">{{ data.label }}</span>
-                  <span v-if="data.size && !data.is_dir" class="tree-size">{{ data.size }}</span>
-                  <el-button v-if="!data.is_dir" size="small" text type="primary"
-                    style="margin-left:8px" @click.stop="downloadFile(data)">下载</el-button>
-                </span>
-              </template>
-            </el-tree>
-            <el-empty v-if="isSearchMode && !searchLoading && searchTreeData.length === 0"
-              description="无匹配文件" :image-size="40" />
-          </div>
-
-          <!-- 右侧：文件预览 -->
-          <div class="file-preview">
-            <div v-if="previewLoading" style="padding:40px;text-align:center">
-              <el-icon class="is-loading" :size="24"><Loading /></el-icon>
-              <p style="color:#999;margin-top:8px">加载中...</p>
-            </div>
-            <div v-else-if="previewContent !== null" class="preview-wrap">
-              <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1e293b;border-radius:var(--radius-sm) var(--radius-sm) 0 0;flex-shrink:0">
-                <span style="color:#ccc;font-size:13px">
-                  {{ selectedFile?.label || selectedFile?.name }}
-                  (已加载 {{ previewOffset }} / {{ previewTotalChars }} 字符，共 {{ previewTotalLines }} 行)
-                </span>
-                <el-button size="small" text style="color:#ccc" @click="downloadFile(selectedFile)">下载</el-button>
-              </div>
-              <pre ref="previewContainer" class="preview-content" @scroll="onPreviewScroll">{{ previewContent }}</pre>
-              <div v-if="previewLoadingMore" style="padding:6px;text-align:center;color:#94a3b8;font-size:12px;background:#0f172a">
-                <el-icon class="is-loading"><Loading /></el-icon> 加载更多...
+        <!-- 会话表格 -->
+        <el-card>
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span>会话列表 <span style="color:var(--text-muted);font-weight:400;font-size:12px">共 {{ shallowTotal }} 个</span></span>
+              <div style="display:flex;gap:8px">
+                <el-select v-model="levelFilter" size="small" placeholder="等级" clearable style="width:120px"
+                  @change="onTaskFilterChange">
+                  <el-option label="L0" value="L0" /><el-option label="L1" value="L1" />
+                  <el-option label="L1.5" value="L1.5" /><el-option label="L2" value="L2" />
+                  <el-option label="L3" value="L3" />
+                  <el-option label="未评估" value="unevaluated" />
+                  <el-option label="失败" value="fail" />
+                </el-select>
+                <el-input v-model="taskKeyword" size="small" placeholder="搜索会话..." clearable
+                  style="width:200px" @input="onTaskFilterChange">
+                  <template #prefix><el-icon><Search /></el-icon></template>
+                </el-input>
               </div>
             </div>
-            <el-empty v-else description="点击左侧文件预览内容" :image-size="80" />
+          </template>
+          <el-table :data="pagedTasks" stripe size="small" style="width:100%"
+            @sort-change="onTaskSort">
+            <el-table-column prop="traj_name" label="会话" min-width="240" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span style="cursor:pointer;color:var(--text-primary)"
+                  @click="openTaskDetail(row)">{{ row.traj_name }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="等级" min-width="90" align="center">
+              <template #default="{ row }">
+                <el-tag size="small" :color="levelTagBg(row.traj_level)" style="color:#fff;border:none"
+                  v-if="row.traj_level && row.traj_level !== 'failed'">
+                  {{ row.traj_level }}
+                </el-tag>
+                <el-tag v-else-if="row.traj_level === 'failed'" size="small" type="danger" effect="plain">失败</el-tag>
+                <el-tag v-else size="small" type="info" effect="plain">未评估</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="eval_completion" label="Completion" min-width="110" align="right" sortable="custom">
+              <template #default="{ row }">
+                <span :style="{ color: completionColor(row.eval_completion) }">
+                  {{ fmtPct(row.eval_completion) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="task_done" label="Task-DONE" min-width="100" align="center">
+              <template #default="{ row }">
+                <span v-if="row.task_done" class="task-done-badge">✓</span>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="工具失败" min-width="90" align="center">
+              <template #default="{ row }">
+                <span v-if="row.tool_fail" style="color:#f56c6c;font-weight:600">✗</span>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="Eval-OC-Trace" min-width="130" align="center">
+              <template #default="{ row }">
+                <span v-if="row.has_eval" class="eval-trace-badge">有</span>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="eval_score" label="评分" min-width="110" align="right" sortable="custom">
+              <template #default="{ row }">
+                <span :style="{ color: scoreColor(row.eval_score) }">{{ fmtScore(row.eval_score) }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="table-footer">
+            <el-pagination layout="total, prev, pager, next" :total="shallowTotal"
+              :page-size="taskPageSize" :current-page="taskPage" @current-change="onTaskPage" small />
+            <span class="poll-hint" v-if="instanceStatus === 'running'">每 10s 自动刷新</span>
           </div>
-        </div>
+        </el-card>
       </el-tab-pane>
     </el-tabs>
 
-    <!-- 分数明细弹窗 -->
-    <el-dialog v-model="scoreDetailVisible" title="评估分数明细" width="900px" destroy-on-close>
-      <div style="margin-bottom:12px;color:#666;font-size:13px">
-        计算公式：score = Π(gate) × Σ(norm_weight × passed/total)
+    <!-- 会话详情弹窗（深层加载：轨迹 / Log / 评测） -->
+    <el-dialog v-model="detailVisible" :title="`会话详情 · ${detailTrajName || ''}`" width="980px"
+      top="4vh" destroy-on-close>
+      <div v-if="detailLoading" style="padding:60px;text-align:center">
+        <el-icon class="is-loading" :size="28" style="color:#6366f1"><Loading /></el-icon>
+        <p style="color:#999;margin-top:12px">{{ detailStatusHint }}</p>
       </div>
-      <el-table :data="scoreDetailRows" stripe border max-height="500" style="width:100%"
-        :default-sort="{ prop: 'task', order: 'ascending' }">
-        <el-table-column prop="task" label="任务" min-width="180" show-overflow-tooltip sortable />
-        <el-table-column label="Gate" width="110" align="center" sortable :sort-by="row => row.gate">
-          <template #default="{ row }">
-            <div :style="{ color: row.gate === 0 ? '#f56c6c' : '#67c23a', fontWeight: 700 }">{{ row.gate }}</div>
-            <div style="font-size:11px;color:#999;margin-top:2px">{{ row.gateExpr }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column label="Bucket 得分" min-width="160">
-          <template #default="{ row }">
-            <div>{{ row.bucketSum != null ? row.bucketSum.toFixed(4) : '-' }}</div>
-            <div style="font-size:11px;color:#999;margin-top:2px">{{ row.bucketExpr }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column label="计算分" width="90" align="center" sortable :sort-by="row => row.score">
-          <template #default="{ row }">
-            <span :style="{ fontWeight: 700, color: row.score === 0 ? '#f56c6c' : row.score >= 1 ? '#67c23a' : '#e6a23c' }">
-              {{ row.score != null ? row.score.toFixed(4) : '-' }}
+      <template v-else-if="detailData">
+        <el-descriptions :column="3" border size="small" style="margin-bottom:16px">
+          <el-descriptions-item label="Harness">
+            <el-tag size="small" :type="harnessTagType(detailData.harness)">{{ harnessLabel(detailData.harness) }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="状态">
+            <el-tag size="small" :type="detailData.verdict?.has_eval ? 'success' : 'info'">
+              {{ detailData.verdict?.has_eval ? '已评测' : '未评测' }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="Task-DONE">
+            <span v-if="detailData.verdict?.task_done" style="color:#10b981;font-weight:600">✓</span>
+            <span v-else style="color:#c0c4cc">—</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="Completion">
+            <span :style="{ color: completionColor(detailData.verdict?.completion) }">
+              {{ fmtPct(detailData.verdict?.completion) }}
             </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="Completion" width="110" align="center" sortable :sort-by="row => row.completion ?? -1">
-          <template #default="{ row }">
-            <span style="color:#999">{{ row.completion != null ? row.completion.toFixed(4) : '-' }}</span>
-          </template>
-        </el-table-column>
-      </el-table>
-      <div style="margin-top:12px;font-size:13px;color:#666">
-        合计: {{ scoreDetailRows.length }} 个任务 ·
-        平均分(计算): {{ avgScoreDisplay }} ·
-        平均分(completion): {{ completionAvgDisplay }}
-      </div>
+          </el-descriptions-item>
+          <el-descriptions-item label="工具调用" :span="2">
+            {{ detailData.assistant_stats?.tool_calls ?? '-' }} 次
+            <span style="color:var(--text-muted)">· 普通轮 {{ detailData.assistant_stats?.plain_rounds ?? '-' }}</span>
+            <span style="color:var(--text-muted)">· assistant {{ detailData.assistant_stats?.assistant_rounds ?? '-' }} 轮</span>
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <el-tabs v-model="detailTab" class="detail-sub-tabs">
+          <!-- 轨迹 -->
+          <el-tab-pane label="轨迹" name="traj">
+            <div v-if="assistantBlocks.length" class="traj-viewer">
+              <div v-for="(b, i) in assistantBlocks" :key="i" class="traj-block" :class="`traj-${b.role || 'meta'}`">
+                <div class="traj-block-head">
+                  <span class="traj-role">{{ roleLabel(b) }}</span>
+                  <span v-if="b.part_type === 'thinking'" class="traj-type">thinking</span>
+                  <span v-if="b.tool_name" class="traj-tool">{{ b.tool_name }}</span>
+                  <span v-if="b.part_type === 'toolCall'" class="traj-type">toolCall</span>
+                  <span v-if="b.isError || b.exitCode" class="traj-err">exit {{ b.exitCode ?? '?' }}</span>
+                  <el-icon v-if="i < assistantBlocks.length - 1" class="traj-fold" :size="14"
+                    @click="toggleBlock(i)">
+                    <ArrowDown v-if="!collapsedBlocks[i]" /><ArrowRight v-else />
+                  </el-icon>
+                </div>
+                <div v-if="!collapsedBlocks[i] && (b.content || b.args)" class="traj-body">
+                  <pre v-if="b.content" class="traj-content">{{ b.content }}</pre>
+                  <pre v-if="b.args" class="traj-args">{{ b.args }}</pre>
+                </div>
+              </div>
+            </div>
+            <el-empty v-else description="无 assistant 轨迹" :image-size="40" />
+          </el-tab-pane>
+
+          <!-- Log -->
+          <el-tab-pane label="Log" name="log">
+            <el-tabs v-model="logTab" class="log-sub-tabs">
+              <el-tab-pane label="主日志" name="task">
+                <div class="log-panel-head">
+                  <span style="color:var(--text-muted)">{{ detailData.log?.path || '无主日志' }}</span>
+                  <el-button size="small" text type="primary" @click="detailLogTailFull = !detailLogTailFull">
+                    {{ detailLogTailFull ? '仅看尾部' : '查看全部' }}
+                  </el-button>
+                </div>
+                <pre class="log-panel" v-if="detailData.log?.tail">{{ logDisplayText(detailData.log.tail) }}</pre>
+                <el-empty v-else description="无主日志" :image-size="30" />
+              </el-tab-pane>
+              <el-tab-pane label="Gateway" name="gateway">
+                <div class="log-panel-head">
+                  <span style="color:var(--text-muted)">{{ detailData.gateway?.path || '无 gateway 日志' }}</span>
+                </div>
+                <pre class="log-panel" v-if="detailData.gateway?.tail">{{ detailData.gateway.tail }}</pre>
+                <el-empty v-else description="无 gateway 日志" :image-size="30" />
+              </el-tab-pane>
+              <el-tab-pane label="Eval 日志" name="eval">
+                <div class="log-panel-head">
+                  <span style="color:var(--text-muted)">{{ detailData.eval_use_log?.path || '无 eval 日志' }}</span>
+                </div>
+                <pre class="log-panel" v-if="detailData.eval_use_log?.tail">{{ detailData.eval_use_log.tail }}</pre>
+                <el-empty v-else description="无 eval 日志" :image-size="30" />
+              </el-tab-pane>
+            </el-tabs>
+          </el-tab-pane>
+
+          <!-- 评测 -->
+          <el-tab-pane label="评测" name="eval">
+            <div class="verdict-panel">
+              <div class="verdict-item"><span class="verdict-label">已评测</span>
+                <el-tag size="small" :type="detailData.verdict?.has_eval ? 'success' : 'info'">
+                  {{ detailData.verdict?.has_eval ? '是' : '否' }}
+                </el-tag>
+              </div>
+              <div class="verdict-item"><span class="verdict-label">Completion</span>
+                <span :style="{ color: completionColor(detailData.verdict?.completion) }">{{ fmtPct(detailData.verdict?.completion) }}</span>
+              </div>
+              <div class="verdict-item"><span class="verdict-label">Task-DONE</span>
+                <span v-if="detailData.verdict?.task_done" style="color:#10b981;font-weight:600">✓</span>
+                <span v-else style="color:#c0c4cc">—</span>
+              </div>
+            </div>
+            <div v-if="evaluatorBlocks.length" class="traj-viewer" style="margin-top:12px">
+              <div v-for="(b, i) in evaluatorBlocks" :key="i" class="traj-block" :class="`traj-${b.role || 'meta'}`">
+                <div class="traj-block-head">
+                  <span class="traj-role">{{ roleLabel(b) }}</span>
+                  <span v-if="b.part_type === 'thinking'" class="traj-type">thinking</span>
+                  <span v-if="b.tool_name" class="traj-tool">{{ b.tool_name }}</span>
+                </div>
+                <pre v-if="b.content" class="traj-content">{{ b.content }}</pre>
+              </div>
+            </div>
+            <el-empty v-else description="无 evaluator 轨迹" :image-size="40" style="margin-top:12px" />
+          </el-tab-pane>
+        </el-tabs>
+      </template>
+      <template v-else>
+        <el-empty description="详情不可用" :image-size="40" />
+      </template>
     </el-dialog>
   </div>
 </template>
@@ -446,7 +461,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, Search, Folder, Document, Loading } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowRight, Search, Folder, Document, Loading } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 
@@ -478,7 +493,7 @@ function ensureTabLoaded(tab) {
   loadedTabs.add(tab)
   if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
   else if (tab === 'logs') { loadTaskLogFiles(); loadTaskStatusMap(); loadLogs() }
-  else if (tab === 'outputs') { loadTopDirs(); loadEvalStats(); loadTrajStats(false, true) }
+  else if (tab === 'outputs') { loadShallow(false) }
 }
 
 // ============ 配置信息 tab ============
@@ -734,421 +749,246 @@ async function loadTaskStatusMap() {
   } catch { /* ignore */ }
 }
 
-// ============ 输出 tab: 评估统计 ============
-const HIDDEN_RE = /^\./
-function isHidden(name) { return HIDDEN_RE.test(name) || name === '__pycache__' }
+// ============ 输出 tab: 浅层漏斗（task_records 会话分级） ============
+// 数据源: GET /instances/{id}/shallow（L0-L3 计数 + 全部行），10s 轮询。
+const shallowLoading = ref(false)
+const shallowSummary = ref({ L0: 0, L1: 0, 'L1.5': 0, L2: 0, L3: 0, graded: 0, total: 0, task_done: 0 })
+const shallowRows = ref([])
+const instanceStatus = ref('')
 
-const evalLoading = ref(false)
-const evalAvailable = ref(false)
-const evalTotalSamples = ref(0)
-const evalUploadedTrajs = ref(0)
-const taskScores = ref({})
-const taskCompleted = ref({})
-const taskEvalDetails = ref({})
-const scoreDetailVisible = ref(false)
-
-const evalCount = computed(() => Object.keys(taskScores.value).length)
-const taskCompletedCount = computed(() => Object.values(taskCompleted.value).filter(Boolean).length)
-const taskCompletedCountDisplay = computed(() => {
-  const total = Object.keys(taskCompleted.value).length
-  if (!total) return '-'
-  return taskCompletedCount.value
-})
-const taskCompletedRateDisplay = computed(() => {
-  const total = Object.keys(taskCompleted.value).length
-  if (!total) return '-'
-  const pct = ((taskCompletedCount.value / total) * 100).toFixed(1)
-  return `${pct}%`
-})
-const avgScoreDisplay = computed(() => {
-  const scores = Object.values(taskScores.value)
-  if (!scores.length) return '-'
-  const avg = scores.reduce((a, b) => a + b, 0) / scores.length
-  return (avg * 100).toFixed(1) + '%'
-})
-
-const scoreDetailRows = computed(() => {
-  const details = taskEvalDetails.value
-  if (!details || !Object.keys(details).length) return []
-  return Object.entries(details)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([task, d]) => ({
-      task,
-      gate: d.gate,
-      gateExpr: d.gate_expr || '-',
-      gateStatus: d.gate_status || {},
-      bucketExpr: d.bucket_expr || '-',
-      bucketSum: d.bucket_sum,
-      score: d.score,
-      completion: d.completion,
-    }))
-})
-
-const completionAvgDisplay = computed(() => {
-  const rows = scoreDetailRows.value.filter(r => r.completion != null)
-  if (!rows.length) return '-'
-  const avg = rows.reduce((a, r) => a + r.completion, 0) / rows.length
-  return (avg * 100).toFixed(1) + '%'
-})
-
-const scoreDistribution = computed(() => {
-  const dist = {}
-  for (const s of Object.values(taskScores.value)) {
-    const idx = Math.min(Math.floor(s * 10), 10)
-    const label = idx * 10 + '%'
-    dist[label] = (dist[label] || 0) + 1
-  }
-  return dist
-})
-
-const distributionBuckets = computed(() => {
-  const dist = scoreDistribution.value
-  const total = Object.values(taskScores.value).length || 1
-  const maxCount = Math.max(1, ...Object.values(dist))
-  const buckets = []
-  for (let i = 0; i <= 10; i++) {
-    const label = i * 10 + '%'
-    const count = dist[label] || 0
-    buckets.push({
-      label,
-      count,
-      pct: (count / maxCount) * 100,
-      ratio: total > 0 ? ((count / total) * 100).toFixed(0) : '0',
-    })
-  }
-  return buckets
-})
-
-async function loadEvalStats(refresh = false) {
-  evalLoading.value = true
-  try {
-    const res = await api.get(`/logs/${id}/eval-stats`, { params: { refresh } })
-    evalAvailable.value = res.available
-    evalTotalSamples.value = res.total_samples || 0
-    evalUploadedTrajs.value = res.uploaded_trajs || 0
-    taskScores.value = res.task_scores || {}
-    taskCompleted.value = res.task_completed || {}
-    taskEvalDetails.value = res.task_eval_details || {}
-  } catch {
-    evalAvailable.value = false
-  } finally {
-    evalLoading.value = false
-  }
-}
-
-// ============ 输出 tab: 轨迹分级 (L0–L3) ============
-const trajLoading = ref(false)
-const trajAvailable = ref(false)
-const trajGradedTrajs = ref(0)
-const trajLevelDist = ref({})
-
-const TRAJ_LEVEL_ORDER = ['none', 'L0', 'L1', 'L1.5', 'L2', 'L3']
-const TRAJ_LEVEL_COLOR = {
-  none: '#909399',
+const LEVEL_COLORS = {
   L0: '#94a3b8',
   L1: '#38bdf8',
   'L1.5': '#818cf8',
   L2: '#a78bfa',
   L3: '#10b981',
 }
-
-const trajBuckets = computed(() => {
-  const dist = trajLevelDist.value
-  const maxCount = Math.max(1, ...TRAJ_LEVEL_ORDER.map(l => dist[l] || 0))
-  return TRAJ_LEVEL_ORDER.map(label => {
-    const count = dist[label] || 0
+const LEVEL_ORDER = ['L0', 'L1', 'L1.5', 'L2', 'L3']
+// 会话行: task_records 行 ∪ traj_name(leaf) ∪ tool_fail 列
+const taskRows = computed(() => {
+  return shallowRows.value.map(r => {
+    const name = r.config_name || ''
+    const leaf = name.includes('/') ? name.split('/').pop() : name
+    const stripped = leaf.replace(/\.json$/, '')
     return {
-      label,
-      count,
-      pct: (count / maxCount) * 100,
-      color: TRAJ_LEVEL_COLOR[label] || '#909399',
+      ...r,
+      traj_name: stripped || leaf,
+      tool_fail: typeof r.tool_fail === 'number' ? r.tool_fail > 0 : !!r.tool_fail,
     }
   })
 })
+const unevaluatedCount = computed(() => taskRows.value.filter(r => !r.traj_level).length)
 
-async function loadTrajStats(refresh = false, cacheOnly = false) {
-  trajLoading.value = true
+// 漏斗柱状图: 高度相对已分级总数（未评估单独一柱，按总数比例）
+const funnelBuckets = computed(() => {
+  const graded = shallowSummary.value.graded || 1
+  return LEVEL_ORDER.map(label => {
+    const count = shallowSummary.value[label] || 0
+    return { label, count, pct: (count / graded) * 100, color: LEVEL_COLORS[label] }
+  })
+})
+const unevaluatedPct = computed(() => {
+  const total = shallowSummary.value.total
+  if (!total) return 0
+  return ((unevaluatedCount.value / total) * 100)
+})
+
+// ---- 表格分页 / 过滤 / 排序（本地，浅层一次性返回全部行） ----
+const levelFilter = ref('')
+const taskKeyword = ref('')
+const taskPage = ref(1)
+const taskPageSize = ref(50)
+const taskSort = ref({})
+
+const filteredTaskRows = computed(() => {
+  let rows = taskRows.value
+  if (levelFilter.value) {
+    if (levelFilter.value === 'unevaluated') rows = rows.filter(r => !r.traj_level)
+    else if (levelFilter.value === 'fail') rows = rows.filter(r => r.traj_level === 'failed')
+    else rows = rows.filter(r => r.traj_level === levelFilter.value)
+  }
+  const kw = taskKeyword.value.trim().toLowerCase()
+  if (kw) rows = rows.filter(r => (r.traj_name || '').toLowerCase().includes(kw))
+  const s = taskSort.value
+  if (s.prop) {
+    const dir = s.order === 'descending' ? -1 : 1
+    const cmp = (a, b) => {
+      let x = a[s.prop], y = b[s.prop]
+      if (x == null) x = -Infinity
+      if (y == null) y = -Infinity
+      if (typeof x === 'string') return x.localeCompare(String(y)) * dir
+      return (x - y) * dir
+    }
+    rows = [...rows].sort(cmp)
+  }
+  return rows
+})
+const pagedTasks = computed(() => {
+  const start = (taskPage.value - 1) * taskPageSize.value
+  return filteredTaskRows.value.slice(start, start + taskPageSize.value)
+})
+const shallowTotal = computed(() => filteredTaskRows.value.length)
+
+function onTaskFilterChange() { taskPage.value = 1 }
+function onTaskPage(p) { taskPage.value = p }
+function onTaskSort({ prop, order }) {
+  taskSort.value = { prop, order }
+  taskPage.value = 1
+}
+
+async function loadShallow(refresh = false) {
+  shallowLoading.value = true
   try {
-    const res = await api.get(`/logs/${id}/traj-stats`, { params: { refresh, cache_only: cacheOnly } })
-    trajAvailable.value = res.available
-    trajGradedTrajs.value = res.graded_trajs || 0
-    trajLevelDist.value = res.level_dist || {}
-  } catch {
-    trajAvailable.value = false
-  } finally {
-    trajLoading.value = false
-  }
+    const res = await api.get(`/instances/${id}/shallow`)
+    shallowSummary.value = res.summary || shallowSummary.value
+    shallowRows.value = res.rows || []
+    instanceStatus.value = res.instance_status || ''
+  } catch { /* interceptor 已提示 */ }
+  finally { shallowLoading.value = false }
 }
 
-// ============ 输出 tab: 文件树（两级加载） ============
-const fileLoading = ref(false)
-const treeData = ref([])
-const treeRef = ref(null)
-const selectedFile = ref(null)
-const previewContent = ref(null)
-const previewOffset = ref(0)
-const previewHasMore = ref(false)
-const previewLoadingMore = ref(false)
-const previewContainer = ref(null)
-const previewTotalChars = ref(0)
-const PREVIEW_PAGE = 200000
-const previewTotalLines = ref(0)
-const previewLoading = ref(false)
-const obsBasePath = ref('')
-const showHidden = ref(false)
-const searchKeyword = ref('')
-const searchLoading = ref(false)
-const searchTreeData = ref([])
-const topDirs = ref([])
-const subtreeCache = {}
-
-const isSearchMode = computed(() => searchKeyword.value.trim().length > 0)
-
-const treeProps = {
-  label: 'label',
-  children: 'children',
-  isLeaf: (data) => !data.is_dir,
-}
-
-/** 加载一级目录列表 */
-async function loadTopDirs(refresh = false) {
-  fileLoading.value = true
+async function requeueShallow() {
   try {
-    const res = await api.get(`/logs/${id}/obs-tree`, { params: { refresh } })
-    obsBasePath.value = res.obs_path
-    topDirs.value = res.dirs || []
-    const dirs = topDirs.value
-      .filter(d => showHidden.value || !isHidden(d))
-      .sort((a, b) => a.localeCompare(b))
-      .map(d => ({
-        label: d,
-        path: obsBasePath.value + d + '/',
-        is_dir: true,
-        subdir: d,
-        children: [{ label: '加载中...', path: '_placeholder_' + d, is_dir: false, _placeholder: true }],
-      }))
-    treeData.value = dirs
-  } finally { fileLoading.value = false }
+    await ElMessageBox.confirm('将全部会话重新排队（traj_level 清空，worker 重新分级）？', '重新排队', { type: 'warning' })
+    requeuing.value = true
+    await api.post(`/instances/${id}/shallow`)
+    ElMessage.success('已重新排队，等待 worker 处理')
+    setTimeout(() => loadShallow(false), 1500)
+  } catch { /* 取消或失败 */ }
+  finally { requeuing.value = false }
 }
 
-/** 加载子目录的文件列表，返回扁平 items */
-async function loadSubtreeItems(subdir) {
-  if (subtreeCache[subdir]) return subtreeCache[subdir]
-  const res = await api.get(`/logs/${id}/obs-subtree`, { params: { subdir } })
-  const items = res.items || []
-  subtreeCache[subdir] = items
-  return items
+// ---- 浅层标签 / 颜色辅助 ----
+function levelTagBg(level) {
+  return LEVEL_COLORS[level] || ''
+}
+function completionColor(v) {
+  if (v == null) return '#909399'
+  if (v >= 0.5) return '#10b981'
+  if (v > 0) return '#e6a23c'
+  return '#f56c6c'
+}
+function scoreColor(v) {
+  if (v == null) return '#909399'
+  if (v >= 0.5) return '#10b981'
+  if (v > 0) return '#e6a23c'
+  return '#f56c6c'
+}
+function fmtPct(v) {
+  if (v == null) return '-'
+  return (v * 100).toFixed(1) + '%'
+}
+function fmtScore(v) {
+  if (v == null) return '-'
+  return Number(v).toFixed(4)
 }
 
-/** 展开一级目录时加载子树 */
-async function handleNodeExpand(data) {
-  if (!data.subdir) return
-  if (data.children && data.children.length > 0 && !data.children[0]._placeholder) return
+// ============ 输出 tab: 深层详情（task_traj_records 本地缓存） ============
+// 触发 POST /deep/{traj_name} → worker 下载到 output_cache → 3s 轮询 status → 拉 detail。
+const detailVisible = ref(false)
+const detailTrajName = ref('')
+const detailLoading = ref(false)
+const detailStatusHint = ref('')
+const detailData = ref(null)
+const detailTab = ref('traj')
+const logTab = ref('task')
+const collapsedBlocks = ref({})
+const detailLogTailFull = ref(false)
+let deepPollTimer = null
+
+watch(detailVisible, (v) => {
+  if (!v && deepPollTimer) {
+    clearInterval(deepPollTimer)
+    deepPollTimer = null
+  }
+})
+
+const assistantBlocks = computed(() => detailData.value?.assistant_trajectory || [])
+const evaluatorBlocks = computed(() => detailData.value?.evaluator_trajectory || [])
+
+async function openTaskDetail(row) {
+  const name = row.traj_name
+  detailTrajName.value = name
+  detailVisible.value = true
+  detailData.value = null
+  detailLoading.value = true
+  detailTab.value = 'traj'
+  logTab.value = 'task'
+  collapsedBlocks.value = {}
+  detailLogTailFull.value = false
+  // 先直接尝试读本地缓存详情（浅层 tsr+log 产物可直接展示，无需触发下载）
   try {
-    const items = await loadSubtreeItems(data.subdir)
-    const parentPath = obsBasePath.value + data.subdir + '/'
-    const children = buildPathTree(items, parentPath)
-    data.children = children.length > 0 ? children : []
-  } catch {
-    data.children = []
-  }
+    const d = await api.get(`/instances/${id}/deep/${name}/detail`)
+    detailData.value = d
+    detailLoading.value = false
+    return
+  } catch { /* 本地无缓存 → 走触发下载流程 */ }
+  // 幂等触发下载；已 downloading/pending 时后端返回 in_progress，不打断
+  let trigger = 'queued'
+  try { trigger = (await api.post(`/instances/${id}/deep/${name}`)).status || 'queued' } catch { /* 404 等由 interceptor 提示 */ }
+  if (trigger === 'in_progress') detailStatusHint.value = '正在后台加载详情…'
+  else detailStatusHint.value = '正在加载详情…'
+  clearInterval(deepPollTimer)
+  deepPollTimer = setInterval(pollDeep, 3000)
+  await pollDeep()
 }
 
-/**
- * 从扁平路径列表构建嵌套树结构
- */
-function buildPathTree(items, parentPath) {
-  const root = { children: new Map() }
-
-  for (const item of items) {
-    const relativePath = item.name
-    if (!relativePath) continue
-
-    const segments = relativePath.split('/')
-    if (!showHidden.value && segments.some(seg => isHidden(seg))) continue
-
-    let current = root
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i]
-      const isLast = i === segments.length - 1
-
-      if (!current.children.has(seg)) {
-        current.children.set(seg, {
-          label: seg,
-          path: isLast ? item.path : parentPath + segments.slice(0, i + 1).join('/') + '/',
-          is_dir: isLast ? item.is_dir : true,
-          size: isLast ? item.size : null,
-          children: new Map(),
-        })
-      }
-      current = current.children.get(seg)
-    }
-  }
-
-  function toArray(node) {
-    if (!node.children || node.children.size === 0) {
-      return { label: node.label, path: node.path, is_dir: node.is_dir, size: node.size }
-    }
-    const dirs = []
-    const files = []
-    for (const child of node.children.values()) {
-      const converted = toArray(child)
-      if (converted.is_dir) dirs.push(converted)
-      else files.push(converted)
-    }
-    dirs.sort((a, b) => a.label.localeCompare(b.label))
-    files.sort((a, b) => a.label.localeCompare(b.label))
-    return {
-      label: node.label, path: node.path, is_dir: node.is_dir, size: node.size,
-      children: [...dirs, ...files],
-    }
-  }
-
-  const dirs = []
-  const files = []
-  for (const child of root.children.values()) {
-    const converted = toArray(child)
-    if (converted.is_dir) dirs.push(converted)
-    else files.push(converted)
-  }
-  dirs.sort((a, b) => a.label.localeCompare(b.label))
-  files.sort((a, b) => a.label.localeCompare(b.label))
-  return [...dirs, ...files]
-}
-
-// ============ 输出 tab: 搜索/过滤 ============
-let searchTimer = null
-
-function onSearchInput() {
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => { doSearch() }, 300)
-}
-
-function onSearchClear() {
-  searchTreeData.value = []
-}
-
-function onFilterChange() {
-  if (isSearchMode.value) doSearch()
-  else loadTopDirs(false)
-}
-
-async function doSearch() {
-  const kw = searchKeyword.value.trim().toLowerCase()
-  if (!kw) {
-    searchTreeData.value = []
+async function pollDeep() {
+  if (!detailVisible.value || !detailTrajName.value) return
+  let st = null
+  try { st = await api.get(`/instances/${id}/deep/${detailTrajName.value}/status`) } catch { return }
+  if (st.status === 'downloading') { detailStatusHint.value = '正在下载缓存…' }
+  if (st.status === 'failed') {
+    // 下载失败：若本地已有浅层 tsr+log 产物，回退直接读详情展示
+    detailStatusHint.value = `下载失败: ${st.error || '未知错误'}，回退本地缓存…`
+    try {
+      const d = await api.get(`/instances/${id}/deep/${detailTrajName.value}/detail`)
+      detailData.value = d
+      detailLoading.value = false
+      return
+    } catch { /* 本地也无缓存 → 展示失败 */ }
+    detailStatusHint.value = `加载失败: ${st.error || '未知错误'}`
+    clearInterval(deepPollTimer)
+    deepPollTimer = null
+    detailLoading.value = false
     return
   }
-
-  searchLoading.value = true
+  if (st.status !== 'done') return
+  clearInterval(deepPollTimer)
+  deepPollTimer = null
   try {
-    const dirsToLoad = topDirs.value.filter(d => !subtreeCache[d])
-    if (dirsToLoad.length > 0) {
-      await Promise.all(dirsToLoad.map(d => loadSubtreeItems(d)))
-    }
-
-    const resultNodes = []
-    for (const subdir of topDirs.value) {
-      if (!showHidden.value && isHidden(subdir)) continue
-      const items = subtreeCache[subdir] || []
-      const filtered = items.filter(item => item.name.toLowerCase().includes(kw))
-      if (filtered.length === 0) continue
-
-      const parentPath = obsBasePath.value + subdir + '/'
-      const children = buildPathTree(filtered, parentPath)
-      resultNodes.push({
-        label: subdir,
-        path: parentPath,
-        is_dir: true,
-        children,
-      })
-    }
-    searchTreeData.value = resultNodes
-  } finally {
-    searchLoading.value = false
+    const d = await api.get(`/instances/${id}/deep/${detailTrajName.value}/detail`)
+    detailData.value = d
+    detailLoading.value = false
+  } catch {
+    detailStatusHint.value = '详情解析中…'
   }
 }
 
-// ============ 输出 tab: 文件操作 ============
-function handleNodeClick(data) {
-  if (!data.is_dir) previewFile(data)
-}
-
-async function previewFile(file) {
-  selectedFile.value = file
-  previewLoading.value = true
-  previewContent.value = null
-  previewOffset.value = 0
-  previewHasMore.value = false
-  previewTotalChars.value = 0
-  try {
-    const res = await api.get(`/logs/${id}/obs-view`,
-      { params: { file_path: file.path, offset: 0, limit: PREVIEW_PAGE } })
-    previewContent.value = res.content || ''
-    previewOffset.value = res.next_offset || 0
-    previewTotalLines.value = res.total_lines || 0
-    previewTotalChars.value = res.total_chars || 0
-    previewHasMore.value = !!res.has_more
-    if (previewContainer.value) previewContainer.value.scrollTop = 0
-  } catch {
-    previewContent.value = '文件加载失败'
-    previewHasMore.value = false
-  } finally { previewLoading.value = false }
-}
-
-async function loadMorePreview() {
-  if (previewLoadingMore.value || !previewHasMore.value || !selectedFile.value) return
-  previewLoadingMore.value = true
-  try {
-    const res = await api.get(`/logs/${id}/obs-view`,
-      { params: { file_path: selectedFile.value.path, offset: previewOffset.value, limit: PREVIEW_PAGE } })
-    previewContent.value = (previewContent.value || '') + (res.content || '')
-    previewOffset.value = res.next_offset || previewOffset.value
-    previewHasMore.value = !!res.has_more
-  } catch {
-    previewHasMore.value = false
-  } finally { previewLoadingMore.value = false }
-}
-
-function onPreviewScroll() {
-  const el = previewContainer.value
-  if (!el || !previewHasMore.value || previewLoadingMore.value) return
-  if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) loadMorePreview()
-}
-
-async function downloadFile(file) {
-  if (!file) return
-  try {
-    // 用 axios 拉取（请求拦截器会带上 Authorization: Bearer），
-    // 直接 window.open 无法携带该头,后端 OAuth2 鉴权会 401 → 下载无效。
-    const blob = await api.get(`/logs/${id}/obs-download`, {
-      params: { file_path: file.path },
-      responseType: 'blob',
-    })
-    const url = window.URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = file.name || file.path.split('/').pop()
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    window.URL.revokeObjectURL(url)
-  } catch {
-    ElMessage.error('文件下载失败')
+// 轨迹 viewer 辅助
+function roleLabel(b) {
+  if (!b) return '?'
+  const map = {
+    assistant: '助手',
+    user: '用户',
+    toolResult: '工具结果',
+    thinking: '思考',
+    toolCall: '工具调用',
+    meta: '系统',
   }
+  return map[b.role] || map[b.part_type] || b.role || b.part_type || '系统'
 }
-
-function handleShortcut(cmd) {
-  const keywords = {
-    gateway: 'gateway.log',
-    run: 'run.log',
-    evaluator: 'evaluator_use.log',
-  }
-  searchKeyword.value = keywords[cmd] || ''
-  doSearch()
+function toggleBlock(i) {
+  collapsedBlocks.value = { ...collapsedBlocks.value, [i]: !collapsedBlocks.value[i] }
+}
+function logDisplayText(text) {
+  if (detailLogTailFull.value) return text
+  return (text || '').slice(-20000)
 }
 
 // ============ 生命周期 ============
+let shallowTimer = null
+
 onMounted(async () => {
   loading.value = true
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
@@ -1159,9 +999,25 @@ onMounted(async () => {
   if (activeTab.value === 'logs') {
     nextTick(() => { if (logContainer.value) logContainer.value.addEventListener('scroll', onScroll) })
   }
+  if (activeTab.value === 'outputs') {
+    shallowTimer = setInterval(() => loadShallow(false), 10000)
+  }
 })
+
+// outputs tab 懒加载时启动浅层轮询；离开时停止
+watch(activeTab, (tab) => {
+  if (tab === 'outputs') {
+    if (!shallowTimer) shallowTimer = setInterval(() => loadShallow(false), 10000)
+  } else if (shallowTimer) {
+    clearInterval(shallowTimer)
+    shallowTimer = null
+  }
+}, { flush: 'sync' })
+
 onUnmounted(() => {
   clearInterval(timer)
+  clearInterval(shallowTimer)
+  clearInterval(deepPollTimer)
   if (logContainer.value) logContainer.value.removeEventListener('scroll', onScroll)
 })
 </script>
@@ -1235,80 +1091,107 @@ onUnmounted(() => {
 .task-opt-name { flex: 1; }
 .task-opt-tag { margin-left: auto; }
 
-/* ---- 输出 tab: 文件树/预览 ---- */
-.split-layout { display: flex; gap: 16px; height: calc(100vh - 300px); }
-.file-list {
-  width: 360px; flex-shrink: 0; overflow: auto;
-  border: 1px solid var(--border-color); border-radius: var(--radius-md);
-  padding: 8px; background: #fff;
+/* ---- 输出 tab: 漏斗柱状图 ---- */
+.funnel-bar-row {
+  display: flex; align-items: flex-end; justify-content: center; gap: 16px;
+  height: 170px; padding: 8px 24px 26px;
+  border-bottom: 1px solid #e5e7eb; margin-bottom: 8px;
 }
-.file-preview { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.tree-node { display: flex; align-items: center; font-size: 13px; }
-.tree-size { margin-left: 6px; font-size: 11px; color: #999; }
-.preview-wrap { height: 100%; display: flex; flex-direction: column; min-height: 0; }
-.preview-content {
-  background: #1e293b; color: #e2e8f0; padding: 12px; margin: 0;
-  min-height: 0;
-  border-radius: 0 0 var(--radius-sm) var(--radius-sm); flex: 1; overflow: auto;
-  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
-  white-space: pre-wrap; word-break: break-all;
-}
-
-/* ---- 输出 tab: 评估统计 ---- */
-.eval-stat-grid {
-  display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
-  align-content: center;
-  padding-bottom: 16px; margin-bottom: 16px;
-  border-bottom: 1px solid var(--border-color, #e5e7eb);
-}
-.eval-charts-row { display: flex; gap: 32px; align-items: stretch; }
-.chart-box { flex: 1; min-width: 0; }
-.chart-title { font-size: 13px; color: var(--text-muted); }
-.chart-title-row {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 8px; min-height: 24px;
-}
-.chart-box > .chart-title { display: block; margin-bottom: 8px; }
-.traj-bar { max-width: 40px; }
-.eval-stat-item { display: flex; flex-direction: column; align-items: center; padding: 8px 0; }
-.eval-stat-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
-.avg-score-link {
-  color: #f59e0b !important;
-  text-decoration: underline;
-  text-decoration-style: dashed;
-  text-underline-offset: 4px;
-}
-.avg-score-link:hover { text-decoration-style: solid; }
-.eval-stat-label { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
-
-/* 柱状图 */
-.score-chart-body {
-  display: flex; align-items: flex-end; gap: 2px;
-  height: 120px; padding-bottom: 20px; position: relative;
-  border-bottom: 1px solid #e5e7eb;
-}
-.score-chart-col {
+.funnel-bar-col {
   flex: 1; display: flex; flex-direction: column; align-items: center;
-  height: 100%; position: relative;
+  height: 100%; position: relative; max-width: 90px;
 }
-.score-chart-count {
-  font-size: 10px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+.funnel-bar-count {
+  font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
   position: absolute; top: 0; white-space: nowrap;
 }
-.score-chart-bar-wrap {
-  flex: 1; width: 100%; display: flex; align-items: flex-end;
-  padding-top: 16px;
+.funnel-bar-track {
+  flex: 1; width: 100%; display: flex; align-items: flex-end; padding-top: 18px;
 }
-.score-chart-bar {
-  width: 100%; max-width: 32px; margin: 0 auto;
-  background: linear-gradient(180deg, #6366f1, #8b5cf6);
+.funnel-bar {
+  width: 100%; max-width: 44px; margin: 0 auto;
   border-radius: 3px 3px 0 0; transition: height 0.3s ease;
   min-height: 2px;
 }
-.score-chart-label {
-  font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums;
-  position: absolute; bottom: -18px; white-space: nowrap;
+.uneval-bar {
+  background: repeating-linear-gradient(135deg, #d8d8dc 0 6px, #c2c2c8 6px 12px);
 }
+.funnel-bar-label {
+  font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+  position: absolute; bottom: -20px; white-space: nowrap;
+}
+
+/* ---- 输出 tab: 会话表格 ---- */
+.table-footer {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: 12px;
+}
+.poll-hint { font-size: 12px; color: var(--text-muted); }
+.task-done-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #10b981; color: #fff; font-size: 11px; font-weight: 700;
+}
+.eval-trace-badge {
+  display: inline-block; padding: 1px 8px; border-radius: 10px;
+  background: rgba(99, 102, 241, .12); color: #6366f1;
+  font-size: 12px;
+}
+
+/* ---- 输出 tab: 会话详情弹窗 ---- */
+.detail-sub-tabs { margin-top: 4px; }
+.log-sub-tabs { margin-top: 4px; }
+.traj-viewer {
+  max-height: 520px; overflow-y: auto; border: 1px solid var(--border-color);
+  border-radius: var(--radius-md); padding: 8px;
+}
+.traj-block { border-radius: 6px; margin-bottom: 6px; overflow: hidden; }
+.traj-block:last-child { margin-bottom: 0; }
+.traj-block-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 10px; font-size: 12px; min-height: 26px;
+}
+.traj-role { font-weight: 600; }
+.traj-type { color: #909399; font-size: 11px; }
+.traj-tool {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: #6366f1; font-size: 11px;
+}
+.traj-err { color: #f56c6c; font-size: 11px; font-weight: 600; }
+.traj-fold { margin-left: auto; cursor: pointer; color: #909399; }
+.traj-fold:hover { color: var(--text-primary); }
+.traj-body { padding: 2px 10px 8px; }
+.traj-content, .traj-args {
+  margin: 0; padding: 0; font-size: 12px; line-height: 1.55;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  white-space: pre-wrap; word-break: break-all;
+}
+.traj-args { color: var(--text-muted); margin-top: 4px; }
+.traj-assistant .traj-block-head { background: rgba(99, 102, 241, .10); }
+.traj-assistant .traj-role { color: #6366f1; }
+.traj-user .traj-block-head { background: rgba(16, 185, 129, .10); }
+.traj-user .traj-role { color: #10b981; }
+.traj-toolResult .traj-block-head { background: #f5f7fa; }
+.traj-toolResult .traj-role { color: #606266; }
+.traj-meta .traj-block-head { background: rgba(230, 162, 60, .10); }
+.traj-meta .traj-role { color: #e6a23c; }
+.log-panel-head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 6px;
+}
+.log-panel {
+  background: #1e293b; color: #e2e8f0; padding: 12px;
+  border-radius: var(--radius-sm); max-height: 420px; overflow: auto;
+  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 12px;
+  white-space: pre-wrap; word-break: break-all; margin: 0;
+}
+.verdict-panel {
+  display: flex; gap: 32px; padding: 12px 16px;
+  border: 1px solid var(--border-color); border-radius: var(--radius-md);
+  background: #fafafa;
+}
+.verdict-item { display: flex; flex-direction: column; gap: 4px; }
+.verdict-label { font-size: 12px; color: var(--text-muted); }
 </style>
 
 

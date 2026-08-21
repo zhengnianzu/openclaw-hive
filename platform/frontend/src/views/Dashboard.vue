@@ -71,7 +71,7 @@
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
-      <el-table :data="filteredInstances" v-loading="loading" stripe style="width:100%" border>
+      <el-table :data="pagedInstances" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
         <el-table-column prop="harness_type" label="Harness" width="120" align="center" resizable>
           <template #default="{row}">
@@ -140,11 +140,21 @@
         </el-table-column>
       </el-table>
     </div>
+
+    <div class="pagination-bar" v-if="filteredInstances.length > 0">
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :total="filteredInstances.length"
+        :page-sizes="[10, 20, 50]"
+        layout="total, sizes, prev, pager, next, jumper"
+        background />
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Search, Monitor, VideoPlay, CircleCheck, CircleClose, Box } from '@element-plus/icons-vue'
@@ -161,6 +171,8 @@ const harnessFilter = ref('')
 const userFilter = ref('')
 const dateRange = ref(null)
 const nameSearch = ref('')
+const currentPage = ref(1)
+const pageSize = ref(20)
 const router = useRouter()
 let timer = null
 
@@ -195,6 +207,20 @@ const filteredInstances = computed(() => {
     list = list.filter(i => i.name.toLowerCase().includes(keyword))
   }
   return list
+})
+
+const pagedInstances = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredInstances.value.slice(start, start + pageSize.value)
+})
+
+// 筛选/每页条数变化时回到第一页；当前页因数据减少而越界时也回退，避免停在空白页
+watch([statusFilter, harnessFilter, userFilter, dateRange, nameSearch, pageSize], () => {
+  currentPage.value = 1
+})
+watch(filteredInstances, (list) => {
+  const maxPage = Math.max(1, Math.ceil(list.length / pageSize.value))
+  if (currentPage.value > maxPage) currentPage.value = maxPage
 })
 
 const totalRunningPods = computed(() => runningInstances.value.reduce((sum, inst) => sum + inst.concurrent_num, 0))
@@ -309,4 +335,5 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 
 .filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .mono-num { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-secondary); white-space: nowrap; }
+.pagination-bar { display: flex; justify-content: flex-end; margin-top: 16px; }
 </style>

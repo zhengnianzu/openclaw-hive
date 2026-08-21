@@ -10,6 +10,27 @@ HOST="${2:-0.0.0.0}"
 PORT="${3:-8087}"
 NGINX_PORT="${4:-80}"
 
+# 输出分析 worker：独立进程管理（pid 文件 worker.pid，日志 worker.log）
+start_worker() {
+    if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null; then
+        echo "输出分析 worker 已在运行 (PID: $(cat worker.pid))"
+        return
+    fi
+    nohup python3 offline/output_worker.py > worker.log 2>&1 &
+    echo $! > worker.pid
+    echo "输出分析 worker 已启动 (PID: $(cat worker.pid))"
+}
+
+stop_worker() {
+    if [ -f worker.pid ]; then
+        kill "$(cat worker.pid)" 2>/dev/null
+        rm -f worker.pid
+        echo "输出分析 worker 已停止"
+    else
+        echo "输出分析 worker 未运行"
+    fi
+}
+
 case "$ACTION" in
     install)
         echo "=== 安装后端依赖 ==="
@@ -49,6 +70,7 @@ case "$ACTION" in
         nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
+        start_worker
 
         # 启动 Nginx（如果已安装）
         if command -v nginx &> /dev/null; then
@@ -81,6 +103,7 @@ case "$ACTION" in
         else
             echo "Uvicorn 未运行"
         fi
+        stop_worker
         # 停止 Nginx（如果由我们启动）
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null && echo "Nginx 已停止"
@@ -94,6 +117,7 @@ case "$ACTION" in
             rm -f platform.pid
             echo "已停止旧进程"
         fi
+        stop_worker
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null
         fi
@@ -107,6 +131,7 @@ case "$ACTION" in
         nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
+        start_worker
 
         if command -v nginx &> /dev/null; then
             NGINX_CONF="$SCRIPT_DIR/nginx.conf"
