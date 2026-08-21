@@ -154,16 +154,40 @@ case "$ACTION" in
         fi
         ;;
 
+    worker-logs)
+        if [ -f worker.log ]; then
+            tail -f worker.log
+        else
+            echo "worker.log 不存在，输出分析 worker 可能未启动"
+        fi
+        ;;
+
+    worker-status)
+        if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null; then
+            echo "输出分析 worker 运行中 (PID: $(cat worker.pid))"
+        else
+            echo "输出分析 worker 未运行"
+        fi
+        echo "--- worker.log 尾部 20 行 ---"
+        if [ -f worker.log ]; then
+            tail -n 20 worker.log
+        else
+            echo "(worker.log 不存在)"
+        fi
+        ;;
+
     *)
-        echo "用法: $0 {install|build|dev|start|stop|restart|logs} [host] [port] [nginx_port]"
+        echo "用法: $0 {install|build|dev|start|stop|restart|logs|worker-logs|worker-status} [host] [port] [nginx_port]"
         echo ""
-        echo "  install   安装依赖（后端 + 前端）"
-        echo "  build     构建前端静态文件"
-        echo "  dev       开发模式（后端热重载）"
-        echo "  start     生产模式启动（uvicorn + nginx）"
-        echo "  stop      停止服务"
-        echo "  restart   重启服务"
-        echo "  logs      查看日志（实时）"
+        echo "  install        安装依赖（后端 + 前端）"
+        echo "  build          构建前端静态文件"
+        echo "  dev            开发模式（后端热重载）"
+        echo "  start          生产模式启动（uvicorn + nginx）"
+        echo "  stop           停止服务"
+        echo "  restart        重启服务"
+        echo "  logs           查看主服务日志（实时）"
+        echo "  worker-logs    查看输出分析 worker 日志（实时）"
+        echo "  worker-status  查看 worker 存活状态 + 日志尾部"
         echo ""
         echo "默认端口: uvicorn=${PORT}, nginx=${NGINX_PORT}"
         ;;
