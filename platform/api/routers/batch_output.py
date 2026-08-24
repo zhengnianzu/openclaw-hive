@@ -139,6 +139,97 @@ async def shallow_tasks(
 
 # ============ 深层 ============
 
+# 漏斗等级（批量入队的合法 traj_level；failed / NULL 不入队）
+_ENQUEUE_LEVELS = _TRAJ_LEVELS
+
+# ⚠ 静态批量端点（enqueue_all/queue）必须定义在参数路由 {traj_name} 之前，
+#   否则 FastAPI 按注册序匹配，POST /deep/enqueue_all 会被 trigger_deep 的
+#   {traj_name} 捕获（traj_name="enqueue_all"）→ 404。
+
+
+@router.post("/{instance_id}/deep/enqueue_all")
+async def deep_enqueue_all(instance_id: str, user: dict = Depends(require_operator)):
+    """把该实例所有已分级（L0-L3）且未下载的行批量置 pending 入队。
+
+    与单会话 trigger_deep 同款幂等保护：
+      - 已 downloading 的不打断（跳过）
+      - 已有 assistant_traj_path（此前下载成功）的跳过，不重复拉 OBS
+      - failed / level IS NULL 的行不参与（无轨迹或不可分级）
+    返回 {queued, skipped_done, skipped_downloading, skipped_ungraded, total}。
+    """
+    inst = _get_instance(instance_id)
+    level_ph = ",".join("?" for _ in _ENQUEUE_LEVELS)
+    with get_connection() as conn:
+        # 已 done 且已下载过（有路径）——批量入队时跳过，不重复下载
+        skipped_done = conn.execute(
+            "SELECT COUNT(*) FROM task_traj_records "
+            "WHERE instance_id=? AND assistant_traj_path IS NOT NULL AND status='done'",
+            (instance_id,),
+        ).fetchone()[0]
+        # 正在下载的——不打断
+        skipped_downloading = conn.execute(
+            "SELECT COUNT(*) FROM task_traj_records "
+            "WHERE instance_id=? AND status='downloading'",
+            (instance_id,),
+        ).fetchone()[0]
+        # 入队：L0-L3 且未下载（无路径）且未 downloading 的行 → pending
+        cur = conn.execute(
+            f"UPDATE task_traj_records SET status='pending', updated_at=CURRENT_TIMESTAMP "
+            f"WHERE instance_id=? AND level IN ({level_ph}) "
+            f"AND assistant_traj_path IS NULL AND status NOT IN ('downloading')",
+            (instance_id, *_ENQUEUE_LEVELS),
+        )
+        conn.commit()
+    queued = cur.rowcount or 0
+    with get_connection() as conn:
+        skipped_ungraded = conn.execute(
+            "SELECT COUNT(*) FROM task_traj_records "
+            "WHERE instance_id=? AND (level IS NULL OR level='failed') "
+            "AND assistant_traj_path IS NULL",
+            (instance_id,),
+        ).fetchone()[0]
+    return {
+        "instance_id": instance_id,
+        "queued": queued,
+        "skipped_done": skipped_done,
+        "skipped_downloading": skipped_downloading,
+        "skipped_ungraded": skipped_ungraded,
+        "total": queued + skipped_done + skipped_downloading + skipped_ungraded,
+        "status": "queued" if queued else "noop",
+        "hint": "worker 常驻消费 pending 行，GET /deep/{traj}/status 或 /deep/queue 观察进度",
+    }
+
+
+@router.get("/{instance_id}/deep/queue")
+async def deep_queue(instance_id: str, user: dict = Depends(get_current_user)):
+    """该实例深层下载队列状态（前端轮询）。
+
+    返回 {summary, rows}：
+      summary = {pending, downloading, done, failed, total}（该实例 task_traj_records 计数）
+      rows    = 按「进行中优先」排序的行（pending/downloading 在前，再 failed/done），
+                每行含 traj_name/level/status/updated_at/error/assistant_traj_path。
+    """
+    inst = _get_instance(instance_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT traj_name, level, status, error, assistant_traj_path, updated_at "
+            "FROM task_traj_records WHERE instance_id=? "
+            "ORDER BY CASE status "
+            "           WHEN 'pending' THEN 0 WHEN 'downloading' THEN 1 "
+            "           WHEN 'failed' THEN 2 ELSE 3 END, updated_at DESC",
+            (instance_id,),
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+        summary = {"pending": 0, "downloading": 0, "done": 0, "failed": 0}
+        for r in rows:
+            st = r["status"]
+            if st in summary:
+                summary[st] += 1
+        summary["total"] = len(rows)
+
+    return {"instance_id": instance_id, "summary": summary, "rows": rows}
+
+
 @router.post("/{instance_id}/deep/{traj_name}")
 async def trigger_deep(instance_id: str, traj_name: str,
                        user: dict = Depends(require_operator)):
@@ -238,10 +329,31 @@ async def deep_detail(instance_id: str, traj_name: str,
     try:
         from src import offline_analysis as oa
         detail = oa.load_task_detail(task_dir, traj_name)
-        # 轨迹 jsonl 缺失（OBS 已清理/仅 tsr+log 浅层产物）→ 用 tsr 兜底，视为可展示详情
-        if not detail.get("assistant_stats") and not oa.read_tsr_stats(task_dir):
-            raise HTTPException(status_code=500,
-                                detail=f"本地详情解析失败: 缓存目录 {task_dir} 无轨迹也无 stats")
+        # 本地是否有真实 assistant 轨迹文件（多候选取最大者；任务确无回复时 OBS 无轨迹，为 None）
+        has_traj_file = bool(oa.find_primary_assistant_trajectory(task_dir))
+        if has_traj_file:
+            # 轨迹文件在但 stats 不可解析，且无 tsr 兜底 → 真异常
+            if not detail.get("assistant_stats") and not oa.read_tsr_stats(task_dir):
+                raise HTTPException(status_code=500,
+                                    detail=f"本地详情解析失败: 缓存目录 {task_dir} 无轨迹也无 stats")
+        else:
+            # 本地无轨迹文件。区分两种情形：
+            #   deep 已下载过（worker 会把可见产物回填到路径列；shallow 只拉 tsr 不碰主 log，
+            #   故仅浅层快照时五项路径列全 NULL 且本地无主 log）→ 任务确无 assistant 轨迹
+            #   （工具全失败/无助手回复）→ 不 409，tsr 兜底展示，前端渲染"无 assistant 轨迹"。
+            #   未触发 deep、无任何深层产物 → 本地仅 tsr 浅层快照 → 409 触发下载。
+            # 注：task_done 不作判据——它标"任务是否完成"，而 done 行里大量 task_done=0
+            #   的浅层产物同样无文件、轨迹仍在 OBS，仍需触发下载。
+            deep_ran = any(tr.get(k) for k in (
+                "assistant_traj_path", "evaluator_traj_path",
+                "task_log_path", "gateway_log_path", "eval_log_path"))
+            if deep_ran or oa.find_primary_log(task_dir, traj_name):
+                if not detail.get("assistant_stats") and not oa.read_tsr_stats(task_dir):
+                    raise HTTPException(status_code=500,
+                                        detail=f"本地详情解析失败: 缓存目录 {task_dir} 无轨迹也无 stats")
+            else:
+                raise HTTPException(status_code=409,
+                                    detail="本地轨迹未下载，请先加载详情触发下载")
     except HTTPException:
         raise
     except Exception as e:

@@ -254,6 +254,68 @@
           <el-empty v-else description="暂无会话数据（运行中会自动采集）" :image-size="40" />
         </el-card>
 
+        <!-- 下载队列（深层: 批量入队 + 状态显示） -->
+        <el-card v-if="deepQueueVisible" style="margin-bottom:16px" v-loading="deepQueueLoading">
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span>下载队列 <span style="color:var(--text-muted);font-weight:400;font-size:12px">深层轨迹/日志按需下载</span></span>
+              <div style="display:flex;gap:8px;align-items:center">
+                <el-button v-if="authStore.isOperator" size="small" type="primary"
+                  :loading="enqueuing" @click="enqueueAllDeep">批量下载</el-button>
+                <el-button size="small" @click="loadDeepQueue(false)">刷新</el-button>
+              </div>
+            </div>
+          </template>
+          <!-- 统计条 -->
+          <div class="deep-queue-stats">
+            <span class="deep-queue-stat" :class="{ 'is-active': deepQueueSummary.pending > 0 }">
+              待下载 <b>{{ deepQueueSummary.pending }}</b>
+            </span>
+            <span class="deep-queue-stat" :class="{ 'is-active': deepQueueSummary.downloading > 0 }">
+              下载中 <b>{{ deepQueueSummary.downloading }}</b>
+            </span>
+            <span class="deep-queue-stat done">已完成 <b>{{ deepQueueSummary.done }}</b></span>
+            <span class="deep-queue-stat fail" v-if="deepQueueSummary.failed > 0">
+              失败 <b>{{ deepQueueSummary.failed }}</b>
+            </span>
+            <span class="deep-queue-stat muted">共 <b>{{ deepQueueSummary.total }}</b></span>
+          </div>
+          <!-- 列表 -->
+          <el-table :data="deepQueueRows" size="small" style="width:100%"
+            :max-height="260" empty-text="暂无下载任务">
+            <el-table-column prop="traj_name" label="会话" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span style="cursor:pointer;color:var(--text-primary)"
+                  @click="openTaskDetail(row)">{{ row.traj_name }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="等级" min-width="80" align="center">
+              <template #default="{ row }">
+                <el-tag size="small" :type="deepLevelTagType(row.level)">{{ row.level || '—' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="110" align="center">
+              <template #default="{ row }">
+                <span v-if="row.status === 'downloading'" class="deep-status downloading">
+                  <el-icon class="is-loading" :size="13"><Loading /></el-icon> 下载中
+                </span>
+                <el-tag v-else size="small" :type="deepStatusTagType(row.status)">{{ deepStatusLabel(row.status) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="更新时间" min-width="150" align="right">
+              <template #default="{ row }">
+                <span style="color:var(--text-muted);font-size:12px">{{ fmtDeepTime(row.updated_at) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="错误" min-width="160" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span v-if="row.error" style="color:#f56c6c;font-size:12px">{{ row.error }}</span>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+
         <!-- 会话表格 -->
         <el-card>
           <template #header>
@@ -493,7 +555,7 @@ function ensureTabLoaded(tab) {
   loadedTabs.add(tab)
   if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
   else if (tab === 'logs') { loadTaskLogFiles(); loadTaskStatusMap(); loadLogs() }
-  else if (tab === 'outputs') { loadShallow(false) }
+  else if (tab === 'outputs') { loadShallow(false); loadDeepQueue(false) }
 }
 
 // ============ 配置信息 tab ============
@@ -883,6 +945,82 @@ function fmtScore(v) {
   return Number(v).toFixed(4)
 }
 
+// ============ 输出 tab: 深层下载队列（批量入队 + 状态显示） ============
+// 数据源: GET /deep/queue（summary 计数 + 按「进行中优先」排序的行）。
+// 轮询: 有 pending/downloading 时 3s（工作在动，紧看），全终态时放 10s（省请求）。
+const deepQueueVisible = ref(false)
+const deepQueueLoading = ref(false)
+const deepQueueSummary = ref({ pending: 0, downloading: 0, done: 0, failed: 0, total: 0 })
+const deepQueueRows = ref([])
+const enqueuing = ref(false)
+let deepQueueTimer = null
+
+const deepQueuePollInterval = computed(() => {
+  const s = deepQueueSummary.value
+  return (s.pending > 0 || s.downloading > 0) ? 3000 : 10000
+})
+watch(deepQueuePollInterval, (ms) => {
+  if (!deepQueueVisible.value) return
+  if (deepQueueTimer) clearInterval(deepQueueTimer)
+  deepQueueTimer = setInterval(() => loadDeepQueue(false), ms)
+})
+
+async function loadDeepQueue(showLoading = true) {
+  if (showLoading) deepQueueLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/deep/queue`)
+    deepQueueSummary.value = res.summary || deepQueueSummary.value
+    deepQueueRows.value = res.rows || []
+    deepQueueVisible.value = true
+  } catch { /* 404/网络等由 interceptor 提示，静默保持上次状态 */ }
+  finally { if (showLoading) deepQueueLoading.value = false }
+}
+
+function startDeepQueuePolling() {
+  if (!deepQueueTimer) deepQueueTimer = setInterval(() => loadDeepQueue(false), deepQueuePollInterval.value)
+}
+function stopDeepQueuePolling() {
+  if (deepQueueTimer) { clearInterval(deepQueueTimer); deepQueueTimer = null }
+}
+
+async function enqueueAllDeep() {
+  try {
+    await ElMessageBox.confirm(
+      '把该实例所有已分级（L0-L3）且尚未下载的会话批量入队，worker 逐个下载？',
+      '批量下载', { type: 'warning' })
+  } catch { return }  // 取消
+  enqueuing.value = true
+  try {
+    const res = await api.post(`/instances/${id}/deep/enqueue_all`)
+    deepQueueVisible.value = true
+    startDeepQueuePolling()
+    const msg = res.queued
+      ? `已入队 ${res.queued} 个会话` +
+        (res.skipped_done ? `，${res.skipped_done} 个已下载跳过` : '') +
+        (res.skipped_ungraded ? `，${res.skipped_ungraded} 个未分级/失败跳过` : '')
+      : '没有可入队的会话（都已分级并下载，或均未分级）'
+    ElMessage.success(msg)
+    await loadDeepQueue(false)
+  } catch (e) {
+    ElMessage.error('批量入队失败: ' + (e?.message || '未知错误'))
+  } finally { enqueuing.value = false }
+}
+
+function deepStatusLabel(s) {
+  return { pending: '待下载', downloading: '下载中', done: '已完成', failed: '失败' }[s] || s || '—'
+}
+function deepStatusTagType(s) {
+  return { pending: 'warning', downloading: 'primary', done: 'success', failed: 'danger' }[s] || 'info'
+}
+function deepLevelTagType(l) {
+  // 复用等级色系: L3 紫 / L2 红 / L1.5 橙 / L1 蓝 / L0 灰 / failed 红
+  return { L0: 'info', L1: 'primary', 'L1.5': 'warning', L2: 'danger', L3: 'warning' }[l] || 'info'
+}
+function fmtDeepTime(t) {
+  if (!t) return '—'
+  return String(t).replace('T', ' ').slice(0, 19)
+}
+
 // ============ 输出 tab: 深层详情（task_traj_records 本地缓存） ============
 // 触发 POST /deep/{traj_name} → worker 下载到 output_cache → 3s 轮询 status → 拉 detail。
 const detailVisible = ref(false)
@@ -916,13 +1054,14 @@ async function openTaskDetail(row) {
   logTab.value = 'task'
   collapsedBlocks.value = {}
   detailLogTailFull.value = false
-  // 先直接尝试读本地缓存详情（浅层 tsr+log 产物可直接展示，无需触发下载）
+  // 先直接尝试读本地缓存详情（浅层 tsr+log 产物可直接展示，无需触发下载）。
+  // 409 = 本地轨迹未下载 → 静默（silent 标记跳过全局弹错），转触发下载分支。
   try {
-    const d = await api.get(`/instances/${id}/deep/${name}/detail`)
+    const d = await api.get(`/instances/${id}/deep/${name}/detail`, { silent: true })
     detailData.value = d
     detailLoading.value = false
     return
-  } catch { /* 本地无缓存 → 走触发下载流程 */ }
+  } catch { /* 本地无轨迹缓存(409) → 走触发下载流程 */ }
   // 幂等触发下载；已 downloading/pending 时后端返回 in_progress，不打断
   let trigger = 'queued'
   try { trigger = (await api.post(`/instances/${id}/deep/${name}`)).status || 'queued' } catch { /* 404 等由 interceptor 提示 */ }
@@ -1001,16 +1140,18 @@ onMounted(async () => {
   }
   if (activeTab.value === 'outputs') {
     shallowTimer = setInterval(() => loadShallow(false), 10000)
+    startDeepQueuePolling()
   }
 })
 
-// outputs tab 懒加载时启动浅层轮询；离开时停止
+// outputs tab 懒加载时启动浅层 + 深层队列轮询；离开时停止
 watch(activeTab, (tab) => {
   if (tab === 'outputs') {
     if (!shallowTimer) shallowTimer = setInterval(() => loadShallow(false), 10000)
-  } else if (shallowTimer) {
-    clearInterval(shallowTimer)
-    shallowTimer = null
+    if (!deepQueueTimer) startDeepQueuePolling()
+  } else {
+    if (shallowTimer) { clearInterval(shallowTimer); shallowTimer = null }
+    stopDeepQueuePolling()
   }
 }, { flush: 'sync' })
 
@@ -1018,6 +1159,7 @@ onUnmounted(() => {
   clearInterval(timer)
   clearInterval(shallowTimer)
   clearInterval(deepPollTimer)
+  stopDeepQueuePolling()
   if (logContainer.value) logContainer.value.removeEventListener('scroll', onScroll)
 })
 </script>
@@ -1119,6 +1261,24 @@ onUnmounted(() => {
 .funnel-bar-label {
   font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
   position: absolute; bottom: -20px; white-space: nowrap;
+}
+
+/* ---- 输出 tab: 下载队列 ---- */
+.deep-queue-stats {
+  display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;
+}
+.deep-queue-stat {
+  padding: 4px 12px; border-radius: 14px; background: #f4f4f5; color: #909399;
+  font-size: 12px; display: inline-flex; align-items: center; gap: 4px;
+}
+.deep-queue-stat b { font-size: 14px; font-weight: 700; }
+.deep-queue-stat.is-active { background: rgba(230, 162, 60, .14); color: #e6a23c; }
+.deep-queue-stat.done { background: rgba(16, 185, 129, .12); color: #10b981; }
+.deep-queue-stat.fail { background: rgba(245, 108, 108, .12); color: #f56c6c; }
+.deep-queue-stat.muted { background: transparent; color: var(--text-muted); padding: 4px 0; }
+.deep-status.downloading {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: #e6a23c; font-size: 12px;
 }
 
 /* ---- 输出 tab: 会话表格 ---- */

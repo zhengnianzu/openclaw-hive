@@ -23,6 +23,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -730,11 +731,18 @@ def _load_per_task_entries(obsutil: str, task_obs: str, origin: str,
        trajectory, task_done, char_len(慢路径)}
     """
     task_obs = task_obs if task_obs.endswith("/") else task_obs + "/"
+    _t0 = time.time()
     entries = _fetch_one_task_stats_valid(obsutil, task_obs, origin, obs_cred_args=obs_cred_args)
     if entries:
+        print(f"    [fast] {os.path.basename(task_obs.rstrip('/'))}: 快路径 tsr 命中 "
+              f"{len(entries)} 条 tool_calls={entries[0].get('tool_calls')} "
+              f"plain_rounds={entries[0].get('plain_rounds')} {time.time()-_t0:.2f}s", flush=True)
         return entries
+    print(f"    [slow] {os.path.basename(task_obs.rstrip('/'))}: 快路径 tsr 未命中/陈旧，回退慢路径下载 "
+          f"{time.time()-_t0:.2f}s", flush=True)
 
     # ── 慢路径：下载 assistant 轨迹 + 主 log，本地重算 ──
+    _t_dl = time.time()
     leaf = task_obs.rstrip("/").split("/")[-1]
     dest_dir = os.path.join(origin, _cache_subdir_for(task_obs))
     os.makedirs(dest_dir, exist_ok=True)
@@ -787,6 +795,10 @@ def _load_per_task_entries(obsutil: str, task_obs: str, origin: str,
             "has_eval": has_eval, "evaluator_completion": score, "verdict_source": source,
             "harness": "hermes", "task_done": bool(logp and has_task_done_marker(logp)),
         }
+        print(f"    [slow] {leaf}: 慢路径完成(hermes) tool_calls={info['tool_calls']} "
+              f"plain_rounds={info['plain_rounds']} has_eval={has_eval} "
+              f"下载+重算 {time.time()-_t_dl:.2f}s", flush=True)
+        return [entry]
     else:
         traj = find_primary_assistant_trajectory(dest_dir)
         if not traj:
@@ -813,6 +825,9 @@ def _load_per_task_entries(obsutil: str, task_obs: str, origin: str,
         entry["char_len"] = len(open(traj, encoding="utf-8", errors="replace").read())
     except OSError:
         entry["char_len"] = 0
+    print(f"    [slow] {leaf}: 慢路径完成 tool_calls={info['tool_calls']} "
+          f"plain_rounds={info['plain_rounds']} has_eval={has_eval} "
+          f"下载+重算 {time.time()-_t_dl:.2f}s", flush=True)
     return [entry]
 
 
@@ -834,6 +849,8 @@ def _entry_is_stale(entry: dict) -> bool:
     if not isinstance(traj, str):
         return True
     if entry.get("tool_calls", 0) <= 0 and entry.get("plain_rounds", 0) <= 0:
+        print(f"    [stale] {entry.get('task') or entry.get('trajectory')}: tsr 判陈旧 "
+              f"(tool_calls={entry.get('tool_calls')} plain_rounds={entry.get('plain_rounds')})", flush=True)
         return True
     return False
 
