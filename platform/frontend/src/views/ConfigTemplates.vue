@@ -12,7 +12,7 @@
         <el-table-column prop="name" label="模板名称" min-width="160" />
         <el-table-column prop="harness_type" label="Harness类型" width="120">
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
+            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="默认" width="80" align="center">
@@ -56,12 +56,12 @@
         <el-tabs v-model="activeTab" style="margin-top:8px">
           <el-tab-pane label="Harness 配置" name="harness">
             <el-form-item label="模型 Base URL">
-              <el-input v-model="form.model_base_url" placeholder="例如：http://192.168.30.95:8084" />
+              <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
             </el-form-item>
             <el-form-item label="Invite Code">
               <el-input v-model="form.invite_code" placeholder="pangu" />
             </el-form-item>
-            <el-form-item v-if="form.harness_type === 'openclaw'" label="API 类型">
+            <el-form-item v-if="['openclaw','opencode','pi'].includes(form.harness_type)" label="API 类型">
               <el-select v-model="form.model_api_type" clearable style="width:100%">
                 <el-option label="Anthropic Messages" value="anthropic-messages" />
                 <el-option label="OpenAI Completions" value="openai-completions" />
