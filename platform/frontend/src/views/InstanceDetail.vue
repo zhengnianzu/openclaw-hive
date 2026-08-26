@@ -261,6 +261,43 @@
           <el-empty v-else description="暂无会话数据（运行中会自动采集）" :image-size="40" />
         </el-card>
 
+        <!-- 状态分析：浅层→深层 流水线阶段（含手动提交浅层） -->
+        <el-card style="margin-bottom:16px">
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span>状态分析</span>
+              <el-tag :type="stageMeta.type" size="small">{{ stageMeta.label }}</el-tag>
+            </div>
+          </template>
+          <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
+            <!-- 浅层 → 深层 状态步骤 -->
+            <div style="display:flex;align-items:center;gap:0;flex-wrap:wrap">
+              <!-- 浅层步骤：非空即已在分析 -->
+              <div :style="{ padding: '6px 14px', borderRadius: '6px', background: shallowActive ? 'var(--el-color-primary-light-9)' : 'transparent', border: '1px solid ' + (shallowActive ? 'var(--el-color-primary-light-5)' : 'var(--el-border-color-lighter)') }">
+                <div :style="{ fontSize: '12px', color: 'var(--text-muted)' }">浅层分析</div>
+                <div :style="{ fontSize: '14px', fontWeight: '600', color: shallowActive ? 'var(--el-color-primary)' : 'var(--text-muted)' }">{{ shallowStepLabel }}</div>
+              </div>
+              <div style="color:var(--text-muted);margin:0 8px">→</div>
+              <!-- 深层步骤：浅层已完成才可进入 -->
+              <div :style="{ padding: '6px 14px', borderRadius: '6px', background: deepActive ? 'var(--el-color-primary-light-9)' : 'transparent', border: '1px solid ' + (deepActive ? 'var(--el-color-primary-light-5)' : 'var(--el-border-color-lighter)') }">
+                <div :style="{ fontSize: '12px', color: 'var(--text-muted)' }">深层分析</div>
+                <div :style="{ fontSize: '14px', fontWeight: '600', color: deepActive ? 'var(--el-color-primary)' : 'var(--text-muted)' }">{{ deepStepLabel }}</div>
+              </div>
+            </div>
+            <div style="flex:1;min-width:200px;font-size:12px;color:var(--text-muted)">
+              {{ stageMeta.desc }}
+              <div v-if="shallowProgress && shallowProgress.total > 0" style="margin-top:4px">
+                已定级 <b>{{ shallowProgress.approved }}</b> / {{ shallowProgress.total }} 个会话
+                <span v-if="shallowProgress.undone > 0">，剩余 <b>{{ shallowProgress.undone }}</b> 未分析</span>
+              </div>
+            </div>
+            <!-- 手动提交浅层：ended 实例且仍有缺口时显示 -->
+            <el-button v-if="authStore.isOperator && pipelineStage === 'ungraded'" type="primary" size="small"
+              :loading="submittingShallow" @click="submitShallow">提交浅层分析</el-button>
+            <el-button v-else-if="pipelineStage === 'queued' || pipelineStage === 'grading'" size="small" disabled>浅层分析处理中…</el-button>
+          </div>
+        </el-card>
+
         <!-- 下载队列（深层: 批量入队 + 状态显示） -->
         <el-card v-if="deepQueueVisible" style="margin-bottom:16px" v-loading="deepQueueLoading">
           <template #header>
@@ -321,6 +358,11 @@
               </template>
             </el-table-column>
           </el-table>
+          <div class="table-footer" style="margin-top:8px">
+            <el-pagination layout="total, prev, pager, next" :total="deepQueueTotal"
+              :page-size="deepQueuePageSize" :current-page="deepQueuePage"
+              @current-change="onDeepQueuePage" small />
+          </div>
         </el-card>
 
         <!-- 会话表格 -->
@@ -872,6 +914,7 @@ const unevaluatedCount = computed(() => taskRows.value.filter(r => !r.traj_level
 
 // 浅层进度（后端 GET /shallow 返回 progress 字段）
 const shallowProgress = ref(null)
+const submittingShallow = ref(false)
 const shallowProgressPct = computed(() => {
   const p = shallowProgress.value
   if (!p || !p.total) return 0
@@ -889,6 +932,69 @@ const shallowProgressStateLabel = computed(() => {
   if (p.queued) return '处理中…'
   return '待处理'
 })
+
+// ---- 状态分析：浅层→深层 流水线当前所处阶段（供顶部状态卡展示） ----
+// empty    = 无 task_records（无会话数据）
+// ungraded = ended 实例且仍有 NULL/failed 行，尚未登记浅层（可手动提交）
+// queued   = 已登记 shallow_requests（worker 排队/处理中）
+// grading  = running/preparing 自动分级中
+// done     = 浅层全部分级完成
+const pipelineStage = computed(() => {
+  const st = inst.value?.status
+  const p = shallowProgress.value
+  const total = shallowSummary.value.total || 0
+  if (!total) return 'empty'
+  const undone = p ? p.undone : total
+  if (undone === 0) return 'done'
+  if (st === 'running' || st === 'preparing') return 'grading'
+  if (p && p.queued) return 'queued'
+  return 'ungraded'
+})
+const stageMeta = computed(() => {
+  const map = {
+    empty:    { label: '暂无会话数据', type: 'info',  desc: '该实例还没有 task_records，先确认任务是否已产出会话' },
+    ungraded: { label: '未分析',       type: 'warning', desc: '有会话未做浅层分级，需提交浅层分析' },
+    queued:   { label: '浅层分析中',   type: 'primary', desc: '已提交浅层分析，worker 正在排队/处理' },
+    grading:  { label: '自动分级中',   type: 'primary', desc: 'running/preparing 实例由 worker 持续采集分级，无需手动提交' },
+    done:     { label: '浅层已完成',   type: 'success', desc: '所有会话均已定级，可进行深层下载/查看详情' },
+  }
+  return map[pipelineStage.value] || { label: pipelineStage.value, type: 'info', desc: '' }
+})
+
+// 状态卡步骤的两步标签：浅层已分级数 / 深层下载进度
+const shallowStepLabel = computed(() => {
+  const p = shallowProgress.value
+  if (!p || !p.total) return '未分析'
+  if (p.undone === 0) return `已完成 ${p.approved}`
+  if (p.queued) return '处理中…'
+  return `${p.approved}/${p.total}`
+})
+const deepStepLabel = computed(() => {
+  const s = deepQueueSummary.value
+  if (!s || !s.total) return '未下载'
+  if (s.downloading > 0) return `下载中 ${s.downloading}`
+  if (s.pending > 0) return `待下载 ${s.pending}`
+  if (s.done > 0) return `已完成 ${s.done}`
+  return '未下载'
+})
+// 步骤高亮：浅层非空即激活；深层需浅层已完成且有下载动作/产物才激活
+const shallowActive = computed(() => pipelineStage.value !== 'empty' && pipelineStage.value !== 'ungraded')
+const deepActive = computed(() => {
+  if (pipelineStage.value !== 'done') return false
+  const s = deepQueueSummary.value
+  return !!(s && s.total > 0)
+})
+
+async function submitShallow() {
+  submittingShallow.value = true
+  try {
+    const res = await api.post(`/instances/${id}/shallow`)
+    shallowProgress.value = { ...(shallowProgress.value || {}), queued: true }
+    ElMessage.success(res.hint || '已提交浅层分析')
+    loadShallow(false)
+  } catch { /* interceptor 已提示 */ }
+  finally { submittingShallow.value = false }
+}
 
 // 漏斗柱状图: 高度相对已分级总数（未评估单独一柱，按总数比例）
 const funnelBuckets = computed(() => {
@@ -994,6 +1100,9 @@ const deepQueueVisible = ref(false)
 const deepQueueLoading = ref(false)
 const deepQueueSummary = ref({ pending: 0, downloading: 0, done: 0, failed: 0, total: 0 })
 const deepQueueRows = ref([])
+const deepQueuePage = ref(1)
+const deepQueuePageSize = ref(50)
+const deepQueueTotal = ref(0)
 const enqueuing = ref(false)
 let deepQueueTimer = null
 
@@ -1010,13 +1119,17 @@ watch(deepQueuePollInterval, (ms) => {
 async function loadDeepQueue(showLoading = true) {
   if (showLoading) deepQueueLoading.value = true
   try {
-    const res = await api.get(`/instances/${id}/deep/queue`)
+    const res = await api.get(`/instances/${id}/deep/queue`, {
+      params: { page: deepQueuePage.value, page_size: deepQueuePageSize.value },
+    })
     deepQueueSummary.value = res.summary || deepQueueSummary.value
     deepQueueRows.value = res.rows || []
+    deepQueueTotal.value = res.total || deepQueueSummary.value.total || 0
     deepQueueVisible.value = true
   } catch { /* 404/网络等由 interceptor 提示，静默保持上次状态 */ }
   finally { if (showLoading) deepQueueLoading.value = false }
 }
+function onDeepQueuePage(p) { deepQueuePage.value = p }
 
 function startDeepQueuePolling() {
   if (!deepQueueTimer) deepQueueTimer = setInterval(() => loadDeepQueue(false), deepQueuePollInterval.value)
@@ -1204,11 +1317,18 @@ async function maybeTriggerShallow() {
   // stopped 实例轨迹可能仍在 OBS（中止已上传的部分 task 目录），同样可分级查看会话详情；
   // worker 处理完（无缺口）删登记出队，不会永久残留。
   if (status !== 'finished' && status !== 'completed' && status !== 'stopped') return
-  // 有未分级(NULL) 或 failed 行即需浅层：worker 的 pending 过滤对 NULL/failed 都重新定级
-  if (!shallowRows.value.some(r => !r.traj_level || r.traj_level === 'failed')) return
+  // 用 progress.undone（剩余未分级会话数）判定缺口，而不是依赖 shallowRows 已填充：
+  //   loadShallow 在 mount 时可能尚未返回，shallowRows 为空会导致永远跳过（既不登记也无提示）。
+  //   只要 ended 实例还有未分级会话就应登记；0 或全部完成则无需登记。
+  const p = shallowProgress.value
+  const undone = p ? p.undone : undefined
+  if (undone === undefined) return      // progress 未加载，等 loadShallow 返回后再触发
+  if (undone === 0) return              // 全部定级，无需浅层
   shallowTriggered = true
   try {
     const res = await api.post(`/instances/${id}/shallow`)
+    // 立即可见：切到「浅层分析中」，无需等下一轮轮询
+    if (shallowProgress.value) shallowProgress.value = { ...shallowProgress.value, queued: true }
     console.debug('浅层已登记', res)
   } catch { /* interceptor 已提示；登记失败不阻塞页面 */ }
 }

@@ -239,33 +239,47 @@ async def deep_enqueue_all(instance_id: str, user: dict = Depends(require_operat
 
 
 @router.get("/{instance_id}/deep/queue")
-async def deep_queue(instance_id: str, user: dict = Depends(get_current_user)):
+async def deep_queue(instance_id: str, page: int = 1, page_size: int = 50,
+                     user: dict = Depends(get_current_user)):
     """该实例深层下载队列状态（前端轮询）。
 
-    返回 {summary, rows}：
+    返回 {summary, rows, total}：
       summary = {pending, downloading, done, failed, total}（该实例 task_traj_records 计数）
-      rows    = 按「进行中优先」排序的行（pending/downloading 在前，再 failed/done），
+      rows    = 按「进行中优先」排序的分页行（pending/downloading 在前，再 failed/done），
                 每行含 traj_name/level/status/updated_at/error/assistant_traj_path。
+      total   = 满足排序的全部行数（用于前端分页 total）。
     """
     inst = _get_instance(instance_id)
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    off = (page - 1) * page_size
     with get_connection() as conn:
+        # summary 独立 COUNT，避免为拿计数而返回全量行（大实例全量行很重）
+        counted = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM task_traj_records "
+            "WHERE instance_id=? GROUP BY status", (instance_id,),
+        ).fetchall()
+        total = 0
+        summary = {"pending": 0, "downloading": 0, "done": 0, "failed": 0}
+        for c in counted:
+            n = c["n"]
+            total += n
+            if c["status"] in summary:
+                summary[c["status"]] = n
+        summary["total"] = total
+
         rows = conn.execute(
             "SELECT traj_name, level, status, error, assistant_traj_path, updated_at "
             "FROM task_traj_records WHERE instance_id=? "
             "ORDER BY CASE status "
             "           WHEN 'pending' THEN 0 WHEN 'downloading' THEN 1 "
-            "           WHEN 'failed' THEN 2 ELSE 3 END, updated_at DESC",
-            (instance_id,),
+            "           WHEN 'failed' THEN 2 ELSE 3 END, updated_at DESC "
+            "LIMIT ? OFFSET ?",
+            (instance_id, page_size, off),
         ).fetchall()
         rows = [dict(r) for r in rows]
-        summary = {"pending": 0, "downloading": 0, "done": 0, "failed": 0}
-        for r in rows:
-            st = r["status"]
-            if st in summary:
-                summary[st] += 1
-        summary["total"] = len(rows)
 
-    return {"instance_id": instance_id, "summary": summary, "rows": rows}
+    return {"instance_id": instance_id, "summary": summary, "rows": rows, "total": total}
 
 
 @router.post("/{instance_id}/deep/{traj_name}")
