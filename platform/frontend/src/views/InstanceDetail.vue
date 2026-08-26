@@ -261,6 +261,55 @@
           <el-empty v-else description="暂无会话数据（运行中会自动采集）" :image-size="40" />
         </el-card>
 
+        <!-- 模型配置 / 用户模拟配置信息面板（任务创建时的连接信息 + 代理映射 + 导出 Excel） -->
+        <el-card style="margin-bottom:16px" v-loading="proxyLoading">
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span>模型配置 / 用户模拟配置 <span style="color:var(--text-muted);font-weight:400;font-size:12px">任务创建时的连接信息</span></span>
+              <el-button size="small" :loading="exportingProxy" @click="exportProxyConfig">导出 Excel</el-button>
+            </div>
+          </template>
+          <el-table v-if="proxyRows.length" :data="proxyRows" size="small" style="width:100%">
+            <el-table-column prop="role" label="名称" min-width="100">
+              <template #default="{ row }">
+                <span style="font-weight:600">{{ row.role }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="baseurl" label="baseurl" min-width="220" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span style="font-family:monospace;font-size:12px">{{ row.baseurl || '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="key_suffix" label="key 后四位" min-width="90" align="center">
+              <template #default="{ row }">
+                <span style="font-family:monospace">{{ row.key_suffix || '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="proxy_name" label="代理名称" min-width="110" align="center">
+              <template #default="{ row }">
+                <el-tag v-if="row.proxy_name" size="small" type="success" effect="plain">{{ row.proxy_name }}</el-tag>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="model" label="模型" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span style="font-size:12px">{{ row.model || '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="启动时间" min-width="150" align="right">
+              <template #default>
+                <span style="color:var(--text-muted);font-size:12px">{{ fmtProxyTime(proxyStartedAt) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="结束时间" min-width="150" align="right">
+              <template #default>
+                <span style="color:var(--text-muted);font-size:12px">{{ proxyStoppedAt ? fmtProxyTime(proxyStoppedAt) : '（未结束）' }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else description="暂无模型配置信息" :image-size="40" />
+        </el-card>
+
         <!-- 状态分析：浅层→深层 流水线阶段（含手动提交浅层） -->
         <el-card style="margin-bottom:16px">
           <template #header>
@@ -380,7 +429,7 @@
                   <el-option label="失败" value="fail" />
                 </el-select>
                 <el-input v-model="taskKeyword" size="small" placeholder="搜索会话..." clearable
-                  style="width:200px" @input="onTaskFilterChange">
+                  style="width:200px">
                   <template #prefix><el-icon><Search /></el-icon></template>
                 </el-input>
               </div>
@@ -612,7 +661,7 @@ function ensureTabLoaded(tab) {
   loadedTabs.add(tab)
   if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
   else if (tab === 'logs') { loadTaskLogFiles(); loadTaskStatusMap(); loadLogs() }
-  else if (tab === 'outputs') { loadShallow(false); loadDeepQueue(false) }
+  else if (tab === 'outputs') { loadShallow(false); loadDeepQueue(false); loadProxyConfig() }
 }
 
 // ============ 配置信息 tab ============
@@ -869,10 +918,12 @@ async function loadTaskStatusMap() {
 }
 
 // ============ 输出 tab: 浅层漏斗（task_records 会话分级） ============
-// 数据源: GET /instances/{id}/shallow（L0-L3 计数 + 全部行），10s 轮询。
+// 统计: GET /instances/{id}/shallow（summary/progress，全量语义，10s 轮询）。
+// 表格: GET /instances/{id}/shallow/tasks（分页 + tag/keyword 过滤 + 排序，后端下沉）。
 const shallowLoading = ref(false)
-const shallowSummary = ref({ L0: 0, L1: 0, 'L1.5': 0, L2: 0, L3: 0, graded: 0, total: 0, task_done: 0 })
-const shallowRows = ref([])
+const shallowSummary = ref({ L0: 0, L1: 0, 'L1.5': 0, L2: 0, L3: 0, graded: 0, total: 0, task_done: 0, unevaluated: 0 })
+const shallowTasks = ref([])
+const shallowTaskTotal = ref(0)
 const instanceStatus = ref('')
 
 const LEVEL_COLORS = {
@@ -896,9 +947,9 @@ function _extractTaskTitle(name) {
   return s || leaf
 }
 
-// 会话行: task_records 行 ∪ traj_name(leaf) ∪ tool_fail 列
+// 会话行: shallow_tasks 返回的当前页行 ∪ traj_name(leaf) ∪ task_title
 const taskRows = computed(() => {
-  return shallowRows.value.map(r => {
+  return shallowTasks.value.map(r => {
     const name = r.config_name || ''
     const leaf = name.includes('/') ? name.split('/').pop() : name
     const stripped = leaf.replace(/\.json$/, '')
@@ -906,11 +957,10 @@ const taskRows = computed(() => {
       ...r,
       traj_name: stripped || leaf,
       task_title: _extractTaskTitle(name), // 展示用简短任务名；traj_name 仍是 API key
-      tool_fail: typeof r.tool_fail === 'number' ? r.tool_fail > 0 : !!r.tool_fail,
+      tool_fail: false, // task_records 无此列，恒 false（仅保留列位，无数据来源）
     }
   })
 })
-const unevaluatedCount = computed(() => taskRows.value.filter(r => !r.traj_level).length)
 
 // 浅层进度（后端 GET /shallow 返回 progress 字段）
 const shallowProgress = ref(null)
@@ -1007,51 +1057,53 @@ const funnelBuckets = computed(() => {
 const unevaluatedPct = computed(() => {
   const total = shallowSummary.value.total
   if (!total) return 0
-  return ((unevaluatedCount.value / total) * 100)
+  return (((shallowSummary.value.unevaluated || 0) / total) * 100)
 })
 
-// ---- 表格分页 / 过滤 / 排序（本地，浅层一次性返回全部行） ----
+// ---- 表格: 分页 / 过滤 / 排序（后端 shallow/tasks 下沉，本地只透传参数触发重拉） ----
 const levelFilter = ref('')
 const taskKeyword = ref('')
 const taskPage = ref(1)
 const taskPageSize = ref(50)
 const taskSort = ref({})
 
-const filteredTaskRows = computed(() => {
-  let rows = taskRows.value
-  if (levelFilter.value) {
-    if (levelFilter.value === 'unevaluated') rows = rows.filter(r => !r.traj_level)
-    else if (levelFilter.value === 'fail') rows = rows.filter(r => r.traj_level === 'failed')
-    else rows = rows.filter(r => r.traj_level === levelFilter.value)
-  }
-  const kw = taskKeyword.value.trim().toLowerCase()
-  if (kw) rows = rows.filter(r => (r.traj_name || '').toLowerCase().includes(kw)
-    || (r.task_title || '').toLowerCase().includes(kw))
-  const s = taskSort.value
-  if (s.prop) {
-    const dir = s.order === 'descending' ? -1 : 1
-    const cmp = (a, b) => {
-      let x = a[s.prop], y = b[s.prop]
-      if (x == null) x = -Infinity
-      if (y == null) y = -Infinity
-      if (typeof x === 'string') return x.localeCompare(String(y)) * dir
-      return (x - y) * dir
-    }
-    rows = [...rows].sort(cmp)
-  }
-  return rows
-})
-const pagedTasks = computed(() => {
-  const start = (taskPage.value - 1) * taskPageSize.value
-  return filteredTaskRows.value.slice(start, start + taskPageSize.value)
-})
-const shallowTotal = computed(() => filteredTaskRows.value.length)
+// 表格直接展示后端返回的当前页行；过滤/排序/分页已由后端完成
+const pagedTasks = computed(() => taskRows.value)
+const shallowTotal = computed(() => shallowTaskTotal.value)
 
-function onTaskFilterChange() { taskPage.value = 1 }
-function onTaskPage(p) { taskPage.value = p }
+function onTaskFilterChange() { taskPage.value = 1; loadTasks() }
+function onTaskPage(p) { taskPage.value = p; loadTasks() }
 function onTaskSort({ prop, order }) {
   taskSort.value = { prop, order }
   taskPage.value = 1
+  loadTasks()
+}
+let taskKwTimer = null
+// 关键词输入防抖：避免每敲一个字符就拉一次分页接口
+watch(taskKeyword, () => {
+  if (taskKwTimer) clearTimeout(taskKwTimer)
+  taskKwTimer = setTimeout(() => { taskPage.value = 1; loadTasks() }, 300)
+})
+
+// 当前页表格数据: GET /shallow/tasks（分页 + tag + keyword + 排序）
+async function loadTasks() {
+  const s = taskSort.value
+  const params = {
+    page: taskPage.value,
+    page_size: taskPageSize.value,
+  }
+  if (levelFilter.value) params.tag = levelFilter.value
+  const kw = taskKeyword.value.trim()
+  if (kw) params.keyword = kw
+  if (s.prop) {
+    params.sort_by = s.prop
+    params.sort_dir = s.order === 'descending' ? 'desc' : 'asc'
+  }
+  try {
+    const res = await api.get(`/instances/${id}/shallow/tasks`, { params })
+    shallowTasks.value = res.tasks || []
+    shallowTaskTotal.value = res.total || 0
+  } catch { /* interceptor 已提示；静默保持上次 */ }
 }
 
 async function loadShallow(refresh = false) {
@@ -1059,11 +1111,12 @@ async function loadShallow(refresh = false) {
   try {
     const res = await api.get(`/instances/${id}/shallow`)
     shallowSummary.value = res.summary || shallowSummary.value
-    shallowRows.value = res.rows || []
     instanceStatus.value = res.instance_status || ''
     shallowProgress.value = res.progress || null
     // 点击驱动：看到输出数据后，若该实例已结束且仍有缺口，登记一次浅层请求
     maybeTriggerShallow()
+    // 表格当前页同刷（分页/过滤/排序由 loadTasks 按当前参数重新请求后端）
+    await loadTasks()
   } catch { /* interceptor 已提示 */ }
   finally { shallowLoading.value = false }
 }
@@ -1174,6 +1227,49 @@ function deepLevelTagType(l) {
 function fmtDeepTime(t) {
   if (!t) return '—'
   return String(t).replace('T', ' ').slice(0, 19)
+}
+
+// ============ 输出 tab: 模型配置 / 用户模拟配置信息面板 ============
+// 数据源: GET /instances/{id}/proxy-config（create_params 加工：key 后四位 + 代理名映射 + 实例起止）。
+// 代理名由 settings/proxy_name.json 做 IP→名称映射，未命中留空；导出走后端 openpyxl 生成 .xlsx。
+const proxyRows = ref([])
+const proxyLoading = ref(false)
+const proxyStartedAt = ref('')
+const proxyStoppedAt = ref('')
+const exportingProxy = ref(false)
+
+function fmtProxyTime(t) {
+  if (!t) return '—'
+  return String(t).replace('T', ' ').slice(0, 19)
+}
+
+async function loadProxyConfig() {
+  proxyLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/proxy-config`)
+    proxyRows.value = res.rows || []
+    proxyStartedAt.value = res.started_at || ''
+    proxyStoppedAt.value = res.stopped_at || ''
+  } catch { /* interceptor 已提示；静默保持上次 */ }
+  finally { proxyLoading.value = false }
+}
+
+async function exportProxyConfig() {
+  exportingProxy.value = true
+  try {
+    // api 拦截器已 unwrap 成 res.data，responseType:'blob' 时 res 直接是 Blob
+    const blob = await api.get(`/instances/${id}/proxy-config/export`, { responseType: 'blob' })
+    const url = window.URL.createObjectURL(blob)
+    const name = `${inst.value?.name || id}_proxy_config.xlsx`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(url)
+  } catch { /* interceptor 已提示 */ }
+  finally { exportingProxy.value = false }
 }
 
 // ============ 输出 tab: 深层详情（task_traj_records 本地缓存） ============
@@ -1317,8 +1413,8 @@ async function maybeTriggerShallow() {
   // stopped 实例轨迹可能仍在 OBS（中止已上传的部分 task 目录），同样可分级查看会话详情；
   // worker 处理完（无缺口）删登记出队，不会永久残留。
   if (status !== 'finished' && status !== 'completed' && status !== 'stopped') return
-  // 用 progress.undone（剩余未分级会话数）判定缺口，而不是依赖 shallowRows 已填充：
-  //   loadShallow 在 mount 时可能尚未返回，shallowRows 为空会导致永远跳过（既不登记也无提示）。
+  // 用 progress.undone（剩余未分级会话数）判定缺口，而不是依赖表格行已填充：
+  //   loadShallow 在 mount 时可能尚未返回，progress 为空会导致永远跳过（既不登记也无提示）。
   //   只要 ended 实例还有未分级会话就应登记；0 或全部完成则无需登记。
   const p = shallowProgress.value
   const undone = p ? p.undone : undefined
@@ -1338,6 +1434,7 @@ watch(activeTab, (tab) => {
   if (tab === 'outputs') {
     if (!shallowTimer) shallowTimer = setInterval(() => loadShallow(false), 10000)
     if (!deepQueueTimer) startDeepQueuePolling()
+    loadProxyConfig()  // 切回输出 tab 刷新模型配置面板
   } else {
     if (shallowTimer) { clearInterval(shallowTimer); shallowTimer = null }
     stopDeepQueuePolling()
