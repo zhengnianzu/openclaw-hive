@@ -10,16 +10,29 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 
 from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 
 router = APIRouter(prefix="/api/instances", tags=["batch-output"])
+
+# proxy_name.json：IP → 代理名映射（platform/settings/proxy_name.json），不存在则映射为空
+_PROXY_NAME_FILE = os.path.join(settings.SETTINGS_DIR, "proxy_name.json")
+_IP_RE = re.compile(r"https?://([0-9.]+)")
+
+# 面板角色：主Agent 取 create_params 顶层，用户模拟/Evaluator 取 agents[] 对应项
+_MAIN_AGENT_ROLE = "主Agent"
+_USER_SIM_ROLE = "用户模拟"
+_EVALUATOR_ROLE = "Evaluator"
 
 # 漏斗档位（x 轴顺序，与 README 一致）
 _TRAJ_LEVELS = ["L0", "L1", "L1.5", "L2", "L3"]
@@ -69,18 +82,17 @@ async def trigger_shallow(instance_id: str, user: dict = Depends(require_operato
 
 @router.get("/{instance_id}/shallow")
 async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
-    """浅层漏斗：统计卡 + 会话表格行（一次性返回，前端分页过滤在本地做）。
+    """浅层统计 + 进度（不再返回会话行，表格数据走 /shallow/tasks 分页接口）。
 
-    返回 {summary, rows}：summary 为 L0-L3 计数（traj_level 分组），rows 为全部
-    task_records 行（含 traj_level 与 eval 列），前端按 level/tag 过滤 + 分页。
+    返回 {summary, progress}：summary 为 L0-L3 计数（traj_level 分组），progress 为
+    浅层处理进度。会话行已由 /shallow/tasks（分页+过滤+排序）承载，避免全量行
+    每 10s 传输约 1MB 造成页面卡顿。
     """
     inst = _get_instance(instance_id)
 
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.status, tr.error_code, "
-            "tr.error_category, tr.eval_score, tr.eval_completion, tr.gate, "
-            "ttr.task_done, ttr.has_eval "
+            "SELECT tr.traj_level, ttr.task_done AS ttr_task_done "
             "FROM task_records tr "
             "LEFT JOIN task_traj_records ttr "
             "  ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name "
@@ -95,7 +107,9 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
         summary[r["traj_level"]] += 1
     summary["graded"] = len(graded)
     summary["total"] = len(rows)
-    summary["task_done"] = sum(1 for r in rows if r.get("task_done"))
+    summary["task_done"] = sum(1 for r in rows if r.get("ttr_task_done"))
+    # 未评估 = traj_level 为 NULL（未被浅层分析覆盖/队列未消费）
+    summary["unevaluated"] = sum(1 for r in rows if r["traj_level"] is None)
 
     # 浅层进度：已分级 + failed 占位 = 处理完；残留 NULL = 未处理。
     # finished 实例已完成分级（历史堆积）时 both = total，进度条隐藏。
@@ -118,7 +132,6 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
         "output_status": inst.get("output_status"),
         "total_tasks": inst.get("total_tasks"),
         "summary": summary,
-        "rows": rows,
         # 浅层进度：processed = graded + failed（已定级）；undone = total - processed；
         # queued = ended 实例且已登记（worker 待处理）；全部行处理后 undone=0。
         "progress": {
@@ -137,39 +150,51 @@ async def shallow_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     tag: str | None = Query(None, description="L0/L1/L1.5/L2/L3/done/fail/unevaluated"),
+    keyword: str | None = Query(None, description="按 config_name 模糊搜索"),
     sort_by: str = Query("task_idx"),
     sort_dir: str = Query("asc"),
     user: dict = Depends(get_current_user),
 ):
-    """会话表格数据（分页 + 标签过滤 + 排序）。"""
+    """会话表格数据（分页 + 标签过滤 + 关键词 + 排序）。"""
     inst = _get_instance(instance_id)
 
-    where = ["instance_id = ?"]
+    where = ["tr.instance_id = ?"]
     params: list = [instance_id]
     if tag:
         if tag == "done":
-            where.append("traj_level IS NOT NULL")
+            where.append("tr.traj_level IS NOT NULL")
         elif tag == "fail":
-            where.append("traj_level = 'failed'")
+            where.append("tr.traj_level = 'failed'")
         elif tag == "unevaluated":
-            where.append("traj_level IS NULL")
+            where.append("tr.traj_level IS NULL")
         elif tag in _TRAJ_LEVELS:
-            where.append("traj_level = ?")
+            where.append("tr.traj_level = ?")
             params.append(tag)
+    if keyword:
+        kw = keyword.strip()
+        if kw:
+            where.append("tr.config_name LIKE ?")
+            params.append(f"%{kw}%")
     where_sql = " AND ".join(where)
 
+    # 排序列限定到白名单；JOIN 后两表均有 task_idx 列，裸列名会歧义，统一加 tr. 前缀。
+    # （_SORTABLE 全部是 task_records 的列。）
     col = sort_by if sort_by in _SORTABLE else "task_idx"
     direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
 
+    from_sql = ("FROM task_records tr "
+                "LEFT JOIN task_traj_records ttr "
+                "  ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name")
     total_row = await async_query_one(
-        f"SELECT COUNT(*) AS n FROM task_records WHERE {where_sql}", tuple(params)
+        f"SELECT COUNT(*) AS n {from_sql} WHERE {where_sql}", tuple(params)
     )
     total = total_row["n"] if total_row else 0
     offset = (page - 1) * page_size
     tasks = await async_query(
-        f"SELECT task_idx, config_name, traj_level, status, error_code, error_category, "
-        f"eval_score, eval_completion, gate "
-        f"FROM task_records WHERE {where_sql} ORDER BY {col} {direction} LIMIT ? OFFSET ?",
+        f"SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.status, tr.error_code, "
+        f"tr.error_category, tr.eval_score, tr.eval_completion, tr.gate, "
+        f"ttr.task_done, ttr.has_eval "
+        f"{from_sql} WHERE {where_sql} ORDER BY tr.{col} {direction} LIMIT ? OFFSET ?",
         tuple(params) + (page_size, offset),
     )
     return {"total": total, "page": page, "page_size": page_size, "tasks": tasks}
@@ -453,3 +478,156 @@ async def deep_detail(instance_id: str, traj_name: str,
             "eval_log_path": tr.get("eval_log_path"),
         },
     }
+
+
+# ============ 模型配置 / 用户模拟配置信息面板 ============
+# 数据来源：task_instances.create_params（创建实例时录入的表单快照），不读实例目录文件。
+# 主Agent = 顶层 model_base_url/model_api_key/model_id；
+# 用户模拟 = agents[] 中 name != 'evaluator' 的项（可多行）；
+# Evaluator = agents[] 中 name == 'evaluator' 的项。
+
+
+def _load_proxy_map() -> dict:
+    """读取 proxy_name.json（IP → 代理名）。文件缺失/解析失败/非 dict 时返回空字典（映射为空）。"""
+    try:
+        with open(_PROXY_NAME_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _proxy_name_for(baseurl: str, proxy_map: dict) -> str:
+    """从 baseurl 提取 IP 查代理名；无 IP / 未命中 / 空映射 → 返回空串。"""
+    if not baseurl:
+        return ""
+    m = _IP_RE.search(baseurl)
+    if not m:
+        return ""
+    return proxy_map.get(m.group(1), "")
+
+
+def _key_suffix(api_key) -> str:
+    """key 只取后四位；空或非字符串返回空串。"""
+    if not api_key or not isinstance(api_key, str):
+        return ""
+    return api_key[-4:] if len(api_key) >= 4 else api_key
+
+
+def _build_proxy_rows(create_params) -> list:
+    """从 create_params dict 拼出面板 rows（key 已截后四位、代理名已映射）。"""
+    if not create_params or not isinstance(create_params, dict):
+        return []
+    proxy_map = _load_proxy_map()
+    rows = []
+
+    # 主Agent：顶层字段
+    rows.append({
+        "role": _MAIN_AGENT_ROLE,
+        "baseurl": create_params.get("model_base_url") or "",
+        "key_suffix": _key_suffix(create_params.get("model_api_key")),
+        "proxy_name": _proxy_name_for(create_params.get("model_base_url"), proxy_map),
+        "model": create_params.get("model_id") or "",
+    })
+
+    # 用户模拟 / Evaluator：agents[]（name 决定角色）
+    for a in (create_params.get("agents") or []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name") or ""
+        role = _EVALUATOR_ROLE if name == "evaluator" else _USER_SIM_ROLE
+        rows.append({
+            "role": role,
+            "baseurl": a.get("base_url") or "",
+            "key_suffix": _key_suffix(a.get("api_key")),
+            "proxy_name": _proxy_name_for(a.get("base_url"), proxy_map),
+            "model": a.get("model") or "",
+        })
+
+    return rows
+
+
+@router.get("/{instance_id}/proxy-config")
+async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_user)):
+    """模型配置/用户模拟配置信息面板数据。
+
+    读 task_instances.create_params → 主Agent/用户模拟/Evaluator 三组 rows
+    （baseurl / key 后四位 / 代理名称 / 模型），key 已截尾，代理名由 settings/proxy_name.json
+    做 IP→名称映射（无映射留空）。运行时间取实例级 started_at ~ stopped_at。
+    """
+    inst = _get_instance(instance_id)
+    rows = []
+    try:
+        if inst.get("create_params"):
+            rows = _build_proxy_rows(json.loads(inst["create_params"]))
+    except (ValueError, TypeError):
+        rows = []  # create_params 非法时静默降级为空，不 500
+
+    return {
+        "instance_id": instance_id,
+        "name": inst.get("name") or "",
+        "status": inst.get("status") or "",
+        "started_at": inst.get("started_at") or "",
+        "stopped_at": inst.get("stopped_at") or "",
+        "rows": rows,
+    }
+
+
+@router.get("/{instance_id}/proxy-config/export")
+async def export_proxy_config(instance_id: str, user: dict = Depends(get_current_user)):
+    """导出模型配置面板为 .xlsx（openpyxl 生成，FileResponse 下载）。"""
+    inst = _get_instance(instance_id)
+    rows = []
+    try:
+        if inst.get("create_params"):
+            rows = _build_proxy_rows(json.loads(inst["create_params"]))
+    except (ValueError, TypeError):
+        rows = []
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "模型配置"
+    headers = ["名称", "baseurl", "key 后四位", "代理名称", "启动时间", "结束时间", "模型"]
+    ws.append(headers)
+    # 表头样式：加粗 + 灰底
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+
+    started = inst.get("started_at") or ""
+    stopped = inst.get("stopped_at") or ""
+    for r in rows:
+        ws.append([
+            r["role"],
+            r["baseurl"],
+            r["key_suffix"],
+            r["proxy_name"],
+            started,
+            stopped,
+            r["model"],
+        ])
+
+    # 列宽自适应（按内容最大宽 + 余量）
+    for col_idx, cell in enumerate(ws[1], start=1):
+        max_len = len(str(cell.value or ""))
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, min_row=2):
+            for c in row:
+                max_len = max(max_len, len(str(c.value or "")))
+        ws.column_dimensions[cell.column_letter].width = max_len + 6
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    safe_name = (inst.get("name") or instance_id).replace("/", "_").replace('"', "")
+    filename = f"{safe_name}_proxy_config.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"content-disposition": f'attachment; filename="{filename}"'},
+    )
