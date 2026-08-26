@@ -98,7 +98,7 @@
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="Harness类型">
-                  <el-tag size="small" :color="harnessColor(createParams.harness_type)" effect="dark">
+                  <el-tag size="small" :color="harnessColor(createParams.harness_type)" :style="{borderColor: harnessColor(createParams.harness_type)}" effect="dark">
                     {{ harnessLabel(createParams.harness_type) }}
                   </el-tag>
                 </el-descriptions-item>
@@ -655,7 +655,7 @@ const HARNESS_COLORS = {
 }
 function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
 function harnessLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[type] || type || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[t] || t || 'openclaw'
 }
 function taskTagType(category) {
   const map = {

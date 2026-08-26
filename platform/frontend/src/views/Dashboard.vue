@@ -77,7 +77,7 @@
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
         <el-table-column prop="harness_type" label="Harness" width="120" align="center" resizable>
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="small">
+            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
@@ -286,7 +286,7 @@ const HARNESS_COLORS = {
 }
 function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
 function harnessLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[type] || type || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[t] || t || 'openclaw'
 }
 function progress(row) {
   if (!row.total_tasks) return 0

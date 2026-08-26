@@ -82,7 +82,7 @@
 
         <el-tab-pane label="Harness配置" name="model">
           <el-form-item label="模型 Base URL">
-            <el-input v-model="form.model_base_url" :placeholder="form.harness_type === 'opencode' ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
+            <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
           </el-form-item>
 
           <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">
@@ -95,12 +95,13 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="form.harness_type === 'openclaw' || form.harness_type === 'opencode'" label="API 类型">
+          <el-form-item v-if="['openclaw','opencode','pi'].includes(form.harness_type)" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
             </el-select>
             <div v-if="form.harness_type === 'opencode'" style="font-size:12px;color:#999;margin-top:4px">决定 provider 的 npm 包：anthropic 用 @ai-sdk/anthropic，openai 用 @ai-sdk/openai-compatible</div>
+            <div v-if="form.harness_type === 'pi'" style="font-size:12px;color:#999;margin-top:4px">写入 models.json 的 providers.custom.api 字段</div>
           </el-form-item>
 
           <el-form-item v-if="form.harness_type === 'openjiuwen'" label="Provider">
@@ -131,7 +132,7 @@
 
               <el-form-item label="模型 Base URL">
                 <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084/v1（user_simulator 需带 /v1）" />
-                <div style="font-size:12px;color:#999;margin-top:4px">user_simulator 走 OpenAI 兼容接口，Base URL 需带 /v1 后缀</div>
+                <div style="font-size:12px;color:#999;margin-top:4px">user_simulator 的 Base URL 需带 /v1 后缀</div>
               </el-form-item>
 
               <el-form-item label="模型 API Key">
@@ -208,7 +209,6 @@
         </el-form-item>
         <el-form-item label="密钥名称">
           <el-input v-model="keyForm.name" placeholder="例如: 250826-任务名称" />
-          <div style="font-size:12px;color:#999;margin-top:4px">密钥名称</div>
         </el-form-item>
       </el-form>
       <template #footer>

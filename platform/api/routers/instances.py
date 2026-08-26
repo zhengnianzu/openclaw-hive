@@ -569,7 +569,11 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_id:
             codex_cfg["model"] = req.model_id
         if req.model_base_url:
-            prov["base_url"] = req.model_base_url
+            # codex 要求 base_url 带 /v1 后缀
+            base_url = req.model_base_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            prov["base_url"] = base_url
         if req.model_api_key:
             prov["experimental_bearer_token"] = req.model_api_key
 
@@ -597,7 +601,11 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_api_key:
             prov["apiKey"] = req.model_api_key
         if req.model_base_url:
-            prov["baseUrl"] = req.model_base_url
+            # pi 要求 baseUrl 带 /v1 后缀
+            base_url = req.model_base_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            prov["baseUrl"] = base_url
         if req.model_api_type:
             prov["api"] = req.model_api_type
         if req.model_id:

@@ -27,7 +27,7 @@
       <el-table-column prop="created_by" label="登记人" width="100" resizable />
       <el-table-column prop="harness_type" label="Harness" width="100" resizable>
         <template #default="{row}">
-          <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
+          <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="model_name" label="Harness模型" min-width="140" show-overflow-tooltip resizable />
@@ -76,7 +76,7 @@
         <el-descriptions-item label="任务名称">{{ currentReg.task_name }}</el-descriptions-item>
         <el-descriptions-item label="需求方">{{ currentReg.requester }}</el-descriptions-item>
         <el-descriptions-item label="Harness类型">
-          <el-tag :color="harnessColor(currentReg.harness_type)" effect="dark" size="small">{{ harnessLabel(currentReg.harness_type) }}</el-tag>
+          <el-tag :color="harnessColor(currentReg.harness_type)" :style="{borderColor: harnessColor(currentReg.harness_type)}" effect="dark" size="small">{{ harnessLabel(currentReg.harness_type) }}</el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="Harness模型">{{ currentReg.model_name }}</el-descriptions-item>
         <el-descriptions-item label="用户模拟模型">{{ currentReg.eval_model_name }}</el-descriptions-item>
