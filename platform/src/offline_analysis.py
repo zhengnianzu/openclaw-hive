@@ -220,9 +220,12 @@ def find_openclaw_sessions(task_dir: str) -> list[str]:
             sessions_dir = os.path.join(root, name, "sessions")
             if not os.path.isdir(sessions_dir):
                 continue
-            for fn in sorted(os.listdir(sessions_dir)):
-                if fn.endswith(".jsonl") and "trajectory" not in fn:
-                    cands.append(os.path.join(sessions_dir, fn))
+            # 递归扫 sessions 子树：真实布局可能嵌套 <ws>/<session_id>/session.jsonl
+            # （obsutil cp -r 生成），file 可能再深一层，不能只 os.listdir 一层。
+            for sroot, sdirs, sfiles in os.walk(sessions_dir):
+                for fn in sorted(sfiles):
+                    if fn.endswith(".jsonl") and "trajectory" not in fn:
+                        cands.append(os.path.join(sroot, fn))
     # claude-code 兜底：<task_dir>/projects/<workspace>/*.jsonl
     # （os.walk 的 root 以 task_dir 开头，projects 不是顶层 basename；用 rel 判断）
     if not cands:
@@ -257,9 +260,11 @@ def find_hermes_sessions(task_dir: str) -> list[str]:
             sessions_dir = os.path.join(root, agent_name, "sessions")
             if not os.path.isdir(sessions_dir):
                 continue
-            for fn in sorted(os.listdir(sessions_dir)):
-                if fn.endswith(".json"):
-                    cands.append(os.path.join(sessions_dir, fn))
+            # 递归扫 sessions 子树（嵌套布局，见 find_openclaw_sessions）
+            for sroot, sdirs, sfiles in os.walk(sessions_dir):
+                for fn in sorted(sfiles):
+                    if fn.endswith(".json"):
+                        cands.append(os.path.join(sroot, fn))
     return cands
 
 
@@ -294,14 +299,16 @@ def list_task_trajectories(task_dir: str) -> list[dict]:
             if not os.path.isdir(sess):
                 continue
             role = "evaluator" if name == "evaluator" else "assistant"
-            for fn in sorted(os.listdir(sess)):
-                if kind_dir == "agents":
-                    if fn.endswith(".jsonl") and "trajectory" not in fn:
-                        note = "解析取最大文件" if role == "assistant" else ""
-                        add(os.path.join(sess, fn), role, note)
-                else:
-                    if fn.endswith(".json"):
-                        add(os.path.join(sess, fn), role)
+            # 递归扫 sessions 子树（嵌套布局 <ws>/<session_id>/session.jsonl）
+            for sroot, sdirs, sfiles in os.walk(sess):
+                for fn in sorted(sfiles):
+                    if kind_dir == "agents":
+                        if fn.endswith(".jsonl") and "trajectory" not in fn:
+                            note = "解析取最大文件" if role == "assistant" else ""
+                            add(os.path.join(sroot, fn), role, note)
+                    else:
+                        if fn.endswith(".json"):
+                            add(os.path.join(sroot, fn), role)
     # claude-code：projects/<workspace>/*.jsonl（assistant 轨迹）
     for root, dirs, files in os.walk(task_dir):
         rel = os.path.relpath(root, task_dir)
@@ -357,13 +364,19 @@ def has_task_done_marker_in_file(log_path: str) -> bool:
 def analyze_trajectory(path: str) -> dict:
     """分析 openclaw assistant 轨迹（jsonl 事件流）。返回 {tool_calls, plain_rounds, assistant_rounds, *_tokens}。
 
-    与源仓 traj_stats.analyze_trajectory 逐字等价：type=='message' 行、role==assistant、
+    与源仓 traj_stats.analyze_trajectory 逐字等价（旧格式）：type=='message' 行、role==assistant、
     content parts 统计 toolCall；claude-code 兼容：顶层 type=='assistant'/'user'
-    （role 在 message 里，同样解析）。"""
+    （role 在 message 里，同样解析）。
+    新增事件流格式（2026-08 实测 0822_rubrics 批）：顶层 type 为 assistant/message、
+    user/message、tool/call、tool/result、step/start、step/end（data 里带 turn/step）。
+    tool_calls 数 tool/call 事件；plain_rounds 数无 tool/call 的 assistant step。
+    """
     tool_calls = 0
     plain_rounds = 0
     assistant_rounds = 0
     input_tk = output_tk = reasoning_tk = 0
+    # 事件流格式：按 (turn, step) 记录该 step 是否伴随 tool/call，用于统计 plain_rounds
+    tool_msgs: dict = {}
 
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -375,6 +388,34 @@ def analyze_trajectory(path: str) -> dict:
             except json.JSONDecodeError:
                 continue
             top_type = obj.get("type")
+
+            # ── 新事件流格式：assistant/message + tool/call（data.turn/step 关联）──
+            if top_type in ("assistant/message", "tool/call", "tool/result",
+                            "user/message"):
+                data = obj.get("data") or {}
+                if top_type == "assistant/message":
+                    assistant_rounds += 1
+                    msg = data.get("message") or {}
+                    usage = msg.get("usage")
+                    if isinstance(usage, dict):
+                        input_tk += usage.get("input") or 0
+                        output_tk += usage.get("output") or 0
+                        reasoning_tk += usage.get("reasoningTokens") or 0
+                    key = (data.get("turn"), data.get("step"))
+                    # 该 assistant step 是否伴随 tool/call（稍后回填）→ 见 tool_calls 计数
+                    tool_msgs.setdefault(key, {"tool": False, "plain": True})
+                elif top_type == "tool/call":
+                    tool_calls += 1
+                    _tk = (data.get("turn"), data.get("step"))
+                    _m = tool_msgs.get(_tk)
+                    if _m is None:
+                        tool_msgs[_tk] = {"tool": True, "plain": False}
+                    else:
+                        _m["tool"] = True
+                        _m["plain"] = False
+                continue
+
+            # ── 旧格式：type in (message, assistant, user) ──
             if top_type not in ("message", "assistant", "user"):
                 continue
             msg = obj.get("message") or {}
@@ -404,6 +445,11 @@ def analyze_trajectory(path: str) -> dict:
             if n_tc == 0:
                 plain_rounds += 1
 
+    # 事件流：assistant step 无 tool/call 的计为 plain_rounds
+    for key, flag in tool_msgs.items():
+        if flag["plain"] and not flag["tool"]:
+            plain_rounds += 1
+
     return {
         "tool_calls": tool_calls,
         "plain_rounds": plain_rounds,
@@ -420,72 +466,180 @@ def parse_openclaw_trajectory(path: str, max_lines: int = _MAX_TRAJ_LINES,
     """openclaw 轨迹 → 归一化消息流（供 print_trajectory / 前端详情）。
 
     每块 {role, part_type, content, tool_name, args, isError, exitCode, details, truncated}。
+
+    支持两种 openclaw jsonl 布局：
+      旧格式  type ∈ (message, assistant, user)（content parts 里 toolCall/tool_use）
+      事件流  2026-08 实测：assistant/message、user/message、tool/result（data.message.content
+              parts 为 reasoning/text/tool-call），配套 assistant/chunk + *-chunks 分片流不承载
+              最终正文（正文在 assistant/message 里），不单独解析。
+    事件流按 data.seq 重排保证时序（user/assistant/tool 结果交错还原）。
     """
-    blocks: list[dict] = []
+    # 读入全部行（受 max_lines/max_bytes 截断），先判布局再解析。
+    raw_lines: list[str] = []
     n_lines = 0
     n_bytes = 0
+    truncated = False
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             n_lines += 1
             n_bytes += len(line.encode("utf-8", "replace"))
             if n_lines > max_lines or n_bytes > max_bytes:
-                blocks.append({"role": None, "part_type": "truncated",
-                               "content": f"[截断] 达到 {max_lines} 行 / {max_bytes // (1024*1024)}MB 限制",
-                               "tool_name": None, "args": None, "isError": None,
-                               "exitCode": None, "details": None})
+                truncated = True
                 break
             line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") not in ("message", "assistant", "user"):
-                continue
-            msg = obj.get("message") or {}
-            role = msg.get("role")
-            if not role:
-                # claude-code 部分行 message.role 可能缺省，用顶层 type 兜底
-                role = obj.get("type") if obj.get("type") in ("assistant", "user") else None
+            if line:
+                raw_lines.append(line)
+    if truncated:
+        tail = (f"[截断] 达到 {max_lines} 行 / {max_bytes // (1024*1024)}MB 限制",)
+    else:
+        tail = ()
+
+    # 判布局：任一事件流类型行 → 事件流；否则旧格式。
+    is_stream = False
+    objs: list[dict] = []
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            obj = None
+        objs.append(obj)
+        if obj and obj.get("type") in ("assistant/message", "user/message", "tool/result"):
+            is_stream = True
+    if not is_stream:
+        return _parse_openclaw_traj_legacy(objs, tail)
+
+    # ── 事件流格式：收集 (seq, block) 排序还原时序 ──
+    seq_blocks: list[tuple[int, dict]] = []
+    for obj in objs:
+        if not obj:
+            continue
+        top_type = obj.get("type")
+        data = obj.get("data") or {}
+        seq = obj.get("seq") or 0
+        if top_type == "user/message":
+            for pt in data.get("content") or []:
+                if not isinstance(pt, dict):
+                    continue
+                if pt.get("type") == "text":
+                    seq_blocks.append((seq, {"role": "user", "part_type": "text",
+                                             "content": pt.get("text"),
+                                             "tool_name": None, "args": None,
+                                             "isError": None, "exitCode": None, "details": None}))
+        elif top_type == "assistant/message":
+            msg = data.get("message") or {}
+            for pt in msg.get("content") or []:
+                if not isinstance(pt, dict):
+                    continue
+                ptype = pt.get("type")
+                if ptype == "reasoning":
+                    seq_blocks.append((seq, {"role": "assistant", "part_type": "thinking",
+                                             "content": pt.get("text"),
+                                             "tool_name": None, "args": None,
+                                             "isError": None, "exitCode": None, "details": None}))
+                elif ptype == "text":
+                    seq_blocks.append((seq, {"role": "assistant", "part_type": "text",
+                                             "content": pt.get("text"),
+                                             "tool_name": None, "args": None,
+                                             "isError": None, "exitCode": None, "details": None}))
+                elif ptype == "tool-call":
+                    seq_blocks.append((seq, {"role": "assistant", "part_type": "toolCall",
+                                             "content": None,
+                                             "tool_name": pt.get("name"),
+                                             "args": pt.get("arguments"),
+                                             "isError": None, "exitCode": None, "details": None,
+                                             "tool_call_id": pt.get("id")}))
+        elif top_type == "tool/result":
+            msg = data.get("message") or {}
+            # content 可能为字符串或 [{type:tool-result, toolCallId, content, isError}]
             content = msg.get("content")
-            if role == "assistant":
-                if isinstance(content, str):
-                    blocks.append({"role": role, "part_type": "text", "content": content,
-                                   "tool_name": None, "args": None, "isError": None,
-                                   "exitCode": None, "details": None})
-                elif isinstance(content, list):
-                    for p in content:
-                        if not isinstance(p, dict):
-                            continue
-                        ptype = p.get("type")
-                        tool_call = p.get("toolCall")
-                        if ptype == "thinking":
-                            content_text, tool_name, args = p.get("thinking"), None, None
-                        elif ptype == "toolCall" or ptype == "tool_use":
-                            # 兼容三种真实布局：
-                            #   扁平   {type, id, name, arguments}     （claude-code tool_use）
-                            #   扁平   {type, id, name, arguments}     （openclaw toolCall 扁平）
-                            #   嵌套   {type, toolCall:{function:{name, arguments}}}
-                            content_text = None
-                            if isinstance(tool_call, dict):
-                                fn = tool_call.get("function") or {}
-                                tool_name = fn.get("name")
-                                args = fn.get("arguments")
-                                if tool_name is None and "name" in tool_call:
-                                    tool_name = tool_call.get("name")
-                                    args = tool_call.get("arguments")
-                            else:
-                                tool_name = p.get("name")
-                                args = p.get("arguments")
-                                if args is None:
-                                    args = p.get("input")   # claude-code: input 即 tool args
+            tcid = None
+            is_err = False
+            if isinstance(content, list):
+                for pt in content:
+                    if not isinstance(pt, dict):
+                        continue
+                    if pt.get("type") == "tool-result":
+                        content = pt.get("content")
+                        tcid = pt.get("toolCallId")
+                        is_err = bool(pt.get("isError"))
+                        break
+                if not isinstance(content, str) and isinstance(content, list):
+                    content = _parts_to_text(content)
+            seq_blocks.append((seq, {"role": "toolResult", "part_type": "toolResult",
+                                     "content": content, "tool_name": None,
+                                     "args": None, "isError": is_err,
+                                     "exitCode": None, "details": None,
+                                     "tool_call_id": tcid}))
+    seq_blocks.sort(key=lambda t: t[0])
+    blocks = [b for _seq, b in seq_blocks]
+    if truncated:
+        blocks.append({"role": None, "part_type": "truncated", "content": tail[0],
+                       "tool_name": None, "args": None, "isError": None,
+                       "exitCode": None, "details": None})
+    return blocks
+
+
+def _parts_to_text(parts) -> str:
+    """tool-result 正文 content 是 parts 数组时拍平为文本（拼接各 text）。"""
+    out = []
+    for pt in parts:
+        if isinstance(pt, dict):
+            if pt.get("type") == "text" and pt.get("text"):
+                out.append(pt["text"])
+            elif isinstance(pt.get("content"), (str, list)):
+                inner = pt["content"]
+                out.append(inner if isinstance(inner, str) else _parts_to_text(inner))
+    return "\n".join(out)
+
+
+def _parse_openclaw_traj_legacy(objs, tail=()) -> list[dict]:
+    """旧格式（type ∈ message/assistant/user）：逐行拆 parts，尾部截断标记可选追加。"""
+    blocks: list[dict] = []
+    for obj in objs:
+        if not obj or obj.get("type") not in ("message", "assistant", "user"):
+            continue
+        msg = obj.get("message") or {}
+        role = msg.get("role")
+        if not role:
+            role = obj.get("type") if obj.get("type") in ("assistant", "user") else None
+        content = msg.get("content")
+        if role == "assistant":
+            if isinstance(content, str):
+                blocks.append({"role": role, "part_type": "text", "content": content,
+                               "tool_name": None, "args": None, "isError": None,
+                               "exitCode": None, "details": None})
+            elif isinstance(content, list):
+                for p in content:
+                    if not isinstance(p, dict):
+                        continue
+                    ptype = p.get("type")
+                    tool_call = p.get("toolCall")
+                    if ptype == "thinking":
+                        content_text, tool_name, args = p.get("thinking"), None, None
+                    elif ptype == "toolCall" or ptype == "tool_use":
+                        # 兼容三种真实布局：
+                        #   扁平   {type, id, name, arguments}     （claude-code tool_use）
+                        #   扁平   {type, id, name, arguments}     （openclaw toolCall 扁平）
+                        #   嵌套   {type, toolCall:{function:{name, arguments}}}
+                        content_text = None
+                        if isinstance(tool_call, dict):
+                            fn = tool_call.get("function") or {}
+                            tool_name = fn.get("name")
+                            args = fn.get("arguments")
+                            if tool_name is None and "name" in tool_call:
+                                tool_name = tool_call.get("name")
+                                args = tool_call.get("arguments")
                         else:
-                            content_text, tool_name, args = p.get("text"), None, None
-                        blocks.append({"role": role, "part_type": ptype,
-                                       "content": content_text,
-                                       "tool_name": tool_name, "args": args,
-                                       "isError": None, "exitCode": None, "details": None})
+                            tool_name = p.get("name")
+                            args = p.get("arguments")
+                            if args is None:
+                                args = p.get("input")   # claude-code: input 即 tool args
+                    else:
+                        content_text, tool_name, args = p.get("text"), None, None
+                    blocks.append({"role": role, "part_type": ptype,
+                                   "content": content_text,
+                                   "tool_name": tool_name, "args": args,
+                                   "isError": None, "exitCode": None, "details": None})
             elif role == "toolResult":
                 details = msg.get("details") or {}
                 blocks.append({"role": role, "part_type": "toolResult",
@@ -500,6 +654,10 @@ def parse_openclaw_trajectory(path: str, max_lines: int = _MAX_TRAJ_LINES,
                 blocks.append({"role": role, "part_type": "text", "content": content,
                                "tool_name": None, "args": None, "isError": None,
                                "exitCode": None, "details": None})
+    if tail:
+        blocks.append({"role": None, "part_type": "truncated", "content": tail[0],
+                       "tool_name": None, "args": None, "isError": None,
+                       "exitCode": None, "details": None})
     return blocks
 
 
@@ -936,13 +1094,19 @@ def read_tsr_stats(task_dir: str) -> dict | None:
     }
 
 
-def load_task_detail(task_dir: str, task: str | None = None) -> dict:
+def load_task_detail(task_dir: str, task: str | None = None,
+                     known_harness: str | None = None) -> dict:
     """本地缓存 cache/<batch>/<leaf>/ 下加载单任务详情。
 
     返回 {harness, assistant_trajectory(blocks), assistant_stats, trajectories(list),
           evaluator_trajectory(blocks), log{path, tail}, gateway{path, tail}, eval_use_log, ...}
     轨迹 jsonl 缺失（OBS 已清理/仅 tsr+log 浅层产物）时，assistant_stats/verdict 用
     tsr 回退；轨迹块置空数组。
+
+    known_harness: DB task_traj_records.harness（浅层从 tsr 判定写入）。详情页优先用它，
+    而非 detect_harness(本地文件布局)——本地只有浅层产物、无 agents/*.jsonl 轨迹文件时，
+    detect_harness 会判 "unknown"，但轨迹其实在 OBS 未下载，harness 应显示 DB 里的真实值。
+    known_harness 非空且非 unknown 时优先；否则回退 detect_harness 兜底。
     """
     out: dict = {}
     out["task"] = task or os.path.basename(os.path.abspath(task_dir))
@@ -952,7 +1116,10 @@ def load_task_detail(task_dir: str, task: str | None = None) -> dict:
     for root, _, files in os.walk(task_dir):
         for fn in files:
             rel_paths.append(os.path.relpath(os.path.join(root, fn), task_dir))
-    out["harness"] = detect_harness(rel_paths)
+    if known_harness and known_harness != "unknown":
+        out["harness"] = known_harness
+    else:
+        out["harness"] = detect_harness(rel_paths)
 
     # assistant 轨迹
     traj = find_primary_assistant_trajectory(task_dir)
@@ -971,21 +1138,29 @@ def load_task_detail(task_dir: str, task: str | None = None) -> dict:
         tsr_stats = read_tsr_stats(task_dir)
         out["assistant_stats"] = tsr_stats
 
-    # evaluator 轨迹（懒加载语义：本地有才读）
-    ev_dir = os.path.join(task_dir, "agents", "evaluator", "sessions")
+    # evaluator 轨迹（懒加载语义：本地有才读）。
+    # 任务目录下可能是嵌套布局 task_dir/<traj_name>/agents/evaluator/sessions/<ws>/<session_id>/session.jsonl
+    # （obsutil cp -r 保留 OBS 父子层），不能只 os.listdir 一层，也不能硬编码 top 级路径——
+    # 同 find_primary_assistant_trajectory / list_task_trajectories：全树递归扫 evaluator/sessions。
     ev_traj = None
-    if os.path.isdir(ev_dir):
-        cands = [os.path.join(ev_dir, fn) for fn in sorted(os.listdir(ev_dir))
-                 if fn.endswith(".jsonl") and "trajectory" not in fn]
+    for root, _dirs, _files in os.walk(task_dir):
+        rel = os.path.relpath(root, task_dir)
+        base = os.path.basename(root)
+        if base not in ("agents", "profiles") or rel.count(os.sep) > 4:
+            continue
+        sess = os.path.join(root, "evaluator", "sessions")
+        if not os.path.isdir(sess):
+            continue
+        cands = []
+        for sroot, _sdirs, sfiles in os.walk(sess):
+            for fn in sorted(sfiles):
+                if fn.endswith(".jsonl") and "trajectory" not in fn:
+                    cands.append(os.path.join(sroot, fn))
+                elif fn.endswith(".json"):
+                    cands.append(os.path.join(sroot, fn))
         if cands:
             ev_traj = max(cands, key=lambda p: os.path.getsize(p))
-    if not ev_traj:
-        ev_dir2 = os.path.join(task_dir, "profiles", "evaluator", "sessions")
-        if os.path.isdir(ev_dir2):
-            cands = [os.path.join(ev_dir2, fn) for fn in sorted(os.listdir(ev_dir2))
-                     if fn.endswith(".json")]
-            if cands:
-                ev_traj = max(cands, key=lambda p: os.path.getsize(p))
+            break
     out["evaluator_trajectory"] = parse_openclaw_trajectory(ev_traj) if ev_traj and ev_traj.endswith(".jsonl") \
         else (parse_hermes_messages(ev_traj) if ev_traj else None)
 

@@ -224,12 +224,19 @@
             <div style="display:flex;justify-content:space-between;align-items:center">
               <span>会话漏斗</span>
               <div>
-                <el-button v-if="authStore.isOperator" size="small" type="warning"
-                  :loading="requeuing" @click="requeueShallow">重新排队</el-button>
                 <el-button size="small" @click="loadShallow(false)">刷新</el-button>
               </div>
             </div>
           </template>
+          <!-- 浅层分析进度条：finished 实例还有未分级行时显示；全部分完隐藏 -->
+          <div v-if="shallowProgress && shallowProgress.undone > 0" style="margin-bottom:12px">
+            <el-progress :percentage="shallowProgressPct" :stroke-width="10"
+              :color="shallowProgressColor" :format="shallowProgressText" />
+            <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:var(--text-muted)">
+              <span>浅层分析{{ shallowProgressStateLabel }}</span>
+              <span>已定级 {{ shallowProgress.approved }} / {{ shallowProgress.total }} 个会话</span>
+            </div>
+          </div>
           <div v-if="shallowSummary.total > 0">
             <!-- 漏斗柱状图: L0→L3 -->
             <div class="funnel-bar-row">
@@ -415,6 +422,13 @@
           <el-descriptions-item label="Task-DONE">
             <span v-if="detailData.verdict?.task_done" style="color:#10b981;font-weight:600">✓</span>
             <span v-else style="color:#c0c4cc">—</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="轨迹">
+            <el-tag v-if="detailData.deep_status === 'downloaded'" size="small" type="success">已下载</el-tag>
+            <el-tag v-else size="small" type="warning">未下载</el-tag>
+            <div v-if="detailData.deep_error" style="color:#f56c6c;font-size:12px;margin-top:2px">
+              {{ detailData.deep_error }}
+            </div>
           </el-descriptions-item>
           <el-descriptions-item label="Completion">
             <span :style="{ color: completionColor(detailData.verdict?.completion) }">
@@ -841,6 +855,26 @@ const taskRows = computed(() => {
 })
 const unevaluatedCount = computed(() => taskRows.value.filter(r => !r.traj_level).length)
 
+// 浅层进度（后端 GET /shallow 返回 progress 字段）
+const shallowProgress = ref(null)
+const shallowProgressPct = computed(() => {
+  const p = shallowProgress.value
+  if (!p || !p.total) return 0
+  const done = p.approved + p.failed
+  return Math.round((done / p.total) * 100)
+})
+const shallowProgressText = computed(() => `${shallowProgressPct.value}%`)
+const shallowProgressColor = computed(() => {
+  if (!shallowProgress.value) return '#409eff'
+  return shallowProgress.value.undone > 0 ? '#e6a23c' : '#10b981'
+})
+const shallowProgressStateLabel = computed(() => {
+  const p = shallowProgress.value
+  if (!p) return ''
+  if (p.queued) return '处理中…'
+  return '待处理'
+})
+
 // 漏斗柱状图: 高度相对已分级总数（未评估单独一柱，按总数比例）
 const funnelBuckets = computed(() => {
   const graded = shallowSummary.value.graded || 1
@@ -905,19 +939,11 @@ async function loadShallow(refresh = false) {
     shallowSummary.value = res.summary || shallowSummary.value
     shallowRows.value = res.rows || []
     instanceStatus.value = res.instance_status || ''
+    shallowProgress.value = res.progress || null
+    // 点击驱动：看到输出数据后，若该实例已结束且仍有缺口，登记一次浅层请求
+    maybeTriggerShallow()
   } catch { /* interceptor 已提示 */ }
   finally { shallowLoading.value = false }
-}
-
-async function requeueShallow() {
-  try {
-    await ElMessageBox.confirm('将全部会话重新排队（traj_level 清空，worker 重新分级）？', '重新排队', { type: 'warning' })
-    requeuing.value = true
-    await api.post(`/instances/${id}/shallow`)
-    ElMessage.success('已重新排队，等待 worker 处理')
-    setTimeout(() => loadShallow(false), 1500)
-  } catch { /* 取消或失败 */ }
-  finally { requeuing.value = false }
 }
 
 // ---- 浅层标签 / 颜色辅助 ----
@@ -1056,17 +1082,24 @@ async function openTaskDetail(row) {
   detailLogTailFull.value = false
   // 先直接尝试读本地缓存详情（浅层 tsr+log 产物可直接展示，无需触发下载）。
   // 409 = 本地轨迹未下载 → 静默（silent 标记跳过全局弹错），转触发下载分支。
+  // deep_status='not_downloaded' = 深层未下载（只有浅层 tsr+log，无轨迹文件）；
+  //   harness/stats 仍可读，但轨迹文件在 OBS，需触发下载后重拉。
   try {
     const d = await api.get(`/instances/${id}/deep/${name}/detail`, { silent: true })
     detailData.value = d
     detailLoading.value = false
-    return
+    // 未下载 → 继续走触发下载流程（不显示轨迹，下载完成后重拉显示）
+    if (d.deep_status === 'not_downloaded') {
+      detailStatusHint.value = '轨迹未下载，正在触发深层加载…'
+    } else {
+      return
+    }
   } catch { /* 本地无轨迹缓存(409) → 走触发下载流程 */ }
   // 幂等触发下载；已 downloading/pending 时后端返回 in_progress，不打断
   let trigger = 'queued'
   try { trigger = (await api.post(`/instances/${id}/deep/${name}`)).status || 'queued' } catch { /* 404 等由 interceptor 提示 */ }
   if (trigger === 'in_progress') detailStatusHint.value = '正在后台加载详情…'
-  else detailStatusHint.value = '正在加载详情…'
+  else if (!detailData.value) detailStatusHint.value = '正在加载详情…'
   clearInterval(deepPollTimer)
   deepPollTimer = setInterval(pollDeep, 3000)
   await pollDeep()
@@ -1127,11 +1160,15 @@ function logDisplayText(text) {
 
 // ============ 生命周期 ============
 let shallowTimer = null
+let shallowTriggered = false
 
 onMounted(async () => {
   loading.value = true
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
   loading.value = false
+  // 点击驱动：打开详情页即登记浅层请求（仅 ended 实例；running 由 worker 持续分级，无需登记）。
+  // 幂等登记，worker 处理完删登记出队；flag 防止同一会话重复 POST。漏斗进度由 10s 轮询反映。
+  maybeTriggerShallow()
   // config tab 常驻 10s 轮询（无论当前在哪个 tab，保持顶部进度条/状态最新）
   timer = setInterval(loadData, 10000)
   ensureTabLoaded(activeTab.value)
@@ -1143,6 +1180,21 @@ onMounted(async () => {
     startDeepQueuePolling()
   }
 })
+
+async function maybeTriggerShallow() {
+  if (shallowTriggered) return
+  const status = inst.value?.status
+  // finished/completed：worker 的 _pick_running_instances 消费这两类登记 + running/preparing；
+  // stopped 实例不会被处理，登记会永久残留。
+  if (status !== 'finished' && status !== 'completed') return
+  // 有未分级(NULL) 或 failed 行即需浅层：worker 的 pending 过滤对 NULL/failed 都重新定级
+  if (!shallowRows.value.some(r => !r.traj_level || r.traj_level === 'failed')) return
+  shallowTriggered = true
+  try {
+    const res = await api.post(`/instances/${id}/shallow`)
+    console.debug('浅层已登记', res)
+  } catch { /* interceptor 已提示；登记失败不阻塞页面 */ }
+}
 
 // outputs tab 懒加载时启动浅层 + 深层队列轮询；离开时停止
 watch(activeTab, (tab) => {

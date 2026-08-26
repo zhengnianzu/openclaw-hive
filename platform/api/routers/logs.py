@@ -723,29 +723,10 @@ async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
             if last_eval is None:
                 return (task_dir, None)
 
-            gate_status = last_eval.get("gate_status", {})
-            bucket_scores = last_eval.get("bucket_scores", {})
-
-            gate_product = 1
-            gate_values = []
-            for gv in gate_status.values():
-                gate_product *= gv
-                gate_values.append(str(gv))
-            gate_expr = "×".join(gate_values) if gate_values else "-"
-
-            bucket_sum = 0.0
-            bucket_detail = []
-            for bk, bv in bucket_scores.items():
-                nw = bv.get("norm_weight", 0)
-                total = bv.get("total", 0)
-                passed = bv.get("passed", 0)
-                ratio = (passed / total) if total > 0 else 0
-                contrib = nw * ratio
-                bucket_sum += contrib
-                if total > 0:
-                    bucket_detail.append(f"{nw:.2g}*{passed}/{total}")
-
-            computed_score = gate_product * bucket_sum
+            # eval_score 定义为 evaluator 给出完成度的评分（evaluation.completion），
+            # 与 task_traj_records.completion 同源。不再用 gate_status/bucket_scores
+            # 那套「gate × 桶加权」累加公式——它算的是 rubric 加权通过率，语义与
+            # evaluator 评分不同，且新版 evaluator log 常无 bucket 明细，公式恒得 0。
             completion = last_eval.get("completion")
             try:
                 completion = float(completion) if completion is not None else None
@@ -753,13 +734,9 @@ async def _download_eval_score(obs_base: str, task_dir: str, tmp_dir: str,
                 completion = None
 
             return (task_dir, {
-                "score": round(computed_score, 4),
+                "score": completion,
                 "completion": completion,
-                "gate": gate_product,
-                "gate_expr": gate_expr,
-                "gate_status": gate_status,
-                "bucket_expr": " + ".join(bucket_detail) if bucket_detail else "-",
-                "bucket_sum": round(bucket_sum, 4),
+                "gate": last_eval.get("gate"),
             })
         except Exception:
             return (task_dir, None)

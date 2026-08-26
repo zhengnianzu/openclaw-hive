@@ -42,20 +42,29 @@ def _get_instance(instance_id: str) -> dict:
 
 @router.post("/{instance_id}/shallow")
 async def trigger_shallow(instance_id: str, user: dict = Depends(require_operator)):
-    """请求浅层分级：把该实例 task_records 中 traj_level 为 NULL 的行重新暴露给 worker 队列。
+    """请求浅层分级：登记该实例到 shallow_requests 表，worker 下一轮消费。
 
-    实际是幂等"重扫"请求——worker 常驻轮询自然消费 traj_level IS NULL 的行；分级完成后
-    traj_level 被回填，行自然出队。前端 10s 轮询 GET 观察结果即可，无需 await 完成。
+    点击驱动：worker 不再全量扫历史 finished 缺口实例（动辄数十万行追不完），
+    只消费 running/preparing + 本表登记的 finished/completed 实例。幂等：重复登记只更新
+    status/created_by，不动已有的处理进度。处理完成后 worker 删登记出队。
+
+    output_status 门控：任务完成（completed）且 output_status='done' 时说明浅层已完成、
+    结果可直接用 → 不再重复登记，直接返回；output_status IS NULL 才允许提交新浅层。
     """
     inst = _get_instance(instance_id)
+    if inst.get("output_status") == "done":
+        return {"instance_id": instance_id, "status": "done",
+                "hint": "该实例浅层已完成(output_status=done)，直接使用，无需重复处理"}
     with get_connection() as conn:
         conn.execute(
-            "UPDATE task_records SET traj_level=NULL "
-            "WHERE instance_id=? AND traj_level IS NOT NULL",
-            (instance_id,),
+            "INSERT INTO shallow_requests (instance_id, created_by, status, created_at) "
+            "VALUES (?, ?, 'queued', CURRENT_TIMESTAMP) "
+            "ON CONFLICT(instance_id) DO UPDATE SET "
+            "status='queued', created_by=excluded.created_by, created_at=CURRENT_TIMESTAMP",
+            (instance_id, user.get("username")),
         )
     return {"instance_id": instance_id, "status": "queued",
-            "hint": "worker 常驻轮询消费，GET /shallow 观察进度"}
+            "hint": "已登记浅层请求，worker 下一轮消费，GET /shallow 观察进度"}
 
 
 @router.get("/{instance_id}/shallow")
@@ -69,9 +78,13 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
 
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT task_idx, config_name, traj_level, status, error_code, error_category, "
-            "eval_score, eval_completion, gate "
-            "FROM task_records WHERE instance_id=? ORDER BY task_idx",
+            "SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.status, tr.error_code, "
+            "tr.error_category, tr.eval_score, tr.eval_completion, tr.gate, "
+            "ttr.task_done, ttr.has_eval "
+            "FROM task_records tr "
+            "LEFT JOIN task_traj_records ttr "
+            "  ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name "
+            "WHERE tr.instance_id=? ORDER BY tr.task_idx",
             (instance_id,),
         ).fetchall()
         rows = [dict(r) for r in rows]
@@ -82,14 +95,39 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
         summary[r["traj_level"]] += 1
     summary["graded"] = len(graded)
     summary["total"] = len(rows)
-    summary["task_done"] = 0
+    summary["task_done"] = sum(1 for r in rows if r.get("task_done"))
+
+    # 浅层进度：已分级 + failed 占位 = 处理完；残留 NULL = 未处理。
+    # finished 实例已完成分级（历史堆积）时 both = total，进度条隐藏。
+    # unaudited = 仍为 NULL 的行数（浅层分析未覆盖/队列未消费）。
+    unaudited = len(rows) - len(graded) - sum(
+        1 for r in rows if r["traj_level"] == "failed")
+    queued = False
+    status = inst.get("status")
+    if status in ("finished", "completed"):
+        # finished/completed 实例是否被登记（worker 待处理或正在处理）
+        with get_connection() as conn:
+            queued = conn.execute(
+                "SELECT 1 FROM shallow_requests WHERE instance_id=? LIMIT 1",
+                (instance_id,),
+            ).fetchone() is not None
 
     return {
         "instance_id": instance_id,
-        "instance_status": inst.get("status"),
+        "instance_status": status,
+        "output_status": inst.get("output_status"),
         "total_tasks": inst.get("total_tasks"),
         "summary": summary,
         "rows": rows,
+        # 浅层进度：processed = graded + failed（已定级）；undone = total - processed；
+        # queued = finished/completed 且已登记（worker 待处理）；全部行处理后 undone=0。
+        "progress": {
+            "approved": len(graded),
+            "failed": sum(1 for r in rows if r["traj_level"] == "failed"),
+            "total": len(rows),
+            "undone": unaudited,
+            "queued": queued,
+        },
     }
 
 
@@ -310,8 +348,12 @@ async def deep_detail(instance_id: str, traj_name: str,
             continue
         rparts = (rel.replace(cache_root, "", 1).lstrip("/") if rel.startswith(cache_root)
                   else rel).split("/")
-        # traj_name 在 rel 中最后一次出现：任务目录 = cache_root + 此前缀
-        idx = len(rparts) - 1 - rparts[::-1].index(tr["traj_name"]) if tr["traj_name"] in rparts else -1
+        # traj_name 在 rel 中第一次出现处：任务目录 = cache_root + 此前缀。
+        # 注：obsutil cp -r 会保留 OBS leaf 目录 → 深层下载后本地是 <batch>/<leaf>/<leaf>/… 双层嵌套，
+        #     assistant_traj_path 指向子层；但日志（run.log/gateway.log/evaluator_use.log）落在父层 dest。
+        #     故取「第一次出现」（=父层任务根）而非最后一次（=子层），否则读不到父层日志。
+        #     浅层 trajectory_rel 为 <batch>/<leaf>/agents/… 时第一次出现即任务根，同样正确。
+        idx = rparts.index(tr["traj_name"]) if tr["traj_name"] in rparts else -1
         if idx >= 0:
             candidate = os.path.join(cache_root, *rparts[:idx + 1])
             if os.path.isdir(candidate):
@@ -328,7 +370,8 @@ async def deep_detail(instance_id: str, traj_name: str,
 
     try:
         from src import offline_analysis as oa
-        detail = oa.load_task_detail(task_dir, traj_name)
+        detail = oa.load_task_detail(task_dir, traj_name,
+                                     known_harness=tr.get("harness"))
         # 本地是否有真实 assistant 轨迹文件（多候选取最大者；任务确无回复时 OBS 无轨迹，为 None）
         has_traj_file = bool(oa.find_primary_assistant_trajectory(task_dir))
         if has_traj_file:
@@ -367,9 +410,20 @@ async def deep_detail(instance_id: str, traj_name: str,
             elif t.get("role") == "evaluator" and not tr.get("evaluator_traj_path"):
                 tr["evaluator_traj_path"] = t["path"]
 
+    # 深层下载状态：5 个路径列任一非空（worker 已回填）或本地轨迹文件可读 = 已下载；
+    # 全 NULL 且无本地轨迹文件 = 未下载。未下载但 harness/stats 可读（DB+tsr）时仍返回
+    # detail，前端据 deep_status 触发下载。
+    deep_paths = [tr.get(k) for k in (
+        "assistant_traj_path", "evaluator_traj_path",
+        "task_log_path", "gateway_log_path", "eval_log_path")]
+    deep_status = ("downloaded" if (any(deep_paths) or has_traj_file)
+                   else "not_downloaded")
+
     return {
         "traj_name": traj_name,
-        "harness": detail.get("harness"),
+        "harness": tr.get("harness") or detail.get("harness"),
+        "deep_status": deep_status,
+        "deep_error": tr.get("error"),
         "assistant_stats": detail.get("assistant_stats"),
         "assistant_trajectory": detail.get("assistant_trajectory"),
         "evaluator_trajectory": detail.get("evaluator_trajectory"),

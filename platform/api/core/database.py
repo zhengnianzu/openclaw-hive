@@ -105,7 +105,8 @@ def init_db():
                 concurrent_num INTEGER DEFAULT 100,
                 config_snapshot TEXT,
                 error_summary TEXT,
-                create_params TEXT
+                create_params TEXT,
+                output_status TEXT          -- 点击输出/浅层完成状态: NULL未输出, done浅层完成可直接用
             );
 
             CREATE TABLE IF NOT EXISTS task_registrations (
@@ -128,6 +129,11 @@ def init_db():
         # migrate: add create_params for existing databases
         try:
             conn.execute("ALTER TABLE task_instances ADD COLUMN create_params TEXT")
+        except Exception:
+            pass
+        # migrate: add output_status for existing databases（点击输出/浅层完成状态）
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN output_status TEXT")
         except Exception:
             pass
         # migrate: add role column for existing databases
@@ -303,6 +309,8 @@ def init_db():
                 trajectory_rel TEXT,                 -- 相对 origin 的 assistant 轨迹路径（缓存内）
                 status TEXT DEFAULT 'done',          -- pending/downloading/done/failed（仅深层触发时置 pending）
                 error TEXT,                          -- 深层下载/解析失败信息
+                shallow_status TEXT,                 -- 浅层处理状态: NULL未处理/processed/empty(OBS无轨迹)/error
+                shallow_error TEXT,                  -- 浅层错误信息
                 assistant_traj_path TEXT,            -- 缓存内相对路径（深层回填）
                 evaluator_traj_path TEXT,
                 task_log_path TEXT,                  -- 主日志相对路径
@@ -314,4 +322,37 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_traj_records_inst ON task_traj_records(instance_id);
             CREATE INDEX IF NOT EXISTS idx_traj_records_task ON task_traj_records(instance_id, config_name);
+        """)
+
+        # migrate: 为已存在的 task_traj_records 补列（IF NOT EXISTS 不会加列），风格同 task_records
+        for col in [
+            "shallow_status TEXT",
+            "shallow_error TEXT",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE task_traj_records ADD COLUMN {col}")
+            except Exception:
+                pass
+        # 迁移回填：已有行都是浅层处理过的——有分级 → processed；failed 占位 → 无轨迹 empty。
+        # 无 level 的 NULL 行保持待处理，交给浅层首次分析。
+        try:
+            conn.execute(
+                "UPDATE task_traj_records SET shallow_status='processed' "
+                "WHERE level IN ('L0','L1','L1.5','L2','L3') AND shallow_status IS NULL")
+            conn.execute(
+                "UPDATE task_traj_records SET shallow_status='empty' "
+                "WHERE level='failed' AND shallow_status IS NULL")
+        except Exception:
+            pass
+
+        # 浅层按需触发登记表：点击驱动 —— 打开实例详情页 POST /{id}/shallow 登记一次，
+        # worker 只消费 running/preparing + 本表登记的 finished 实例，不再全量扫历史缺口。
+        # 处理完成（实例不再有缺口）后删除登记，实例出队。running 实例不入本表（持续分级）。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS shallow_requests (
+                instance_id TEXT PRIMARY KEY,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'queued'
+            );
         """)
