@@ -107,6 +107,7 @@ def init_db():
                 error_summary TEXT,
                 create_params TEXT,
                 output_status TEXT          -- 点击输出/浅层完成状态: NULL未输出, done浅层完成可直接用
+                , task_done_sync INTEGER NOT NULL DEFAULT 0   -- 终态(completed/finished)后最后扫描是否完成: 0待扫, 1已终扫
             );
 
             CREATE TABLE IF NOT EXISTS task_registrations (
@@ -134,6 +135,11 @@ def init_db():
         # migrate: add output_status for existing databases（点击输出/浅层完成状态）
         try:
             conn.execute("ALTER TABLE task_instances ADD COLUMN output_status TEXT")
+        except Exception:
+            pass
+        # migrate: add task_done_sync for existing databases（终态后最后扫描标记）
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN task_done_sync INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
         # migrate: add role column for existing databases

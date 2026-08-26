@@ -346,10 +346,11 @@
           </template>
           <el-table :data="pagedTasks" stripe size="small" style="width:100%"
             @sort-change="onTaskSort">
-            <el-table-column prop="traj_name" label="会话" min-width="240" show-overflow-tooltip>
+            <el-table-column prop="task_title" label="任务名称" min-width="240" show-overflow-tooltip>
               <template #default="{ row }">
                 <span style="cursor:pointer;color:var(--text-primary)"
-                  @click="openTaskDetail(row)">{{ row.traj_name }}</span>
+                  :title="row.traj_name"
+                  @click="openTaskDetail(row)">{{ row.task_title || row.traj_name }}</span>
               </template>
             </el-table-column>
             <el-table-column label="等级" min-width="90" align="center">
@@ -840,6 +841,19 @@ const LEVEL_COLORS = {
   L3: '#10b981',
 }
 const LEVEL_ORDER = ['L0', 'L1', 'L1.5', 'L2', 'L3']
+// 从 traj_name/config stem 抽取任务名称（仅展示用）：
+//   <序号>_<角色>_<任务标题>_<hash8>_q1  → 取中间 title 段（标题本身可含 _）
+//   user_profile_* / task_<hash>.json 等无规律命名 → 原样回退（保留完整 traj_name）
+function _extractTaskTitle(name) {
+  const leaf = name.includes('/') ? name.split('/').pop() : name
+  const s = leaf.replace(/\.json$/, '').replace(/_q\d+$/, '')
+  const parts = s.split('_')
+  if (parts.length >= 4 && /^\d{2,}$/.test(parts[0]) && /^[0-9a-f]{8}$/.test(parts[parts.length - 1])) {
+    return parts.slice(2, -1).join('_') || s
+  }
+  return s || leaf
+}
+
 // 会话行: task_records 行 ∪ traj_name(leaf) ∪ tool_fail 列
 const taskRows = computed(() => {
   return shallowRows.value.map(r => {
@@ -849,6 +863,7 @@ const taskRows = computed(() => {
     return {
       ...r,
       traj_name: stripped || leaf,
+      task_title: _extractTaskTitle(name), // 展示用简短任务名；traj_name 仍是 API key
       tool_fail: typeof r.tool_fail === 'number' ? r.tool_fail > 0 : !!r.tool_fail,
     }
   })
@@ -904,7 +919,8 @@ const filteredTaskRows = computed(() => {
     else rows = rows.filter(r => r.traj_level === levelFilter.value)
   }
   const kw = taskKeyword.value.trim().toLowerCase()
-  if (kw) rows = rows.filter(r => (r.traj_name || '').toLowerCase().includes(kw))
+  if (kw) rows = rows.filter(r => (r.traj_name || '').toLowerCase().includes(kw)
+    || (r.task_title || '').toLowerCase().includes(kw))
   const s = taskSort.value
   if (s.prop) {
     const dir = s.order === 'descending' ? -1 : 1
@@ -1184,9 +1200,10 @@ onMounted(async () => {
 async function maybeTriggerShallow() {
   if (shallowTriggered) return
   const status = inst.value?.status
-  // finished/completed：worker 的 _pick_running_instances 消费这两类登记 + running/preparing；
-  // stopped 实例不会被处理，登记会永久残留。
-  if (status !== 'finished' && status !== 'completed') return
+  // finished/completed/stopped：worker 的 _pick_running_instances 消费这类登记 + running/preparing。
+  // stopped 实例轨迹可能仍在 OBS（中止已上传的部分 task 目录），同样可分级查看会话详情；
+  // worker 处理完（无缺口）删登记出队，不会永久残留。
+  if (status !== 'finished' && status !== 'completed' && status !== 'stopped') return
   // 有未分级(NULL) 或 failed 行即需浅层：worker 的 pending 过滤对 NULL/failed 都重新定级
   if (!shallowRows.value.some(r => !r.traj_level || r.traj_level === 'failed')) return
   shallowTriggered = true

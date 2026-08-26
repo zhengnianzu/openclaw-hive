@@ -85,9 +85,9 @@ def _obs_base_path(config_path: str) -> str:
 
 def _pick_running_instances(conn) -> list[dict]:
     """浅层队列来源：running/preparing 的实例（其 task_records 由在线 _sync_task_records 维护）
-    + 被点击登记的 finished/completed 实例（shallow_requests 表，见 POST /{instance_id}/shallow）。
+    + 被点击登记的 finished/completed/stopped 实例（shallow_requests 表，见 POST /{instance_id}/shallow）。
 
-    finished/completed 实例不再无条件全量拉取（历史缺口动辄数十万行，全量扫永远追不完）；
+    finished/completed/stopped 实例不再无条件全量拉取（历史缺口动辄数十万行，全量扫永远追不完）；
     只有用户打开详情页 POST /{id}/shallow 登记过的才进队列。worker 处理完（实例无缺口）由
     _clear_shallow_request 删登记出队（completed 同时置 output_status='done'）。
 
@@ -98,7 +98,7 @@ def _pick_running_instances(conn) -> list[dict]:
         "SELECT ti.id, ti.name, ti.config_path, ti.status "
         "FROM task_instances ti "
         "WHERE ti.status IN ('running','preparing') "
-        "OR (ti.status IN ('finished','completed') AND EXISTS ("
+        "OR (ti.status IN ('finished','completed','stopped') AND EXISTS ("
         "    SELECT 1 FROM shallow_requests sr WHERE sr.instance_id = ti.id)) "
         "ORDER BY ti.created_at DESC"
     ).fetchall()
@@ -365,11 +365,11 @@ def _fetch_tsr_entries_fast(obsutil: str, task_obs: str, origin: str) -> list[di
 
 
 def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
-    """finished 实例浅层补全：OBS 轨迹探测 → task_records 缺失行 INSERT + 分级 + task_traj_records。
+    """finished/stopped 实例浅层补全：OBS 轨迹探测 → task_records 缺失行 INSERT + 分级 + task_traj_records。
 
     背景：在线 _sync_task_records 只跑 running 实例且按增量变化驱动，多 task 并发终止时
-    可能漏写部分行；worker 浅层只消费 task_records 已有行。结果 finished 实例的漏斗/列表缺
-    行、task_traj_records 为空 → 点会话 404「无轨迹记录」。
+    可能漏写部分行；worker 浅层只消费 task_records 已有行。结果 finished/stopped 实例的漏斗/列
+    表缺行、task_traj_records 为空 → 点会话 404「无轨迹记录」。
 
     做法：一次 obsutil ls -d 枚举 obs_base 下全部 task 叶子目录（OBS 侧 1 次往返），
     与 task_records 中 traj_level IS NULL 的缺口行做集合差（leaf == config stem）：
@@ -411,13 +411,16 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
     # 把 N 次 OBS 往返降为 1 次（OBS 侧一次拿到整批目录集合）。
     obs_leaves = _list_obs_leaves(obsutil, obs_base)
 
-    # 任务异常/失败的缺口行：轨迹几乎不存在（抽查 100% 无 OBS 目录），批量 failed 占位
-    # 退出缺口队列（避免每轮逐行探测 OBS）。已分级/占位的行不再进入缺口查询。
-    failed_rows = [g for g in gaps if g["status"] == "任务异常"]
-    if failed_rows:
-        _batch_placeholder_failed(inst, failed_rows, "任务异常缺口批量占位")
+    # 任务异常/失败的缺口行：轨迹几乎不存在（finished 场景抽查 100% 无 OBS 目录），批量
+    # failed 占位退出缺口队列（避免每轮逐行探测 OBS）。已分级/占位的行不再进入缺口查询。
+    # 例外：stopped 实例（如中途中止）轨迹往往已部分上传，任务异常 ≠ 无轨迹——仍逐行探测
+    # OBS（见下 _backfill_one 的 obs_leaves 集合差），避免把有真实轨迹的会话误标 failed。
+    if inst["status"] != "stopped":
+        failed_rows = [g for g in gaps if g["status"] == "任务异常"]
+        if failed_rows:
+            _batch_placeholder_failed(inst, failed_rows, "任务异常缺口批量占位")
 
-    # 任务成功/未知状态的缺口行：轨迹可能在 OBS（在线竞态漏写分级），逐行拉 tsr 分级。
+    # 任务成功/未知/stopped 的缺口行：轨迹可能在 OBS（在线竞态漏写分级），逐行拉 tsr 分级。
     # OBS 集合里没有的 → 轨迹整批已失效/未上传，直接 failed 占位（不再逐行探测）。
     # 行级并发：OBS 拉 tsr 是 I/O 密集（subprocess cp），串行逐行等下载极慢；用线程池并行。
     # obs_leaves 只读、DB 写各用独立 get_connection()（WAL）、obsutil 独立子进程——线程安全。
@@ -473,8 +476,9 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
             print(f"    [fail] {inst['id']} 补全 {config_name}: {e}", flush=True)
             return 0
 
-    # 跳过已批量占位的"任务异常"行，其余进线程池。
-    work = [g for g in gaps if g["status"] != "任务异常"]
+    # 跳过已批量占位的"任务异常"行，其余进线程池；stopped 例外：任务异常行未批占，全量探测。
+    work = ([g for g in gaps if g["status"] != "任务异常"]
+            if inst["status"] != "stopped" else gaps)
     n = 0
     if work:
         with ThreadPoolExecutor(max_workers=BACKFILL_CONCURRENCY,
@@ -582,10 +586,10 @@ def _insert_task_record_placeholder(inst: dict, config_name: str, meta: dict,
 
 
 def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
-    """处理一个实例的浅层队列：finished 从 OBS 轨迹补全（快路径，不慢路径下载）；
+    """处理一个实例的浅层队列：finished/stopped 从 OBS 轨迹补全（快路径，不慢路径下载）；
     running/preparing 分级 task_records 未回填行（仅一次，不做 stale 回收）。"""
-    if inst["status"] == "finished":
-        # finished：实例已结束轨迹不变，补全从 OBS 轨迹快路径补齐在线竞态漏写的行。
+    if inst["status"] in ("finished", "stopped"):
+        # finished/stopped：实例已结束轨迹不变，补全从 OBS 轨迹快路径补齐在线竞态漏写的行。
         # 补全已覆盖全部 OBS 轨迹（有 tsr 分级 / 无 tsr 占位），直接 return，不落通用 pending
         # 逻辑——通用分支对无 tsr 行会走 _load_per_task_entries 慢路径下载整轨迹。
         n_backfilled = _backfill_finished_tasks(inst, origin, obsutil)
@@ -850,9 +854,9 @@ def _run_once(obsutil: str, origin: str,
         for inst in insts:
             if instance_id and inst["id"] != instance_id:
                 continue
-            # 每轮预算：finished 补全（_backfill_finished_tasks 枚举 OBS）有配额，
-            # 跑满后本轮的 finished 全部跳过（running/preparing 不受限）。
-            if (inst["status"] == "finished"
+            # 每轮预算：finished/stopped 补全（_backfill_finished_tasks 枚举 OBS）有配额，
+            # 跑满后本轮的 finished/stopped 全部跳过（running/preparing 不受限）。
+            if (inst["status"] in ("finished", "stopped")
                     and n_backfilled_inst >= BACKFILL_MAX_INSTANCES_PER_ROUND):
                 continue
             try:
@@ -860,9 +864,9 @@ def _run_once(obsutil: str, origin: str,
             except Exception as e:
                 r = {"n_processed": 0, "n_failed": 0}
                 print(f"    [fail] 实例 {inst['id']} 分级失败: {e}", flush=True)
-            if inst["status"] in ("finished", "completed"):
+            if inst["status"] in ("finished", "completed", "stopped"):
                 n_backfilled_inst += 1
-                # 点击驱动：finished/completed 实例处理完（无剩余缺口）即删登记出队；
+                # 点击驱动：registered 实例处理完（无剩余缺口）即删登记出队；
                 # completed 同时置 output_status='done'（浅层完成，点击输出下次直接用）。
                 # 仍有缺口（一轮限 300 行没清完）保留登记，下轮继续。
                 with get_connection() as conn:

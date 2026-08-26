@@ -104,8 +104,8 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
         1 for r in rows if r["traj_level"] == "failed")
     queued = False
     status = inst.get("status")
-    if status in ("finished", "completed"):
-        # finished/completed 实例是否被登记（worker 待处理或正在处理）
+    if status in ("finished", "completed", "stopped"):
+        # finished/completed/stopped 实例是否被登记（worker 待处理或正在处理）
         with get_connection() as conn:
             queued = conn.execute(
                 "SELECT 1 FROM shallow_requests WHERE instance_id=? LIMIT 1",
@@ -120,7 +120,7 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
         "summary": summary,
         "rows": rows,
         # 浅层进度：processed = graded + failed（已定级）；undone = total - processed；
-        # queued = finished/completed 且已登记（worker 待处理）；全部行处理后 undone=0。
+        # queued = ended 实例且已登记（worker 待处理）；全部行处理后 undone=0。
         "progress": {
             "approved": len(graded),
             "failed": sum(1 for r in rows if r["traj_level"] == "failed"),
@@ -410,14 +410,13 @@ async def deep_detail(instance_id: str, traj_name: str,
             elif t.get("role") == "evaluator" and not tr.get("evaluator_traj_path"):
                 tr["evaluator_traj_path"] = t["path"]
 
-    # 深层下载状态：5 个路径列任一非空（worker 已回填）或本地轨迹文件可读 = 已下载；
-    # 全 NULL 且无本地轨迹文件 = 未下载。未下载但 harness/stats 可读（DB+tsr）时仍返回
-    # detail，前端据 deep_status 触发下载。
+    # 深层下载状态：以 DB 5 个路径列是否回填为准（worker 下载成功后落列）。
+    # 全 NULL = 深层从未成功回填（即便本地残留旧版缓存的轨迹文件），判 not_downloaded，
+    # 前端据 deep_status 触发重新下载补齐（网关/eval 日志随重构后的下载一并落盘并回填）。
     deep_paths = [tr.get(k) for k in (
         "assistant_traj_path", "evaluator_traj_path",
         "task_log_path", "gateway_log_path", "eval_log_path")]
-    deep_status = ("downloaded" if (any(deep_paths) or has_traj_file)
-                   else "not_downloaded")
+    deep_status = ("downloaded" if any(deep_paths) else "not_downloaded")
 
     return {
         "traj_name": traj_name,

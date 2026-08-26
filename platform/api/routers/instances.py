@@ -1411,11 +1411,19 @@ def recover_orphan_preparing() -> int:
 
 
 def _refresh_running_once():
-    """后台线程：预热 running/preparing 实例的状态与分析缓存。"""
+    """后台线程：预热 running/preparing 实例的状态与分析缓存。
+
+    含终态(completed/finished)最后一次同步：在线同步只在 running 期间跑，实例完成
+    那一刻 `if inst["status"] == "running"` 的分支会错过最后一次写入；且运行窗口内若
+    后台没跑到该实例，task_records 会永久缺行。用 task_done_sync 标记兜底：
+    终态且 task_done_sync=0 的实例，每轮重扫直至写入成功后置位，缺行实例据此补齐。
+    """
     try:
         with get_connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM task_instances WHERE status IN ('running','preparing')"
+                "SELECT * FROM task_instances "
+                "WHERE status IN ('running','preparing') "
+                "OR (status IN ('completed','finished') AND task_done_sync=0)"
             ).fetchall()
     except Exception:
         return
@@ -1431,6 +1439,27 @@ def _refresh_running_once():
                     _sync_task_records(inst["id"], inst["config_path"])
                 except Exception:
                     pass
+            elif inst["status"] in ("completed", "finished"):
+                # 终态最后同步：在线同步只在 running 期间跑，完成那一刻/运行窗口内漏跑的
+                # 实例 task_records 会永久缺行。task_done_sync=0 的终态实例在此补网——
+                # 仅当 task_records 整体为空(0 行)时才需要 full 重扫；行已完整的实例
+                # 直接置位，避免对海量历史终态实例全量重扫。写库成功才置位，否则下轮
+                # refresher 重试（任务日志已定稿，增量扫描 changed 为空集，故 full=True
+                # 全量写一次，ON CONFLICT 幂等）。
+                gap = 0
+                with get_connection() as conn:
+                    gap = conn.execute(
+                        "SELECT COUNT(*) FROM task_records WHERE instance_id=?",
+                        (inst["id"],),
+                    ).fetchone()[0]
+                if gap == 0:
+                    _compute_analyze(inst["config_path"], inst["total_tasks"])
+                    _sync_task_records(inst["id"], inst["config_path"], True)
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE task_instances SET task_done_sync=1 WHERE id=?",
+                        (inst["id"],),
+                    )
         except Exception:
             continue
 

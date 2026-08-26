@@ -1206,43 +1206,95 @@ def _tail_text(path: str | None, max_bytes: int) -> str | None:
 
 def download_task_detail(obsutil: str, task_obs: str, origin: str,
                          obs_cred_args: list[str] | None = None) -> str:
-    """层级2：按需下载单个 task 详情所需文件到 cache/<task相对路径>/，返回本地 task_dir。
+    """层级2：只下载「详情所需」文件到 cache/<task相对路径>/，返回本地 task_dir。
+
+    下载集合 = DB task_traj_records 5 个路径列对应文件 + 详情/状态表附加项，**一一列举**，
+    不做整任务递归 cp、不带 include/exclude——每类是确定的文件，失败即抛（不静默补救）：
+      - 日志（OBS 固定相对路径，直接 cp 到同相对路径）：
+          workdir/run.log（主日志）、workdir/gateway.log（openclaw 排障）、
+          logs/evaluator_use.log（eval 日志）、logs/traj_stats_result.json（分级快路径）。
+      - 轨迹（session 文件名动态，先 ls 定位精确对象再 cp）：
+          openclaw：agents/<main|assistant*>/sessions/<ws>/<sid>/session.jsonl
+                    与 agents/evaluator/sessions/<ws>/<sid>/session.jsonl
+          hermes：  profiles/<main|assistant*>/sessions/*.json
+          claude-code：projects/<ws>/*.jsonl
 
     cache 子目录 = _cache_subdir_for(task_obs)（obs://bucket/<batch>/<task> → cache/<batch>/<task>）。
-    整任务递归 cp + include/exclude（模式源自源仓 download_task；include 按完整路径匹配，
-    天然覆盖 task 下任意嵌套的 user_profile_*/agents|profiles 布局）。
+    轨迹与日志统一落任务根 dest，**不再产生 <batch>/<task>/<task>/ 双层嵌套**——加载端
+    find_* / list_task_trajectories 全树扫描，flat 布局与旧 nested 布局都能读到。
     """
     task_obs = task_obs if task_obs.endswith("/") else task_obs + "/"
     dest = os.path.join(origin, _cache_subdir_for(task_obs))
     os.makedirs(dest, exist_ok=True)
+    leaf = task_obs.rstrip("/").rsplit("/", 1)[-1]
 
-    top = [ln.strip() for ln in run_obsutil_ls(obsutil, task_obs, one_level=False)]
-    harness = detect_harness(top)
-    if harness == "hermes":
-        include = ["*logs/trajectories/*query*.json", "*logs*.log",
-                   "*profiles/assistant*/sessions/*.json", "*profiles/main/sessions/*.json",
-                   "*profiles/assistant*/state.db*", "*profiles/main/state.db*"]
-        exclude = ["*.trajectory.jsonl", "*_use.log", "*profiles/*/logs/*", "*_logs/*.log"]
-    else:
-        include = ["*assistant*sessions*.jsonl", "*agents/main/sessions/*.jsonl",
-                   "*logs*.log", "*evaluator*sessions*.jsonl",
-                   "*logs/trajectories/*query*.json",
-                   "*profiles/assistant*/sessions/*.json",
-                   "*profiles/main/sessions/*.json",
-                   "*profiles/assistant*/state.db*", "*profiles/main/state.db*",
-                   "*projects/*/*.jsonl"]  # claude-code: projects/<ws>/<session>.jsonl
-        exclude = ["*.trajectory.jsonl", "*_use.log", "*profiles/*/logs/*", "*_logs/*.log"]
-    run_obsutil_cp(obsutil, task_obs, dest, recursive=True,
-                   include=include, exclude=exclude)
-    # 主 log + gateway（openclaw）
-    for rel in (LOG_CANDIDATES[0], GATEWAY_LOG_REL, EVAL_USE_LOG_REL):
+    def _cp_one(rel: str, required: bool = True) -> None:
+        """cp 单对象 task_obs+rel → dest/rel（按 '/'-分离的相对路径落位）。"""
         dpath = os.path.join(dest, *rel.split("/"))
         os.makedirs(os.path.dirname(dpath), exist_ok=True)
+        # obsutil cp 目标为具体文件路径；仅当远端对象不存在时跳过（required 时抛）
         try:
             run_obsutil_cp(obsutil, task_obs + rel, dpath)
         except RuntimeError:
+            if required:
+                raise
+            print(f"    [deep] {leaf}: 可选日志缺失 {rel}（跳过）", flush=True)
+
+    # 1) 日志 + 分级快路径（固定相对路径）。
+    _cp_one(GATEWAY_LOG_REL, required=False)      # hermes 无 gateway.log
+    _cp_one(EVAL_USE_LOG_REL, required=False)     # 无 evaluator 时没有该文件
+    # 主日志候选（与 find_primary_log 同序）：至少一个成功才算下载完成。
+    main_log_done = False
+    for rel in LOG_CANDIDATES:
+        rel = rel.format(task=leaf)
+        try:
+            _cp_one(rel)
+            main_log_done = True
+            break
+        except RuntimeError:
             continue
+    if not main_log_done:
+        raise RuntimeError(f"{leaf}: 主日志缺失（试过 {LOG_CANDIDATES[0]} 等候选）")
+    _cp_one(TSR_REL, required=False)              # 分级快路径（浅层可能已拉）
+
+    # 2) 轨迹（动态 session 路径）。先枚举 OBS 全量对象，按 harness 布局筛出精确对象名再 cp。
+    objs = [ln.strip() for ln in run_obsutil_ls(obsutil, task_obs, one_level=False)]
+    keys = [o for o in objs if o.startswith(task_obs) and not o.rstrip("/").endswith("/")]
+    # 只挑种子（log/profile/query/state.db 的过滤不动，本函数只关心轨迹与会话文件）
+    traj_rel = _plan_traj_rels(keys, task_obs)
+    for rel in traj_rel:
+        _cp_one(rel)
     return dest
+
+
+def _plan_traj_rels(keys: list[str], task_obs: str) -> list[str]:
+    """从 OBS 全量对象 key 中筛出需下载的轨迹相对路径（相对 task_obs），按布局判定 harness。
+
+    - openclaw：agents/{assistant*,main}/sessions/**/session.jsonl（排除 .trajectory.jsonl）
+                 + agents/evaluator/sessions/**/session.jsonl
+    - hermes：  profiles/{assistant*,main}/sessions/*.json
+    - claude-code：projects/<ws>/*.jsonl
+    返回相对路径列表（已排序，assistant 在前）。空 = 无轨迹（任务确无回复）。
+    """
+    rels: list[str] = []
+    for k in keys:
+        rel = k[len(task_obs):] if k.startswith(task_obs) else k
+        rel = rel.lstrip("/")
+        # openclaw main/assistant 侧
+        if (rel.startswith("agents/") and "/sessions/" in rel
+                and rel.endswith(".jsonl") and "trajectory" not in rel):
+            rels.append(rel)
+        # hermes profiles 侧
+        elif (rel.startswith("profiles/") and "/sessions/" in rel
+              and rel.endswith(".json")):
+            rels.append(rel)
+        # claude-code projects 侧
+        elif (rel.startswith("projects/") and rel.count("/") <= 2
+              and rel.endswith(".jsonl") and "trajectory" not in rel):
+            rels.append(rel)
+    # 只保留会话目录下直接是 session 文件的行（避免 scoop 到 profile 的 state.json 等；
+    # 但 hermes 的 session_*.json 都在 sessions/ 下，过滤条件已足够）。
+    return sorted(set(rels))
 
 
 # ============ 状态表（task_status） ============
