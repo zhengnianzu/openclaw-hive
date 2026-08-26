@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/instances", tags=["instances"])
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json"}
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -50,7 +50,7 @@ _ERROR_CODE_DESC = {
     "S009": "upload traj to OBS failed",
     "T001": "Task_Failed", "T002": "达到最大轮次", "T003": "连续3次未收到回复",
     "T004": "AgentExecutionError", "T005": "AssertionError",
-    "T006": "API call failed", "T007": "TimeoutError",
+    "T006": "API call failed", "T007": "TimeoutError", "T008": "HarnessError",
     "T010": "Uncategorized Traceback", "X999": "unclassified exception",
 }
 
@@ -138,7 +138,12 @@ async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
     if not effective_base:
         raise ValueError("未配置 key 申请的 base_url（key_gen.yaml.default.base_url 或传入 model_base_url）")
 
-    api_url = effective_base.rstrip("/") + "/" + str(rule["endpoint"]).lstrip("/")
+    # 去掉尾部 /v1
+    effective_base = effective_base.rstrip("/")
+    if effective_base.endswith("/v1"):
+        effective_base = effective_base[:-3]
+
+    api_url = effective_base + "/" + str(rule["endpoint"]).lstrip("/")
     method = rule["method"]
 
     # invite_code + name + 规则里的额外固定参数（如 token）
@@ -387,7 +392,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs"}
+        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs"}
         traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
@@ -398,6 +403,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
     openjiuwen_path = os.path.join(instance_dir, "openjiuwen.json")
     opencode_path = os.path.join(instance_dir, "opencode.json")
+    codex_path = os.path.join(instance_dir, "config.toml")
+    pi_path = os.path.join(instance_dir, "models.json")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
@@ -408,6 +415,10 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         base.run_config.sandbox.harness_local_config_file = openjiuwen_path
     elif req.harness_type == "opencode":
         base.run_config.sandbox.harness_local_config_file = opencode_path
+    elif req.harness_type == "codex":
+        base.run_config.sandbox.harness_local_config_file = codex_path
+    elif req.harness_type == "pi":
+        base.run_config.sandbox.harness_local_config_file = pi_path
     else:
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -533,6 +544,72 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         with open(opencode_path, "w", encoding="utf-8") as f:
             json.dump(opencode_cfg, f, indent=2, ensure_ascii=False)
+    elif req.harness_type == "codex":
+        # config.toml 结构:
+        #   顶层: model / model_provider / model_reasoning_effort / disable_response_storage / sandbox_mode
+        #   [model_providers.<name>]: name / base_url / experimental_bearer_token / wire_api
+        import tomllib
+        import tomli_w
+        codex_template = os.path.join(harness_settings_dir, "config.toml")
+        if not os.path.exists(codex_template):
+            codex_template = os.path.join(settings.SETTINGS_DIR, "config.toml")
+        with open(codex_template, "rb") as f:
+            codex_cfg = tomllib.load(f)
+
+        # 找到顶层 model_provider 指向的 provider 段(默认 "custom");不存在则自建
+        main_provider_key = codex_cfg.get("model_provider") or "custom"
+        providers = codex_cfg.setdefault("model_providers", {})
+        prov = providers.setdefault(main_provider_key, {
+            "name": main_provider_key,
+            "base_url": "",
+            "experimental_bearer_token": "",
+            "wire_api": "responses",
+        })
+
+        if req.model_id:
+            codex_cfg["model"] = req.model_id
+        if req.model_base_url:
+            prov["base_url"] = req.model_base_url
+        if req.model_api_key:
+            prov["experimental_bearer_token"] = req.model_api_key
+
+        with open(codex_path, "wb") as f:
+            tomli_w.dump(codex_cfg, f)
+    elif req.harness_type == "pi":
+        # models.json 结构: providers.<name>.{baseUrl, api, apiKey, models: [{id, name, ...}]}
+        pi_template = os.path.join(harness_settings_dir, "models.json")
+        if not os.path.exists(pi_template):
+            pi_template = os.path.join(settings.SETTINGS_DIR, "models.json")
+        with open(pi_template, "r", encoding="utf-8") as f:
+            pi_cfg = json.load(f)
+
+        providers = pi_cfg.setdefault("providers", {})
+        main_provider_key = "custom"
+        if main_provider_key not in providers:
+            providers[main_provider_key] = {
+                "baseUrl": "",
+                "api": "openai-completions",
+                "apiKey": "",
+                "models": [],
+            }
+
+        prov = providers[main_provider_key]
+        if req.model_api_key:
+            prov["apiKey"] = req.model_api_key
+        if req.model_base_url:
+            prov["baseUrl"] = req.model_base_url
+        if req.model_api_type:
+            prov["api"] = req.model_api_type
+        if req.model_id:
+            models_list = prov.setdefault("models", [])
+            if models_list:
+                models_list[0]["id"] = req.model_id
+                models_list[0]["name"] = req.model_id
+            else:
+                models_list.append({"id": req.model_id, "name": req.model_id})
+
+        with open(pi_path, "w", encoding="utf-8") as f:
+            json.dump(pi_cfg, f, indent=2, ensure_ascii=False)
     else:
         openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
         if not os.path.exists(openclaw_template):
@@ -590,6 +667,28 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 opencode_cfg.setdefault("provider", {}).setdefault("local-provider", {}).setdefault("options", {})["apiKey"] = req.model_api_key
                 with open(opencode_path, "w", encoding="utf-8") as f:
                     json.dump(opencode_cfg, f, indent=2, ensure_ascii=False)
+            elif req.harness_type == "codex" and os.path.exists(codex_path):
+                # codex config.toml: 用 tomllib(读) + tomli_w(写) 正式解析。
+                # 与前面 codex 分支保持一致,避免正则替换在多段/嵌套 table 上的边界问题。
+                import tomllib
+                import tomli_w
+                with open(codex_path, "rb") as f:
+                    codex_cfg = tomllib.load(f)
+                main_provider_key = codex_cfg.get("model_provider") or "custom"
+                prov = codex_cfg.setdefault("model_providers", {}).setdefault(
+                    main_provider_key,
+                    {"name": main_provider_key, "base_url": "",
+                     "experimental_bearer_token": "", "wire_api": "responses"},
+                )
+                prov["experimental_bearer_token"] = req.model_api_key
+                with open(codex_path, "wb") as f:
+                    tomli_w.dump(codex_cfg, f)
+            elif req.harness_type == "pi" and os.path.exists(pi_path):
+                with open(pi_path, "r", encoding="utf-8") as f:
+                    pi_cfg = json.load(f)
+                pi_cfg.setdefault("providers", {}).setdefault("custom", {})["apiKey"] = req.model_api_key
+                with open(pi_path, "w", encoding="utf-8") as f:
+                    json.dump(pi_cfg, f, indent=2, ensure_ascii=False)
             elif os.path.exists(openclaw_path):
                 with open(openclaw_path, "r", encoding="utf-8") as f:
                     openclaw_cfg = json.load(f)

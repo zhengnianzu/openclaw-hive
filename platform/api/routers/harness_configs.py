@@ -20,6 +20,8 @@ HARNESS_FILES = {
     "claude-code": "cc_settings.json",
     "openjiuwen": "openjiuwen.json",
     "opencode": "opencode.json",
+    "codex": "config.toml",
+    "pi": "models.json",
     "common": None,
 }
 
@@ -29,6 +31,8 @@ EXPECTED_FILES = {
     "claude-code": ["cc_settings.json", "config.yaml", "user_proxy_model.json"],
     "openjiuwen": ["openjiuwen.json", "config.yaml", "user_proxy_model.json"],
     "opencode": ["opencode.json", "config.yaml", "user_proxy_model.json"],
+    "codex": ["config.toml", "config.yaml", "user_proxy_model.json"],
+    "pi": ["models.json", "config.yaml", "user_proxy_model.json"],
     "common": ["config.yaml", "user_proxy_model.json"],
 }
 
@@ -429,7 +433,7 @@ def copy_harness_config(config_id: int, body: CopyRequest, user: dict = Depends(
 def ensure_defaults():
     """Auto-register default harness configs from settings/ for each type."""
     with get_connection() as conn:
-        for htype in ["openclaw", "hermes", "claude-code", "openjiuwen", "opencode"]:
+        for htype in ["openclaw", "hermes", "claude-code", "openjiuwen", "opencode", "codex", "pi"]:
             existing = conn.execute(
                 "SELECT id FROM harness_configs WHERE harness_type = ? AND version = ?",
                 (htype, DEFAULT_VERSION),
