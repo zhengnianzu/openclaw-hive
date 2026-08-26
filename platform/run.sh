@@ -10,6 +10,49 @@ HOST="${2:-0.0.0.0}"
 PORT="${3:-8087}"
 NGINX_PORT="${4:-80}"
 
+# 输出分析 worker：浅层（分级/补全）+ 深层（下载/回填）两个独立进程
+#  - 浅层: pid worker.pid / 日志 worker.log
+#  - 深层: pid deep_worker.pid / 日志 deep_worker.log
+start_worker() {
+    if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null; then
+        echo "浅层 worker 已在运行 (PID: $(cat worker.pid))"
+        return
+    fi
+    nohup python3 offline/output_worker.py --shallow-only > worker.log 2>&1 &
+    echo $! > worker.pid
+    echo "浅层 worker 已启动 (PID: $(cat worker.pid))"
+}
+
+stop_worker() {
+    if [ -f worker.pid ]; then
+        kill "$(cat worker.pid)" 2>/dev/null
+        rm -f worker.pid
+        echo "浅层 worker 已停止"
+    else
+        echo "浅层 worker 未运行"
+    fi
+}
+
+start_deep_worker() {
+    if [ -f deep_worker.pid ] && kill -0 "$(cat deep_worker.pid)" 2>/dev/null; then
+        echo "深层 worker 已在运行 (PID: $(cat deep_worker.pid))"
+        return
+    fi
+    nohup python3 offline/output_worker.py --deep-only > deep_worker.log 2>&1 &
+    echo $! > deep_worker.pid
+    echo "深层 worker 已启动 (PID: $(cat deep_worker.pid))"
+}
+
+stop_deep_worker() {
+    if [ -f deep_worker.pid ]; then
+        kill "$(cat deep_worker.pid)" 2>/dev/null
+        rm -f deep_worker.pid
+        echo "深层 worker 已停止"
+    else
+        echo "深层 worker 未运行"
+    fi
+}
+
 case "$ACTION" in
     install)
         echo "=== 安装后端依赖 ==="
@@ -49,6 +92,8 @@ case "$ACTION" in
         nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
+        start_worker
+        start_deep_worker
 
         # 启动 Nginx（如果已安装）
         if command -v nginx &> /dev/null; then
@@ -81,6 +126,8 @@ case "$ACTION" in
         else
             echo "Uvicorn 未运行"
         fi
+        stop_worker
+        stop_deep_worker
         # 停止 Nginx（如果由我们启动）
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null && echo "Nginx 已停止"
@@ -94,6 +141,8 @@ case "$ACTION" in
             rm -f platform.pid
             echo "已停止旧进程"
         fi
+        stop_worker
+        stop_deep_worker
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null
         fi
@@ -107,6 +156,8 @@ case "$ACTION" in
         nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
+        start_worker
+        start_deep_worker
 
         if command -v nginx &> /dev/null; then
             NGINX_CONF="$SCRIPT_DIR/nginx.conf"
@@ -129,16 +180,62 @@ case "$ACTION" in
         fi
         ;;
 
+    worker-logs)
+        if [ -f worker.log ]; then
+            echo "=== 浅层 worker.log ==="
+            tail -f worker.log
+        else
+            echo "worker.log 不存在，浅层 worker 可能未启动"
+        fi
+        ;;
+
+    deep-worker-logs)
+        if [ -f deep_worker.log ]; then
+            echo "=== 深层 deep_worker.log ==="
+            tail -f deep_worker.log
+        else
+            echo "deep_worker.log 不存在，深层 worker 可能未启动"
+        fi
+        ;;
+
+    worker-status)
+        if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null; then
+            echo "浅层 worker 运行中 (PID: $(cat worker.pid))"
+        else
+            echo "浅层 worker 未运行"
+        fi
+        if [ -f deep_worker.pid ] && kill -0 "$(cat deep_worker.pid)" 2>/dev/null; then
+            echo "深层 worker 运行中 (PID: $(cat deep_worker.pid))"
+        else
+            echo "深层 worker 未运行"
+        fi
+        echo "--- 浅层 worker.log 尾部 20 行 ---"
+        if [ -f worker.log ]; then
+            tail -n 20 worker.log
+        else
+            echo "(worker.log 不存在)"
+        fi
+        echo "--- 深层 deep_worker.log 尾部 20 行 ---"
+        if [ -f deep_worker.log ]; then
+            tail -n 20 deep_worker.log
+        else
+            echo "(deep_worker.log 不存在)"
+        fi
+        ;;
+
     *)
-        echo "用法: $0 {install|build|dev|start|stop|restart|logs} [host] [port] [nginx_port]"
+        echo "用法: $0 {install|build|dev|start|stop|restart|logs|worker-logs|deep-worker-logs|worker-status} [host] [port] [nginx_port]"
         echo ""
-        echo "  install   安装依赖（后端 + 前端）"
-        echo "  build     构建前端静态文件"
-        echo "  dev       开发模式（后端热重载）"
-        echo "  start     生产模式启动（uvicorn + nginx）"
-        echo "  stop      停止服务"
-        echo "  restart   重启服务"
-        echo "  logs      查看日志（实时）"
+        echo "  install        安装依赖（后端 + 前端）"
+        echo "  build          构建前端静态文件"
+        echo "  dev            开发模式（后端热重载）"
+        echo "  start          生产模式启动（uvicorn + nginx + 浅层/深层 worker）"
+        echo "  stop           停止服务"
+        echo "  restart        重启服务"
+        echo "  logs           查看主服务日志（实时）"
+        echo "  worker-logs    查看浅层 worker 日志（实时）"
+        echo "  deep-worker-logs 查看深层 worker 日志（实时）"
+        echo "  worker-status  查看浅层/深层 worker 状态 + 日志尾部"
         echo ""
         echo "默认端口: uvicorn=${PORT}, nginx=${NGINX_PORT}"
         ;;

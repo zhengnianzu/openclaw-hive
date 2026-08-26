@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     OBS_BUCKET: str = "obs://rl-agentdata"
     CONFIG_TEMPLATE: str = ""
     SETTINGS_DIR: str = ""
+    OUTPUT_CACHE: str = ""
 
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
@@ -35,6 +36,8 @@ class Settings(BaseSettings):
             self.OBSUTIL_PATH = os.path.join(platform_dir, "obsutil", "obsutil")
         if not self.SETTINGS_DIR:
             self.SETTINGS_DIR = os.path.join(platform_dir, "settings")
+        if not self.OUTPUT_CACHE:
+            self.OUTPUT_CACHE = os.path.join(platform_dir, "output_cache")
 
 
 settings = Settings()

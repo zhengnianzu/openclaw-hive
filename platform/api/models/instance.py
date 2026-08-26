@@ -64,6 +64,7 @@ class InstanceInfo(BaseModel):
     failed_tasks: int = 0
     concurrent_num: int = 100
     harness_type: str = "openclaw"
+    output_status: Optional[str] = None  # NULL=未做浅层/未输出, done=浅层完成可直接用
 
 
 class InstanceOverview(BaseModel):
