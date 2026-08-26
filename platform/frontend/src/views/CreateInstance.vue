@@ -19,6 +19,8 @@
           <el-option label="Claude Code" value="claude-code" />
           <el-option label="Jiuwen Claw" value="openjiuwen" />
           <el-option label="OpenCode" value="opencode" />
+          <el-option label="Codex" value="codex" />
+          <el-option label="Pi" value="pi" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -128,7 +130,8 @@
               </el-form-item>
 
               <el-form-item label="模型 Base URL">
-                <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084" />
+                <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084/v1（user_simulator 需带 /v1）" />
+                <div style="font-size:12px;color:#999;margin-top:4px">user_simulator 走 OpenAI 兼容接口，Base URL 需带 /v1 后缀</div>
               </el-form-item>
 
               <el-form-item label="模型 API Key">
@@ -203,8 +206,9 @@
         <el-form-item label="Invite Code">
           <el-input v-model="keyForm.invite_code" placeholder="pangu" />
         </el-form-item>
-        <el-form-item label="Name">
-          <el-input v-model="keyForm.name" placeholder="mtime-任务名称" />
+        <el-form-item label="密钥名称">
+          <el-input v-model="keyForm.name" placeholder="例如: 250826-任务名称" />
+          <div style="font-size:12px;color:#999;margin-top:4px">密钥名称</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -293,8 +297,10 @@ async function generateApiKey() {
     const res = await api.post('/generate-api-key', null, { params })
     if (keyTarget.type === 'agent' && keyTarget.agentIdx >= 0) {
       form.value.agents[keyTarget.agentIdx].api_key = res.api_key
+      form.value.agents[keyTarget.agentIdx].invite_code = keyForm.value.invite_code
     } else {
       form.value.model_api_key = res.api_key
+      form.value.invite_code = keyForm.value.invite_code
     }
     localStorage.setItem('last_invite_code', keyForm.value.invite_code)
     ElMessage.success(`API Key 已生成: ${res.api_key.slice(0, 4)}****${res.api_key.slice(-4)}`)

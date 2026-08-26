@@ -100,7 +100,7 @@ const downloadingId = ref(null)
 
 const createVisible = ref(false)
 const creating = ref(false)
-const createForm = ref({ name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'openclaw_automation.py' })
+const createForm = ref({ name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'harness_automation.py' })
 
 async function loadRepos() {
   loading.value = true
@@ -112,7 +112,7 @@ async function loadRepos() {
 }
 
 function openCreateDialog() {
-  createForm.value = { name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'openclaw_automation.py' }
+  createForm.value = { name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'harness_automation.py' }
   createVisible.value = true
 }
 

@@ -68,7 +68,7 @@ def main() -> None:
         sandbox_ids = get_all_use_env_id()
     else:
         sandbox_id_prefix = config_dict.sandbox_id_prefix
-        sandbox_namespace = config_dict.sandbox_namespace
+        sandbox_namespace = config_dict.get("sandbox_namespace", "omni-env-default-worker")
         sandbox_ids = get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace)
         if not sandbox_ids:
             print(f"sandbox_id_prefix={sandbox_id_prefix} 下没有找到任何运行中的 Pod")

@@ -12,7 +12,7 @@
         <el-table-column prop="name" label="模板名称" min-width="160" />
         <el-table-column prop="harness_type" label="Harness类型" width="120">
           <template #default="{row}">
-            <el-tag :type="harnessTagType(row.harness_type)" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
+            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="默认" width="80" align="center">
@@ -47,6 +47,8 @@
             <el-option label="Claude Code" value="claude-code" />
             <el-option label="Jiuwen Claw" value="openjiuwen" />
             <el-option label="OpenCode" value="opencode" />
+            <el-option label="Codex" value="codex" />
+            <el-option label="Pi" value="pi" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -211,10 +213,17 @@ const form = ref(defaultForm())
 const agents = ref([{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }])
 
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', common: 'info' }[type] || ''
 }
+const HARNESS_COLORS = {
+  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
+  openjiuwen: '#f56c6c', opencode: '#909399',
+  codex: '#8e44ad', pi: '#17a2b8',
+  common: '#c0c4cc',
+}
+function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[type] || type
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[type] || type
 }
 
 function addAgent() {
