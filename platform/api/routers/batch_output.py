@@ -626,8 +626,17 @@ async def export_proxy_config(instance_id: str, user: dict = Depends(get_current
 
     safe_name = (inst.get("name") or instance_id).replace("/", "_").replace('"', "")
     filename = f"{safe_name}_proxy_config.xlsx"
+    # HTTP 头只能用 latin-1，中文文件名会 UnicodeEncodeError。
+    # 用 RFC 5987 的 filename*（UTF-8 百分号编码）承载中文名，
+    # 再给一个纯 ASCII 的 filename 兜底（非 ASCII 字符替换为下划线）。
+    from urllib.parse import quote
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    disposition = (
+        f"attachment; filename=\"{ascii_fallback}\"; "
+        f"filename*=UTF-8''{quote(filename)}"
+    )
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"content-disposition": f'attachment; filename="{filename}"'},
+        headers={"content-disposition": disposition},
     )
