@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
+    # 对话导出服务（模型配置面板「浏览/导出」对接，.env 配置）
+    EXPORT_BASE: str = ""
+    EXPORT_ACCESS_KEY: str = ""
+
     class Config:
         env_file = ".env"
 

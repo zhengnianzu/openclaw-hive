@@ -15,7 +15,9 @@ import os
 import re
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
@@ -33,6 +35,24 @@ _IP_RE = re.compile(r"https?://([0-9.]+)")
 _MAIN_AGENT_ROLE = "主Agent"
 _USER_SIM_ROLE = "用户模拟"
 _EVALUATOR_ROLE = "Evaluator"
+
+# 角色 → create_params 里的字段定位（供对话导出：取完整 key + model）
+_MAIN_AGENT = "main_agent"
+_USER_SIM = "user_simulator"
+_EVALUATOR = "evaluator"
+_ROLE_TO_KEY = {
+    _MAIN_AGENT_ROLE: (_MAIN_AGENT, "model_api_key", "model_base_url", "model_id"),
+    _USER_SIM_ROLE: (_USER_SIM, "api_key", "base_url", "model"),
+    _EVALUATOR_ROLE: (_EVALUATOR, "api_key", "base_url", "model"),
+}
+
+# 导出方式（外部服务允许的 mode）+ 默认 mode
+_EXPORT_MODES = ["export", "reformat", "eval", "reconstruct", "full_reformat"]
+_DEFAULT_MODE = "export"
+
+# 导出任务状态：外部 queued/running/success/failed + 本地未导出
+_EXPORT_STATUS_ACTIVE = {"queued", "running"}
+_EXPORT_STATUS_FINAL = {"success", "failed"}
 
 # 漏斗档位（x 轴顺序，与 README 一致）
 _TRAJ_LEVELS = ["L0", "L1", "L1.5", "L2", "L3"]
@@ -547,6 +567,121 @@ def _build_proxy_rows(create_params) -> list:
     return rows
 
 
+# ============ 模型配置面板：对话导出（对接外部 EXPORT_BASE 服务） ============
+# 说明：浏览/导出提交/状态查询都经本后端代理，完整 key + model + access-key 只在服务端拼装，
+# 前端只接触 rows 里的 key_suffix（后四位）。外部服务契约见 doc/README_export.md / 用户提供文档。
+
+def _agent_for_role(create_params: dict, role: str) -> dict:
+    """按角色从 create_params 定位完整连接信息 dict（key/baseurl/model）。
+
+    找不到该角色时返回空 dict（调用方判定 404）。主Agent 取顶层字段；
+    用户模拟/Evaluator 取 agents[] 里 name 匹配项（agents[].name 是 user_simulator/evaluator，
+    映射到显示角色，与 _build_proxy_rows 的分组逻辑一致）。
+    """
+    if not create_params or not isinstance(create_params, dict):
+        return {}
+    if role == _MAIN_AGENT_ROLE:
+        return {
+            "key": create_params.get("model_api_key") or "",
+            "baseurl": create_params.get("model_base_url") or "",
+            "model": create_params.get("model_id") or "",
+        }
+    # 显示角色 → agents[].name：evaluator 命中，其余非主Agent 角色按 user_simulator 处理
+    target_name = "evaluator" if role == _EVALUATOR_ROLE else "user_simulator"
+    for a in (create_params.get("agents") or []):
+        if not isinstance(a, dict):
+            continue
+        if (a.get("name") or "") == target_name:
+            return {
+                "key": a.get("api_key") or "",
+                "baseurl": a.get("base_url") or "",
+                "model": a.get("model") or "",
+            }
+    return {}
+
+
+def _export_status_map(instance_id: str) -> dict:
+    """读 model_export_tasks，返回 {role: {...}}（未导出的角色不在 map 里）。"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT role, export_id, export_name, mode, status, session_path, "
+            "total_sessions, error_message FROM model_export_tasks WHERE instance_id=?",
+            (instance_id,),
+        ).fetchall()
+    out = {}
+    for r in rows:
+        out[r["role"]] = dict(r)
+    return out
+
+
+def _upsert_export_task(instance_id: str, role: str, model_key: str, model: str,
+                        export_id: int, export_name: str, mode: str, status: str,
+                        session_path: str = "", total_sessions: int = None,
+                        error_message: str = ""):
+    """UPSERT 一条导出任务（UNIQUE(instance_id, role)）。update 时刷新 updated_at。"""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT id FROM model_export_tasks WHERE instance_id=? AND role=?",
+            (instance_id, role),
+        ).fetchone()
+        if cur:
+            conn.execute(
+                "UPDATE model_export_tasks SET model_key=?, model=?, export_id=?, export_name=?, "
+                "mode=?, status=?, session_path=?, total_sessions=?, error_message=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (model_key, model, export_id, export_name, mode, status,
+                 session_path, total_sessions, error_message, cur["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO model_export_tasks (instance_id, role, model_key, model, export_id, "
+                "export_name, mode, status, session_path, total_sessions, error_message) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (instance_id, role, model_key, model, export_id, export_name, mode,
+                 status, session_path, total_sessions, error_message),
+            )
+
+
+def _export_url(path: str, params: dict) -> str:
+    """拼外部服务完整 URL：base（去尾斜杠）+ path + query（已 URL-encode）。
+
+    保留空值参数（如 model=），外部契约要求 key/model 参数始终出现在 query 里。
+    """
+    base = (settings.EXPORT_BASE or "").rstrip("/")
+    qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items() if v is not None)
+    return f"{base}{path}?{qs}" if qs else f"{base}{path}"
+
+
+async def _call_export(path: str, params: dict, timeout: float = 30.0) -> dict:
+    """调外部导出服务。状态码非 2xx 时抛 HTTPException（透传外部 detail）。
+
+    返回 JSON dict。外部 403/404/400 的三类 detail（Invalid access-key / Not found / Invalid mode）
+    原样透传给前端，语义与契约一致。
+    """
+    if not settings.EXPORT_BASE or not settings.EXPORT_ACCESS_KEY:
+        raise HTTPException(status_code=500, detail="导出服务未配置（EXPORT_BASE / EXPORT_ACCESS_KEY）")
+    params = {**params, "access-key": settings.EXPORT_ACCESS_KEY}
+    url = _export_url(path, params)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resp = await client.get(url)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"导出服务不可达: {e}")
+    if resp.status_code >= 400:
+        detail = "导出服务返回错误"
+        try:
+            body = resp.json()
+            if isinstance(body, dict) and body.get("detail"):
+                detail = body["detail"]
+        except ValueError:
+            pass
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    try:
+        return resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="导出服务返回非 JSON 响应")
+
+
 @router.get("/{instance_id}/proxy-config")
 async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_user)):
     """模型配置/用户模拟配置信息面板数据。
@@ -554,6 +689,7 @@ async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_us
     读 task_instances.create_params → 主Agent/用户模拟/Evaluator 三组 rows
     （baseurl / key 后四位 / 代理名称 / 模型），key 已截尾，代理名由 settings/proxy_name.json
     做 IP→名称映射（无映射留空）。运行时间取实例级 started_at ~ stopped_at。
+    每行并回带对话导出信息（export_status / session_path / total_sessions，来自 model_export_tasks）。
     """
     inst = _get_instance(instance_id)
     rows = []
@@ -562,6 +698,17 @@ async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_us
             rows = _build_proxy_rows(json.loads(inst["create_params"]))
     except (ValueError, TypeError):
         rows = []  # create_params 非法时静默降级为空，不 500
+
+    # 合并对话导出状态：role → model_export_tasks 行
+    export_map = _export_status_map(instance_id)
+    for r in rows:
+        ex = export_map.get(r["role"])
+        r["export_status"] = (ex or {}).get("status") or "unexported"
+        r["session_path"] = (ex or {}).get("session_path") or ""
+        r["total_sessions"] = (ex or {}).get("total_sessions")
+        r["export_id"] = (ex or {}).get("export_id")
+        r["export_name"] = (ex or {}).get("export_name") or ""
+        r["export_mode"] = (ex or {}).get("mode") or ""
 
     return {
         "instance_id": instance_id,
@@ -640,3 +787,152 @@ async def export_proxy_config(instance_id: str, user: dict = Depends(get_current
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"content-disposition": disposition},
     )
+
+
+# ============ 模型配置面板：对话导出端点 ============
+
+def _role_cred_from(create_params, role: str, inst: dict):
+    """按角色取完整连接信息；create_params 非法或该角色缺失时抛 404。
+
+    返回 (key, model)。供导出提交/浏览/状态查询定位该 row 的凭据。
+    """
+    cp = None
+    try:
+        if inst.get("create_params"):
+            cp = json.loads(inst["create_params"])
+    except (ValueError, TypeError):
+        cp = None
+    info = _agent_for_role(cp, role)
+    if not info or not info.get("key"):
+        raise HTTPException(status_code=404, detail=f"角色 {role} 未找到或缺失 key")
+    return info["key"], info.get("model") or ""
+
+
+@router.post("/{instance_id}/proxy-config/export")
+async def submit_proxy_export(instance_id: str, body: dict, user: dict = Depends(get_current_user)):
+    """提交对话导出（对接外部 EXPORT_BASE /export/submit）。
+
+    body: {role, export_name, model?, mode?}。role 定位 create_params 里的完整 key+model，
+    后端拼 access-key 调外部服务，把返回的 export_id/session_path 落 model_export_tasks（queued）。
+    """
+    role = (body or {}).get("role") or ""
+    if role not in _ROLE_TO_KEY:
+        raise HTTPException(status_code=400, detail=f"非法角色: {role}")
+    export_name = (body or {}).get("export_name") or ""
+    mode = (body or {}).get("mode") or _DEFAULT_MODE
+    if mode not in _EXPORT_MODES:
+        raise HTTPException(status_code=400, detail=f"非法 mode {mode}（allowed: {', '.join(_EXPORT_MODES)}）")
+
+    inst = _get_instance(instance_id)
+    key, model = _role_cred_from(inst.get("create_params"), role, inst)
+    if (body or {}).get("model"):
+        model = body["model"]
+
+    resp = await _call_export("/export/submit", {
+        "key": key,
+        "model": model,
+        "export_name": export_name,
+        "mode": mode,
+    })
+    export_id = resp.get("export_id")
+    session_path = resp.get("session_path") or ""
+
+    _upsert_export_task(
+        instance_id, role, key, model,
+        export_id=export_id, export_name=export_name, mode=mode,
+        status="queued", session_path=session_path,
+    )
+    return {
+        "instance_id": instance_id,
+        "role": role,
+        "export_id": export_id,
+        "session_path": session_path,
+        "status": "queued",
+        "mode": mode,
+        "export_name": export_name,
+    }
+
+
+@router.get("/{instance_id}/proxy-config/export/status")
+async def proxy_export_status(instance_id: str, user: dict = Depends(get_current_user)):
+    """查询对话导出状态（对接外部 EXPORT_BASE /export/status）。
+
+    只轮询 status IN (queued,running) 的行；终态/unexported 直接读表，不打外部。
+    返回全部角色的 export_status + session_path + total_sessions + error_message。
+    """
+    inst = _get_instance(instance_id)
+    export_map = _export_status_map(instance_id)
+
+    # 刷新进行中的行：逐个调外部 status，回填 DB
+    for role, ex in export_map.items():
+        if (ex.get("status") or "") not in _EXPORT_STATUS_ACTIVE:
+            continue
+        key, model = _role_cred_from(inst.get("create_params"), role, inst)
+        if not ex.get("export_id"):
+            continue
+        try:
+            resp = await _call_export("/export/status", {
+                "export_id": ex["export_id"],
+                "key": key,
+            })
+        except HTTPException as e:
+            # 外部报错（如 export_id 已清）不把任务置 failed 之外的猜：回填 error 并标 failed
+            _upsert_export_task(
+                instance_id, role, key, model,
+                export_id=ex.get("export_id"), export_name=ex.get("export_name") or "",
+                mode=ex.get("mode") or _DEFAULT_MODE, status="failed",
+                session_path=ex.get("session_path") or "",
+                error_message=str(e.detail),
+            )
+            continue
+        status = (resp or {}).get("status") or "failed"
+        _upsert_export_task(
+            instance_id, role, key, model,
+            export_id=ex.get("export_id"), export_name=ex.get("export_name") or "",
+            mode=ex.get("mode") or _DEFAULT_MODE, status=status,
+            session_path=(resp or {}).get("session_path") or ex.get("session_path") or "",
+            total_sessions=(resp or {}).get("total_sessions"),
+            error_message=(resp or {}).get("error_message") or "",
+        )
+
+    # 重新读最新状态返回
+    export_map = _export_status_map(instance_id)
+    rows = []
+    cp = None
+    try:
+        if inst.get("create_params"):
+            cp = json.loads(inst["create_params"])
+    except (ValueError, TypeError):
+        cp = None
+    for r in _build_proxy_rows(cp):
+        ex = export_map.get(r["role"])
+        rows.append({
+            "role": r["role"],
+            "export_status": (ex or {}).get("status") or "unexported",
+            "session_path": (ex or {}).get("session_path") or "",
+            "total_sessions": (ex or {}).get("total_sessions"),
+            "export_id": (ex or {}).get("export_id"),
+            "error_message": (ex or {}).get("error_message") or "",
+        })
+    return {"instance_id": instance_id, "rows": rows}
+
+
+@router.get("/{instance_id}/proxy-config/browse")
+async def browse_proxy_export(instance_id: str, role: str = Query(...),
+                              user: dict = Depends(get_current_user)):
+    """返回外部对话浏览页 URL（前端拿到后 window.open 到 export_base/export/view）。
+
+    完整 key + access-key 拼在后端 URL 里，前端只拿成品链接不可见 key 明文。
+    不能直接用 302 重定向：本端点是鉴权接口，window.open 的裸导航不带 Bearer token 会 401，
+    永远到不了重定向。改为返回 JSON，前端走带 token 的 axios 取 URL 再新开标签页。
+    """
+    inst = _get_instance(instance_id)
+    key, model = _role_cred_from(inst.get("create_params"), role, inst)
+    # 外部 /export/view 需要 access-key 参数；_call_export 自动附加，但 browse 走 _export_url
+    # 直接拼链接，这里显式带上 access-key。
+    url = _export_url("/export/view", {
+        "key": key,
+        "model": model,
+        "access-key": settings.EXPORT_ACCESS_KEY,
+    })
+    return {"url": url}
