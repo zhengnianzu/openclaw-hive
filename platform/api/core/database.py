@@ -362,3 +362,26 @@ def init_db():
                 status TEXT DEFAULT 'queued'
             );
         """)
+
+        # 模型配置面板「对话导出」登记表：一行 = 某实例某角色（主Agent/用户模拟/Evaluator）的导出任务。
+        # 提交导出时 UPSERT（UNIQUE(instance_id, role)），外部服务返回 export_id/session_path 落库；
+        # 状态轮询时回填 status/total_sessions/error_message。存完整 model_key 供 status 轮询带 key。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS model_export_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                model TEXT NOT NULL,
+                export_id INTEGER,
+                export_name TEXT,
+                mode TEXT DEFAULT 'export',
+                status TEXT DEFAULT 'unexported',
+                session_path TEXT,
+                total_sessions INTEGER,
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(instance_id, role)
+            );
+        """)

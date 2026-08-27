@@ -296,6 +296,38 @@
                 <span style="font-size:12px">{{ row.model || '—' }}</span>
               </template>
             </el-table-column>
+            <el-table-column label="浏览" min-width="80" align="center">
+              <template #default="{ row }">
+                <el-button size="small" text type="primary" :disabled="!row.key_suffix"
+                  @click="browseProxyExport(row)">浏览</el-button>
+              </template>
+            </el-table-column>
+            <el-table-column label="导出" min-width="80" align="center">
+              <template #default="{ row }">
+                <el-button size="small" text type="primary" :disabled="!row.key_suffix"
+                  @click="openExportDialog(row)">导出</el-button>
+              </template>
+            </el-table-column>
+            <el-table-column prop="export_status" label="导出状态" min-width="110" align="center">
+              <template #default="{ row }">
+                <el-tag v-if="row.export_status === 'queued' || row.export_status === 'running'"
+                  size="small" type="primary" effect="plain">正在进行中</el-tag>
+                <el-tag v-else-if="row.export_status === 'success'" size="small" type="success" effect="plain">完成</el-tag>
+                <el-tag v-else-if="row.export_status === 'failed'" size="small" type="danger" effect="plain">导出失败</el-tag>
+                <span v-else style="color:#c0c4cc">未导出</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="session_path" label="导出路径" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span v-if="row.session_path" style="font-family:monospace;font-size:11px">{{ row.session_path }}</span>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="total_sessions" label="导出的会话数" min-width="90" align="center">
+              <template #default="{ row }">
+                <span>{{ row.total_sessions ?? '—' }}</span>
+              </template>
+            </el-table-column>
             <el-table-column label="启动时间" min-width="150" align="right">
               <template #default>
                 <span style="color:var(--text-muted);font-size:12px">{{ fmtProxyTime(proxyStartedAt) }}</span>
@@ -309,6 +341,27 @@
           </el-table>
           <el-empty v-else description="暂无模型配置信息" :image-size="40" />
         </el-card>
+
+        <!-- 对话导出弹窗：填入导出名称（默认任务名）+ 导出方式下拉 → 提交 -->
+        <el-dialog v-model="exportDialogVisible" title="对话导出" width="480px" append-to-body>
+          <el-form label-width="90px" size="small">
+            <el-form-item label="角色">
+              <span style="font-weight:600">{{ exportDialogRole }}</span>
+            </el-form-item>
+            <el-form-item label="导出名称">
+              <el-input v-model="exportDialogName" placeholder="导出名称（默认任务名，建议纯英文）" maxlength="64" />
+            </el-form-item>
+            <el-form-item label="导出方式">
+              <el-select v-model="exportDialogMode" style="width:100%">
+                <el-option v-for="m in exportModes" :key="m.value" :label="m.label" :value="m.value" />
+              </el-select>
+            </el-form-item>
+          </el-form>
+          <template #footer>
+            <el-button @click="exportDialogVisible = false">取消</el-button>
+            <el-button type="primary" :loading="submittingExport" @click="submitProxyExport">提交</el-button>
+          </template>
+        </el-dialog>
 
         <!-- 状态分析：浅层→深层 流水线阶段（含手动提交浅层） -->
         <el-card style="margin-bottom:16px">
@@ -661,7 +714,7 @@ function ensureTabLoaded(tab) {
   loadedTabs.add(tab)
   if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
   else if (tab === 'logs') { loadTaskLogFiles(); loadTaskStatusMap(); loadLogs() }
-  else if (tab === 'outputs') { loadShallow(false); loadDeepQueue(false); loadProxyConfig() }
+  else if (tab === 'outputs') { loadShallow(false); loadDeepQueue(false); loadProxyConfig(); setTimeout(refreshProxyExportStatus, 500) }
 }
 
 // ============ 配置信息 tab ============
@@ -1279,6 +1332,91 @@ async function exportProxyConfig() {
   finally { exportingProxy.value = false }
 }
 
+// ============ 输出 tab: 模型配置面板 — 对话导出（浏览/导出/状态/路径/会话数） ============
+// 后端代理外部 EXPORT_BASE /export/view|submit|status，完整 key/access-key 只在服务端。
+// 浏览 = 302 跳外部浏览页；导出 = 弹窗填名称+方式 → POST /proxy-config/export；状态轮询 GET /export/status。
+const exportDialogVisible = ref(false)
+const exportDialogRole = ref('')
+const exportDialogName = ref('')
+const exportDialogMode = ref('export')
+const submittingExport = ref(false)
+let exportPollTimer = null
+
+const exportModes = [
+  { value: 'export', label: 'export（默认导出）' },
+  { value: 'reformat', label: 'reformat' },
+  { value: 'eval', label: 'eval' },
+  { value: 'reconstruct', label: 'reconstruct' },
+  { value: 'full_reformat', label: 'full_reformat（全量）' },
+]
+
+async function browseProxyExport(row) {
+  // 后端鉴权接口，裸 window.open 不带 Bearer token 会 401。走带 token 的 axios 取外部
+  // /export/view URL（key+access-key 在后端拼好），再新开标签页打开成品链接。
+  try {
+    const res = await api.get(`/instances/${id}/proxy-config/browse?role=${encodeURIComponent(row.role)}`)
+    if (res.url) window.open(res.url, '_blank')
+  } catch { /* interceptor 已提示 */ }
+}
+
+function openExportDialog(row) {
+  exportDialogRole.value = row.role
+  exportDialogName.value = inst.value?.name || ''
+  exportDialogMode.value = 'export'
+  exportDialogVisible.value = true
+}
+
+async function submitProxyExport() {
+  submittingExport.value = true
+  try {
+    const res = await api.post(`/instances/${id}/proxy-config/export`, {
+      role: exportDialogRole.value,
+      export_name: exportDialogName.value,
+      mode: exportDialogMode.value,
+    })
+    exportDialogVisible.value = false
+    ElMessage.success(`导出已提交（export_id=${res.export_id}）`)
+    // 立即拉一次状态（有进行中任务则启动轮询）
+    await refreshProxyExportStatus()
+  } catch { /* interceptor 已提示 */ }
+  finally { submittingExport.value = false }
+}
+
+async function refreshProxyExportStatus() {
+  const res = await api.get(`/instances/${id}/proxy-config/export/status`)
+  const rows = res.rows || []
+  const byRole = {}
+  for (const r of rows) byRole[r.role] = r
+  const merged = (proxyRows.value || []).map(r => {
+    const ex = byRole[r.role]
+    if (!ex) return r
+    return { ...r, export_status: ex.export_status, session_path: ex.session_path, total_sessions: ex.total_sessions, export_id: ex.export_id }
+  })
+  proxyRows.value = merged
+  // 有进行中任务则轮询，全部到终态停止
+  const active = merged.some(r => r.export_status === 'queued' || r.export_status === 'running')
+  if (exportPollTimer) { clearInterval(exportPollTimer); exportPollTimer = null }
+  if (active) {
+    exportPollTimer = setInterval(async () => {
+      try {
+        const st = await api.get(`/instances/${id}/proxy-config/export/status`, { silent: true })
+        const m = (st.rows || []).reduce((acc, r) => { acc[r.role] = r; return acc }, {})
+        proxyRows.value = (proxyRows.value || []).map(r => {
+          const ex = m[r.role]
+          return ex ? { ...r, export_status: ex.export_status, session_path: ex.session_path, total_sessions: ex.total_sessions } : r
+        })
+        const stillActive = proxyRows.value.some(r => r.export_status === 'queued' || r.export_status === 'running')
+        if (!stillActive && exportPollTimer) { clearInterval(exportPollTimer); exportPollTimer = null }
+      } catch { /* 轮询失败静默，下轮再试 */ }
+    }, 5000)
+  }
+}
+
+// 离开输出 tab 时停止导出轮询
+function stopExportPoll() {
+  if (exportPollTimer) { clearInterval(exportPollTimer); exportPollTimer = null }
+}
+
 // ============ 输出 tab: 深层详情（task_traj_records 本地缓存） ============
 // 触发 POST /deep/{traj_name} → worker 下载到 output_cache → 3s 轮询 status → 拉 detail。
 const detailVisible = ref(false)
@@ -1442,9 +1580,11 @@ watch(activeTab, (tab) => {
     if (!shallowTimer) shallowTimer = setInterval(() => loadShallow(false), 10000)
     if (!deepQueueTimer) startDeepQueuePolling()
     loadProxyConfig()  // 切回输出 tab 刷新模型配置面板
+    setTimeout(refreshProxyExportStatus, 500)
   } else {
     if (shallowTimer) { clearInterval(shallowTimer); shallowTimer = null }
     stopDeepQueuePolling()
+    stopExportPoll()
   }
 }, { flush: 'sync' })
 
@@ -1453,6 +1593,7 @@ onUnmounted(() => {
   clearInterval(shallowTimer)
   clearInterval(deepPollTimer)
   stopDeepQueuePolling()
+  stopExportPoll()
   if (logContainer.value) logContainer.value.removeEventListener('scroll', onScroll)
 })
 </script>
