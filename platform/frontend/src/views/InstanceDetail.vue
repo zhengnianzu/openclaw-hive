@@ -747,17 +747,17 @@ const progressStatus = computed(() => {
 function statusColor(s) { return { running: 'success', preparing: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
 function statusText(s) { return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
 function harnessTagType(t) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', common: 'info' }[t] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', common: 'info' }[t] || ''
 }
 const HARNESS_COLORS = {
   openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
   openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
   common: '#c0c4cc',
 }
 function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
 function harnessLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[t] || t || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[t] || t || 'openclaw'
 }
 function taskTagType(category) {
   const map = {

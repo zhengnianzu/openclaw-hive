@@ -228,6 +228,16 @@ _FRAMEWORK_LAYOUTS = {
         "workspace_base": "/home/ma-user/.pi/workspace",
         "skill_subdir": ".agents/skills",
     },
+    "grok": {
+        "harness_dir":            "/home/ma-user/.grok",
+        "harness_local_config":   "uploads/grok/config.toml",
+        "harness_sandbox_config": "/home/ma-user/.grok/config.toml",
+        "upload_paths": [
+           "/home/ma-user/.grok/sessions",
+        ],
+        "workspace_base": "/home/ma-user/.grok/workspace",
+        "skill_subdir": "skills",
+    },
 
 }
 
@@ -530,7 +540,7 @@ def prepare_local_agent_config(sandbox_config, data_config_file: Optional[str] =
             encoding="utf-8",
         )
 
-    if AGENT_FRAMEWORK == "opencode":
+    elif AGENT_FRAMEWORK == "opencode":
         # opencode.json: agents.system_prompt和agent:evaluator注入
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         providers = data.setdefault("provider", {})
@@ -596,7 +606,7 @@ def prepare_local_agent_config(sandbox_config, data_config_file: Optional[str] =
         )
         logging.info(f"Updated opencode.json with provider/agent from {local_model_path}")
 
-    if AGENT_FRAMEWORK == "pi":
+    elif AGENT_FRAMEWORK == "pi":
         # models.json: 注入provider
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         providers = data.setdefault("providers", {})
@@ -651,7 +661,7 @@ def prepare_local_agent_config(sandbox_config, data_config_file: Optional[str] =
         )
         logging.info(f"Updated models.json with provider from {local_model_path}")
 
-    if AGENT_FRAMEWORK == "codex":
+    elif AGENT_FRAMEWORK == "codex":
         # [model_providers.<key>] 追加到 config.toml, 已存在则跳过
         toml_text = Path(local_path).read_text(encoding="utf-8")
         new_blocks: List[str] = []
@@ -694,8 +704,53 @@ def prepare_local_agent_config(sandbox_config, data_config_file: Optional[str] =
             logging.info(
                 f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
             )
+    
+    elif AGENT_FRAMEWORK == "grok":
+        # [model.<provider>] 追加到 config.toml, 已存在则跳过
+        toml_text = Path(local_path).read_text(encoding="utf-8")
+        new_blocks: List[str] = []
 
-    if AGENT_FRAMEWORK == "openclaw":
+        for agent_name, cfg in model_cfg.items():
+            if agent_name == "user_simulator":
+                continue
+            if not (cfg.get("model") and cfg.get("base_url")
+                    and cfg.get("api_key") and cfg.get("provider")):
+                logging.warning(
+                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
+                )
+                continue
+
+            provider_key = cfg["provider"]
+            if f"[model.{provider_key}]" in toml_text:
+                logging.info(
+                    f"codex provider {provider_key} already exists in config.toml, skip"
+                )
+                continue
+
+            base_url = cfg["base_url"].rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url = base_url + "/v1"
+            api_key = cfg["api_key"]
+
+            block = (
+                f"[model.{provider_key}]\n"
+                f'model     = "{cfg.get("model")}"\n'
+                f'name      = "{cfg.get("model")}"\n'
+                f'base_url  = "{base_url}"\n'
+                f'api_key   = "{api_key}"\n'
+            )
+            new_blocks.append(block)
+            logging.info(f"Added codex provider: {provider_key} (agent={agent_name})")
+
+        if new_blocks:
+            toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
+            Path(local_path).write_text(toml_text, encoding="utf-8")
+            logging.info(
+                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
+            )
+
+
+    elif AGENT_FRAMEWORK == "openclaw":
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         data.setdefault("models", {}).setdefault("mode", "merge")
         providers = data["models"].setdefault("providers", {})

@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/instances", tags=["instances"])
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json", "grok_config.toml"}
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -392,7 +392,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs"}
+        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs", "grok": "grok_trajs"}
         traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
@@ -405,6 +405,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     opencode_path = os.path.join(instance_dir, "opencode.json")
     codex_path = os.path.join(instance_dir, "config.toml")
     pi_path = os.path.join(instance_dir, "models.json")
+    grok_path = os.path.join(instance_dir, "grok_config.toml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
@@ -419,6 +420,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         base.run_config.sandbox.harness_local_config_file = codex_path
     elif req.harness_type == "pi":
         base.run_config.sandbox.harness_local_config_file = pi_path
+    elif req.harness_type == "grok":
+        base.run_config.sandbox.harness_local_config_file = grok_path
     else:
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -618,6 +621,31 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         with open(pi_path, "w", encoding="utf-8") as f:
             json.dump(pi_cfg, f, indent=2, ensure_ascii=False)
+    elif req.harness_type == "grok":
+        import tomllib
+        import tomli_w
+        grok_template = os.path.join(harness_settings_dir, "grok_config.toml")
+        if not os.path.exists(grok_template):
+            grok_template = os.path.join(settings.SETTINGS_DIR, "grok_config.toml")
+        with open(grok_template, "rb") as f:
+            grok_cfg = tomllib.load(f)
+
+        # 新版 grok_config.toml 将模型配置放在 [model.default-model] 下
+        model_section = grok_cfg.setdefault("model", {}).setdefault("default-model", {})
+        if req.model_id:
+            model_section["model"] = req.model_id
+            model_section["name"] = req.model_id
+        if req.model_base_url:
+            # grok 要求 base_url 带 /v1 后缀
+            base_url = req.model_base_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            model_section["base_url"] = base_url
+        if req.model_api_key:
+            model_section["api_key"] = req.model_api_key
+
+        with open(grok_path, "wb") as f:
+            tomli_w.dump(grok_cfg, f)
     else:
         openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
         if not os.path.exists(openclaw_template):
@@ -697,6 +725,14 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 pi_cfg.setdefault("providers", {}).setdefault("custom", {})["apiKey"] = req.model_api_key
                 with open(pi_path, "w", encoding="utf-8") as f:
                     json.dump(pi_cfg, f, indent=2, ensure_ascii=False)
+            elif req.harness_type == "grok" and os.path.exists(grok_path):
+                import tomllib
+                import tomli_w
+                with open(grok_path, "rb") as f:
+                    grok_cfg = tomllib.load(f)
+                grok_cfg.setdefault("model", {}).setdefault("default-model", {})["api_key"] = req.model_api_key
+                with open(grok_path, "wb") as f:
+                    tomli_w.dump(grok_cfg, f)
             elif os.path.exists(openclaw_path):
                 with open(openclaw_path, "r", encoding="utf-8") as f:
                     openclaw_cfg = json.load(f)

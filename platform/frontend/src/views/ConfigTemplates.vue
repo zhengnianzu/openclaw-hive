@@ -49,6 +49,7 @@
             <el-option label="OpenCode" value="opencode" />
             <el-option label="Codex" value="codex" />
             <el-option label="Pi" value="pi" />
+            <el-option label="Grok" value="grok" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -56,7 +57,7 @@
         <el-tabs v-model="activeTab" style="margin-top:8px">
           <el-tab-pane label="Harness 配置" name="harness">
             <el-form-item label="模型 Base URL">
-              <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
+              <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
             </el-form-item>
             <el-form-item label="Invite Code">
               <el-input v-model="form.invite_code" placeholder="pangu" />
@@ -218,12 +219,12 @@ function harnessTagType(type) {
 const HARNESS_COLORS = {
   openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
   openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
   common: '#c0c4cc',
 }
 function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[type] || type
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[type] || type
 }
 
 function addAgent() {

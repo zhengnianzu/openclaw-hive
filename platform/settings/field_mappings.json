@@ -65,6 +65,14 @@
       "providers.custom.models[0].name"
     ]
   },
+  "grok": {
+    "model_id": [
+      "model.default-model.model",
+      "model.default-model.name"
+    ],
+    "model_base_url": "model.default-model.base_url",
+    "model_api_key": "model.default-model.api_key"
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",

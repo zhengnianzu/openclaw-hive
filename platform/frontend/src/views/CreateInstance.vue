@@ -21,6 +21,7 @@
           <el-option label="OpenCode" value="opencode" />
           <el-option label="Codex" value="codex" />
           <el-option label="Pi" value="pi" />
+          <el-option label="Grok" value="grok" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -82,7 +83,7 @@
 
         <el-tab-pane label="Harness配置" name="model">
           <el-form-item label="模型 Base URL">
-            <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
+            <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
           </el-form-item>
 
           <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">

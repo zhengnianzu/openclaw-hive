@@ -17,6 +17,7 @@
         <el-option label="OpenCode" value="opencode" />
         <el-option label="Codex" value="codex" />
         <el-option label="Pi" value="pi" />
+        <el-option label="Grok" value="grok" />
       </el-select>
     </div>
 
@@ -59,6 +60,7 @@
             <el-option label="OpenCode" value="opencode" />
             <el-option label="Codex" value="codex" />
             <el-option label="Pi" value="pi" />
+            <el-option label="Grok" value="grok" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -86,17 +88,17 @@ const images = ref([])
 const form = ref({ name: '', address: '', harness_type: 'openclaw' })
 
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', common: 'info' }[type] || ''
 }
 const HARNESS_COLORS = {
   openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
   openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
   common: '#c0c4cc',
 }
 function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', common: '通用' }[type] || type || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[type] || type || 'openclaw'
 }
 
 const filteredImages = computed(() => {
