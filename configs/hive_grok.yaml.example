@@ -1,9 +1,8 @@
-# ==================== 全局配置 ====================
 global:
   # 控制面服务地址，SDK 通过此地址与控制面通信
-  controlplane_base_url: http://192.168.11.87:30081
+  controlplane_base_url: http://local_host:30081
   # API 认证密钥，用于 SDK 与控制面之间的身份校验
-  api_key: "omni-env-default-api-key"
+  api_key: "api-key"
   logger:
     name: test
     level: INFO
@@ -13,8 +12,8 @@ global:
     stream: stdout
     max_backup_count: 14
     encoding: utf-8
-    format: "%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s"
-    datefmt: "%Y-%m-%d %H:%M:%S"
+    format: '%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
     when: midnight
     interval: 1
 
@@ -25,12 +24,10 @@ sandbox:
   x86_cpu:
     architecture: x86           # CPU 架构: x86 或 arm64
     accelerator: null           # 加速器类型: null(无)/npu/gpu
-    lease_ttl_seconds: 900         # 900s检测沙箱存活
-    max_ttl_second: 8000          # 沙箱最大存活时间，大于任务执行时间
-    wait_timeout_seconds: 1200   # 等待沙箱就绪的超时时间（秒）
-
+    ttl_seconds: 3600            # 沙箱生存时间（秒），超时后自动回收
+    wait_timeout_seconds: 300   # 等待沙箱就绪的超时时间（秒）
     sandbox:
-      image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:26.8.3
+      image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:26.8.27v2
       # 环境变量配置
       env:
         - name: PIP_INDEX_URL
@@ -40,7 +37,7 @@ sandbox:
         - name: NODE_TLS_REJECT_UNAUTHORIZED
           value: "0"
         - name: SERPER_API_KEY
-          value: sk-rLrYl50px293GI08sCZqyaryUukn45lBVWyuGqc6RjZq1UPi
+          value: sk-key
         - name: SERPER_API_URL
           value: https://yibuapi.com/serper/
         - name: OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS
@@ -53,23 +50,22 @@ sandbox:
         memory_limit: "8Gi"       # 内存上限
 
 
-sandbox_id_prefix: zx
-sandbox_namespace: omni-env-default-worker
 
 s3:
   s3_uploader_script: /home/ma-user/obsutil/obsutil
   s3_download_script: /home/ma-user/obsutil/obsutil
   bucket_name: obs://s3-asset-b-hd-cce-aifm-nlp-exp
 
+sandbox_id_prefix: zx
 
 run_config:
-  harness_type: opencode
+  harness_type: grok
   start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
   total_num: 0      # 任务总数, 0表示不限制任务数量
   concurrent_num: 6   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
-    openclaw_local_config_file: "uploads/opencode.json"
+    openclaw_local_config_file: "uploads/grok_config.toml"
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:
@@ -80,15 +76,14 @@ run_config:
     task_download_path: "downloads"
     main_code_tar: "uploads/openclaw-task.tar"
     main_code_dir:
-    main_python_file: "harness_automation.py"
+    main_python_file: "harness_automation.py"  # start脚本文件
   obs:
     download_timeout: 1200
     upload_timeout: 900
     traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
-    traj_save_path: opencode_trajs/simple_tests
+    traj_save_path: grok_trajs/traj_08271625
     skill_download_path:
     user_config_download_path: zengxiang/task_configs/
     user_profile_download_path:
     agents_download_path:
-    default_skills:

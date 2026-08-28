@@ -21,6 +21,7 @@
           <el-option label="OpenCode" value="opencode" />
           <el-option label="Codex" value="codex" />
           <el-option label="Pi" value="pi" />
+          <el-option label="Grok" value="grok" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>

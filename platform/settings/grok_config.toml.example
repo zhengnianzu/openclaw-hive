@@ -1,0 +1,48 @@
+[cli]
+installer = "npm"
+auto_update = true
+
+[marketplace]
+default_skills_installs_purged = true
+
+[model.default-model]
+model = "claude-opus-4-7"
+base_url = "http://115.120.120.64:8082/v1"
+name = "claude-opus-4-7"
+description = "Optional"
+api_key = "sk-xxxxx"
+temperature = 0.7
+top_p = 0.95
+max_completion_tokens = 327680
+context_window = 200000
+
+[models]
+default = "default-model"
+web_search = "default-model"
+
+[session]
+auto_compact_threshold_percent = 85
+load_envrc = true
+
+[memory]
+enabled = false
+
+[toolset.web_search]
+[toolset.web_fetch]
+allow_local = true
+
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_token" }
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 6000
+tool_timeouts = { create_issue = 120 }
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest", "--browser", "chromium"]
+enabled = true
+startup_timeout_sec = 120
