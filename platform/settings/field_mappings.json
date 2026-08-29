@@ -51,6 +51,28 @@
       "agent.main.model"
     ]
   },
+  "codex": {
+    "model_id": "model",
+    "model_base_url": "model_providers.custom.base_url",
+    "model_api_key": "model_providers.custom.experimental_bearer_token"
+  },
+  "pi": {
+    "model_api_key": "providers.custom.apiKey",
+    "model_base_url": "providers.custom.baseUrl",
+    "model_api_type": "providers.custom.api",
+    "model_id": [
+      "providers.custom.models[0].id",
+      "providers.custom.models[0].name"
+    ]
+  },
+  "grok": {
+    "model_id": [
+      "model.default-model.model",
+      "model.default-model.name"
+    ],
+    "model_base_url": "model.default-model.base_url",
+    "model_api_key": "model.default-model.api_key"
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",

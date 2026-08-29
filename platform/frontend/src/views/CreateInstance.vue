@@ -19,6 +19,9 @@
           <el-option label="Claude Code" value="claude-code" />
           <el-option label="Jiuwen Claw" value="openjiuwen" />
           <el-option label="OpenCode" value="opencode" />
+          <el-option label="Codex" value="codex" />
+          <el-option label="Pi" value="pi" />
+          <el-option label="Grok" value="grok" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -80,7 +83,7 @@
 
         <el-tab-pane label="Harness配置" name="model">
           <el-form-item label="模型 Base URL">
-            <el-input v-model="form.model_base_url" :placeholder="form.harness_type === 'opencode' ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
+            <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
           </el-form-item>
 
           <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">
@@ -93,12 +96,13 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="form.harness_type === 'openclaw' || form.harness_type === 'opencode'" label="API 类型">
+          <el-form-item v-if="['openclaw','opencode','pi'].includes(form.harness_type)" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
             </el-select>
             <div v-if="form.harness_type === 'opencode'" style="font-size:12px;color:#999;margin-top:4px">决定 provider 的 npm 包：anthropic 用 @ai-sdk/anthropic，openai 用 @ai-sdk/openai-compatible</div>
+            <div v-if="form.harness_type === 'pi'" style="font-size:12px;color:#999;margin-top:4px">写入 models.json 的 providers.custom.api 字段</div>
           </el-form-item>
 
           <el-form-item v-if="form.harness_type === 'openjiuwen'" label="Provider">
@@ -128,7 +132,8 @@
               </el-form-item>
 
               <el-form-item label="模型 Base URL">
-                <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084" />
+                <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084/v1（user_simulator 需带 /v1）" />
+                <div style="font-size:12px;color:#999;margin-top:4px">user_simulator 的 Base URL 需带 /v1 后缀</div>
               </el-form-item>
 
               <el-form-item label="模型 API Key">
@@ -203,8 +208,8 @@
         <el-form-item label="Invite Code">
           <el-input v-model="keyForm.invite_code" placeholder="pangu" />
         </el-form-item>
-        <el-form-item label="Name">
-          <el-input v-model="keyForm.name" placeholder="mtime-任务名称" />
+        <el-form-item label="密钥名称">
+          <el-input v-model="keyForm.name" placeholder="例如: 250826-任务名称" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -293,8 +298,10 @@ async function generateApiKey() {
     const res = await api.post('/generate-api-key', null, { params })
     if (keyTarget.type === 'agent' && keyTarget.agentIdx >= 0) {
       form.value.agents[keyTarget.agentIdx].api_key = res.api_key
+      form.value.agents[keyTarget.agentIdx].invite_code = keyForm.value.invite_code
     } else {
       form.value.model_api_key = res.api_key
+      form.value.invite_code = keyForm.value.invite_code
     }
     localStorage.setItem('last_invite_code', keyForm.value.invite_code)
     ElMessage.success(`API Key 已生成: ${res.api_key.slice(0, 4)}****${res.api_key.slice(-4)}`)

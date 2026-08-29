@@ -6,7 +6,7 @@ class CodeRepoCreate(BaseModel):
     obs_path: str
     version: str = "v1"
     description: str = ""
-    main_python_file: str = "openclaw_automation.py"
+    main_python_file: str = "harness_automation.py"
 
 
 class CodeRepoInfo(BaseModel):
@@ -15,6 +15,6 @@ class CodeRepoInfo(BaseModel):
     obs_path: str
     version: str
     description: str = ""
-    main_python_file: str = "openclaw_automation.py"
+    main_python_file: str = "harness_automation.py"
     created_at: str
     created_by: str = ""

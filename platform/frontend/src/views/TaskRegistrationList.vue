@@ -27,7 +27,7 @@
       <el-table-column prop="created_by" label="登记人" width="100" resizable />
       <el-table-column prop="harness_type" label="Harness" width="100" resizable>
         <template #default="{row}">
-          <el-tag :type="harnessTagType(row.harness_type)" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
+          <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="model_name" label="Harness模型" min-width="140" show-overflow-tooltip resizable />
@@ -76,7 +76,7 @@
         <el-descriptions-item label="任务名称">{{ currentReg.task_name }}</el-descriptions-item>
         <el-descriptions-item label="需求方">{{ currentReg.requester }}</el-descriptions-item>
         <el-descriptions-item label="Harness类型">
-          <el-tag :type="harnessTagType(currentReg.harness_type)" size="small">{{ harnessLabel(currentReg.harness_type) }}</el-tag>
+          <el-tag :color="harnessColor(currentReg.harness_type)" :style="{borderColor: harnessColor(currentReg.harness_type)}" effect="dark" size="small">{{ harnessLabel(currentReg.harness_type) }}</el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="Harness模型">{{ currentReg.model_name }}</el-descriptions-item>
         <el-descriptions-item label="用户模拟模型">{{ currentReg.eval_model_name }}</el-descriptions-item>
@@ -111,6 +111,9 @@
             <el-option label="Claude Code" value="claude-code" />
             <el-option label="Jiuwen Claw" value="openjiuwen" />
             <el-option label="OpenCode" value="opencode" />
+            <el-option label="Codex" value="codex" />
+            <el-option label="Pi" value="pi" />
+            <el-option label="Grok" value="grok" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -194,10 +197,17 @@ function statusLabel(s) {
   return { pending: '待执行', executing: '执行中', completed: '已完成', cancelled: '已取消' }[s] || s
 }
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', common: 'info' }[type] || ''
 }
+const HARNESS_COLORS = {
+  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
+  openjiuwen: '#f56c6c', opencode: '#909399',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
+  common: '#c0c4cc',
+}
+function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[type] || type || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[type] || type || 'openclaw'
 }
 function templateName(id) {
   if (!id) return '-'

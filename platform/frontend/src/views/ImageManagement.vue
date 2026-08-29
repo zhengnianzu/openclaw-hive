@@ -15,6 +15,9 @@
         <el-option label="Claude Code" value="claude-code" />
         <el-option label="Jiuwen Claw" value="openjiuwen" />
         <el-option label="OpenCode" value="opencode" />
+        <el-option label="Codex" value="codex" />
+        <el-option label="Pi" value="pi" />
+        <el-option label="Grok" value="grok" />
       </el-select>
     </div>
 
@@ -24,7 +27,7 @@
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
         <el-table-column prop="harness_type" label="Harness 类型" width="130" align="center">
           <template #default="{ row }">
-            <el-tag :type="harnessTagType(row.harness_type)" size="small">
+            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
@@ -55,6 +58,9 @@
             <el-option label="Claude Code" value="claude-code" />
             <el-option label="Jiuwen Claw" value="openjiuwen" />
             <el-option label="OpenCode" value="opencode" />
+            <el-option label="Codex" value="codex" />
+            <el-option label="Pi" value="pi" />
+            <el-option label="Grok" value="grok" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -82,10 +88,17 @@ const images = ref([])
 const form = ref({ name: '', address: '', harness_type: 'openclaw' })
 
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', common: 'info' }[type] || ''
 }
+const HARNESS_COLORS = {
+  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
+  openjiuwen: '#f56c6c', opencode: '#909399',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
+  common: '#c0c4cc',
+}
+function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[type] || type
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[type] || type || 'openclaw'
 }
 
 const filteredImages = computed(() => {

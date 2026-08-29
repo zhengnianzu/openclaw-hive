@@ -14,6 +14,9 @@
         <el-option label="Claude Code" value="claude-code" />
         <el-option label="Jiuwen Claw" value="openjiuwen" />
         <el-option label="OpenCode" value="opencode" />
+        <el-option label="Codex" value="codex" />
+        <el-option label="Pi" value="pi" />
+        <el-option label="Grok" value="grok" />
         <el-option label="通用" value="common" />
       </el-select>
     </div>
@@ -22,7 +25,7 @@
       <el-table :data="configs" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="harness_type" label="类型" width="120">
           <template #default="{row}">
-            <el-tag :type="tagType(row.harness_type)" size="small">{{ typeLabel(row.harness_type) }}</el-tag>
+            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="small" :style="{ border: 'none' }">{{ typeLabel(row.harness_type) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="version" label="版本" width="80" />
@@ -62,6 +65,9 @@
             <el-option label="Claude Code" value="claude-code" />
             <el-option label="Jiuwen Claw" value="openjiuwen" />
             <el-option label="OpenCode" value="opencode" />
+            <el-option label="Codex" value="codex" />
+            <el-option label="Pi" value="pi" />
+            <el-option label="Grok" value="grok" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -181,6 +187,8 @@ const HARNESS_FILE_LABELS = {
   'claude-code': 'Harness (cc_settings)',
   openjiuwen: 'Harness (openjiuwen.json)',
   opencode: 'Harness (opencode.json)',
+  codex: 'Harness (config.toml)',
+  pi: 'Harness (models.json)',
   common: 'Harness 配置',
 }
 
@@ -189,10 +197,18 @@ function harnessFileLabel(t) {
 }
 
 function tagType(t) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', common: 'info' }[t] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', common: 'info' }[t] || ''
 }
+// harness 类型 -> 显示色(hex)。后续加 harness 只需在这里追加一行。
+const HARNESS_COLORS = {
+  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
+  openjiuwen: '#f56c6c', opencode: '#909399',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
+  common: '#c0c4cc',
+}
+function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
 function typeLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', common: '通用' }[t] || t
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[t] || t
 }
 function fileCount(row) {
   try { return JSON.parse(row.config_files_json || '[]').length } catch { return 0 }
@@ -209,6 +225,9 @@ function computeMappingHints() {
   else if (fname === 'openjiuwen.json') section = fieldMappings.value['openjiuwen']
   else if (fname === 'openclaw.json') section = fieldMappings.value['openclaw']
   else if (fname === 'opencode.json') section = fieldMappings.value['opencode']
+  else if (fname === 'config.toml') section = fieldMappings.value['codex']
+  else if (fname === 'models.json') section = fieldMappings.value['pi']
+  else if (fname === 'grok_config.toml') section = fieldMappings.value['grok']
   else if (fname.includes('hermes')) section = fieldMappings.value['hermes']
   else if (fname.includes('cc_settings')) section = fieldMappings.value['claude-code']
   else if (fname.includes('user_proxy')) section = fieldMappings.value['user_proxy_model']
