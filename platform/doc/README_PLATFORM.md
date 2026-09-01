@@ -94,11 +94,30 @@ ADMIN_PASSWORD=admin123
 | `OBS_BUCKET` | `obs://rl-agentdata` | OBS 桶地址 |
 | `CONFIG_TEMPLATE` | `{HIVE_ROOT}/config.yaml` | 创建任务实例的 config 模板 |
 | `HIVE_ROOT` | 自动检测 | openclaw-hive 项目根目录 |
+| `OUTPUT_CACHE` | `{HIVE_ROOT}/platform/output_cache` | 离线工具本地缓存根（绝对路径直接用；相对路径基于 platform/ 解析）。下载布局 `output_cache/<batch>/<task>/...` |
+| `INSTANCE_DIR` | `{HIVE_ROOT}/platform/instances` | 实例目录根（绝对路径直接用；留空默认 platform/instances）。布局 `<INSTANCE_DIR>/<instance_id>/config.yaml + outputs/ + configs/` |
 | `SECRET_KEY` | 随机生成 | JWT 签名密钥 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | 1440 | Token 有效期（分钟） |
 | `DB_PATH` | `{HIVE_ROOT}/platform/platform.db` | SQLite 数据库路径 |
 | `ADMIN_USERNAME` | `admin` | 初始管理员用户名 |
 | `ADMIN_PASSWORD` | `admin123` | 初始管理员密码 |
+
+### 缓存 / 实例目录迁移（sfs_turbo）
+
+`OUTPUT_CACHE` 与 `INSTANCE_DIR` 支持指向共享盘（如 sfs_turbo），用于释放本地盘空间。当前生产配置：
+
+```bash
+OUTPUT_CACHE=/mnt/sfs_turbo/s3-asset-b-hd-cce-aifm-nlp-exp/zhengnianzu/output_cache_v1
+INSTANCE_DIR=/mnt/sfs_turbo/s3-asset-b-hd-cce-aifm-nlp-exp/platform/platform/instances
+```
+
+迁移 `INSTANCE_DIR` 时需注意：
+
+- **代码只有一处硬编码**：`instances.py` 的 `_get_instance_dir()` 用 `settings.INSTANCE_DIR` 拼路径；`logs.py`、`output_worker.py` 都从 DB `task_instances.config_path` 反推实例目录，会自动跟随。
+- **DB 必须同步**：`task_instances.config_path` 存的是绝对路径，历史实例的日志/输出/评分缓存（`_eval_score.json` / `_traj_score.json`）靠它定位。切换 `INSTANCE_DIR` 后需把这些行的前缀从旧位置批量替换到新位置，否则历史实例 404。`config_snapshot` 内嵌的旧路径只用于取 `s3.bucket_name`，是死数据，不用改。
+- **sfs_turbo（NFSv3）不支持 rename**：`rsync` 默认写临时文件再 rename 会报 `Operation not permitted`；`cp -a` 的逐文件 chmod（setattr）会卡在 D 状态。复制到 sfs_turbo 用 `cp -r`（不带 `-p`）或 `rsync --inplace --no-perms`。
+- **实例内 `configs` 是软链接**，指向本地盘 `downloads/configs/...`，不在实例目录内，删旧 instances 目录不影响它。
+- 改 `.env` 后需**重启服务**（`config.py` 在 import 时读取），并在删旧目录前**备份 platform.db**。
 
 ## 核心功能
 

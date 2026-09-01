@@ -206,7 +206,7 @@ async def generate_api_key(
 
 
 def _get_instance_dir(instance_id: str) -> str:
-    return os.path.join(settings.HIVE_ROOT, "platform", "instances", instance_id)
+    return os.path.join(settings.INSTANCE_DIR, instance_id)
 
 
 def _get_output_dir(config_path: str) -> str:
