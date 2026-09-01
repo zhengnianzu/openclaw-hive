@@ -22,6 +22,7 @@
           <el-option label="Codex" value="codex" />
           <el-option label="Pi" value="pi" />
           <el-option label="Grok" value="grok" />
+          <el-option label="DSH" value="dsh" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -77,7 +78,7 @@
           </el-form-item>
 
           <el-form-item label="轨迹保存路径">
-            <el-input v-model="form.traj_save_path" placeholder="自动生成：openclaw_trajs/traj_{task_name}" />
+            <el-input v-model="form.traj_save_path" placeholder="自动生成：{harness}_trajs/traj_{task_name}" />
           </el-form-item>
         </el-tab-pane>
 
@@ -96,7 +97,7 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="['openclaw','opencode','pi'].includes(form.harness_type)" label="API 类型">
+          <el-form-item v-if="['openclaw','opencode','pi','dsh'].includes(form.harness_type)" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />

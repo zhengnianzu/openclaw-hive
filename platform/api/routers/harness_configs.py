@@ -23,6 +23,7 @@ HARNESS_FILES = {
     "codex": "config.toml",
     "pi": "models.json",
     "grok": "grok_config.toml",
+    "dsh": "dsh_settings.yaml",
     "common": None,
 }
 
@@ -35,6 +36,7 @@ EXPECTED_FILES = {
     "codex": ["config.toml", "config.yaml", "user_proxy_model.json"],
     "pi": ["models.json", "config.yaml", "user_proxy_model.json"],
     "grok": ["grok_config.toml", "config.yaml", "user_proxy_model.json"],
+    "dsh": ["dsh_settings.yaml", "config.yaml", "user_proxy_model.json"],
     "common": ["config.yaml", "user_proxy_model.json"],
 }
 
@@ -435,7 +437,7 @@ def copy_harness_config(config_id: int, body: CopyRequest, user: dict = Depends(
 def ensure_defaults():
     """Auto-register default harness configs from settings/ for each type."""
     with get_connection() as conn:
-        for htype in ["openclaw", "hermes", "claude-code", "openjiuwen", "opencode", "codex", "pi", "grok"]:
+        for htype in ["openclaw", "hermes", "claude-code", "openjiuwen", "opencode", "codex", "pi", "grok", "dsh"]:
             existing = conn.execute(
                 "SELECT id FROM harness_configs WHERE harness_type = ? AND version = ?",
                 (htype, DEFAULT_VERSION),

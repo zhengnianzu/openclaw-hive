@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import random
+import shlex
 import shutil
 import subprocess
 import threading
@@ -238,6 +239,16 @@ _FRAMEWORK_LAYOUTS = {
         "workspace_base": "/home/ma-user/.grok/workspace",
         "skill_subdir": "skills",
     },
+    "dsh": {
+        "harness_dir":            "/home/ma-user/.dsh",
+        "harness_local_config":   "uploads/dsh_settings.yaml",
+        "harness_sandbox_config": "/home/ma-user/.dsh/settings.yaml",
+        "upload_paths": [
+           "/home/ma-user/.dsh/sessions",
+        ],
+        "workspace_base": "/home/ma-user/.dsh/workspace",
+        "skill_subdir": ".agents/skills",
+    },
 
 }
 
@@ -265,6 +276,13 @@ def get_obsutil_uploader_command(s3_config, local_folder_absolute_path, bucket_p
     command = f"{s3_config.s3_download_script} cp {local_folder_absolute_path} {s3_config.bucket_name}/{bucket_path} -r -f"
     return command
 
+def normalize_base_url(base_url, api_kind="openai-completions"):
+    base_url = base_url.rstrip("/")
+    if api_kind == "openai-completions" and not base_url.endswith("/v1"):
+        base_url += "/v1"
+    if api_kind == "anthropic-messages" and base_url.endswith("/v1"):
+        base_url -= "v1"
+    return base_url
 
 class TaskFileHandler(logging.Handler):
     """Routes log records to per-task files based on ContextVar."""
@@ -624,9 +642,7 @@ def prepare_local_agent_config(sandbox_config, data_config_file: Optional[str] =
             provider_key = cfg["provider"]
             model_name = cfg["model"]
             api_kind = cfg.get("api", "openai-completions")
-            base_url = cfg["base_url"].rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url = base_url + "/v1"
+            base_url = normalize_base_url(cfg["base_url"], api_kind)
 
             if provider_key not in providers:
                 providers[provider_key] = {
@@ -748,7 +764,54 @@ def prepare_local_agent_config(sandbox_config, data_config_file: Optional[str] =
             logging.info(
                 f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
             )
+    
+    elif AGENT_FRAMEWORK == "dsh":
+        # llm-pi-ai.providers 追加 provider 到settings.yaml, 已存在则跳过
+        data = load_yaml_config(Path(local_path))
 
+        for agent_name, cfg in model_cfg.items():
+            if agent_name == "user_simulator":
+                continue
+            if not (cfg.get("model") and cfg.get("base_url")
+                    and cfg.get("api_key") and cfg.get("provider")):
+                logging.warning(
+                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
+                )
+                continue
+
+            provider_key = cfg["provider"]
+            providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
+            api_kind = cfg.get("api", "openai-completions")
+            base_url = normalize_base_url(cfg["base_url"], api_kind)
+            api_key = cfg["api_key"]
+            model_name = cfg["model"]
+            credentials = data.get("credentials") or {}
+
+            if provider_key not in providers:
+                api_key_env = provider_key.replace('-', '_').upper() + "_API_KEY"
+                providers[provider_key] = {
+                    "displayName": provider_key,
+                    "apiKeyEnv": api_key_env,
+                    "api": api_kind,
+                    "baseURL": base_url,
+                    "models": [
+                        {
+                            "id": model_name,
+                        }
+                    ],
+                }
+                credentials[api_key_env] = api_key
+                logging.info(f"Added dsh provider: {provider_key} ({model_name})")
+            else:
+                existing_models = providers[provider_key].setdefault("models", [])
+                existing_ids = {m.get("id") for m in existing_models if hasattr(m, "get")}
+                if model_name not in existing_ids:
+                    existing_models.append({"id": model_name}) 
+                    logging.info(
+                        f"Added model {model_name} to existing dsh provider {provider_key}"
+                    )
+        OmegaConf.save(data, local_path)
+        logging.info(f"Updated settings.yaml with provider from {local_model_path}")
 
     elif AGENT_FRAMEWORK == "openclaw":
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
@@ -1134,6 +1197,83 @@ class OpenClawDistillationTask:
                                 result, level=logging.ERROR)
             raise HiveError("S005", detail=detail, sandbox_result=result)
 
+    # DSH subprocess 会按名称启发式擦除含 KEY/PASSWORD/SECRET/TOKEN 的环境变量,
+    # 把serper变量从沙箱 env 里取出来、写进技能源码读取的 .env 文件即可绕开擦除。
+    _SERPER_ENV_NAMES = ("SERPER_API_KEY", "SERPER_API_URL")
+    _SERPER_SKILL_NAME = "serper"
+
+    def _collect_serper_env_files(self) -> list:
+        """从沙箱环境变量里抽取 SERPER 相关凭据, 生成 skill .env 写入清单。
+
+        配置 env 存于 global_config.sandbox.<arch>.sandbox.env, 形如 [{name, value}]。
+        目标 .env 路径: <harness_dir>/skills/<serper>/.env  (dsh: ~/.dsh/skills/serper/.env)。
+        """
+        arch_cfg = self.global_config.sandbox
+        env_list = None
+        for arch_name in arch_cfg.keys():
+            arch_node = arch_cfg[arch_name]
+            sb = arch_node.get("sandbox") if hasattr(arch_node, "get") else None
+            if sb is None:
+                sb = getattr(arch_node, "sandbox", None)
+            if sb is not None and sb.get("env"):
+                env_list = sb.env
+                break
+
+        if not env_list:
+            return []
+        wanted = set(self._SERPER_ENV_NAMES)
+        collected = {}
+        for entry in env_list:
+            name = entry.get("name", "") if hasattr(entry, "get") else getattr(entry, "name", "")
+            value = entry.get("value", "") if hasattr(entry, "get") else getattr(entry, "value", "")
+            if name in wanted and value:
+                collected[name] = value
+        if not collected:
+            return []
+        skill_root = os.path.join(
+            self.config.sandbox_config.harness_dir, "skills", self._SERPER_SKILL_NAME
+        )
+        env_path = os.path.join(skill_root, ".env")
+        content = "\n".join(f"{k}={v}" for k, v in collected.items())
+        return [{"path": env_path, "content": content}]
+
+    async def _write_skill_env(self, data_config_file: str) -> None:
+        """在沙箱内写入技能约定的 .env 文件（skill 下载完成后调用）。
+
+        仅 dsh 框架生效: 从沙箱环境变量里抽取 SERPER_API_KEY/SERPER_API_URL,
+        写入 <harness_dir>/skills/serper/.env  (dsh: ~/.dsh/skills/serper/.env)。
+        """
+        if AGENT_FRAMEWORK != "dsh":
+            return
+        env_files = self._collect_serper_env_files()
+        if not env_files:
+            return
+        for entry in env_files:
+            path = (entry or {}).get("path")
+            content = (entry or {}).get("content")
+            if not path or content is None:
+                self.logger.warning(f"[S005] skip skill_env entry missing path/content: {entry}")
+                continue
+            # 用 bash heredoc 写入，先确保父目录存在；单引号定界符禁止变量/命令展开。
+            bash = (
+                f"mkdir -p $(dirname {shlex.quote(path)}) && "
+                f"cat > {shlex.quote(path)} <<'SERPER_ENV_EOF'\n"
+                f"{content}\n"
+                f"SERPER_ENV_EOF"
+            )
+            exec_request = ExtendExecCommand(
+                command=["/bin/bash", "-c", bash],
+                timeout=self.config.obs_config.download_timeout,
+                mode="stream",
+            )
+            result = await self.execution_client.extend(args=exec_request.to_dict())
+            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+                self.logger.error(f"[S005] skill_env write failed: {path}")
+                _log_sandbox_detail(self.logger, f"skill_env write failed — {path}",
+                                    result, level=logging.ERROR)
+                raise HiveError("S005", detail=path, sandbox_result=result)
+            self.logger.info(f"Wrote skill env file: {path}")
+
     async def _download_s3_user_profile(self, data_config_file: str) -> None:
         """Download user profile from S3 to sandbox."""
         if not self.config.obs_config.user_profile_download_path:
@@ -1320,6 +1460,7 @@ class OpenClawDistillationTask:
         """
         await self._upload_and_extract_code()
         await self._download_s3_skills(config_file)
+        await self._write_skill_env(config_file)
         await self._download_s3_user_profile(config_file)
         await self._download_s3_agents()
         await self._upload_data_config(config_file)

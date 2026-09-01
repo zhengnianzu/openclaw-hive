@@ -73,6 +73,15 @@
     "model_base_url": "model.default-model.base_url",
     "model_api_key": "model.default-model.api_key"
   },
+  "dsh": {
+    "model_id": [
+      "agent-default-model.model",
+      "llm-pi-ai.providers.custom.models[0].id"
+    ],
+    "model_base_url": "llm-pi-ai.providers.custom.baseURL",
+    "model_api_key": "credentials.CUSTOM_API_KEY",
+    "model_api_type": "llm-pi-ai.providers.custom.api"
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",
