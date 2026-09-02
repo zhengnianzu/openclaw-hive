@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     CONFIG_TEMPLATE: str = ""
     SETTINGS_DIR: str = ""
     OUTPUT_CACHE: str = ""
+    INSTANCE_DIR: str = ""
 
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
@@ -42,6 +43,8 @@ class Settings(BaseSettings):
             self.SETTINGS_DIR = os.path.join(platform_dir, "settings")
         if not self.OUTPUT_CACHE:
             self.OUTPUT_CACHE = os.path.join(platform_dir, "output_cache")
+        if not self.INSTANCE_DIR:
+            self.INSTANCE_DIR = os.path.join(platform_dir, "instances")
 
 
 settings = Settings()
