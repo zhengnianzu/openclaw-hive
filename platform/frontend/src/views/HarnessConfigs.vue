@@ -17,6 +17,7 @@
         <el-option label="Codex" value="codex" />
         <el-option label="Pi" value="pi" />
         <el-option label="Grok" value="grok" />
+        <el-option label="DSH" value="dsh" />
         <el-option label="通用" value="common" />
       </el-select>
     </div>
@@ -68,6 +69,7 @@
             <el-option label="Codex" value="codex" />
             <el-option label="Pi" value="pi" />
             <el-option label="Grok" value="grok" />
+            <el-option label="DSH" value="dsh" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -189,6 +191,8 @@ const HARNESS_FILE_LABELS = {
   opencode: 'Harness (opencode.json)',
   codex: 'Harness (config.toml)',
   pi: 'Harness (models.json)',
+  grok: 'Harness (grok_config.toml)',
+  dsh: 'Harness (dsh_settings.yaml)',
   common: 'Harness 配置',
 }
 
@@ -197,18 +201,18 @@ function harnessFileLabel(t) {
 }
 
 function tagType(t) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', common: 'info' }[t] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[t] || ''
 }
 // harness 类型 -> 显示色(hex)。后续加 harness 只需在这里追加一行。
 const HARNESS_COLORS = {
   openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
-  openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
+  openjiuwen: '#f56c6c', opencode: '#909399', codex: '#8e44ad', 
+  pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
   common: '#c0c4cc',
 }
 function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
 function typeLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[t] || t
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[t] || t
 }
 function fileCount(row) {
   try { return JSON.parse(row.config_files_json || '[]').length } catch { return 0 }
@@ -228,6 +232,7 @@ function computeMappingHints() {
   else if (fname === 'config.toml') section = fieldMappings.value['codex']
   else if (fname === 'models.json') section = fieldMappings.value['pi']
   else if (fname === 'grok_config.toml') section = fieldMappings.value['grok']
+  else if (fname === 'dsh_settings.yaml') section = fieldMappings.value['dsh']
   else if (fname.includes('hermes')) section = fieldMappings.value['hermes']
   else if (fname.includes('cc_settings')) section = fieldMappings.value['claude-code']
   else if (fname.includes('user_proxy')) section = fieldMappings.value['user_proxy_model']

@@ -1,0 +1,21 @@
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+
+agent-presets:
+  default: standard
+agent-default-model:
+  provider: custom
+  model: claude-opus-4-7
+llm-pi-ai:
+  providers:
+    custom:
+      displayName: custom
+      apiKeyEnv: CUSTOM_API_KEY
+      api: anthropic-messages
+      baseURL: http://115.120.120.64:8082/
+      models:
+        - id: claude-opus-4-7
+
+credentials:
+  CUSTOM_API_KEY: sk-xxxxx
+  EXA_API_KEY:    BSAGqO4xyWP9kyBfvitCOw2lT_6T_vb

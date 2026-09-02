@@ -114,6 +114,7 @@
             <el-option label="Codex" value="codex" />
             <el-option label="Pi" value="pi" />
             <el-option label="Grok" value="grok" />
+            <el-option label="DSH" value="dsh" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -197,17 +198,17 @@ function statusLabel(s) {
   return { pending: '待执行', executing: '执行中', completed: '已完成', cancelled: '已取消' }[s] || s
 }
 function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', common: 'info' }[type] || ''
+  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[type] || ''
 }
 const HARNESS_COLORS = {
   openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
   openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084',
+  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
   common: '#c0c4cc',
 }
 function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
 function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', common: '通用' }[type] || type || 'openclaw'
+  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[type] || type || 'openclaw'
 }
 function templateName(id) {
   if (!id) return '-'

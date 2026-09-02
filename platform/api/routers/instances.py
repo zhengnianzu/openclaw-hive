@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/instances", tags=["instances"])
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json", "grok_config.toml"}
+ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json", "grok_config.toml", "dsh_settings.yaml"}
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -392,7 +392,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs", "grok": "grok_trajs"}
+        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs", "grok": "grok_trajs", "dsh": "dsh_trajs"}
         traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
@@ -406,6 +406,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     codex_path = os.path.join(instance_dir, "config.toml")
     pi_path = os.path.join(instance_dir, "models.json")
     grok_path = os.path.join(instance_dir, "grok_config.toml")
+    dsh_path = os.path.join(instance_dir, "dsh_settings.yaml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     if req.harness_type == "hermes":
@@ -422,6 +423,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         base.run_config.sandbox.harness_local_config_file = pi_path
     elif req.harness_type == "grok":
         base.run_config.sandbox.harness_local_config_file = grok_path
+    elif req.harness_type == "dsh":
+        base.run_config.sandbox.harness_local_config_file = dsh_path
     else:
         base.run_config.sandbox.harness_local_config_file = openclaw_path
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -603,14 +606,17 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         prov = providers[main_provider_key]
         if req.model_api_key:
             prov["apiKey"] = req.model_api_key
-        if req.model_base_url:
-            # pi 要求 baseUrl 带 /v1 后缀
-            base_url = req.model_base_url.rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-            prov["baseUrl"] = base_url
         if req.model_api_type:
             prov["api"] = req.model_api_type
+        if req.model_base_url:
+            # pi 要求 openai-completions 带 /v1 后缀, anthropic-messages 不带
+            base_url = req.model_base_url.rstrip("/")
+            if prov["api"] == "openai-completions" and not base_url.endswith("/v1"):
+                base_url += "/v1"
+            if prov["api"] == "anthropic-messages" and base_url.endswith("/v1"):
+                base_url -= "v1"
+            prov["baseUrl"] = base_url
+        
         if req.model_id:
             models_list = prov.setdefault("models", [])
             if models_list:
@@ -646,6 +652,54 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         with open(grok_path, "wb") as f:
             tomli_w.dump(grok_cfg, f)
+    elif req.harness_type == "dsh":
+        # dsh_settings.yaml 结构
+        dsh_template = os.path.join(harness_settings_dir, "dsh_settings.yaml")
+        if not os.path.exists(dsh_template):
+            dsh_template = os.path.join(settings.SETTINGS_DIR, "dsh_settings.yaml")
+        dsh_omega = OmegaConf.load(dsh_template)
+
+        # 顶层 provider key 由 agent-default-model.provider 指向（默认 custom）
+        default_model = dsh_omega.get("agent-default-model") or OmegaConf.create({})
+        main_provider_key = str(default_model.get("provider") or "custom")
+
+        providers = dsh_omega.setdefault("llm-pi-ai", OmegaConf.create({})).setdefault("providers", OmegaConf.create({}))
+        if main_provider_key not in providers:
+            providers[main_provider_key] = OmegaConf.create({
+                "displayName": main_provider_key,
+                "apiKeyEnv": main_provider_key.replace("-", "_").upper() + "_API_KEY",
+                "api": req.model_api_type,
+                "baseURL": "",
+                "models": [],
+            })
+        prov = providers[main_provider_key]
+        api_key_env = str(prov.get("apiKeyEnv") or (main_provider_key.replace("-", "_").upper() + "_API_KEY"))
+
+        if req.model_api_type:
+            prov["api"] = req.model_api_type
+        if req.model_base_url:
+            # dsh 要求 openai-completions 带 /v1 后缀, anthropic-messages 不带
+            base_url = req.model_base_url.rstrip("/")
+            if prov["api"] == "openai-completions" and not base_url.endswith("/v1"):
+                base_url += "/v1"
+            if prov["api"] == "anthropic-messages" and base_url.endswith("/v1"):
+                base_url -= "v1"
+            prov["baseURL"] = base_url
+        if req.model_id:
+            models_list = prov.get("models")
+            if models_list and len(models_list) > 0:
+                models_list[0]["id"] = req.model_id
+            else:
+                prov["models"] = [OmegaConf.create({"id": req.model_id})]
+            # 同步 agent-default-model.model
+            dsh_omega.setdefault("agent-default-model", OmegaConf.create({}))["model"] = req.model_id
+            dsh_omega["agent-default-model"].setdefault("provider", main_provider_key)
+
+        if req.model_api_key:
+            credentials = dsh_omega.setdefault("credentials", OmegaConf.create({}))
+            credentials[api_key_env] = req.model_api_key
+
+        OmegaConf.save(dsh_omega, dsh_path)
     else:
         openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
         if not os.path.exists(openclaw_template):
@@ -733,6 +787,16 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 grok_cfg.setdefault("model", {}).setdefault("default-model", {})["api_key"] = req.model_api_key
                 with open(grok_path, "wb") as f:
                     tomli_w.dump(grok_cfg, f)
+            elif req.harness_type == "dsh" and os.path.exists(dsh_path):
+                dsh_omega = OmegaConf.load(dsh_path)
+                default_model = dsh_omega.get("agent-default-model") or OmegaConf.create({})
+                main_provider_key = str(default_model.get("provider") or "custom")
+                providers = dsh_omega.setdefault("llm-pi-ai", OmegaConf.create({})).setdefault("providers", OmegaConf.create({}))
+                prov = providers.get(main_provider_key)
+                api_key_env = str((prov and prov.get("apiKeyEnv")) or (main_provider_key.replace("-", "_").upper() + "_API_KEY"))
+                credentials = dsh_omega.setdefault("credentials", OmegaConf.create({}))
+                credentials[api_key_env] = req.model_api_key
+                OmegaConf.save(dsh_omega, dsh_path)
             elif os.path.exists(openclaw_path):
                 with open(openclaw_path, "r", encoding="utf-8") as f:
                     openclaw_cfg = json.load(f)
