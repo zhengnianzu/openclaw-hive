@@ -804,7 +804,7 @@ async function loadData() {
 async function loadCreateParams() { try { createParams.value = await api.get(`/instances/${id}/create-params`) } catch {} }
 async function startInstance() { await api.post(`/instances/${id}/start`); ElMessage.success('已启动'); loadData() }
 async function stopInstance() { await ElMessageBox.confirm('确认停止？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadData() }
-async function retryFailed() { await api.post(`/instances/${id}/retry-failed`); ElMessage.success('重跑已启动'); loadData() }
+async function retryFailed() { router.push(`/create?copy_from=${id}&copy_complete_from=${id}`) }
 
 const configFiles = ref([]); const configLoading = ref(false); const activeConfigTab = ref(''); const configContent = ref('')
 async function loadConfigFiles() {

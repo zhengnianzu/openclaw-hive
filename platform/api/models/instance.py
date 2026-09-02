@@ -48,6 +48,9 @@ class InstanceCreate(BaseModel):
 
     harness_config_id: Optional[int] = None
 
+    # 重跑失败场景: 传入源实例 id,创建后把源实例 complete.jsonl 搬到新实例 output,
+    copy_complete_from: Optional[str] = None
+
 
 class InstanceInfo(BaseModel):
     id: str

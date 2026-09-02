@@ -297,7 +297,7 @@ function progress(row) {
 
 async function startInstance(id) { await api.post(`/instances/${id}/start`); ElMessage.success('已启动'); loadInstances() }
 async function stopInstance(id) { await ElMessageBox.confirm('确认停止该实例？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadInstances() }
-async function retryFailed(id) { await api.post(`/instances/${id}/retry-failed`); ElMessage.success('重跑已启动'); loadInstances() }
+async function retryFailed(id) { router.push(`/create?copy_from=${id}&copy_complete_from=${id}`) }
 async function deleteInstance(id) { await ElMessageBox.confirm('确认删除该实例？配置文件也会被删除。', '提示', { type: 'warning' }); await api.delete(`/instances/${id}`); ElMessage.success('已删除'); loadInstances() }
 
 function handleCommand(cmd, row) {

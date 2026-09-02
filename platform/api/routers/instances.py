@@ -854,6 +854,20 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 
+    # --- 6. 重跑失败: 搬源实例 complete.jsonl 到新实例 output 目录 ---
+    if req.copy_complete_from:
+        with get_connection() as conn:
+            src_row = conn.execute(
+                "SELECT config_path FROM task_instances WHERE id=?", (req.copy_complete_from,)
+            ).fetchone()
+        if src_row:
+            src_output_dir = _get_output_dir(src_row["config_path"])
+            src_complete = os.path.join(src_output_dir, "complete.jsonl")
+            if os.path.exists(src_complete):
+                new_output_dir = _get_output_dir(config_path)
+                os.makedirs(new_output_dir, exist_ok=True)
+                shutil.copy2(src_complete, os.path.join(new_output_dir, "complete.jsonl"))
+
     return InstanceInfo(**dict(row))
 
 
@@ -1170,57 +1184,6 @@ def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
         )
 
     return {"message": "实例已停止"}
-
-
-@router.post("/{instance_id}/retry-failed")
-async def retry_failed(instance_id: str, user: dict = Depends(require_operator)):
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="实例不存在")
-
-    inst = dict(row)
-    if inst["status"] == "running" and _is_pid_running(inst.get("pid")):
-        raise HTTPException(status_code=400, detail="实例正在运行中，请先停止")
-
-    config_path = inst["config_path"]
-    output_dir = _get_output_dir(config_path)
-    os.makedirs(output_dir, exist_ok=True)
-
-    failed_file = os.path.join(output_dir, "failed.jsonl")
-    retry_file = os.path.join(output_dir, "retry.jsonl")
-    if os.path.exists(failed_file):
-        if os.path.exists(retry_file):
-            os.remove(retry_file)
-        os.rename(failed_file, retry_file)
-    elif not os.path.exists(retry_file):
-        raise HTTPException(status_code=400, detail="没有失败任务可重跑")
-
-    log_file = os.path.join(output_dir, "nohup.log")
-    clean_log_file = os.path.join(output_dir, "nohup_clean.log")
-
-    hive_py = os.path.join(settings.HIVE_ROOT, "hive.py")
-    env = os.environ.copy()
-    env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
-
-    with open(log_file, "a") as lf:
-        proc = subprocess.Popen(
-            ["python", hive_py, "--config", config_path, "--failed"],
-            stdout=lf, stderr=lf,
-            cwd=settings.HIVE_ROOT,
-            env=env,
-            start_new_session=True,
-        )
-
-    _status_cache.pop(instance_id, None)
-
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
-            (proc.pid, datetime.now().isoformat(), instance_id),
-        )
-
-    return {"message": "重跑失败任务已启动", "pid": proc.pid}
 
 
 @router.get("/{instance_id}/overview", response_model=InstanceOverview)
