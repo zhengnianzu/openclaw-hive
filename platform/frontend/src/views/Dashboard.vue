@@ -55,15 +55,7 @@
         <el-option label="待启动" value="created" />
       </el-select>
       <el-select v-model="harnessFilter" placeholder="Harness筛选" clearable size="default" style="width:140px">
-        <el-option label="Openclaw" value="openclaw" />
-        <el-option label="Hermes" value="hermes" />
-        <el-option label="Claude Code" value="claude-code" />
-        <el-option label="Jiuwen Claw" value="openjiuwen" />
-        <el-option label="OpenCode" value="opencode" />
-        <el-option label="Codex" value="codex" />
-        <el-option label="Pi" value="pi" />
-        <el-option label="Grok" value="grok" />
-        <el-option label="DSH" value="dsh" />
+        <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
       </el-select>
       <el-select v-model="userFilter" placeholder="创建者筛选" clearable filterable size="default" style="width:160px">
         <el-option v-for="u in userOptions" :key="u" :label="u" :value="u" />
@@ -77,9 +69,9 @@
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="pagedInstances" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
-        <el-table-column prop="harness_type" label="Harness" width="120" align="center" resizable>
+        <el-table-column prop="harness_type" label="Harness" width="160" align="center" resizable>
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">
+            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type), maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}" effect="dark" size="default">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
@@ -159,13 +151,15 @@
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Search, Monitor, VideoPlay, CircleCheck, CircleClose, Box } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { useHarnessStore } from '../stores/harness'
 
 const authStore = useAuthStore()
+const harnessStore = useHarnessStore()
 const instances = ref([])
 const loading = ref(false)
 const timeEstimates = ref({})
@@ -178,6 +172,7 @@ const nameSearch = ref('')
 const currentPage = ref(1)
 const pageSize = ref(20)
 const router = useRouter()
+const route = useRoute()
 let timer = null
 
 const progressColor = [
@@ -220,12 +215,42 @@ const pagedInstances = computed(() => {
 
 // 筛选/每页条数变化时回到第一页；当前页因数据减少而越界时也回退，避免停在空白页
 watch([statusFilter, harnessFilter, userFilter, dateRange, nameSearch, pageSize], () => {
+  if (restoring) return
   currentPage.value = 1
+  syncQuery()
 })
+watch([currentPage, pageSize], () => { syncQuery() })
 watch(filteredInstances, (list) => {
   const maxPage = Math.max(1, Math.ceil(list.length / pageSize.value))
   if (currentPage.value > maxPage) currentPage.value = maxPage
 })
+
+// 筛选状态写进 URL query，详情页返回时 query 还在即可恢复筛选态
+let restoring = false
+function syncQuery() {
+  if (restoring) return
+  const q = {}
+  if (statusFilter.value) q.status = statusFilter.value
+  if (harnessFilter.value) q.harness = harnessFilter.value
+  if (userFilter.value) q.user = userFilter.value
+  if (dateRange.value && dateRange.value.length === 2) q.date = dateRange.value.join(',')
+  if (nameSearch.value) q.q = nameSearch.value
+  if (currentPage.value > 1) q.page = String(currentPage.value)
+  if (pageSize.value !== 20) q.size = String(pageSize.value)
+  router.replace({ query: q })
+}
+function restoreFromQuery() {
+  restoring = true
+  const q = route.query
+  if (q.status) statusFilter.value = String(q.status)
+  if (q.harness) harnessFilter.value = String(q.harness)
+  if (q.user) userFilter.value = String(q.user)
+  if (q.date) dateRange.value = String(q.date).split(',')
+  if (q.q) nameSearch.value = String(q.q)
+  if (q.page) currentPage.value = Number(q.page) || 1
+  if (q.size) pageSize.value = Number(q.size) || 20
+  restoring = false
+}
 
 const totalRunningPods = computed(() => runningInstances.value.reduce((sum, inst) => sum + inst.concurrent_num, 0))
 
@@ -277,19 +302,8 @@ function statusColor(s) {
 function statusText(s) {
   return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
 }
-function harnessTagType(t) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[t] || ''
-}
-const HARNESS_COLORS = {
-  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
-  openjiuwen: '#f56c6c', opencode: '#909399', codex: '#8e44ad', 
-  pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
-  common: '#c0c4cc',
-}
-function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
-function harnessLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[t] || t || 'openclaw'
-}
+function harnessColor(t) { return harnessStore.color(t) }
+function harnessLabel(t) { return harnessStore.label(t) }
 function progress(row) {
   if (!row.total_tasks) return 0
   return Math.round(((row.completed_tasks + row.failed_tasks) / row.total_tasks) * 100)
@@ -297,7 +311,7 @@ function progress(row) {
 
 async function startInstance(id) { await api.post(`/instances/${id}/start`); ElMessage.success('已启动'); loadInstances() }
 async function stopInstance(id) { await ElMessageBox.confirm('确认停止该实例？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadInstances() }
-async function retryFailed(id) { await api.post(`/instances/${id}/retry-failed`); ElMessage.success('重跑已启动'); loadInstances() }
+async function retryFailed(id) { router.push(`/create?copy_from=${id}&copy_complete_from=${id}`) }
 async function deleteInstance(id) { await ElMessageBox.confirm('确认删除该实例？配置文件也会被删除。', '提示', { type: 'warning' }); await api.delete(`/instances/${id}`); ElMessage.success('已删除'); loadInstances() }
 
 function handleCommand(cmd, row) {
@@ -305,7 +319,7 @@ function handleCommand(cmd, row) {
   actions[cmd]?.()
 }
 
-onMounted(() => { loadInstances(); timer = setInterval(loadInstances, 10000) })
+onMounted(() => { restoreFromQuery(); harnessStore.load(); loadInstances(); timer = setInterval(loadInstances, 10000) })
 onUnmounted(() => clearInterval(timer))
 </script>
 

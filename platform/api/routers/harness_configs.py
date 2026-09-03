@@ -11,34 +11,13 @@ from ..core.config import settings
 from ..core.database import get_connection
 from ..core.security import get_current_user, require_operator
 from ..models.harness_config import HarnessConfigCreate, HarnessConfigUpdate, HarnessConfigInfo
+from . import harness_meta
 
 router = APIRouter(prefix="/api/harness-configs", tags=["harness-configs"])
 
-HARNESS_FILES = {
-    "openclaw": "openclaw.json",
-    "hermes": "hermes_config.yaml",
-    "claude-code": "cc_settings.json",
-    "openjiuwen": "openjiuwen.json",
-    "opencode": "opencode.json",
-    "codex": "config.toml",
-    "pi": "models.json",
-    "grok": "grok_config.toml",
-    "dsh": "dsh_settings.yaml",
-    "common": None,
-}
-
-EXPECTED_FILES = {
-    "openclaw": ["openclaw.json", "config.yaml", "user_proxy_model.json"],
-    "hermes": ["hermes_config.yaml", "config.yaml", "user_proxy_model.json"],
-    "claude-code": ["cc_settings.json", "config.yaml", "user_proxy_model.json"],
-    "openjiuwen": ["openjiuwen.json", "config.yaml", "user_proxy_model.json"],
-    "opencode": ["opencode.json", "config.yaml", "user_proxy_model.json"],
-    "codex": ["config.toml", "config.yaml", "user_proxy_model.json"],
-    "pi": ["models.json", "config.yaml", "user_proxy_model.json"],
-    "grok": ["grok_config.toml", "config.yaml", "user_proxy_model.json"],
-    "dsh": ["dsh_settings.yaml", "config.yaml", "user_proxy_model.json"],
-    "common": ["config.yaml", "user_proxy_model.json"],
-}
+# 由 platform/settings/harness_config.json 派生; 新增 harness 只需改 JSON
+HARNESS_FILES = {k: v.get("agent_config") for k, v in harness_meta._entries().items()}
+EXPECTED_FILES = harness_meta.EXPECTED_FILES()
 
 DEFAULT_VERSION = "默认"
 
@@ -437,7 +416,7 @@ def copy_harness_config(config_id: int, body: CopyRequest, user: dict = Depends(
 def ensure_defaults():
     """Auto-register default harness configs from settings/ for each type."""
     with get_connection() as conn:
-        for htype in ["openclaw", "hermes", "claude-code", "openjiuwen", "opencode", "codex", "pi", "grok", "dsh"]:
+        for htype in harness_meta.listable_types():
             existing = conn.execute(
                 "SELECT id FROM harness_configs WHERE harness_type = ? AND version = ?",
                 (htype, DEFAULT_VERSION),

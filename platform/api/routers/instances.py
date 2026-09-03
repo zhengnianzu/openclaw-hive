@@ -19,13 +19,14 @@ from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
+from . import harness_meta
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json", "grok_config.toml", "dsh_settings.yaml"}
+ALLOWED_CONFIG_FILES = harness_meta.ALLOWED_CONFIG_FILES()
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -392,12 +393,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs", "grok": "grok_trajs", "dsh": "dsh_trajs"}
-        traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
+        traj_prefix = harness_meta.traj_prefix(req.harness_type)
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
         base.sandbox.x86_cpu.sandbox.image = req.image_name.strip()
 
+    # harness 配置文件路径: 由 harness_config.json 的 agent_config 派生。
+    # 下方各 harness 配置生成分支仍按原变量名引用这些局部变量, 故在此集中定义。
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
     cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
@@ -409,24 +411,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     dsh_path = os.path.join(instance_dir, "dsh_settings.yaml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
-    if req.harness_type == "hermes":
-        base.run_config.sandbox.harness_local_config_file = hermes_config_path
-    elif req.harness_type == "claude-code":
-        base.run_config.sandbox.harness_local_config_file = cc_settings_path
-    elif req.harness_type == "openjiuwen":
-        base.run_config.sandbox.harness_local_config_file = openjiuwen_path
-    elif req.harness_type == "opencode":
-        base.run_config.sandbox.harness_local_config_file = opencode_path
-    elif req.harness_type == "codex":
-        base.run_config.sandbox.harness_local_config_file = codex_path
-    elif req.harness_type == "pi":
-        base.run_config.sandbox.harness_local_config_file = pi_path
-    elif req.harness_type == "grok":
-        base.run_config.sandbox.harness_local_config_file = grok_path
-    elif req.harness_type == "dsh":
-        base.run_config.sandbox.harness_local_config_file = dsh_path
-    else:
-        base.run_config.sandbox.harness_local_config_file = openclaw_path
+    # harness_local_config_file: 直接用 agent_config 文件名拼路径, 兜底 openclaw.json
+    _agent_cfg = harness_meta.agent_config(req.harness_type) or "openclaw.json"
+    base.run_config.sandbox.harness_local_config_file = os.path.join(instance_dir, _agent_cfg)
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
 
     base.run_config.task.task_output_path = os.path.join(instance_dir, "outputs")
@@ -854,6 +841,20 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 
+    # --- 6. 重跑失败: 搬源实例 complete.jsonl 到新实例 output 目录 ---
+    if req.copy_complete_from:
+        with get_connection() as conn:
+            src_row = conn.execute(
+                "SELECT config_path FROM task_instances WHERE id=?", (req.copy_complete_from,)
+            ).fetchone()
+        if src_row:
+            src_output_dir = _get_output_dir(src_row["config_path"])
+            src_complete = os.path.join(src_output_dir, "complete.jsonl")
+            if os.path.exists(src_complete):
+                new_output_dir = _get_output_dir(config_path)
+                os.makedirs(new_output_dir, exist_ok=True)
+                shutil.copy2(src_complete, os.path.join(new_output_dir, "complete.jsonl"))
+
     return InstanceInfo(**dict(row))
 
 
@@ -1170,57 +1171,6 @@ def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
         )
 
     return {"message": "实例已停止"}
-
-
-@router.post("/{instance_id}/retry-failed")
-async def retry_failed(instance_id: str, user: dict = Depends(require_operator)):
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="实例不存在")
-
-    inst = dict(row)
-    if inst["status"] == "running" and _is_pid_running(inst.get("pid")):
-        raise HTTPException(status_code=400, detail="实例正在运行中，请先停止")
-
-    config_path = inst["config_path"]
-    output_dir = _get_output_dir(config_path)
-    os.makedirs(output_dir, exist_ok=True)
-
-    failed_file = os.path.join(output_dir, "failed.jsonl")
-    retry_file = os.path.join(output_dir, "retry.jsonl")
-    if os.path.exists(failed_file):
-        if os.path.exists(retry_file):
-            os.remove(retry_file)
-        os.rename(failed_file, retry_file)
-    elif not os.path.exists(retry_file):
-        raise HTTPException(status_code=400, detail="没有失败任务可重跑")
-
-    log_file = os.path.join(output_dir, "nohup.log")
-    clean_log_file = os.path.join(output_dir, "nohup_clean.log")
-
-    hive_py = os.path.join(settings.HIVE_ROOT, "hive.py")
-    env = os.environ.copy()
-    env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
-
-    with open(log_file, "a") as lf:
-        proc = subprocess.Popen(
-            ["python", hive_py, "--config", config_path, "--failed"],
-            stdout=lf, stderr=lf,
-            cwd=settings.HIVE_ROOT,
-            env=env,
-            start_new_session=True,
-        )
-
-    _status_cache.pop(instance_id, None)
-
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
-            (proc.pid, datetime.now().isoformat(), instance_id),
-        )
-
-    return {"message": "重跑失败任务已启动", "pid": proc.pid}
 
 
 @router.get("/{instance_id}/overview", response_model=InstanceOverview)

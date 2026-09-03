@@ -1,0 +1,86 @@
+{
+    "_meta": {
+        "_comment": "Harness 元配置 — 新增 harness 只需在此文件加一条,前后端自动派生。字段: id(类型标识)/name(显示名)/hive_config(共用 config.yaml)/user_config(共用 user_proxy_model.json)/agent_config(各 harness 自己的配置文件名)/ui_color(标签颜色)。",
+        "exclude_from_lists": ["common"]
+    },
+    "openclaw": {
+        "id": "openclaw",
+        "name": "OpenClaw",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "openclaw.json",
+        "ui_color": "#409eff"
+    },
+    "hermes": {
+        "id": "hermes",
+        "name": "Hermes",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "hermes_config.yaml",
+        "ui_color": "#e6a23c"
+    },
+    "claude-code": {
+        "id": "claude-code",
+        "name": "Claude Code",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "cc_settings.json",
+        "ui_color": "#67c23a"
+    },
+    "openjiuwen": {
+        "id": "openjiuwen",
+        "name": "Jiuwen Claw",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "openjiuwen.json",
+        "ui_color": "#f56c6c"
+    },
+    "opencode": {
+        "id": "opencode",
+        "name": "OpenCode",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "opencode.json",
+        "ui_color": "#909399"
+    },
+    "codex": {
+        "id": "codex",
+        "name": "Codex",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "config.toml",
+        "ui_color": "#8e44ad"
+    },
+    "pi": {
+        "id": "pi",
+        "name": "Pi",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "models.json",
+        "ui_color": "#17a2b8"
+    },
+    "grok": {
+        "id": "grok",
+        "name": "Grok",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "grok_config.toml",
+        "ui_color": "#00d084"
+    },
+    "dsh": {
+        "id": "dsh",
+        "name": "DeepSeek Harness",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "dsh_settings.yaml",
+        "ui_color": "#ff6b81"
+    },
+    "common": {
+        "id": "common",
+        "name": "通用",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": null,
+        "ui_color": "#c0c4cc"
+    }
+}

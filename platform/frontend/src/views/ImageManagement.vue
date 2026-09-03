@@ -10,15 +10,7 @@
     <div class="filter-bar">
       <el-select v-model="typeFilter" placeholder="Harness 类型" clearable size="default" style="width:160px">
         <el-option label="通用" value="common" />
-        <el-option label="OpenClaw" value="openclaw" />
-        <el-option label="Hermes" value="hermes" />
-        <el-option label="Claude Code" value="claude-code" />
-        <el-option label="Jiuwen Claw" value="openjiuwen" />
-        <el-option label="OpenCode" value="opencode" />
-        <el-option label="Codex" value="codex" />
-        <el-option label="Pi" value="pi" />
-        <el-option label="Grok" value="grok" />
-        <el-option label="DSH" value="dsh" />
+        <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
       </el-select>
     </div>
 
@@ -54,15 +46,7 @@
         <el-form-item label="Harness 类型" required>
           <el-select v-model="form.harness_type" style="width:100%">
             <el-option label="通用" value="common" />
-            <el-option label="OpenClaw" value="openclaw" />
-            <el-option label="Hermes" value="hermes" />
-            <el-option label="Claude Code" value="claude-code" />
-            <el-option label="Jiuwen Claw" value="openjiuwen" />
-            <el-option label="OpenCode" value="opencode" />
-            <el-option label="Codex" value="codex" />
-            <el-option label="Pi" value="pi" />
-            <el-option label="Grok" value="grok" />
-            <el-option label="DSH" value="dsh" />
+            <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -78,9 +62,11 @@
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
+import { useHarnessStore } from '../stores/harness'
 import api from '../api'
 
 const authStore = useAuthStore()
+const harnessStore = useHarnessStore()
 const loading = ref(false)
 const creating = ref(false)
 const dialogVisible = ref(false)
@@ -89,19 +75,8 @@ const images = ref([])
 
 const form = ref({ name: '', address: '', harness_type: 'openclaw' })
 
-function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[type] || ''
-}
-const HARNESS_COLORS = {
-  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
-  openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
-  common: '#c0c4cc',
-}
-function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
-function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[type] || type || 'openclaw'
-}
+function harnessColor(type) { return harnessStore.color(type) }
+function harnessLabel(type) { return harnessStore.label(type) }
 
 const filteredImages = computed(() => {
   if (!typeFilter.value) return images.value
@@ -139,7 +114,7 @@ async function handleDelete(row) {
   } catch { /* cancelled */ }
 }
 
-onMounted(loadImages)
+onMounted(() => { harnessStore.load(); loadImages() })
 </script>
 
 <style scoped>

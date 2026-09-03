@@ -14,15 +14,7 @@
       </el-form-item>
       <el-form-item label="Harness类型" required>
         <el-select v-model="form.harness_type" style="width:100%">
-          <el-option label="Openclaw" value="openclaw" />
-          <el-option label="Hermes" value="hermes" />
-          <el-option label="Claude Code" value="claude-code" />
-          <el-option label="Jiuwen Claw" value="openjiuwen" />
-          <el-option label="OpenCode" value="opencode" />
-          <el-option label="Codex" value="codex" />
-          <el-option label="Pi" value="pi" />
-          <el-option label="Grok" value="grok" />
-          <el-option label="DSH" value="dsh" />
+          <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -124,9 +116,11 @@ import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { obsBucket } from '../api/obsConfig'
+import { useHarnessStore } from '../stores/harness'
 
 const router = useRouter()
 const route = useRoute()
+const harnessStore = useHarnessStore()
 const submitting = ref(false)
 const isCopy = computed(() => !!route.query.copy_from)
 
@@ -220,6 +214,7 @@ function confirmObsSelect() {
 }
 
 onMounted(async () => {
+  harnessStore.load()
   const copyFrom = route.query.copy_from
   if (copyFrom) {
     try {

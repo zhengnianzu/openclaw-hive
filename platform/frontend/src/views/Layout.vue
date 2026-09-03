@@ -55,10 +55,12 @@
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import { useHarnessStore } from '../stores/harness'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const harnessStore = useHarnessStore()
 
 const roleLabel = computed(() => {
   const map = { admin: '管理员', operator: '运行者', viewer: '浏览者' }
@@ -67,6 +69,7 @@ const roleLabel = computed(() => {
 
 onMounted(() => {
   if (authStore.token) authStore.fetchMe()
+  harnessStore.load()
 })
 
 function logout() {
