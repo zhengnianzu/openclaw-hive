@@ -14,15 +14,7 @@
 
       <el-form-item label="Harness 类型">
         <el-select v-model="form.harness_type" @change="onHarnessChange" style="width:200px">
-          <el-option label="OpenClaw" value="openclaw" />
-          <el-option label="Hermes" value="hermes" />
-          <el-option label="Claude Code" value="claude-code" />
-          <el-option label="Jiuwen Claw" value="openjiuwen" />
-          <el-option label="OpenCode" value="opencode" />
-          <el-option label="Codex" value="codex" />
-          <el-option label="Pi" value="pi" />
-          <el-option label="Grok" value="grok" />
-          <el-option label="DSH" value="dsh" />
+          <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
           <el-option label="通用" value="common" />
         </el-select>
       </el-form-item>
@@ -253,11 +245,13 @@ import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { useHarnessStore } from '../stores/harness'
 import { obsBucket, stripBucket, joinBucket } from '../api/obsConfig'
 
 const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
+const harnessStore = useHarnessStore()
 const creating = ref(false)
 const activeTab = ref('obs')
 
@@ -487,6 +481,7 @@ function confirmObsSelect() {
 }
 
 onMounted(async () => {
+  harnessStore.load()
   const copyFrom = route.query.copy_from
   const fromRegistration = route.query.from_registration
   if (copyFrom) {

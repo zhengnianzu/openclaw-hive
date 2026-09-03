@@ -42,15 +42,7 @@
         </el-form-item>
         <el-form-item label="Harness类型">
           <el-select v-model="form.harness_type" style="width:100%">
-            <el-option label="OpenClaw" value="openclaw" />
-            <el-option label="Hermes" value="hermes" />
-            <el-option label="Claude Code" value="claude-code" />
-            <el-option label="Jiuwen Claw" value="openjiuwen" />
-            <el-option label="OpenCode" value="opencode" />
-            <el-option label="Codex" value="codex" />
-            <el-option label="Pi" value="pi" />
-            <el-option label="Grok" value="grok" />
-            <el-option label="DSH" value="dsh" />
+            <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -156,7 +148,9 @@ import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import api from '../api'
+import { useHarnessStore } from '../stores/harness'
 
+const harnessStore = useHarnessStore()
 const templates = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
@@ -213,20 +207,8 @@ const defaultForm = () => ({
 })
 const form = ref(defaultForm())
 const agents = ref([{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }])
-
-function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[type] || ''
-}
-const HARNESS_COLORS = {
-  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
-  openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
-  common: '#c0c4cc',
-}
-function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
-function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[type] || type
-}
+function harnessColor(type) { return harnessStore.color(type) }
+function harnessLabel(type) { return harnessStore.label(type) }
 
 function addAgent() {
   agents.value.push({ name: '', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' })
@@ -328,6 +310,7 @@ async function deleteTemplate(row) {
 }
 
 onMounted(() => {
+  harnessStore.load()
   loadTemplates()
   loadImages()
   loadCodeRepos()

@@ -19,13 +19,14 @@ from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
+from . import harness_meta
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
 
-ALLOWED_CONFIG_FILES = {"config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json", "openjiuwen.json", "opencode.json", "config.toml", "models.json", "grok_config.toml", "dsh_settings.yaml"}
+ALLOWED_CONFIG_FILES = harness_meta.ALLOWED_CONFIG_FILES()
 
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
@@ -392,12 +393,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     if req.traj_save_path:
         base.run_config.obs.traj_save_path = req.traj_save_path
     else:
-        traj_prefixes = {"hermes": "hermes_trajs", "claude-code": "cc_trajs", "openjiuwen": "openjiuwen_trajs", "opencode": "opencode_trajs", "codex": "codex_trajs", "pi": "pi_trajs", "grok": "grok_trajs", "dsh": "dsh_trajs"}
-        traj_prefix = traj_prefixes.get(req.harness_type, "openclaw_trajs")
+        traj_prefix = harness_meta.traj_prefix(req.harness_type)
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
     if req.image_name:
         base.sandbox.x86_cpu.sandbox.image = req.image_name.strip()
 
+    # harness 配置文件路径: 由 harness_config.json 的 agent_config 派生。
+    # 下方各 harness 配置生成分支仍按原变量名引用这些局部变量, 故在此集中定义。
     openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
     cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
@@ -409,24 +411,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     dsh_path = os.path.join(instance_dir, "dsh_settings.yaml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
-    if req.harness_type == "hermes":
-        base.run_config.sandbox.harness_local_config_file = hermes_config_path
-    elif req.harness_type == "claude-code":
-        base.run_config.sandbox.harness_local_config_file = cc_settings_path
-    elif req.harness_type == "openjiuwen":
-        base.run_config.sandbox.harness_local_config_file = openjiuwen_path
-    elif req.harness_type == "opencode":
-        base.run_config.sandbox.harness_local_config_file = opencode_path
-    elif req.harness_type == "codex":
-        base.run_config.sandbox.harness_local_config_file = codex_path
-    elif req.harness_type == "pi":
-        base.run_config.sandbox.harness_local_config_file = pi_path
-    elif req.harness_type == "grok":
-        base.run_config.sandbox.harness_local_config_file = grok_path
-    elif req.harness_type == "dsh":
-        base.run_config.sandbox.harness_local_config_file = dsh_path
-    else:
-        base.run_config.sandbox.harness_local_config_file = openclaw_path
+    # harness_local_config_file: 直接用 agent_config 文件名拼路径, 兜底 openclaw.json
+    _agent_cfg = harness_meta.agent_config(req.harness_type) or "openclaw.json"
+    base.run_config.sandbox.harness_local_config_file = os.path.join(instance_dir, _agent_cfg)
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
 
     base.run_config.task.task_output_path = os.path.join(instance_dir, "outputs")

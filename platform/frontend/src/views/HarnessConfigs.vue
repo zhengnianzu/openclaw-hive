@@ -9,32 +9,24 @@
 
     <div style="margin-bottom:16px">
       <el-select v-model="typeFilter" placeholder="全部类型" clearable style="width:160px" @change="loadList">
-        <el-option label="OpenClaw" value="openclaw" />
-        <el-option label="Hermes" value="hermes" />
-        <el-option label="Claude Code" value="claude-code" />
-        <el-option label="Jiuwen Claw" value="openjiuwen" />
-        <el-option label="OpenCode" value="opencode" />
-        <el-option label="Codex" value="codex" />
-        <el-option label="Pi" value="pi" />
-        <el-option label="Grok" value="grok" />
-        <el-option label="DSH" value="dsh" />
+        <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
         <el-option label="通用" value="common" />
       </el-select>
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="configs" v-loading="loading" stripe style="width:100%" border>
-        <el-table-column prop="harness_type" label="类型" width="120">
+        <el-table-column prop="harness_type" label="类型" width="160">
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="small" :style="{ border: 'none' }">{{ typeLabel(row.harness_type) }}</el-tag>
+            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="default" :style="{ border: 'none' }">{{ typeLabel(row.harness_type) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="version" label="版本" width="80" />
-        <el-table-column prop="description" label="描述" min-width="160" show-overflow-tooltip />
-        <el-table-column label="文件数" width="80" align="center">
+        <el-table-column prop="version" label="版本" width="100" />
+        <el-table-column prop="description" label="描述" min-width="180" show-overflow-tooltip />
+        <el-table-column label="文件数" width="90" align="center">
           <template #default="{row}">{{ fileCount(row) }}</template>
         </el-table-column>
-        <el-table-column prop="updated_at" label="更新时间" width="160" />
+        <el-table-column prop="updated_at" label="更新时间" width="170" />
         <el-table-column label="操作" width="200" fixed="right" v-if="authStore.isOperator">
           <template #default="{row}">
             <div style="display:flex;align-items:center;gap:4px">
@@ -61,15 +53,7 @@
       <el-form :model="editForm" label-width="140px">
         <el-form-item label="Harness 类型" v-if="!isEditing">
           <el-select v-model="editForm.harness_type" style="width:100%">
-            <el-option label="OpenClaw" value="openclaw" />
-            <el-option label="Hermes" value="hermes" />
-            <el-option label="Claude Code" value="claude-code" />
-            <el-option label="Jiuwen Claw" value="openjiuwen" />
-            <el-option label="OpenCode" value="opencode" />
-            <el-option label="Codex" value="codex" />
-            <el-option label="Pi" value="pi" />
-            <el-option label="Grok" value="grok" />
-            <el-option label="DSH" value="dsh" />
+            <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -158,9 +142,11 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { useHarnessStore } from '../stores/harness'
 import { joinBucket } from '../api/obsConfig'
 
 const authStore = useAuthStore()
+const harnessStore = useHarnessStore()
 const configs = ref([])
 const loading = ref(false)
 const typeFilter = ref('')
@@ -183,37 +169,12 @@ let fileConfigId = null
 
 const fieldMappings = ref({})
 
-const HARNESS_FILE_LABELS = {
-  openclaw: 'Harness (openclaw.json)',
-  hermes: 'Harness (hermes_config)',
-  'claude-code': 'Harness (cc_settings)',
-  openjiuwen: 'Harness (openjiuwen.json)',
-  opencode: 'Harness (opencode.json)',
-  codex: 'Harness (config.toml)',
-  pi: 'Harness (models.json)',
-  grok: 'Harness (grok_config.toml)',
-  dsh: 'Harness (dsh_settings.yaml)',
-  common: 'Harness 配置',
-}
-
 function harnessFileLabel(t) {
-  return HARNESS_FILE_LABELS[t] || 'Harness 配置'
+  return harnessStore.fileLabel(t)
 }
 
-function tagType(t) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[t] || ''
-}
-// harness 类型 -> 显示色(hex)。后续加 harness 只需在这里追加一行。
-const HARNESS_COLORS = {
-  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
-  openjiuwen: '#f56c6c', opencode: '#909399', codex: '#8e44ad', 
-  pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
-  common: '#c0c4cc',
-}
-function harnessColor(t) { return HARNESS_COLORS[t] || '#909399' }
-function typeLabel(t) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[t] || t
-}
+function harnessColor(t) { return harnessStore.color(t) }
+function typeLabel(t) { return harnessStore.label(t) }
 function fileCount(row) {
   try { return JSON.parse(row.config_files_json || '[]').length } catch { return 0 }
 }
@@ -224,18 +185,22 @@ function computeMappingHints() {
   if (!currentFile.value || !fieldMappings.value) { mappingHints.value = []; return }
   const hints = []
   const fname = currentFile.value
+  // 文件名 -> fieldMappings section: 用 agentConfig(harness_type->文件名)反查
   let section = null
   if (fname === 'config.yaml') section = fieldMappings.value['config.yaml']
-  else if (fname === 'openjiuwen.json') section = fieldMappings.value['openjiuwen']
-  else if (fname === 'openclaw.json') section = fieldMappings.value['openclaw']
-  else if (fname === 'opencode.json') section = fieldMappings.value['opencode']
-  else if (fname === 'config.toml') section = fieldMappings.value['codex']
-  else if (fname === 'models.json') section = fieldMappings.value['pi']
-  else if (fname === 'grok_config.toml') section = fieldMappings.value['grok']
-  else if (fname === 'dsh_settings.yaml') section = fieldMappings.value['dsh']
-  else if (fname.includes('hermes')) section = fieldMappings.value['hermes']
-  else if (fname.includes('cc_settings')) section = fieldMappings.value['claude-code']
   else if (fname.includes('user_proxy')) section = fieldMappings.value['user_proxy_model']
+  else {
+    // 按 agent_config 匹配 harness_type
+    for (const [htype, hfile] of Object.entries(harnessStore.agentConfig)) {
+      if (hfile && fname === hfile) { section = fieldMappings.value[htype]; break }
+      if (hfile && fname.includes(hfile.split('.')[0])) { section = fieldMappings.value[htype]; break }
+    }
+    // 兼容 hermes_config / cc_settings 等含关键词的
+    if (!section) {
+      if (fname.includes('hermes')) section = fieldMappings.value['hermes']
+      else if (fname.includes('cc_settings')) section = fieldMappings.value['claude-code']
+    }
+  }
 
   if (section) {
     for (const [field, paths] of Object.entries(section)) {
@@ -417,7 +382,7 @@ async function refreshFileList() {
   } catch { /* ignore */ }
 }
 
-onMounted(() => { loadList(); loadMappings() })
+onMounted(() => { harnessStore.load(); loadList(); loadMappings() })
 </script>
 
 <style scoped>

@@ -106,15 +106,7 @@
       <el-form :model="editForm" label-width="140px">
         <el-form-item label="Harness类型">
           <el-select v-model="editForm.harness_type" style="width:100%">
-            <el-option label="Openclaw" value="openclaw" />
-            <el-option label="Hermes" value="hermes" />
-            <el-option label="Claude Code" value="claude-code" />
-            <el-option label="Jiuwen Claw" value="openjiuwen" />
-            <el-option label="OpenCode" value="opencode" />
-            <el-option label="Codex" value="codex" />
-            <el-option label="Pi" value="pi" />
-            <el-option label="Grok" value="grok" />
-            <el-option label="DSH" value="dsh" />
+            <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
             <el-option label="通用" value="common" />
           </el-select>
         </el-form-item>
@@ -175,9 +167,11 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, ArrowDown } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { useHarnessStore } from '../stores/harness'
 
 const router = useRouter()
 const authStore = useAuthStore()
+const harnessStore = useHarnessStore()
 const registrations = ref([])
 const loading = ref(false)
 
@@ -197,19 +191,8 @@ function statusType(s) {
 function statusLabel(s) {
   return { pending: '待执行', executing: '执行中', completed: '已完成', cancelled: '已取消' }[s] || s
 }
-function harnessTagType(type) {
-  return { openclaw: 'primary', hermes: 'warning', 'claude-code': 'success', openjiuwen: 'danger', opencode: 'info', codex: 'warning', pi: 'success', grok: 'success', dsh: 'primary', common: 'info' }[type] || ''
-}
-const HARNESS_COLORS = {
-  openclaw: '#409eff', hermes: '#e6a23c', 'claude-code': '#67c23a',
-  openjiuwen: '#f56c6c', opencode: '#909399',
-  codex: '#8e44ad', pi: '#17a2b8', grok: '#00d084', dsh: '#0A3D91',
-  common: '#c0c4cc',
-}
-function harnessColor(type) { return HARNESS_COLORS[type] || '#909399' }
-function harnessLabel(type) {
-  return { openclaw: 'OpenClaw', hermes: 'Hermes', 'claude-code': 'Claude Code', openjiuwen: 'Jiuwen Claw', opencode: 'OpenCode', codex: 'Codex', pi: 'Pi', grok: 'Grok', dsh: 'DSH', common: '通用' }[type] || type || 'openclaw'
-}
+function harnessColor(type) { return harnessStore.color(type) }
+function harnessLabel(type) { return harnessStore.label(type) }
 function templateName(id) {
   if (!id) return '-'
   const tpl = templateList.value.find(t => t.id === id)
@@ -295,7 +278,7 @@ async function loadTemplates() {
   } catch { templateList.value = [] }
 }
 
-onMounted(() => { loadRegistrations(); loadTemplates() })
+onMounted(() => { harnessStore.load(); loadRegistrations(); loadTemplates() })
 </script>
 
 <style scoped>
