@@ -1,17 +1,15 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-browser-plugin"],
   "provider": {
     "local-provider": {
       "npm": "@ai-sdk/anthropic",
       "name": "local-provider",
       "options": {
-        "baseURL": "http://your-gateway-host:8082/v1",
-        "apiKey": "your-api-key"
+        "baseURL": "http://115.120.62.121:8082/v1",
+        "apiKey": "sk-xxxxx"
       },
       "models": {
-        "model-id-here": {
-          "name": "model-id-here"
-        }
       }
     }
   },
@@ -19,7 +17,7 @@
     "main": {
       "description": "main actor",
       "mode": "primary",
-      "model": "local-provider/model-id-here",
+      "model": "local-provider/tkfly_deepseek-v4-flash",
       "prompt": "",
       "tools": {
         "write": true,

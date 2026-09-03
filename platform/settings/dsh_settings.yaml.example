@@ -15,6 +15,7 @@ llm-pi-ai:
       baseURL: http://115.120.120.64:8082/
       models:
         - id: claude-opus-4-7
+          contextWindow: 200000
 
 credentials:
   CUSTOM_API_KEY: sk-xxxxx

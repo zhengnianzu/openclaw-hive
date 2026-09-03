@@ -35,15 +35,22 @@ outputs/
 platform/code/
 platform/downloads/
 platform/obsutil_linux_amd64.tar.gz
-platform/platform.db.bak.20260724193028
-platform/platform.db.bak.20260724193942
-platform/platform.db.bak.20260725195617
+platform/platform.db.bak.*
 platform/session_cc.sh
 platform/settings/cc_settings.json
 platform/settings/claude-code/
 platform/settings/hermes_config.yaml
 platform/settings/openclaw/
 platform/settings/key_gen.yaml
+backup_task_traj_20260826_172448.db
+deep_worker.pid
+hive_output.db
+hive_output.db-shm
+hive_output.db-wal
+platform.db.bak.20260809101613
+settings/proxy_name.json
+worker.pid
+
 
 # 实际配置文件，含密钥
 configs/hive_*.yaml

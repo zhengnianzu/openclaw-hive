@@ -715,6 +715,19 @@ class OpenClawDistillationTask:
             f"default={len(set(default_skills))}) in {time.time() - start_time:.1f}s"
         )
 
+    async def _run_skill_cmd(self, bash: str, *, detail: str) -> None:
+        """在沙箱里执行 skill 相关命令, 统一 [S005] 错误处理。"""
+        exec_request = ExtendExecCommand(
+            command=["/bin/bash", "-c", bash],
+            timeout=self.config.obs_config.download_timeout,
+            mode="stream",
+        )
+        result = await self.execution_client.extend(args=exec_request.to_dict())
+        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+            self.logger.error(f"[S005] skill fetch failed: {detail}")
+            _log_sandbox_detail(self.logger, f"skill fetch failed — {detail}",
+                                result, level=logging.ERROR)
+            raise HiveError("S005", detail=detail, sandbox_result=result)
 
     async def _download_s3_user_profile(self, data_config_file: str) -> None:
         """Download user profile from S3 to sandbox."""
