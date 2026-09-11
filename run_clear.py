@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import subprocess
+import json
 from omegaconf import OmegaConf
 
 from env_sdk.compat.legacy_adapter import build_make_config   # 安装新版sdk, 新增导入该项
@@ -14,7 +15,7 @@ python run_clear.py --del_all 删除所有pods
 python run_clear.py --config config.yaml 删除指定沙箱
 """
 
-def get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace):
+def get_sandbox_ids_from_k8s_old(sandbox_id_prefix, sandbox_namespace):
     prefix = f"sandbox-{sandbox_id_prefix}-"
     try:
         result = subprocess.run(
@@ -31,6 +32,49 @@ def get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace):
         return sandbox_ids
     except subprocess.TimeoutExpired:
         print("错误： kubectl 执行超时")
+        return []
+
+
+def get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace):
+    """
+    从 k8s 获取 sandbox_id。
+    真正的 sandbox_id 存储在 Pod label 'omni-env.ai/sandbox-id' 中，
+    而不是从 Pod 名推导。
+    """
+    # 用 label selector 直接过滤，避免拉取全部 Pod
+    label_selector = f"omni-env.ai/sandbox-id"
+    try:
+        result = subprocess.run(
+            [
+                "kubectl", "get", "pods",
+                "-n", sandbox_namespace,
+                "-l", label_selector,
+                "-o", "json",
+                "--no-headers",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"kubectl get pods 执行失败：{result.stderr.strip()}")
+            return []
+
+        data = json.loads(result.stdout)
+        sandbox_ids = []
+        for item in data.get("items", []):
+            labels = item.get("metadata", {}).get("labels", {})
+            sid = labels.get("omni-env.ai/sandbox-id")
+            if not sid:
+                continue
+            # 如果指定了前缀，只保留匹配的
+            if sandbox_id_prefix and not sid.startswith(sandbox_id_prefix):
+                continue
+            sandbox_ids.append(sid)
+        return sandbox_ids
+    except subprocess.TimeoutExpired:
+        print("错误：kubectl 执行超时")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"解析 kubectl JSON 输出失败：{e}")
         return []
 
 
