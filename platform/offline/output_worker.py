@@ -95,7 +95,7 @@ def _pick_running_instances(conn) -> list[dict]:
     比较错位 8h；且按"是否有缺口"过滤是零成本（有索引/聚合），只有缺口实例才碰 OBS。
     """
     rows = conn.execute(
-        "SELECT ti.id, ti.name, ti.config_path, ti.status "
+        "SELECT ti.id, ti.name, ti.config_path, ti.status, ti.config_snapshot "
         "FROM task_instances ti "
         "WHERE ti.status IN ('running','preparing') "
         "OR (ti.status IN ('finished','completed','stopped') AND EXISTS ("
@@ -134,14 +134,49 @@ def _pick_pending_rows(conn, instance_id: str | None = None) -> list[dict]:
 
 def _instance_by_id(conn, instance_id: str) -> dict | None:
     row = conn.execute(
-        "SELECT id, name, config_path FROM task_instances WHERE id=?", (instance_id,)
+        "SELECT id, name, config_path, config_snapshot FROM task_instances WHERE id=?", (instance_id,)
     ).fetchone()
     return dict(row) if row else None
 
 
 def _make_obs_base_for(inst: dict) -> str:
-    """取 obs_base；实例的 config.yaml 不存在时抛 FileNotFoundError（调用方标 failed / 跳过）。"""
+    """取 obs_base：优先 DB config_snapshot（不依赖 /mnt 挂载），回退磁盘 config.yaml。
+
+    优先 snapshot 的原因同 _instance_harness_type：它是建实例时固化的 config 全文
+    （run_config.obs.traj_save_bucket + traj_save_path），实例迁移或 config.yaml 被
+    清理后仍能定位 OBS 根——否则 logs-only 任务（无轨迹，只有日志）的深层下载会
+    因配置文件缺失而整体失败，连日志都拿不到。
+    """
+    from src import offline_analysis as oa
+    base = oa.obs_base_from_snapshot(inst.get("config_snapshot"))
+    if base:
+        return base
     return _obs_base_path(inst["config_path"])
+
+
+def _instance_harness_type(inst: dict) -> str:
+    """取实例 harness 类型：优先 DB config_snapshot，其次磁盘 config.yaml，最后回退 'openclaw'。
+
+    优先 config_snapshot 的原因：它是建实例时固化的 config 全文（run_config.harness_type），
+    不依赖 /mnt/sfs_turbo 挂载；实例迁移/文件缺失时 DB 记录仍在，类型仍可追溯。
+    """
+    snap = inst.get("config_snapshot")
+    if snap:
+        try:
+            import yaml
+            ht = (yaml.safe_load(snap) or {}).get("run_config", {}).get("harness_type")
+            if ht:
+                return str(ht)
+        except Exception:
+            pass
+    try:
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load(inst["config_path"])
+        ht = cfg.run_config.get("harness_type") if hasattr(cfg.run_config, "get") \
+            else getattr(cfg.run_config, "harness_type", None)
+        return str(ht) if ht else "openclaw"
+    except Exception:
+        return "openclaw"
 
 
 # ============ 浅层：单实例分级 ============
@@ -155,7 +190,7 @@ def _level_rows_for_instance(inst: dict) -> list[dict]:
     """
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.updated_at, "
+            "SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.status, tr.updated_at, "
             "       MAX(ttr.shallow_status) AS shallow_status "
             "FROM task_records tr "
             "LEFT JOIN task_traj_records ttr "
@@ -262,6 +297,12 @@ _FINAL_STATUS_RE = re.compile(
 )
 
 
+def _task_log_path(inst: dict, task_idx: int) -> str:
+    """实例本地单任务日志路径 <inst_dir>/outputs/config/logs/task-<idx>.log（零 OBS 成本）。"""
+    return os.path.join(os.path.dirname(inst["config_path"]),
+                        "outputs", "config", "logs", f"task-{task_idx}.log")
+
+
 def _read_task_log_map(inst: dict) -> dict:
     """扫实例 outputs/config/logs/task-*.log，得到 {config_name: {task_idx, status, code}}。
 
@@ -281,6 +322,7 @@ def _read_task_log_map(inst: dict) -> dict:
         config_name = None
         status = None
         code = None
+        task_done = False
         try:
             with open(os.path.join(logs_dir, fn), errors="replace") as f:
                 for line in f:
@@ -291,22 +333,29 @@ def _read_task_log_map(inst: dict) -> dict:
                     if ms:
                         status = ms.group("status")
                         code = ms.group("code")
+                    if not task_done and oa.TRAJ_DONE_MARKER in line:
+                        task_done = True
         except OSError:
             continue
         if config_name:
-            out[config_name] = {"task_idx": idx, "status": status or "任务异常", "code": code}
+            out[config_name] = {"task_idx": idx, "status": status or "任务异常",
+                                "code": code, "task_done": task_done}
     return out
 
 
 # ============ 单任务日志（按需，仅补齐缺失 config 的 status/code） ============
 
 def _read_task_log_for(inst: dict, task_idx: int) -> dict:
-    """读单个 task-<idx>.log，返回 {task_idx, config_name, status, code}（读不到返回空 dict）。"""
-    log = os.path.join(os.path.dirname(inst["config_path"]),
-                       "outputs", "config", "logs", f"task-{task_idx}.log")
+    """读单个 task-<idx>.log，返回 {task_idx, config_name, status, code, task_done}。
+
+    task_done = 主 log 含「Task_Done」标记，供无 tsr 时的日志兜底分级判断任务是否完成。
+    读不到返回空 dict。
+    """
+    log = _task_log_path(inst, task_idx)
     if not os.path.isfile(log):
         return {}
     config_name = status = code = None
+    task_done = False
     try:
         with open(log, errors="replace") as f:
             for line in f:
@@ -317,18 +366,25 @@ def _read_task_log_for(inst: dict, task_idx: int) -> dict:
                 if ms:
                     status = ms.group("status")
                     code = ms.group("code")
+                if not task_done and oa.TRAJ_DONE_MARKER in line:
+                    task_done = True
     except OSError:
         return {}
     return {"task_idx": task_idx, "config_name": config_name,
-            "status": status or "任务异常", "code": code}
+            "status": status or "任务异常", "code": code, "task_done": task_done}
 
 
-def _fetch_tsr_entries_fast(obsutil: str, task_obs: str, origin: str) -> list[dict]:
+def _fetch_tsr_entries_fast(obsutil: str, task_obs: str, origin: str,
+                            instance_harness_type: str | None = None) -> list[dict]:
     """补全专用快路径：拉单个 task 的 logs/traj_stats_result.json（约 1KB）→ tsr entries。
 
     本地已有同源 tsr 缓存时直接读不重复下载（-f 强制覆盖会浪费 OBS 往返）。
     返回 [] = 无 tsr / 解析失败（不慢路径下载，调用方占位）。task_done 不在这里拉
     （那是详情列，留深层按需；补全只关心分级所需的 tool_calls/plain_rounds）。
+
+    instance_harness_type: 实例 config.yaml 的 run_config.harness_type（如 openjiuwen/hermes/openclaw）。
+    注入给 harness_tsr_to_entries，覆盖 tsr 自身 harness_type 字段缺失时的 harness_home 猜测逻辑，
+    确保存量实例（tsr 无 harness_type 字段）也能按正确框架分级。
     """
     task_obs = task_obs if task_obs.endswith("/") else task_obs + "/"
     leaf = task_obs.rstrip("/").rsplit("/", 1)[-1]
@@ -359,6 +415,10 @@ def _fetch_tsr_entries_fast(obsutil: str, task_obs: str, origin: str) -> list[di
         return []
     if not isinstance(data, dict):
         return []
+    # tsr 自身无 harness_type 字段时（存量实例），用实例级 instance_harness_type 补填，
+    # 避免 harness_tsr_to_entries 回退到 harness_home 路径猜测（openjiuwen 写 ~/.openclaw 导致误判）。
+    if instance_harness_type and not data.get("harness_type"):
+        data = dict(data, harness_type=instance_harness_type)
     entries = oa.harness_tsr_to_entries(data, task_obs=task_obs)
     print(f"    [tsr-cache] {leaf}: 解析出 {len(entries)} 条 entry", flush=True)
     return entries
@@ -390,6 +450,9 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
     要么 failed 占位——不会残留 NULL 缺口（对无轨迹的故障行退出队列，避免每轮重扫）。
     """
     obs_base = _make_obs_base_for(inst)
+    # 实例级 harness 类型：占位行与 compute_level 的 harness 兜底都用它，避免一律写死 openclaw
+    # （存量实例 tsr 无 harness_type 字段时，靠这个值定级；也用于无 tsr 占位行的 harness 列）。
+    inst_ht = _instance_harness_type(inst)
     with get_connection() as conn:
         gaps = [dict(r) for r in conn.execute(
             "SELECT config_name, task_idx, status, error_code "
@@ -439,26 +502,41 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
                 _insert_task_record_placeholder(inst, config_name, meta)
                 _upsert_traj_record(inst, {"config_name": config_name},
                                     meta.get("task_idx"), config_name,
-                                    "failed", "openclaw", {}, None,
+                                    "failed", inst_ht, {}, None,
                                     traj_name=leaf, shallow_status="empty",
                                     shallow_error="OBS 无轨迹目录")
                 return 0
             # 补全专用快路径：只拉 tsr（约 1KB），不下载主 log / 不慢路径下载整轨迹。
-            entries = _fetch_tsr_entries_fast(obsutil, task_obs, origin)
+            entries = _fetch_tsr_entries_fast(obsutil, task_obs, origin, inst_ht)
             if not entries:
-                # 无有效 tsr：不慢路径下载（补全不能因大轨迹卡死整轮）。写占位行：
+                # 无有效 tsr（缺失/空壳）：先从实例本地日志兜底判分级——含「Task_Done」
+                # 标记即视为任务完成，至少 L1.5（零 OBS 成本，读 task-<idx>.log）。传
+                # meta["status"] 以便旧版 harness 采信「所有任务执行完成!」标识。
+                fb = oa.log_fallback_grade(_task_log_path(inst, meta.get("task_idx") or 0),
+                                           inst_ht, meta.get("status"))
+                if fb:
+                    fb_entry, fb_level = fb
+                    _insert_task_record_placeholder(inst, config_name, meta, level=fb_level)
+                    _upsert_traj_record(inst, {"config_name": config_name},
+                                        meta.get("task_idx"), config_name,
+                                        fb_level, fb_entry.get("harness", inst_ht),
+                                        fb_entry, None, traj_name=leaf,
+                                        shallow_status="log_fallback",
+                                        shallow_error="无有效 tsr，日志兜底")
+                    return 1
+                # 日志也无 Task_Done：不慢路径下载（补全不能因大轨迹卡死整轮）。写占位行：
                 #   task_records: status 取日志、traj_level='failed'（不可分级，不进漏斗）
                 #   task_traj_records: status='done'、无路径 → 点会话时 trigger_deep 置
                 #     pending → 深层按需下载解析（否则 trigger_deep 404「无轨迹记录」）
                 _insert_task_record_placeholder(inst, config_name, meta)
                 _upsert_traj_record(inst, {"config_name": config_name},
                                     meta.get("task_idx"), config_name,
-                                    "failed", "openclaw", {}, None,
+                                    "failed", inst_ht, {}, None,
                                     traj_name=leaf, shallow_status="error",
                                     shallow_error="OBS 有目录但无有效 tsr")
                 return 0
             entry = entries[0]
-            level = oa.compute_level(entry.get("harness", "openclaw"),
+            level = oa.compute_level(entry.get("harness", inst_ht),
                                      entry.get("tool_calls", 0),
                                      entry.get("plain_rounds", 0),
                                      entry.get("evaluator_completion"))
@@ -468,7 +546,7 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
                 leaf2 = os.path.basename(str(e.get("task") or "")).rstrip("/") or leaf
                 _upsert_traj_record(inst, {"config_name": config_name},
                                     meta.get("task_idx"), config_name,
-                                    level, e.get("harness", "openclaw"),
+                                    level, e.get("harness", inst_ht),
                                     e, e.get("trajectory"), traj_name=leaf2,
                                     shallow_status="processed")
             return 1
@@ -614,6 +692,37 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
     except Exception as e:
         print(f"    [warn] {inst['id']} 枚举 OBS task 目录失败: {e}", flush=True)
     is_running = inst["status"] == "running"
+    # 实例级 harness 类型：占位行 harness 列与 compute_level 兜底都用它，避免写死 openclaw。
+    inst_ht = _instance_harness_type(inst)
+
+    def grade_log_fallback_or_failed(inst: dict, config_name: str, task_idx,
+                                     ht: str, shallow_status: str,
+                                     shallow_error: str,
+                                     status: str | None = None) -> bool:
+        """无有效 tsr 时的统一落库：先本地日志兜底（Task_Done → ≥L1.5），否则 failed 占位。
+
+        返回 True = 日志兜底成功分级；False = failed 占位。读本地 task-<idx>.log（零 OBS
+        成本），覆盖 openjiuwen 老镜像写空壳 tsr 等场景。task_records 已有行用
+        _apply_level_to_task_records 回填，无行用 _insert_task_record_placeholder 补齐。
+        status = 已知任务执行状态（task_records.status），传给 log_fallback_grade 以便对
+        旧版 harness 采信「所有任务执行完成!」标识（需与「任务成功」互相印证）。
+        """
+        leaf = os.path.splitext(config_name)[0]
+        fb = oa.log_fallback_grade(_task_log_path(inst, task_idx or 0), ht, status)
+        if fb:
+            fb_entry, fb_level = fb
+            _apply_level_to_task_records(inst, config_name, fb_level, fb_entry)
+            _upsert_traj_record(inst, {"config_name": config_name}, task_idx, config_name,
+                                fb_level, fb_entry.get("harness", ht), fb_entry, None,
+                                traj_name=leaf, shallow_status="log_fallback",
+                                shallow_error="无有效 tsr，日志兜底")
+            return True
+        _apply_level_to_task_records(inst, config_name, "failed")
+        _upsert_traj_record(inst, {"config_name": config_name}, task_idx, config_name,
+                            "failed", ht, {}, None,
+                            traj_name=leaf, shallow_status=shallow_status,
+                            shallow_error=shallow_error)
+        return False
 
     def _grade_one_task(r: dict) -> tuple[int, int, str]:
         """处理一个 task 行：OBS 下载/解析（I/O 密集）+ 写库。返回 (ok|fail, 0, config_name)。
@@ -636,26 +745,21 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
             # OBS 侧无对应 task 目录。running 实例轨迹可能尚未上传 → 保持 NULL 下轮重试；
             # 其他状态（preparing 终态/stopped）轨迹已失效 → 标 empty 一次到位，不反复重扫。
             if not is_running:
-                _apply_level_to_task_records(inst, config_name, "failed")
-                _upsert_traj_record(inst, {"config_name": config_name},
-                                    r.get("task_idx"), config_name,
-                                    "failed", "openclaw", {}, None,
-                                    traj_name=leaf, shallow_status="empty",
-                                    shallow_error="OBS 无轨迹目录")
+                grade_log_fallback_or_failed(inst, config_name, r.get("task_idx"),
+                                             inst_ht, "empty", "OBS 无轨迹目录",
+                                             r.get("status"))
             return (0, 0, config_name)
         try:
-            entries = oa._load_per_task_entries(obsutil, task_obs, origin)
+            entries = oa._load_per_task_entries(obsutil, task_obs, origin,
+                                                instance_harness_type=inst_ht)
             if not entries:
-                _apply_level_to_task_records(inst, config_name, "failed")
-                _upsert_traj_record(inst, {"config_name": config_name},
-                                    r.get("task_idx"), config_name,
-                                    "failed", "openclaw", {}, None,
-                                    traj_name=leaf, shallow_status="error",
-                                    shallow_error="OBS 有目录但无有效 tsr")
+                grade_log_fallback_or_failed(inst, config_name, r.get("task_idx"),
+                                             inst_ht, "error", "OBS 有目录但无有效 tsr",
+                                             r.get("status"))
                 return (0, 1, config_name)
             # 每 task 通常只有 1 条 entry（assistant 主轨迹）；多条时逐条落，等级按第一条
             entry = entries[0]
-            level = oa.compute_level(entry.get("harness", "openclaw"),
+            level = oa.compute_level(entry.get("harness", inst_ht),
                                      entry.get("tool_calls", 0),
                                      entry.get("plain_rounds", 0),
                                      entry.get("evaluator_completion"))
@@ -666,14 +770,14 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
                 # entry 不含 traj_name/config_name 列（只有 task=leaf），显式传入 leaf
                 leaf2 = os.path.basename(str(e.get("task") or "")).rstrip("/") or stem
                 _upsert_traj_record(inst, e, r.get("task_idx"), config_name,
-                                    level, e.get("harness", "openclaw"),
+                                    level, e.get("harness", inst_ht),
                                     e, e.get("trajectory"), traj_name=leaf2,
                                     shallow_status="processed")
             return (1, 0, config_name)
         except Exception as e:
             _upsert_traj_record(inst, {"config_name": config_name},
                                 r.get("task_idx"), config_name,
-                                "failed", "openclaw", {}, None,
+                                "failed", inst_ht, {}, None,
                                 traj_name=leaf, shallow_status="error",
                                 shallow_error=str(e)[:300])
             print(f"    [fail] {inst['id']} {config_name}: {e}", flush=True)

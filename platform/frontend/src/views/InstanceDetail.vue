@@ -479,7 +479,7 @@
                   <el-option label="L1.5" value="L1.5" /><el-option label="L2" value="L2" />
                   <el-option label="L3" value="L3" />
                   <el-option label="未评估" value="unevaluated" />
-                  <el-option label="失败" value="fail" />
+                  <el-option label="未分级" value="fail" />
                 </el-select>
                 <el-input v-model="taskKeyword" size="small" placeholder="搜索会话..." clearable
                   style="width:200px">
@@ -503,7 +503,7 @@
                   v-if="row.traj_level && row.traj_level !== 'failed'">
                   {{ row.traj_level }}
                 </el-tag>
-                <el-tag v-else-if="row.traj_level === 'failed'" size="small" type="danger" effect="plain">失败</el-tag>
+                <el-tag v-else-if="row.traj_level === 'failed'" size="small" type="info" effect="plain">未分级</el-tag>
                 <el-tag v-else size="small" type="info" effect="plain">未评估</el-tag>
               </template>
             </el-table-column>

@@ -222,8 +222,14 @@ async def shallow_tasks(
 
 # ============ 深层 ============
 
-# 漏斗等级（批量入队的合法 traj_level；failed / NULL 不入队）
+# 漏斗等级（批量入队的合法 traj_level）
 _ENQUEUE_LEVELS = _TRAJ_LEVELS
+# 深层入队额外放行 'failed'：这一类是"有日志无轨迹"的任务（工具全失败/无助手回复/
+# 任务未跑完），轨迹列恒 NULL；旧逻辑把它们排除，导致批量下载永远拉不到、详情页
+# 只能靠单点触发。其下载量极小（主 log + 可选 gateway/eval + tsr，无轨迹文件），
+# 放行后批量按钮即可让这类任务的日志一并可见。level IS NULL（浅层未分级）仍排除——
+# 那批可能还没有 OBS 目录，量也可能极大，交给单点触发。
+_ENQUEUE_LEVELS_DEEP = _TRAJ_LEVELS + ["failed"]
 
 # ⚠ 静态批量端点（enqueue_all/queue）必须定义在参数路由 {traj_name} 之前，
 #   否则 FastAPI 按注册序匹配，POST /deep/enqueue_all 会被 trigger_deep 的
@@ -232,21 +238,29 @@ _ENQUEUE_LEVELS = _TRAJ_LEVELS
 
 @router.post("/{instance_id}/deep/enqueue_all")
 async def deep_enqueue_all(instance_id: str, user: dict = Depends(require_operator)):
-    """把该实例所有已分级（L0-L3）且未下载的行批量置 pending 入队。
+    """把该实例所有已分级（L0-L3 + failed）且未下载的行批量置 pending 入队。
 
     与单会话 trigger_deep 同款幂等保护：
       - 已 downloading 的不打断（跳过）
-      - 已有 assistant_traj_path（此前下载成功）的跳过，不重复拉 OBS
-      - failed / level IS NULL 的行不参与（无轨迹或不可分级）
+      - 已有任一深层路径列（此前下载成功过）的跳过，不重复拉 OBS
+      - level IS NULL（浅层未分级，可能还没有 OBS 目录）的行不参与
+      - 'failed' 行参与：这类是"有日志无轨迹"的任务，下载量极小（主 log + 可选
+        gateway/eval + tsr），放行后其日志也能在详情页直接看到。
     返回 {queued, skipped_done, skipped_downloading, skipped_ungraded, total}。
     """
     inst = _get_instance(instance_id)
-    level_ph = ",".join("?" for _ in _ENQUEUE_LEVELS)
+    level_ph = ",".join("?" for _ in _ENQUEUE_LEVELS_DEEP)
+    # "已下载"判据 = 5 个路径列任一非空（worker 下载成功后回填）。不能只看
+    # assistant_traj_path：logs-only 任务（无轨迹）下载成功后该列仍为 NULL，
+    # 只看它会把这类行每轮重复入队、重复拉 OBS。
+    _any_path = ("(assistant_traj_path IS NOT NULL OR evaluator_traj_path IS NOT NULL "
+                 "OR task_log_path IS NOT NULL OR gateway_log_path IS NOT NULL "
+                 "OR eval_log_path IS NOT NULL)")
     with get_connection() as conn:
-        # 已 done 且已下载过（有路径）——批量入队时跳过，不重复下载
+        # 已 done 且已下载过（有任一路径）——批量入队时跳过，不重复下载
         skipped_done = conn.execute(
-            "SELECT COUNT(*) FROM task_traj_records "
-            "WHERE instance_id=? AND assistant_traj_path IS NOT NULL AND status='done'",
+            f"SELECT COUNT(*) FROM task_traj_records "
+            f"WHERE instance_id=? AND {_any_path} AND status='done'",
             (instance_id,),
         ).fetchone()[0]
         # 正在下载的——不打断
@@ -255,20 +269,19 @@ async def deep_enqueue_all(instance_id: str, user: dict = Depends(require_operat
             "WHERE instance_id=? AND status='downloading'",
             (instance_id,),
         ).fetchone()[0]
-        # 入队：L0-L3 且未下载（无路径）且未 downloading 的行 → pending
+        # 入队：L0-L3 + failed 且未下载（无任一路径）且未 downloading 的行 → pending
         cur = conn.execute(
             f"UPDATE task_traj_records SET status='pending', updated_at=CURRENT_TIMESTAMP "
             f"WHERE instance_id=? AND level IN ({level_ph}) "
-            f"AND assistant_traj_path IS NULL AND status NOT IN ('downloading')",
-            (instance_id, *_ENQUEUE_LEVELS),
+            f"AND NOT {_any_path} AND status NOT IN ('downloading')",
+            (instance_id, *_ENQUEUE_LEVELS_DEEP),
         )
         conn.commit()
     queued = cur.rowcount or 0
     with get_connection() as conn:
         skipped_ungraded = conn.execute(
-            "SELECT COUNT(*) FROM task_traj_records "
-            "WHERE instance_id=? AND (level IS NULL OR level='failed') "
-            "AND assistant_traj_path IS NULL",
+            f"SELECT COUNT(*) FROM task_traj_records "
+            f"WHERE instance_id=? AND level IS NULL AND NOT {_any_path}",
             (instance_id,),
         ).fetchone()[0]
     return {
@@ -334,15 +347,19 @@ async def trigger_deep(instance_id: str, traj_name: str,
     inst = _get_instance(instance_id)
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT id, status, assistant_traj_path FROM task_traj_records "
-            "WHERE instance_id=? AND traj_name=?",
+            "SELECT id, status, assistant_traj_path, evaluator_traj_path, "
+            "task_log_path, gateway_log_path, eval_log_path "
+            "FROM task_traj_records WHERE instance_id=? AND traj_name=?",
             (instance_id, traj_name),
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404,
                                 detail=f"无轨迹记录: {traj_name}（浅层分级可能尚未完成）")
-        # 路径列已齐全（此前下载成功过）→ 恢复 done，不重复下载
-        if row["assistant_traj_path"]:
+        # 任一路径列已回填（此前下载成功过）→ 恢复 done，不重复下载。
+        # 判据取全部 5 列而非只 assistant_traj_path：logs-only 任务（无轨迹）下载成功后
+        # assistant_traj_path 仍为 NULL，只看它会把这类行反复重下。
+        if any(row[k] for k in ("assistant_traj_path", "evaluator_traj_path",
+                                "task_log_path", "gateway_log_path", "eval_log_path")):
             conn.execute(
                 "UPDATE task_traj_records SET status='done', updated_at=CURRENT_TIMESTAMP "
                 "WHERE id=?",
@@ -378,6 +395,48 @@ async def deep_status(instance_id: str, traj_name: str,
     return dict(row)
 
 
+def _resolve_task_dir(inst: dict, tr: dict, cache_root: str) -> str | None:
+    """定位某 task 的本地缓存目录（deep_detail / deep_extra_log 共用），无则 None。
+
+    优先级：
+      1. assistant_traj_path / trajectory_rel —— worker 深层回填的缓存绝对路径，或浅层
+         写入的 OBS 相对路径。取 traj_name 第一次出现处前缀（obsutil cp -r 保留 leaf 目录，
+         日志落父层，故取父层而非子层）。
+      2. cache_root/<traj_name> —— 退化，直接以任务名为目录名。
+      3. 实例 OBS 根（config_snapshot → 磁盘 config.yaml）派生 —— logs-only 任务兜底：
+         失败/无回复的任务不写轨迹，前两列恒为 NULL，但日志始终存在（worker 已回填
+         *_log_path）。仅靠 1/2 无法定位，详情恒 409；此路现算 <cache>/<batch>/…/<traj_name>。
+    """
+    from src import offline_analysis as oa
+
+    traj_name = tr.get("traj_name") or tr.get("config_name") or ""
+    for rel in (tr.get("assistant_traj_path"), tr.get("trajectory_rel")):
+        if not rel:
+            continue
+        rparts = (rel.replace(cache_root, "", 1).lstrip("/") if rel.startswith(cache_root)
+                  else rel).split("/")
+        idx = rparts.index(traj_name) if traj_name in rparts else -1
+        if idx >= 0:
+            candidate = os.path.join(cache_root, *rparts[:idx + 1])
+            if os.path.isdir(candidate):
+                return candidate
+    candidate = os.path.join(cache_root, traj_name)
+    if os.path.isdir(candidate):
+        return candidate
+    obs_base = oa.obs_base_from_snapshot(inst.get("config_snapshot"))
+    if not obs_base:
+        try:
+            from offline.output_worker import _obs_base_path
+            obs_base = _obs_base_path(inst["config_path"])
+        except Exception:
+            obs_base = None
+    if obs_base:
+        candidate = oa.task_cache_dir(cache_root, obs_base, traj_name)
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
 @router.get("/{instance_id}/deep/{traj_name}/detail")
 async def deep_detail(instance_id: str, traj_name: str,
                       user: dict = Depends(get_current_user)):
@@ -397,40 +456,24 @@ async def deep_detail(instance_id: str, traj_name: str,
     tr = dict(tr)
 
     cache_root = os.path.abspath(settings.OUTPUT_CACHE)
-    # 任务目录判定优先级：
-    #   1. assistant_traj_path（worker 深层下载后回填的缓存绝对路径，obsutil cp 保留
-    #      OBS leaf 目录 → "<batch>/<leaf>/<leaf>/projects/..."，取 traj_name 最后出现处前缀）
-    #   2. trajectory_rel（浅层写入的 OBS 路径，<batch...>/<leaf>/...，取 leaf 前缀）
-    task_dir = None
-    for rel in (tr.get("assistant_traj_path"), tr.get("trajectory_rel")):
-        if not rel:
-            continue
-        rparts = (rel.replace(cache_root, "", 1).lstrip("/") if rel.startswith(cache_root)
-                  else rel).split("/")
-        # traj_name 在 rel 中第一次出现处：任务目录 = cache_root + 此前缀。
-        # 注：obsutil cp -r 会保留 OBS leaf 目录 → 深层下载后本地是 <batch>/<leaf>/<leaf>/… 双层嵌套，
-        #     assistant_traj_path 指向子层；但日志（run.log/gateway.log/evaluator_use.log）落在父层 dest。
-        #     故取「第一次出现」（=父层任务根）而非最后一次（=子层），否则读不到父层日志。
-        #     浅层 trajectory_rel 为 <batch>/<leaf>/agents/… 时第一次出现即任务根，同样正确。
-        idx = rparts.index(tr["traj_name"]) if tr["traj_name"] in rparts else -1
-        if idx >= 0:
-            candidate = os.path.join(cache_root, *rparts[:idx + 1])
-            if os.path.isdir(candidate):
-                task_dir = candidate
-                break
-    if task_dir is None:
-        # 退化：直接以 traj_name 为目录名
-        candidate = os.path.join(cache_root, tr["traj_name"])
-        if os.path.isdir(candidate):
-            task_dir = candidate
+    from src import offline_analysis as oa
+    task_dir = _resolve_task_dir(inst, tr, cache_root)
     if task_dir is None:
         raise HTTPException(status_code=409,
                             detail="本地缓存不存在，请先 POST /deep/{traj_name} 触发下载")
 
     try:
-        from src import offline_analysis as oa
+        # harness 以实例为准（config_snapshot 的 run_config.harness_type）：task_traj_records.harness
+        # 是浅层分级时写的，存量行可能因旧版写死 openclaw 而失真（openjiuwen 实例 tsr 无
+        # harness_type 字段，曾回退 harness_home 猜测）。实例级最准，回退行值。
+        inst_harness = None
+        try:
+            from offline.output_worker import _instance_harness_type
+            inst_harness = _instance_harness_type(inst)
+        except Exception:
+            inst_harness = None
         detail = oa.load_task_detail(task_dir, traj_name,
-                                     known_harness=tr.get("harness"))
+                                     known_harness=inst_harness or tr.get("harness"))
         # 本地是否有真实 assistant 轨迹文件（多候选取最大者；任务确无回复时 OBS 无轨迹，为 None）
         has_traj_file = bool(oa.find_primary_assistant_trajectory(task_dir))
         if has_traj_file:
@@ -472,14 +515,18 @@ async def deep_detail(instance_id: str, traj_name: str,
     # 深层下载状态：以 DB 5 个路径列是否回填为准（worker 下载成功后落列）。
     # 全 NULL = 深层从未成功回填（即便本地残留旧版缓存的轨迹文件），判 not_downloaded，
     # 前端据 deep_status 触发重新下载补齐（网关/eval 日志随重构后的下载一并落盘并回填）。
+    # 例外：缓存目录是本次由实例 OBS 根派生定位到的（deep_paths 全 NULL 但本地确有主日志）——
+    # 说明深层其实跑过、只是路径列未回填（存量行），本地已有可展示内容，判 downloaded
+    # 避免前端无谓地再触发一次下载、也避免 409 轮询空转。
     deep_paths = [tr.get(k) for k in (
         "assistant_traj_path", "evaluator_traj_path",
         "task_log_path", "gateway_log_path", "eval_log_path")]
-    deep_status = ("downloaded" if any(deep_paths) else "not_downloaded")
+    local_log = oa.find_primary_log(task_dir, traj_name)
+    deep_status = ("downloaded" if any(deep_paths) or local_log else "not_downloaded")
 
     return {
         "traj_name": traj_name,
-        "harness": tr.get("harness") or detail.get("harness"),
+        "harness": inst_harness or tr.get("harness") or detail.get("harness"),
         "deep_status": deep_status,
         "deep_error": tr.get("error"),
         "assistant_stats": detail.get("assistant_stats"),
@@ -489,6 +536,7 @@ async def deep_detail(instance_id: str, traj_name: str,
         "log": detail.get("log"),
         "gateway": detail.get("gateway"),
         "eval_use_log": detail.get("eval_use_log"),
+        "extra_logs": detail.get("extra_logs") or [],
         "verdict": detail.get("verdict"),
         "paths": {
             "assistant_traj_path": tr.get("assistant_traj_path"),
@@ -498,6 +546,48 @@ async def deep_detail(instance_id: str, traj_name: str,
             "eval_log_path": tr.get("eval_log_path"),
         },
     }
+
+
+@router.get("/{instance_id}/deep/{traj_name}/log")
+async def deep_extra_log(instance_id: str, traj_name: str,
+                         path: str = Query(..., description="extra_logs 里的容器相对路径"),
+                         user: dict = Depends(get_current_user)):
+    """读取任务目录下某个「其他日志」的尾部文本（详情页「其他日志」下拉切换时按需拉取）。
+
+    path 必须落在该任务的本地缓存目录内（防路径穿越读任意文件）；只读本地缓存，不触发下载。
+    任务目录定位逻辑与 deep_detail 一致（路径列 → traj_name 目录 → 实例 OBS 根派生）。
+    """
+    from src import offline_analysis as oa
+
+    inst = _get_instance(instance_id)
+    with get_connection() as conn:
+        tr = conn.execute(
+            "SELECT traj_name, assistant_traj_path, trajectory_rel FROM task_traj_records "
+            "WHERE instance_id=? AND traj_name=?",
+            (instance_id, traj_name),
+        ).fetchone()
+    if not tr:
+        raise HTTPException(status_code=404, detail=f"无轨迹记录: {traj_name}")
+
+    cache_root = os.path.abspath(settings.OUTPUT_CACHE)
+    task_dir = _resolve_task_dir(inst, dict(tr), cache_root)
+    if not task_dir:
+        raise HTTPException(status_code=409,
+                            detail="本地缓存不存在，请先 POST /deep/{traj_name} 触发下载")
+
+    # 归一化后必须仍在 task_dir 内（realpath 比较，防 ../ 穿越与软链出逃）
+    target = os.path.realpath(os.path.join(task_dir, path))
+    root = os.path.realpath(task_dir)
+    if not (target == root or target.startswith(root + os.sep)):
+        raise HTTPException(status_code=400, detail="非法日志路径")
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=404, detail=f"日志不存在: {path}")
+
+    listed = {e["path"] for e in oa.list_extra_logs(task_dir, traj_name)}
+    if path not in listed and os.path.relpath(target, root) not in listed:
+        raise HTTPException(status_code=404, detail=f"不在可读日志清单内: {path}")
+    return {"traj_name": traj_name, "path": path,
+            "tail": oa._tail_text(target, oa._LOG_MAX_BYTES)}
 
 
 # ============ 模型配置 / 用户模拟配置信息面板 ============

@@ -90,6 +90,28 @@ def _make_openclaw_traj_flat(path: str) -> str:
     return _write(path, "".join(json.dumps(l, ensure_ascii=False) + "\n" for l in lines))
 
 
+def _make_openjiuwen_query(path: str, n_tool_turns: int = 2, n_plain_turns: int = 1) -> str:
+    """构造 openjiuwen 轨迹（logs/trajectories/<run_id>/query<N>.json，turns[] 顶层 tool_calls[]）。"""
+    turns = []
+    turn_no = 1
+    for i in range(n_tool_turns):
+        turns.append({
+            "turn": turn_no, "user_input": f"第{turn_no}轮问", "agent_content": f"第{i}轮答",
+            "tool_calls": [{"tool": "search", "input": {"q": str(i)}, "output": f"结果{i}"}],
+            "files": [], "stop_reason": "complete", "evidence_incomplete": False,
+        })
+        turn_no += 1
+    for _ in range(n_plain_turns):
+        turns.append({
+            "turn": turn_no, "user_input": "继续", "agent_content": "无工具收尾",
+            "tool_calls": [], "files": [], "stop_reason": "complete", "evidence_incomplete": False,
+        })
+        turn_no += 1
+    data = {"query": "Q", "agent_name": "main", "turns": turns,
+            "outcome": "done", "evaluations": []}
+    return _write(path, json.dumps(data, ensure_ascii=False))
+
+
 class TestComputeLevel(unittest.TestCase):
     """S5: compute_level 单 authority 判定。"""
 
@@ -134,8 +156,60 @@ class TestDetectHarness(unittest.TestCase):
             oa.detect_harness(["agents/main/sessions/2026-01-01.jsonl",
                                "agents/evaluator/sessions/x.jsonl"]), "openclaw")
 
+    def test_openjiuwen_layout(self):
+        self.assertEqual(
+            oa.detect_harness(["logs/trajectories/20260910T170528/query1.json",
+                               "logs/traj_stats_result.json"]), "openjiuwen")
+
     def test_empty_fallback(self):
-        self.assertIn(oa.detect_harness([]), ("openclaw", "hermes", "unknown"))
+        self.assertIn(oa.detect_harness([]), ("openclaw", "hermes", "openjiuwen", "unknown"))
+
+
+class TestOpenjiuwenParser(unittest.TestCase):
+    """openjiuwen query<N>.json → analyze_openjiuwen_turns 逐轮统计。"""
+
+    def test_synthetic(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _make_openjiuwen_query(os.path.join(d, "query1.json"))
+            r = oa.analyze_openjiuwen_turns(p)
+            self.assertEqual(r["tool_calls"], 2)
+            self.assertEqual(r["plain_rounds"], 1)
+            self.assertEqual(r["assistant_rounds"], 3)
+
+    def test_plain_rounds_requires_no_toolcalls(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _make_openjiuwen_query(os.path.join(d, "query1.json"),
+                                       n_tool_turns=0, n_plain_turns=2)
+            r = oa.analyze_openjiuwen_turns(p)
+            self.assertEqual(r["tool_calls"], 0)
+            self.assertEqual(r["plain_rounds"], 2)
+
+    def test_gate_openjiuwen_is_not_openclaw(self):
+        # openjiuwen 落顶层 tool_calls[]，旧统计常得 0；L1 门槛应「有产出即过」，不是 openclaw 的 ≥3。
+        self.assertEqual(oa.compute_level("openjiuwen", 0, 1), "L1")
+        self.assertEqual(oa.compute_level("openjiuwen", 2, 1), "L1")
+        self.assertEqual(oa.compute_level("openjiuwen", 0, 0), "L0")
+
+    def test_find_and_plan(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _make_openjiuwen_query(
+                os.path.join(d, "logs", "trajectories", "20260910T170528", "query1.json"),
+                n_tool_turns=2, n_plain_turns=1)
+            self.assertEqual(oa.find_openjiuwen_sessions(d), [p])
+            self.assertEqual(oa.find_primary_assistant_trajectory(d), p)
+            # OBS 对象枚举 → 精确 plan 相对路径
+            rel = "logs/trajectories/20260910T170528/query1.json"
+            keys = [f"obs://b/x/task_task_30/{rel}", "obs://b/x/task_task_30/workdir/run.log"]
+            self.assertEqual(oa._plan_traj_rels(keys, "obs://b/x/task_task_30/"), [rel])
+
+    def test_parse_blocks(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _make_openjiuwen_query(os.path.join(d, "query1.json"))
+            blocks = oa.parse_openjiuwen_trajectory(p)
+            types = [b["part_type"] for b in blocks]
+            # 每轮: user(text) → assistant(text) → toolCall(s)；构造 2 工具轮 + 1 纯轮
+            self.assertEqual(types.count("toolCall"), 2)
+            self.assertEqual(types[0], "text")
 
 
 class TestHermesParser(unittest.TestCase):
@@ -276,6 +350,165 @@ class TestCacheLayout(unittest.TestCase):
         # 无 task_obs → 旧式 <task>/相对路径（backward compat）
         e2 = tp.harness_tsr_to_entries(d)
         self.assertEqual(e2[0]["trajectory"], "agents/main/sessions/x.jsonl")
+
+
+class TestObsBaseFromSnapshot(unittest.TestCase):
+    """config_snapshot → OBS 根 → 本地缓存目录（logs-only 任务的详情定位兜底）。"""
+
+    SNAP = (
+        "global:\n  logger:\n    name: test\n"
+        "run_config:\n  harness_type: openjiuwen\n"
+        "  obs:\n"
+        "    traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp\n"
+        "    traj_save_path: openjiuwen_trajs/traj_admin2609101705\n"
+    )
+
+    def test_base_from_snapshot(self):
+        self.assertEqual(oa.obs_base_from_snapshot(self.SNAP),
+                         "obs://s3-asset-b-hd-cce-aifm-nlp-exp/"
+                         "openjiuwen_trajs/traj_admin2609101705/")
+
+    def test_base_trailing_slash_normalized(self):
+        snap = self.SNAP.replace("traj_admin2609101705",
+                                 "openjiuwen_trajs/").replace(
+            "traj_save_path: openjiuwen_trajs/openjiuwen_trajs/",
+            "traj_save_path: /openjiuwen_trajs/")
+        self.assertTrue(oa.obs_base_from_snapshot(snap).endswith("/"))
+
+    def test_base_none_on_missing(self):
+        self.assertIsNone(oa.obs_base_from_snapshot(None))
+        self.assertIsNone(oa.obs_base_from_snapshot(""))
+        self.assertIsNone(oa.obs_base_from_snapshot("run_config: {harness_type: pi}\n"))
+        self.assertIsNone(oa.obs_base_from_snapshot("not: [valid: yaml"))
+
+    def test_task_cache_dir_matches_download_rule(self):
+        # 与 download_task_detail / _cache_subdir_for 同规则：丢桶名 + 丢属主段。
+        # obs_base 恒含属主前缀（<bucket>/<owner>/<batch>/…），故首段总是被丢弃。
+        base = "obs://b/owner/batch_x/"
+        self.assertEqual(oa.task_cache_dir("/cache", base, "task_task_28204"),
+                         os.path.join("/cache", "batch_x", "task_task_28204"))
+        # 多级 batch 前缀（属主/多段批次）整段保留在 batch 之后
+        base2 = "obs://b/owner/a/b/c/"
+        self.assertEqual(oa.task_cache_dir("/cache", base2, "t1"),
+                         os.path.join("/cache", "a", "b", "c", "t1"))
+
+
+class TestExtraLogs(unittest.TestCase):
+    """其他日志清单：只列非固定三类，去重主日志副本，大小降序。"""
+
+    def _mk(self, d, rel, content=""):
+        p = os.path.join(d, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+        return p
+
+    def test_lists_only_non_primary(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._mk(d, "workdir/run.log", "main")
+            self._mk(d, "workdir/gateway.log", "gw")
+            self._mk(d, "logs/evaluator_use.log", "eval")
+            self._mk(d, "logs/task_task_28204.log", "truncated copy")
+            self._mk(d, "task_task_28204/logs/logs/run/jiuwen.log", "j" * 100)
+            self._mk(d, "task_task_28204/logs/logs/llm.log", "l" * 50)
+            names = [os.path.basename(e["path"])
+                     for e in oa.list_extra_logs(d, "task_task_28204")]
+            self.assertEqual(names, ["jiuwen.log", "llm.log"])  # size desc
+            # 固定三类 + 主日志候选副本均不在列
+            self.assertNotIn("run.log", names)
+            self.assertNotIn("gateway.log", names)
+            self.assertNotIn("evaluator_use.log", names)
+            self.assertNotIn("task_task_28204.log", names)
+
+    def test_primary_fallback_also_excluded(self):
+        # 无 workdir/run.log 时主日志回退 logs/<task>.log —— 该文件本身也不得出现在其他日志
+        with tempfile.TemporaryDirectory() as d:
+            self._mk(d, "logs/t1.log", "main via fallback")
+            self._mk(d, "logs/run/jiuwen.log", "j" * 10)
+            names = [os.path.basename(e["path"])
+                     for e in oa.list_extra_logs(d, "t1")]
+            self.assertEqual(names, ["jiuwen.log"])
+
+    def test_empty_when_no_extra(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._mk(d, "workdir/run.log", "main")
+            self.assertEqual(oa.list_extra_logs(d, "t1"), [])
+
+
+class TestLogFallbackGrade(unittest.TestCase):
+    """无有效 tsr 时的日志兜底分级：Task_Done → ≥L1.5，家族门不适用，分数抬级。"""
+
+    def _mklog(self, d, body):
+        p = os.path.join(d, "task-4.log")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def test_no_marker_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._mklog(d, "[Evaluator] turn=1 agent=main 输出\n")
+            self.assertIsNone(oa.log_fallback_grade(p, "openjiuwen"))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(oa.log_fallback_grade("/no/such/log", "openjiuwen"))
+
+    def test_marker_no_eval_is_l1_5(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._mklog(d, "【Task_Done】\n")
+            e, lv = oa.log_fallback_grade(p, "openjiuwen")
+            self.assertEqual(lv, "L1.5")
+            self.assertTrue(e["task_done"])
+            self.assertTrue(e["passed_gate"])
+            self.assertFalse(e["has_eval"])
+            self.assertIsNone(e["evaluator_completion"])
+
+    def test_openclaw_family_never_below_l1_5(self):
+        # 家族门（tool_calls>=3）在兜底路径不适用：tool_calls 无从统计，不得打回 L0/L1
+        with tempfile.TemporaryDirectory() as d:
+            p = self._mklog(d, "【Task_Done】\n")
+            for ht in ("openclaw", "opencode", "claude-code", "hermes", "openjiuwen"):
+                _, lv = oa.log_fallback_grade(p, ht)
+                self.assertIn(lv, ("L1.5", "L2", "L3"),
+                              msg=f"{ht} 兜底不得低于 L1.5，实际 {lv}")
+
+    def test_score_maps_up_but_floor_l1_5(self):
+        body_tpl = (
+            "【Task_Done】\n"
+            "[Evaluator] turn=1 agent=main 输出\n"
+            "{\n"
+            '  "completion": %s\n'
+            "}\n"
+        )
+        cases = {"0.3": "L1.5", "0.5": "L2", "0.8": "L2", "1.0": "L3"}
+        for sc, want in cases.items():
+            with tempfile.TemporaryDirectory() as d:
+                p = self._mklog(d, body_tpl % sc)
+                e, lv = oa.log_fallback_grade(p, "openclaw")
+                self.assertEqual(lv, want, msg=f"score={sc} 期望 {want} 实际 {lv}")
+                self.assertTrue(e["has_eval"])
+                self.assertEqual(e["verdict_source"], "log")
+                self.assertEqual(e["evaluator_completion"], float(sc))
+
+    def test_legacy_marker_requires_success_status(self):
+        # 旧版 openclaw harness 用「所有任务执行完成!」；单用不可靠，须与「任务成功」互证
+        with tempfile.TemporaryDirectory() as d:
+            p = self._mklog(d, "所有任务执行完成!\n")
+            self.assertIsNone(oa.log_fallback_grade(p, "openclaw"),
+                              "无 status 时不得采信旧标识")
+            self.assertIsNone(oa.log_fallback_grade(p, "openclaw", "任务异常"),
+                              "非任务成功时不得采信旧标识")
+            e, lv = oa.log_fallback_grade(p, "openclaw", "任务成功")
+            self.assertEqual(lv, "L1.5")
+            self.assertTrue(e["task_done"])
+
+    def test_new_marker_ignores_status(self):
+        # 【Task_Done】是权威信号：无需 status 印证，任何 status 下都判完成
+        with tempfile.TemporaryDirectory() as d:
+            p = self._mklog(d, "【Task_Done】\n")
+            for st in (None, "任务成功", "任务异常", "任务失败"):
+                fb = oa.log_fallback_grade(p, "openclaw", st)
+                self.assertIsNotNone(fb, msg=f"status={st} 下新标识应判完成")
+                self.assertEqual(fb[1], "L1.5")
 
 
 class TestStaleTsr(unittest.TestCase):

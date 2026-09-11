@@ -43,6 +43,13 @@ from src.traj_pipeline import (  # noqa: E402
 )
 from src.traj_stats_light import has_task_done_marker  # noqa: E402
 
+# L1 门槛口径：openclaw 族（工具调用落 content parts）需 ≥3 工具调用 且 有纯轮；
+# 其余 harness（hermes/openjiuwen/codex/…，工具调用落顶层 tool_calls[]，旧统计常得 0）有产出即过。
+_OPENCLAW_FAMILY = {"openclaw", "opencode", "claude-code"}
+
+# openjiuwen 轨迹文件名：logs/trajectories/<run_id>/query<N>.json（executor.Trajectory.save 落盘）
+_OPENJIUWEN_TRAJ_RE = re.compile(r"^query\d+\.json$")
+
 # ============ 本地配置（output_cache / obsutil 路径，统一取自 .env） ============
 
 def _load_env_value(key: str) -> str | None:
@@ -111,6 +118,37 @@ def _cache_subdir_for(task_obs: str) -> str:
     return "/".join(parts[1:]) if len(parts) > 1 else rel
 
 
+def obs_base_from_snapshot(snapshot_text: str | None) -> str | None:
+    """从 task_instances.config_snapshot（config 全文）解析 OBS 轨迹根。
+
+    返回 "<traj_save_bucket>/<traj_save_path>/"（与 output_worker._obs_base_path 同口径），
+    解析失败/字段缺失返回 None。优先 config_snapshot 而非磁盘 config.yaml 的原因同
+    _instance_harness_type：快照是建实例时固化的全文，不依赖 /mnt/sfs_turbo 挂载——
+    实例迁移或配置文件被清理后仍能定位缓存目录（日志回显不受影响）。
+    """
+    if not snapshot_text:
+        return None
+    try:
+        import yaml
+        obs = (yaml.safe_load(snapshot_text) or {}).get("run_config", {}).get("obs") or {}
+    except Exception:
+        return None
+    bucket = obs.get("traj_save_bucket")
+    path = obs.get("traj_save_path")
+    if not bucket or not path:
+        return None
+    return f"{str(bucket).rstrip('/')}/{str(path).strip('/')}/"
+
+
+def task_cache_dir(cache_root: str, obs_base: str, traj_name: str) -> str:
+    """给定实例 OBS 根 + 任务名，算该任务本地缓存目录（绝对路径，不校验存在性）。
+
+    与 download_task_detail 落盘位置同规则：<cache_root>/<batch>/<...>/<traj_name>。
+    """
+    return os.path.join(cache_root, *_cache_subdir_for(
+        obs_base.rstrip("/") + "/" + traj_name.strip("/") + "/").split("/"))
+
+
 # 主日志统一为 workdir/run.log（见 memory obs-traj-formats：3 批次均最全正源）
 # 回退候选：traj_stats 旧逻辑读 logs/<task>.log / logs/harness_automation.log
 LOG_CANDIDATES = ("workdir/run.log", "logs/harness_automation.log", "logs/{task}.log")
@@ -164,7 +202,8 @@ def run_obsutil_cp(obsutil: str, src: str, dst: str, include=None, exclude=None,
 # ============ harness 判定 + 路径解析 ============
 
 def detect_harness(task_file_list: list[str]) -> str:
-    """按文件布局判定 harness：profiles/*/sessions/*.json → hermes；agents/*/sessions/*.jsonl → openclaw。
+    """按文件布局判定 harness：profiles/*/sessions/*.json → hermes；agents/*/sessions/*.jsonl → openclaw；
+    logs/trajectories/*/query<N>.json → openjiuwen。
 
     不用 harness_home（hermes 批次的 traj_stats_result.json 也写 /home/ma-user/.openclaw）。
     claude-code 布局（projects/<ws>/*.jsonl，顶层 type=assistant/user）归 openclaw 处理。
@@ -174,7 +213,15 @@ def detect_harness(task_file_list: list[str]) -> str:
     has_agents = any(("agents/" in p and "/sessions/" in p and p.endswith(".jsonl"))
                      or ("projects/" in p and p.endswith(".jsonl"))
                      for p in task_file_list)
-    return "hermes" if has_profiles else "openclaw" if has_agents else "unknown"
+    has_jiuwen = any(_OPENJIUWEN_TRAJ_RE.match(os.path.basename(p))
+                     and "trajectories" in p.split("/") for p in task_file_list)
+    if has_profiles:
+        return "hermes"
+    if has_agents:
+        return "openclaw"
+    if has_jiuwen:
+        return "openjiuwen"
+    return "unknown"
 
 
 def parse_task_obs_path(task_obs: str) -> tuple[str, str]:
@@ -268,6 +315,24 @@ def find_hermes_sessions(task_dir: str) -> list[str]:
     return cands
 
 
+def find_openjiuwen_sessions(task_dir: str) -> list[str]:
+    """openjiuwen：logs/trajectories/<run_id>/query<N>.json（每 query 一份轨迹）。
+
+    落盘由 executor.Trajectory.save 写入，结构 {query, agent_name, turns[], outcome,
+    evaluations}（见 openjiuwen src/evaluator/trajectory.py）。与 openclaw/hermes 的
+    sessions/*.json(l) 布局完全不同：工具调用落在 turn.tool_calls[]，无独立会话文件。
+    """
+    cands = []
+    for root, dirs, files in os.walk(task_dir):
+        rel = os.path.relpath(root, task_dir)
+        if "logs" not in rel.split(os.sep) or "trajectories" not in rel.split(os.sep):
+            continue
+        for fn in sorted(files):
+            if _OPENJIUWEN_TRAJ_RE.match(fn):
+                cands.append(os.path.join(root, fn))
+    return cands
+
+
 def list_task_trajectories(task_dir: str) -> list[dict]:
     """列出该 task 本地目录下的全部轨迹文件（assistant1/main/evaluator，两 harness）。
 
@@ -318,6 +383,14 @@ def list_task_trajectories(task_dir: str) -> list[dict]:
         for fn in sorted(files):
             if fn.endswith(".jsonl") and "trajectory" not in fn:
                 add(os.path.join(root, fn), "assistant", "解析取最大文件")
+    # openjiuwen：logs/trajectories/<run_id>/query<N>.json
+    for root, dirs, files in os.walk(task_dir):
+        parts = os.path.relpath(root, task_dir).split(os.sep)
+        if "trajectories" not in parts:
+            continue
+        for fn in sorted(files):
+            if _OPENJIUWEN_TRAJ_RE.match(fn):
+                add(os.path.join(root, fn), "assistant", "解析取最大文件")
     return out
 
 
@@ -329,6 +402,9 @@ def find_primary_assistant_trajectory(task_dir: str) -> str | None:
     hm = find_hermes_sessions(task_dir)
     if hm:
         return max(hm, key=lambda p: os.path.getsize(p))
+    jw = find_openjiuwen_sessions(task_dir)
+    if jw:
+        return max(jw, key=lambda p: os.path.getsize(p))
     return None
 
 
@@ -352,11 +428,74 @@ def find_eval_use_log(task_dir: str) -> str | None:
     return p if os.path.isfile(p) else None
 
 
+# 已作为主日志/gateway/eval 单独展示的日志相对路径——list_extra_logs 排除它们，避免重复。
+_KNOWN_LOG_RELS = (LOG_CANDIDATES[0], GATEWAY_LOG_REL, EVAL_USE_LOG_REL)
+
+
+def list_extra_logs(task_dir: str, task: str | None = None, limit: int = 20) -> list[dict]:
+    """列出任务目录下除主/gateway/eval 之外的其余日志文件（供详情页「其他日志」）。
+
+    不同 harness 的排障日志布局各异（openjiuwen: logs/logs/run/jiuwen.log、
+    logs/logs/interface/*.log、logs/logs/performance/*.log；其他框架亦可能另有
+    *.log），这些文件深层下载后已落本地，但旧详情页只展示固定的三类，用户看不到。
+    本函数全树扫 *.log（含 .log.N 轮转），排除三类固定日志，按大小降序返回前 limit 个。
+    返回 [{path(容器相对), size, mtime}]；不含 tail（由调用方按需读取，避免一次读太多）。
+    """
+    task = task or os.path.basename(os.path.abspath(task_dir))
+    primary = find_primary_log(task_dir, task)
+    gw = find_gateway_log(task_dir)
+    ev = find_eval_use_log(task_dir)
+    resolved = {os.path.realpath(p) for p in (primary, gw, ev) if p}
+    # 三类固定日志的文件名：主日志候选（run.log / harness_automation.log / <task>.log，
+    # 双层嵌套下会有同名副本）+ gateway.log + evaluator_use.log。同名一律不列——
+    # 它们要么已被上方"主日志/Gateway/Eval 日志"页签呈现，要么是同一文件的副本。
+    skip_names = {os.path.basename(r.format(task=task)) for r in LOG_CANDIDATES}
+    skip_names |= {GATEWAY_LOG_REL.rsplit("/", 1)[-1], EVAL_USE_LOG_REL.rsplit("/", 1)[-1]}
+    # 其余文件按 (文件名, 大小) 与已解析的 gateway/eval 去重：双层嵌套下同一日志有父/子两份。
+    resolved_sig = {(os.path.basename(p), os.path.getsize(p))
+                    for p in (gw, ev) if p and os.path.isfile(p)}
+    out: list[dict] = []
+    for root, _dirs, files in os.walk(task_dir):
+        for fn in files:
+            low = fn.lower()
+            if not (low.endswith(".log") or ".log." in low):
+                continue
+            if fn in skip_names:
+                continue
+            full = os.path.join(root, fn)
+            if os.path.realpath(full) in resolved:
+                continue
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if (fn, st.st_size) in resolved_sig:
+                continue
+            out.append({"path": os.path.relpath(full, task_dir),
+                        "size": st.st_size, "mtime": st.st_mtime})
+    out.sort(key=lambda d: d["size"], reverse=True)
+    return out[:limit]
+
+
 # ============ 主日志「【Task_Done】」 ============
 
 def has_task_done_marker_in_file(log_path: str) -> bool:
     """主 log 是否含「【Task_Done】」标记（复用 src/traj_stats_light）。"""
     return has_task_done_marker(log_path)
+
+
+def _has_legacy_done_marker(log_path: str) -> bool:
+    """主 log 是否含旧版 harness 的「所有任务执行完成!」完成标识。
+
+    仅作 log_fallback_grade 的辅助信号（需与 status='任务成功' 互相印证），不单独暴露。
+    """
+    if not log_path or not os.path.isfile(log_path):
+        return False
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            return LEGACY_DONE_MARKER in f.read()
+    except OSError:
+        return False
 
 
 # ============ openclaw jsonl 轨迹解析（从源仓迁入，无外部依赖） ============
@@ -663,6 +802,87 @@ def _parse_openclaw_traj_legacy(objs, tail=()) -> list[dict]:
 
 # ============ hermes messages[] 解析（新实现，修源仓 bug） ============
 
+def analyze_openjiuwen_turns(path: str) -> dict:
+    """openjiuwen 轨迹（logs/trajectories/<run_id>/query<N>.json）统计。
+
+    结构 {query, agent_name, turns[], outcome, evaluations}，逐 turn：
+      {turn, user_input, agent_content, tool_calls[], files[], stop_reason, evidence_incomplete}
+    返回 {tool_calls, plain_rounds, assistant_rounds}：
+    - tool_calls   : 各 turn 顶层 tool_calls[] 总数（采集侧 extract_tool_calls* 已归一并落盘）
+    - plain_rounds : 无 tool_calls 但有 agent_content 的 turn 数（有产出即算一轮纯轮）
+    - assistant_rounds: turn 总数
+    ⚠ 与 openclaw 的 content parts / hermes 的 messages[] 均不同，不可复用。
+    """
+    tool_calls = 0
+    plain_rounds = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"tool_calls": 0, "plain_rounds": 0, "assistant_rounds": 0}
+
+    turns = data.get("turns") or []
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        tcs = t.get("tool_calls")
+        n_tc = len(tcs) if isinstance(tcs, list) else 0
+        tool_calls += n_tc
+        # 有内容产出且无工具调用的 turn 计为「纯轮」，与 hermes 口径一致（plain_rounds>0 即过 L1）。
+        if n_tc == 0 and (t.get("agent_content") or "").strip():
+            plain_rounds += 1
+
+    return {"tool_calls": tool_calls, "plain_rounds": plain_rounds,
+            "assistant_rounds": len(turns)}
+
+
+def parse_openjiuwen_trajectory(path: str, max_lines: int = _MAX_TRAJ_LINES,
+                                max_bytes: int = _MAX_TRAJ_BYTES) -> list[dict]:
+    """openjiuwen query<N>.json → 归一化消息流（与 parse_hermes_messages 同结构）。
+
+    每 turn 展开为：user_input(text) + agent_content(text) + 各 tool_call(toolCall)；
+    files 证据折成一行 text 提示（详情页可见产物）。
+    """
+    blocks: list[dict] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    except OSError:
+        return blocks
+    if raw.count("\n") > max_lines or len(raw.encode("utf-8", "replace")) > max_bytes:
+        blocks.append({"role": None, "part_type": "truncated",
+                       "content": f"[截断] 达到 {max_lines} 行 / {max_bytes // (1024*1024)}MB 限制",
+                       "tool_name": None, "args": None, "isError": None,
+                       "exitCode": None, "details": None})
+        return blocks
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return blocks
+
+    def _blk(role, part_type, content, tool_name=None, args=None):
+        return {"role": role, "part_type": part_type, "content": content,
+                "tool_name": tool_name, "args": args, "isError": None,
+                "exitCode": None, "details": None}
+
+    for t in (data.get("turns") or []):
+        if not isinstance(t, dict):
+            continue
+        blocks.append(_blk("user", "text", t.get("user_input")))
+        if (t.get("agent_content") or "").strip():
+            blocks.append(_blk("assistant", "text", t.get("agent_content")))
+        for tc in (t.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            blocks.append(_blk("assistant", "toolCall",
+                               tc.get("output") or "", tool_name=tc.get("tool"), args=tc.get("input")))
+        files = t.get("files") or []
+        if files:
+            names = ", ".join((f.get("name") or "") for f in files if isinstance(f, dict))
+            blocks.append(_blk("assistant", "text", f"[产物]: {names}"))
+    return blocks
+
+
 def analyze_hermes_messages(path: str) -> dict:
     """hermes session_*.json（OpenAI-chat messages[]）统计。
 
@@ -775,6 +995,16 @@ def parse_hermes_messages(path: str, max_lines: int = _MAX_TRAJ_LINES,
 # ============ 主 log 裁决解析（从源仓迁入，纯正则无外部依赖） ============
 
 _EVAL_MARKER = re.compile(r"\[Evaluator\]\s+turn=(\d+)\s+agent=\S+.*输出")
+# 实例本地 task-<idx>.log 的每行带渲染前缀「 │ 」(U+2502)，会挡住 JSON 块的大括号定位
+# （行首成 " │ {" 而非 "{"），剥离后与 OBS 主 log 同构、可解析出 completion 分数。
+_BOX_PREFIX_RE = re.compile(r"^\s*│\s?")
+
+
+def _strip_box_prefix(lines: list[str]) -> list[str]:
+    """若日志行带「 │ 」渲染前缀则统一剥离（无前缀的 OBS 主 log 原样返回，零改动）。"""
+    if any("│" in l for l in lines[:50]):
+        return [_BOX_PREFIX_RE.sub("", l) for l in lines]
+    return lines
 
 
 def _parse_json_block_after(lines: list[str], idx: int):
@@ -802,7 +1032,7 @@ def extract_first_evaluator_obj(log_path: str):
     if not os.path.isfile(log_path):
         return None
     with open(log_path, encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+        lines = _strip_box_prefix(f.readlines())
 
     marks = []
     for i, l in enumerate(lines):
@@ -836,17 +1066,18 @@ def compute_level(harness: str, tool_calls: int, plain_rounds: int,
     """按 README 口径出 L0/L1/L1.5/L2/L3（单点打标函数）。
 
     - L0   = 有轨迹（调用方保证）
-    - L1   : openclaw = tool_calls>=3 且 plain_rounds>0；hermes = plain_rounds>0
+    - L1   : openclaw 族 = tool_calls>=3 且 plain_rounds>0；其余（hermes/openjiuwen/…）= plain_rounds>0
     - L1.5 : L1 且有数值 completion
     - L2   : L1.5 且 completion>=0.5
     - L3   : L1.5 且 completion==1
+
+    口径与 harness_tsr_to_entries 的 passed_gate 一致（同用 _OPENCLAW_FAMILY 判定），
+    避免快/慢路径对同一 harness 给出不同等级。
     """
-    if harness == "openclaw":
+    if harness in _OPENCLAW_FAMILY:
         passed = tool_calls >= 3 and plain_rounds > 0
-    elif harness == "hermes":
-        passed = plain_rounds > 0
     else:
-        passed = False
+        passed = plain_rounds > 0
     if not passed:
         return "L0"
     if completion is None:
@@ -854,6 +1085,60 @@ def compute_level(harness: str, tool_calls: int, plain_rounds: int,
     if completion >= 0.5:
         return "L2" if completion < 1.0 else "L3"
     return "L1.5"
+
+
+# 旧版 openclaw harness（2026-07 前批次，如 wanyi/ChanghaoLau 早期实例）的完成标识：主 log
+# 打印「所有任务执行完成!」。单独用不可靠（任务异常样本中也有约 6% 命中），故仅当调用方能
+# 提供 status='任务成功' 时才采信它作为 task-done 信号（两个信号一致才判成功）。
+LEGACY_DONE_MARKER = "所有任务执行完成!"
+
+
+def log_fallback_grade(log_path: str, harness: str,
+                       status: str | None = None) -> tuple[dict, str] | None:
+    """无有效 tsr（缺失/空壳）时的日志兜底分级——从主 log 判任务是否成功。
+
+    主 log 含「【Task_Done】」标记 = assistant/模拟器声明任务已完成 → 视为成功，至少 L1.5
+    （即"有评测"档的下界）。若同一条 log 还能解析出 evaluator completion，则按其数值抬级
+    （0.5≤c<1 → L2，c==1 → L3），不会低于 L1.5。
+
+    status: 调用方已知的任务执行状态（task_records.status）。提供且为「任务成功」时，额外
+    采信旧版 harness 的 LEGACY_DONE_MARKER 作为完成信号——该标记单独用有误判（任务异常里也
+    偶现），故必须与「任务成功」互相印证。status 为 None 时只用「【Task_Done】」。
+
+    返回 (entry, level)；无完成标记（任务未完成/日志不可读）返回 None，由调用方照旧 failed
+    占位。用于补全快路径拿到空壳 tsr（如 openjiuwen 老镜像写死 harness_home=~/.openclaw、
+    trajectory=null、计数全零）或旧版 harness 无 tsr 时，不再直接判不可分级。
+    """
+    if not log_path or not os.path.isfile(log_path):
+        return None
+    has_done = has_task_done_marker(log_path)
+    if not has_done and status == "任务成功":
+        has_done = _has_legacy_done_marker(log_path)
+    if not has_done:
+        return None
+    has_eval, score = extract_first_evaluator_verdict(log_path)
+    # Task_Done 已表明任务产出完成，直接认定过 L1 门槛，**不再过 compute_level 的家族门**：
+    # 该门对 openclaw 族要求 tool_calls>=3，而此处 tool_calls 无从统计（计 0），会把已完成的
+    # openclaw 任务误打回 L0。故此处按「已在 L1 以上」直接映射分数，1.5 为地板：
+    #   无分数 → L1.5；score<0.5 → L1.5；0.5≤score<1 → L2；score==1 → L3。
+    if score is None or score < 0.5:
+        level = "L1.5"
+    else:
+        level = "L3" if score >= 1.0 else "L2"
+    entry = {
+        "harness": harness,
+        "tool_calls": 0,
+        "assistant_rounds": 0,
+        "plain_rounds": 1,
+        "has_ge3_toolcalls": False,
+        "has_plain_round": True,
+        "passed_gate": True,
+        "has_eval": has_eval or score is not None,
+        "evaluator_completion": score,
+        "verdict_source": "log" if score is not None else None,
+        "task_done": True,
+    }
+    return entry, level
 
 
 def stats_from_per_task_compact(stats: dict) -> dict:
@@ -880,9 +1165,12 @@ def stats_from_per_task_compact(stats: dict) -> dict:
 
 
 def _load_per_task_entries(obsutil: str, task_obs: str, origin: str,
-                           obs_cred_args: list[str] | None = None) -> list[dict]:
+                           obs_cred_args: list[str] | None = None,
+                           instance_harness_type: str | None = None) -> list[dict]:
     """单 task 打标 entry：快路径（tsr）优先，stats 陈旧/缺失 → 回退慢路径（assistant 轨迹 + 主 log）。
 
+    instance_harness_type: 实例级 harness 类型（从 config.yaml run_config.harness_type 读取），
+      快路径 tsr 无 harness_type 字段时注入；慢路径 else-分支（非 hermes）用来决定 L1 门槛和标签。
     返回 per_task entry 列表（结构与 stats_from_per_task 兼容）：
       {task, harness, tool_calls, assistant_rounds, plain_rounds, has_ge3_toolcalls,
        has_plain_round, passed_gate, has_eval, evaluator_completion, verdict_source,
@@ -961,13 +1249,21 @@ def _load_per_task_entries(obsutil: str, task_obs: str, origin: str,
         traj = find_primary_assistant_trajectory(dest_dir)
         if not traj:
             return []
-        info = analyze_trajectory(traj)
+        # openjiuwen 轨迹是 pretty JSON（query<N>.json，turns[]），不能用 openclaw 的
+        # jsonl 行解析器（会全部 JSONDecodeError → 0/0）。按实例 harness 类型分派。
+        _slow_harness = instance_harness_type or harness
+        info = (analyze_openjiuwen_turns(traj)
+                if _slow_harness == "openjiuwen" else analyze_trajectory(traj))
         logp = find_primary_log(dest_dir, leaf)
         has_eval, score, source = (False, None, None)
         if logp:
             has_eval, score = extract_first_evaluator_verdict(logp)
             source = "log" if has_eval else None
-        gate = info["tool_calls"] >= 3 and info["plain_rounds"] > 0
+        # openclaw 族用严格门槛（≥3工具调用 且 有纯轮）；其余 harness 有产出即过。
+        if _slow_harness in _OPENCLAW_FAMILY:
+            gate = info["tool_calls"] >= 3 and info["plain_rounds"] > 0
+        else:
+            gate = info["plain_rounds"] > 0
         entry = {
             "task": leaf, "trajectory": os.path.relpath(traj, origin),
             "tool_calls": info["tool_calls"], "assistant_rounds": info["assistant_rounds"],
@@ -976,7 +1272,7 @@ def _load_per_task_entries(obsutil: str, task_obs: str, origin: str,
             "has_plain_round": info["plain_rounds"] > 0,
             "passed_gate": gate,
             "has_eval": has_eval, "evaluator_completion": score, "verdict_source": source,
-            "harness": "openclaw", "task_done": bool(logp and has_task_done_marker(logp)),
+            "harness": _slow_harness, "task_done": bool(logp and has_task_done_marker(logp)),
         }
     # char_len（详情列）
     try:
@@ -1130,6 +1426,9 @@ def load_task_detail(task_dir: str, task: str | None = None,
         if out["harness"] == "hermes":
             out["assistant_trajectory"] = parse_hermes_messages(traj)
             out["assistant_stats"] = analyze_hermes_messages(traj)
+        elif out["harness"] == "openjiuwen":
+            out["assistant_trajectory"] = parse_openjiuwen_trajectory(traj)
+            out["assistant_stats"] = analyze_openjiuwen_turns(traj)
         else:
             out["assistant_trajectory"] = parse_openclaw_trajectory(traj)
             out["assistant_stats"] = analyze_trajectory(traj)
@@ -1177,6 +1476,10 @@ def load_task_detail(task_dir: str, task: str | None = None,
     eu = find_eval_use_log(task_dir)
     out["eval_use_log"] = {"path": os.path.relpath(eu, task_dir) if eu else None,
                            "tail": _tail_text(eu, _LOG_MAX_BYTES) if eu else None}
+
+    # 其他日志（各 harness 自有排障日志，如 openjiuwen 的 jiuwen.log/性能日志）。
+    # 与三类固定日志解耦：即便无轨迹（logs-only 失败任务），这些日志同样可看。
+    out["extra_logs"] = list_extra_logs(task_dir, task)
 
     # verdict（主 log 首轮；无轨迹且 tsr 兜底时同样用主 log）
     has_eval, score = (False, None)
@@ -1274,6 +1577,7 @@ def _plan_traj_rels(keys: list[str], task_obs: str) -> list[str]:
                  + agents/evaluator/sessions/**/session.jsonl
     - hermes：  profiles/{assistant*,main}/sessions/*.json
     - claude-code：projects/<ws>/*.jsonl
+    - openjiuwen：logs/trajectories/<run_id>/query<N>.json
     返回相对路径列表（已排序，assistant 在前）。空 = 无轨迹（任务确无回复）。
     """
     rels: list[str] = []
@@ -1291,6 +1595,10 @@ def _plan_traj_rels(keys: list[str], task_obs: str) -> list[str]:
         # claude-code projects 侧
         elif (rel.startswith("projects/") and rel.count("/") <= 2
               and rel.endswith(".jsonl") and "trajectory" not in rel):
+            rels.append(rel)
+        # openjiuwen：logs/trajectories/<run_id>/query<N>.json
+        elif (_OPENJIUWEN_TRAJ_RE.match(rel.rsplit("/", 1)[-1])
+              and "trajectories" in rel.split("/")):
             rels.append(rel)
     # 只保留会话目录下直接是 session 文件的行（避免 scoop 到 profile 的 state.json 等；
     # 但 hermes 的 session_*.json 都在 sessions/ 下，过滤条件已足够）。

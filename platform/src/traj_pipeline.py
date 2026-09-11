@@ -207,7 +207,18 @@ def harness_tsr_to_entries(d, task_obs=None):
     if not task or not isinstance(agents, list):
         return []
     harness_home = d.get("harness_home") or ""
-    harness = "openclaw" if ".openclaw" in harness_home else "hermes"
+    # 优先读 tsr 里的显式 harness 字段：新版 task_status.py 写 harness_type，
+    # 另有一种变体只写 harness（实测 liuhao 批次 dsv4pro-260910-1114）。两者皆无时
+    # 回退旧逻辑（harness_home 含 .openclaw → openclaw，否则 hermes）——该回退对
+    # openjiuwen 老镜像会把 /home/ma-user/.openclaw 误判成 openclaw，故显式字段优先。
+    _ht = d.get("harness_type") or d.get("harness") or ""
+    if _ht:
+        harness = _ht
+    else:
+        harness = "openclaw" if ".openclaw" in harness_home else "hermes"
+    # openclaw 族（工具调用落 content parts）L1 = ≥3 工具调用 且 有纯轮；
+    # hermes 族及其他（工具调用落顶层 tool_calls[]，旧统计得 0）L1 = 有产出即过。
+    _OPENCLAW_FAMILY = {"openclaw", "opencode", "claude-code"}
     sub = cache_subdir_for(task_obs) if task_obs else None
     entries = []
     for a in agents:
@@ -217,8 +228,8 @@ def harness_tsr_to_entries(d, task_obs=None):
         pr = a.get("plain_rounds") or 0
         has_ge3 = bool(a.get("has_ge3_toolcalls"))
         has_plain = bool(a.get("has_plain_round"))
-        # L1 门槛: openclaw = ≥3工具调用 且 有纯轮; hermes = 有产出(纯轮>0)。与 process_root 口径一致。
-        passed = (has_ge3 and has_plain) if harness == "openclaw" else has_plain
+        # L1 门槛: openclaw 族 = ≥3工具调用 且 有纯轮; 其余 = 有产出(纯轮>0)。
+        passed = (has_ge3 and has_plain) if harness in _OPENCLAW_FAMILY else has_plain
         # trajectory 绝对容器路径(如 <harness_home>/agents/main/sessions/<uuid>.jsonl)
         # → 映射成 origin 相对路径 <batch>/<leaf>/agents/main/sessions/<uuid>.jsonl,
         #   供详情页按需下载定位（与慢路径 _load_per_task_entries 同目录布局）。
