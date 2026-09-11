@@ -38,6 +38,7 @@ _FRAMEWORK_LAYOUTS: dict = {
             "/home/ma-user/.hermes/profiles/*/sessions",
             "/home/ma-user/.hermes/profiles/*/logs",
             "/home/ma-user/.hermes/profiles/*/workspace",
+            "/home/ma-user/.hermes/profiles/*/state.db",
         ],
         # workspace 隔离在 profiles/<name>/ 里
         "workspace_base": None,
