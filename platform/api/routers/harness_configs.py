@@ -309,8 +309,8 @@ def save_file(config_id: int, filename: str, content: str = Body(..., media_type
 
     with open(fpath, "w", encoding="utf-8") as f:
         f.write(content)
-
-    _update_files_json(conn, config_id, row["harness_type"], row["version"])
+    with get_connection() as conn:
+        _update_files_json(conn, config_id, row["harness_type"], row["version"])
     return {"detail": "已保存", "filename": filename}
 
 
@@ -332,8 +332,8 @@ def init_file(config_id: int, req: InitFileRequest, user: dict = Depends(require
     d = _config_dir(row["harness_type"], row["version"])
     os.makedirs(d, exist_ok=True)
     shutil.copy2(src, os.path.join(d, req.filename))
-
-    _update_files_json(conn, config_id, row["harness_type"], row["version"])
+    with get_connection() as conn:
+        _update_files_json(conn, config_id, row["harness_type"], row["version"])
     return {"detail": f"已从模板初始化 {req.filename}"}
 
 
@@ -356,8 +356,8 @@ async def pull_obs(config_id: int, req: PullObsRequest, user: dict = Depends(req
     os.makedirs(d, exist_ok=True)
 
     await _pull_obs_file(obs_path, d)
-
-    _update_files_json(conn, config_id, row["harness_type"], row["version"])
+    with get_connection() as conn:
+        _update_files_json(conn, config_id, row["harness_type"], row["version"])
     return {"detail": "已从 OBS 拉取更新"}
 
 

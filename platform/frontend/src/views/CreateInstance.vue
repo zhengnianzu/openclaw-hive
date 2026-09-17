@@ -491,8 +491,8 @@ onMounted(async () => {
       form.value.name = params.name + '-copy'
       form.value.task_name = genTaskId()
       // 重跑失败场景: 透传 copy_complete_from, 后端创建时搬源实例 complete.jsonl
+      form.value.copy_complete_from = route.query.copy_complete_from || null
       if (route.query.copy_complete_from) {
-        form.value.copy_complete_from = route.query.copy_complete_from
         form.value.name = params.name + '-retry'
       }
       if (!form.value.agents || form.value.agents.length === 0) {

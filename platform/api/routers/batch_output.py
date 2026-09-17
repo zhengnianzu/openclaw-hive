@@ -164,6 +164,79 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
     }
 
 
+@router.get("/{instance_id}/shallow/export")
+async def export_shallow_funnel(instance_id: str, user: dict = Depends(get_current_user)):
+    """导出会话漏斗各层级计数为 .xlsx（openpyxl，与 proxy-config/export 同模式）。"""
+    inst = _get_instance(instance_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT tr.traj_level, ttr.task_done AS ttr_task_done "
+            "FROM task_records tr "
+            "LEFT JOIN task_traj_records ttr "
+            " ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name "
+            "WHERE tr.instance_id=? ORDER BY tr.task_idx",
+            (instance_id,),
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+    graded = [r for r in rows if r["traj_level"] in _TRAJ_LEVELS]
+    summary = {lv: 0 for lv in _TRAJ_LEVELS}
+    for r in graded:
+        summary[r["traj_level"]] += 1
+    total = len(rows)
+    unevaluated = sum(1 for r in rows if r["traj_level"] is None)
+    failed = sum(1 for r in rows if r["traj_level"] == "failed")
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "会话漏斗"
+    headers = ["层级", "数量", "占比"]
+    ws.append(headers)
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+
+    # 行顺序与前端漏斗柱状图一致：L0→L3；占比按已分级总数（同前端柱高逻辑）
+    for lv in _TRAJ_LEVELS:
+        count = summary[lv]
+        ratio = f"{(count / len(graded) * 100):.1f}%" if graded else "—"
+        ws.append([lv, count, ratio])
+    # 未评估一列前端按总数比例单独画，failed 不进漏斗；这两行不参与占比口径
+    uneval_ratio = f"{(unevaluated / total * 100):.1f}%" if total else "—"
+    ws.append(["未评估", unevaluated, uneval_ratio])
+    ws.append(["failed", failed, ""])
+    ws.append(["总计", total, ""])
+
+    # 列宽自适应（按内容最大宽 + 余量）
+    for col_idx, cell in enumerate(ws[1], start=1):
+        max_len = len(str(cell.value or ""))
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, min_row=2):
+            for c in row:
+                max_len = max(max_len, len(str(c.value or "")))
+        ws.column_dimensions[cell.column_letter].width = max_len + 6
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    safe_name = (inst.get("name") or instance_id).replace("/", "_").replace('"', "")
+    filename = f"{safe_name}_funnel.xlsx"
+    # RFC 5987 filename* 承载中文文件名，ASCII filename 兜底（同 proxy-config/export）
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    disposition = (
+        f"attachment; filename=\"{ascii_fallback}\"; "
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"content-disposition": disposition},
+    )
+
 @router.get("/{instance_id}/shallow/tasks")
 async def shallow_tasks(
     instance_id: str,

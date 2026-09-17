@@ -17,7 +17,7 @@
         "hive_config": "config.yaml",
         "user_config": "user_proxy_model.json",
         "agent_config": "hermes_config.yaml",
-        "ui_color": "#e6a23c"
+        "ui_color": "#B45309"
     },
     "claude-code": {
         "id": "claude-code",
@@ -73,7 +73,7 @@
         "hive_config": "config.yaml",
         "user_config": "user_proxy_model.json",
         "agent_config": "dsh_settings.yaml",
-        "ui_color": "#ff6b81"
+        "ui_color": "#ff8c00"
     },
     "common": {
         "id": "common",
