@@ -114,7 +114,7 @@
                 <el-descriptions-item label="Agent目录">{{ obsPath(createParams.agent_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="用户Config目录">{{ obsPath(createParams.user_config_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="用户Profile目录">{{ obsPath(createParams.user_profile_dir) }}</el-descriptions-item>
-                <el-descriptions-item label="轨迹保存路径">{{ obsPath(createParams.traj_save_path) }}</el-descriptions-item>
+                <el-descriptions-item label="轨迹保存路径">{{ trajSaveFullPath || obsPath(createParams.traj_save_path) }}</el-descriptions-item>
               </el-descriptions>
             </el-collapse-item>
 
@@ -218,12 +218,22 @@
       </el-tab-pane>
       <!-- ================= 输出 ================= -->
       <el-tab-pane label="输出" name="outputs">
+        <!-- 轨迹保存路径 -->
+        <el-card v-if="trajSaveFullPath" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span style="font-size:13px;font-weight:600;color:var(--text-secondary)">轨迹保存路径</span>
+            <span style="font-family:monospace;font-size:13px;word-break:break-all">{{ trajSaveFullPath }}</span>
+            <el-button size="small" text type="primary" @click="copyTrajPath">复制</el-button>
+          </div>
+        </el-card>
+
         <!-- 统计面板（浅层漏斗） -->
         <el-card style="margin-bottom:16px" v-loading="shallowLoading">
           <template #header>
             <div style="display:flex;justify-content:space-between;align-items:center">
               <span>会话漏斗</span>
               <div>
+                <el-button size="small" :loading="exportingFunnel" @click="exportFunnel">导出 Excel</el-button>
                 <el-button size="small" @click="loadShallow(false)">刷新</el-button>
               </div>
             </div>
@@ -785,6 +795,26 @@ function obsPath(dir) {
   return `${bucket.replace(/\/$/, '')}/${dir.replace(/^\//, '')}`
 }
 
+// 轨迹保存路径的完整 OBS 路径（含桶名）。
+const trajSaveFullPath = computed(() => {
+  const cp = createParams.value
+  const rawPath = cp.traj_save_path
+  if (!rawPath) return ''
+  if (String(rawPath).startsWith('obs://')) return rawPath
+  const bucket = cp.obs_bucket
+  if (!bucket) return rawPath
+  return `${String(bucket).replace(/\/+$/, '')}/${String(rawPath).replace(/^\/+/, '')}`
+})
+
+async function copyTrajPath() {
+  try {
+    await navigator.clipboard.writeText(trajSaveFullPath.value)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选择复制')
+  }
+}
+
 async function loadData() {
   try { const [i, o] = await Promise.all([api.get(`/instances/${id}`), api.get(`/instances/${id}/overview`)]); inst.value = i; overview.value = o } catch {}
   // 准备中：拉下载进度（已下载多少个 config）
@@ -1110,6 +1140,25 @@ const unevaluatedPct = computed(() => {
   if (!total) return 0
   return (((shallowSummary.value.unevaluated || 0) / total) * 100)
 })
+
+// 导出漏斗各层级计数为 Excel（后端 openpyxl 生成 .xlsx，同 proxy-config/export 模式）
+const exportingFunnel = ref(false)
+async function exportFunnel() {
+  exportingFunnel.value = true
+  try {
+    const blob = await api.get(`/instances/${id}/shallow/export`, { responseType: 'blob' })
+    const url = window.URL.createObjectURL(blob)
+    const name = `${inst.value?.name || id}_funnel.xlsx`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(url)
+  } catch { /* interceptor 已提示 */ }
+  finally { exportingFunnel.value = false }
+}
 
 // ---- 表格: 分页 / 过滤 / 排序（后端 shallow/tasks 下沉，本地只透传参数触发重拉） ----
 const levelFilter = ref('')

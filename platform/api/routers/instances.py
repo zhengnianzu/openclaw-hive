@@ -908,6 +908,7 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
     if not row["create_params"]:
         raise HTTPException(status_code=404, detail="该实例无创建参数记录")
     params = json.loads(row["create_params"])
+    params.pop("copy_complete_from", None) # 不继承
     # OBS 桶名不在 create_params 里，从 config_snapshot(s3.bucket_name) 取出，
     # 供前端把各 OBS 目录字段拼成完整 obs:// 路径展示。
     if row["config_snapshot"]:
