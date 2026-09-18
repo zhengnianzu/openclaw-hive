@@ -1388,6 +1388,7 @@ const exportModes = [
   { value: 'eval', label: 'eval' },
   { value: 'reconstruct', label: 'reconstruct' },
   { value: 'full_reformat', label: 'full_reformat（全量）' },
+  { value: 'jiuwen_reformat', label: 'jiuwen_reformat（九问导出）' },
 ]
 
 async function browseProxyExport(row) {

@@ -47,7 +47,8 @@ _ROLE_TO_KEY = {
 }
 
 # 导出方式（外部服务允许的 mode）+ 默认 mode
-_EXPORT_MODES = ["export", "reformat", "eval", "reconstruct", "full_reformat"]
+_EXPORT_MODES = ["export", "reformat", "eval", "reconstruct", "full_reformat",
+                 "jiuwen_reformat"]
 _DEFAULT_MODE = "export"
 
 # 导出任务状态：外部 queued/running/success/failed + 本地未导出
