@@ -187,6 +187,22 @@
             </el-select>
             <div style="font-size:12px;color:#999;margin-top:4px">不选则使用默认uploads中的tar文件；选择后自动下载并打包，config.yaml 的 main_code_tar 将指向打包后的tar文件</div>
           </el-form-item>
+
+          <el-form-item label="任务队列">
+            <div style="display:flex;gap:8px;width:100%">
+              <el-select v-model="form.queue_id" placeholder="选择队列（不选则直接启动，不参与排队）"
+                style="flex:1" clearable>
+                <el-option v-for="queue in queueList" :key="queue.id" :label="queue.id" :value="queue.id">
+                  <span>{{ queue.id }}</span>
+                  <span style="float:right;color:#999;font-size:12px">
+                    运行 {{ queue.active_tasks }}/{{ queue.max_concurrent }} · 排队 {{ queue.queued_tasks }}
+                  </span>
+                </el-option>
+              </el-select>
+              <el-button type="primary" @click="queuePickerVisible = true">新建队列</el-button>
+            </div>
+            <div style="font-size:12px;color:#999;margin-top:4px">任务加入队列后，将按照队列顺序执行</div>
+          </el-form-item>
         </el-tab-pane>
       </el-tabs>
 
@@ -210,6 +226,8 @@
         <el-button type="primary" @click="generateApiKey" :loading="keyGenerating">生成</el-button>
       </template>
     </el-dialog>
+
+    <QueuePicker v-model="queuePickerVisible" :selected-id="form.queue_id" @picked="onQueuePicked" />
 
     <!-- OBS Browser Dialog -->
     <el-dialog v-model="obsVisible" title="选择OBS目录" width="700px" destroy-on-close>
@@ -244,6 +262,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
+import QueuePicker from '../components/QueuePicker.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 import { obsBucket, stripBucket, joinBucket } from '../api/obsConfig'
@@ -332,6 +351,7 @@ const form = ref({
   invite_code: '',
   harness_config_id: null,
   copy_complete_from: null,
+  queue_id: null,
   agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }],
 })
 
@@ -354,6 +374,22 @@ function removeAgentTab(tabName) {
 const imageList = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
+const queueList = ref([])
+const queuePickerVisible = ref(false)
+
+async function loadQueues() {
+  try {
+    queueList.value = await api.get('/queues')
+  } catch {
+    queueList.value = []
+  }
+}
+
+// 加入队列窗口回填：选中的队列直接写进表单；若窗口里新建了队列，重新拉一次列表
+async function onQueuePicked(queueId) {
+  form.value.queue_id = queueId
+  await loadQueues()
+}
 
 async function loadHarnessConfigs() {
   try {
@@ -558,6 +594,7 @@ onMounted(async () => {
   loadImages()
   loadCodeRepos()
   loadHarnessConfigs()
+  loadQueues()
 })
 </script>
 

@@ -12,6 +12,38 @@ class AgentConfig(BaseModel):
     invite_code: str = ""
 
 
+class QueueInfo(BaseModel):
+    """队列信息模型"""
+    id: str
+    name: str
+    max_concurrent: int = 1    # 队列并发量（展示用；当前调度为严格串行）
+    description: str = ""
+    created_by: Optional[str] = None
+    created_at: str
+    active_tasks: int = 0      # 派生字段：运行中的任务数
+    queued_tasks: int = 0      # 派生字段：排队中的任务数
+    task_count: int = 0        # 派生字段：该队列下的任务总数（用于判断能否删除）
+
+
+class QueueCreate(BaseModel):
+    """创建队列请求模型"""
+    id: str                        # 队列ID，用户输入，必须唯一
+    name: str = ""                 # 队列显示名称（留空时用 id 兜底）
+    max_concurrent: int = 1        # 并发量，默认 1
+    description: str = ""
+
+
+class QueueTaskItem(BaseModel):
+    """队列详情中的任务行（对应设计图「队列详情」表格）"""
+    id: str
+    name: str
+    status: str
+    queue_position: int = 0
+    position_label: str = ""           # 如 "1 (等待中)" / "-"
+    created_at: str
+    estimated_start_at: Optional[str] = None   # 预计开始时间
+
+
 class InstanceCreate(BaseModel):
     name: str
     task_name: str
@@ -51,6 +83,9 @@ class InstanceCreate(BaseModel):
     # 重跑失败场景: 传入源实例 id,创建后把源实例 complete.jsonl 搬到新实例 output,
     copy_complete_from: Optional[str] = None
 
+    # 队列支持
+    queue_id: Optional[str] = None
+
 
 class InstanceInfo(BaseModel):
     id: str
@@ -68,6 +103,8 @@ class InstanceInfo(BaseModel):
     concurrent_num: int = 100
     harness_type: str = "openclaw"
     output_status: Optional[str] = None  # NULL=未做浅层/未输出, done=浅层完成可直接用
+    queue_id: Optional[str] = None      # 所属队列ID
+    queue_position: int = 0              # 在队列中的位置
 
 
 class InstanceOverview(BaseModel):

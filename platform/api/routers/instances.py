@@ -19,9 +19,16 @@ from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
+from ..services.queue_scheduler import (
+    schedule_queue, check_global_sandbox_capacity, OCCUPYING_STATUSES,
+)
 from . import harness_meta
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
+
+# 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
+_OCCUPYING_STATUSES = OCCUPYING_STATUSES
+_OCCUPYING_PLACEHOLDERS = ",".join("?" * len(_OCCUPYING_STATUSES))
 
 # 独立的 key 申请路由（路径 /api/generate-api-key，不带 instances 前缀）
 key_router = APIRouter(prefix="/api", tags=["api-key"])
@@ -227,13 +234,32 @@ def _count_lines(file_path: str) -> int:
 
 
 def _is_pid_running(pid: int) -> bool:
+    """判断进程是否真的还活着。
+
+    只用 os.kill(pid, 0) 不够：僵尸进程（已退出、父进程还没回收）的进程表项仍在，
+    kill 会返回成功，于是被误判为「运行中」。任务因此永远卡在 running ——
+    pid_alive 恒 True、total_tasks 又可能为 0，all_done 永远不成立，
+    后台 refresher 也就永远不把它判成终态，同队列后面的任务全被堵死。
+    这里额外检查进程状态，Z（zombie）视为已结束。
+    """
     if not pid:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    # 僵尸/已死进程：读 /proc/<pid>/stat 取第 3 个字段（状态）
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        # 进程名可能含空格/括号，取最后一个 ')' 之后再分割
+        state = data[data.rindex(b")") + 2:].split(b" ", 1)[0].decode()
+        if state == "Z":
+            return False
+    except (OSError, ValueError, IndexError):
+        # 读不到 /proc（非 Linux 等）时退回 kill 的判断
+        pass
+    return True
 
 
 def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
@@ -277,6 +303,9 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
 
     pid_alive = _is_pid_running(inst.get("pid"))
     all_done = inst["total_tasks"] > 0 and (completed + failed) >= inst["total_tasks"]
+    # 进程已结束：即使 total_tasks 为 0（例如统计任务数时目录里没有输入文件），
+    # 也必须判终态。否则「pid 已死 + total_tasks=0」的实例会永远卡在 running，
+    # 同队列后续任务全部被堵死。
     if not pid_alive or all_done:
         inst["status"] = "completed" if failed == 0 else "finished"
 
@@ -830,14 +859,36 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         json.dump(user_proxy_cfg, f, indent=2, ensure_ascii=False)
 
     # --- 5. 入库（不统计任务数，留到启动时统计） ---
+    # 队列支持：如果指定了 queue_id，计算 queue_position
+    queue_position = 0
+    if req.queue_id:
+        # 验证队列是否存在
+        with get_connection() as conn:
+            queue_exists = conn.execute(
+                "SELECT id FROM task_queues WHERE id = ?", (req.queue_id,)
+            ).fetchone()
+
+        if not queue_exists:
+            raise HTTPException(status_code=400, detail=f"队列 '{req.queue_id}' 不存在")
+
+        # 查询队列中最大 queue_position
+        with get_connection() as conn:
+            max_pos = conn.execute(
+                "SELECT MAX(queue_position) as max_pos FROM task_instances WHERE queue_id = ?",
+                (req.queue_id,)
+            ).fetchone()
+
+        queue_position = (max_pos['max_pos'] or 0) + 1
+
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO task_instances
-               (id, name, config_path, status, created_by, total_tasks, concurrent_num, config_snapshot, create_params, created_at)
-               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)""",
+               (id, name, config_path, status, created_by, total_tasks, concurrent_num,
+                config_snapshot, create_params, created_at, queue_id, queue_position)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], 0,
              req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json(),
-             datetime.now().isoformat()),
+             datetime.now().isoformat(), req.queue_id, queue_position),
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 
@@ -1079,6 +1130,68 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
     if inst["status"] == "preparing":
         raise HTTPException(status_code=400, detail="实例正在准备中，请稍候")
 
+    # 队列支持：如果任务在队列中，判断是否可以立即运行
+    queue_id = inst.get("queue_id")
+    if queue_id:
+        # 「启动」= 重新加入队列排队：排到队尾。停止后再启动若沿用旧的 queue_position，
+        # 会插回原来的位置，而不是按设计图「重新加入队列排队」。
+        with get_connection() as conn:
+            max_pos = conn.execute(
+                "SELECT MAX(queue_position) AS m FROM task_instances WHERE queue_id = ?",
+                (queue_id,)
+            ).fetchone()
+            new_pos = (max_pos["m"] or 0) + 1
+            conn.execute(
+                "UPDATE task_instances SET queue_position=? WHERE id=?",
+                (new_pos, instance_id)
+            )
+        inst["queue_position"] = new_pos
+        _status_cache.pop(instance_id, None)
+
+        # 检查队列中是否有占用槽位的任务。preparing 必须一起算：任务在
+        # _prepare_instance 期间（OBS 下载/打包）还不是 running，若只认 running，
+        # 同队列的第二个任务会被同时放行，串行就失效了。
+        with get_connection() as conn:
+            occupying = conn.execute(
+                f"SELECT id FROM task_instances WHERE queue_id = ? "
+                f"AND status IN ({_OCCUPYING_PLACEHOLDERS})",
+                (queue_id, *_OCCUPYING_STATUSES)
+            ).fetchall()
+
+        # 检查全局沙箱资源
+        available_capacity = await check_global_sandbox_capacity()
+
+        if len(occupying) > 0:
+            # 队列槽位被占用，进入排队状态
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET status='queued' WHERE id=?",
+                    (instance_id,)
+                )
+            _status_cache.pop(instance_id, None)
+
+            queue_position = inst.get("queue_position", 0)
+            return {
+                "message": f"任务已加入队列（位置: {queue_position}），等待前方任务完成",
+                "status": "queued",
+                "queue_position": queue_position
+            }
+
+        elif inst["concurrent_num"] > available_capacity:
+            # 资源不足，进入排队状态
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET status='queued' WHERE id=?",
+                    (instance_id,)
+                )
+            _status_cache.pop(instance_id, None)
+
+            return {
+                "message": f"沙箱资源不足（需要 {inst['concurrent_num']}, 可用 {available_capacity}），任务已排队",
+                "status": "queued"
+            }
+
+    # 无队列或队列空闲，可以直接启动
     # 标记为 preparing 状态
     with get_connection() as conn:
         conn.execute("UPDATE task_instances SET status='preparing' WHERE id=?", (instance_id,))
@@ -1089,6 +1202,34 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
     asyncio.create_task(_prepare_and_launch(instance_id, inst))
 
     return {"message": "实例准备中，正在后台下载配置并启动", "status": "preparing"}
+
+
+def _launch_mock_task(output_dir: str, log_file: str):
+    """空跑任务（MOCK_TASK_RUN=1 时替代真实 hive.py）。
+
+    刻意用「真实子进程」而不是进程内 sleep：这样 pid 是真的、stop 的 killpg 是真的、
+    完成检测也是真的（写真的 complete.jsonl 让后台 refresher 自己发现），
+    于是 pid 记录 / 停止 / 完成判定 / 队列续跑全部走生产路径，只有任务本身是空的。
+
+    用 flush 保证 python 自己 sleep，父进程退出后继续跑。
+    """
+    seconds = max(1, int(settings.MOCK_TASK_SECONDS))
+    complete_file = os.path.join(output_dir, "complete.jsonl")
+    script = (
+        "import time, os, sys\n"
+        f"sys.stdout.reconfigure(line_buffering=True)\n"
+        f"print('[MOCK] 空跑 {seconds}s -> {complete_file}')\n"
+        f"time.sleep({seconds})\n"
+        f"with open({complete_file!r}, 'a') as f:\n"
+        f"    f.write('{{\"mock\": true}}\\n')\n"
+        f"print('[MOCK] 已写入 complete.jsonl')\n"
+    )
+    with open(log_file, "a") as lf:
+        return subprocess.Popen(
+            ["python", "-c", script],
+            stdout=lf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
 
 
 async def _prepare_and_launch(instance_id: str, inst: dict):
@@ -1103,6 +1244,10 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
             )
         _status_cache.pop(instance_id, None)
         print(f"[start] 实例 {instance_id} 准备失败: {e}")
+        # 队列任务准备失败会卡住整个队列，调度下一个排队任务
+        queue_id = inst.get("queue_id")
+        if queue_id:
+            asyncio.create_task(schedule_queue(queue_id))
         return
 
     # 启动 hive
@@ -1113,18 +1258,20 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
         log_file = os.path.join(output_dir, "nohup.log")
         clean_log_file = os.path.join(output_dir, "nohup_clean.log")
 
-        hive_py = os.path.join(settings.HIVE_ROOT, "hive.py")
         env = os.environ.copy()
         env["RLXF_CLEAN_LOG_PATH"] = clean_log_file
 
-        with open(log_file, "a") as lf:
-            proc = subprocess.Popen(
-                ["python", hive_py, "--config", config_path],
-                stdout=lf, stderr=lf,
-                cwd=settings.HIVE_ROOT,
-                env=env,
-                start_new_session=True,
-            )
+        if settings.MOCK_TASK_RUN:
+            proc = _launch_mock_task(output_dir, log_file)
+        else:
+            with open(log_file, "a") as lf:
+                proc = subprocess.Popen(
+                    ["python", os.path.join(settings.HIVE_ROOT, "hive.py"), "--config", config_path],
+                    stdout=lf, stderr=lf,
+                    cwd=settings.HIVE_ROOT,
+                    env=env,
+                    start_new_session=True,
+                )
 
         with get_connection() as conn:
             conn.execute(
@@ -1132,6 +1279,11 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
                 (proc.pid, datetime.now().isoformat(), instance_id),
             )
         _status_cache.pop(instance_id, None)
+
+        # 任务启动成功后，触发队列调度（如果在队列中）
+        queue_id = inst.get("queue_id")
+        if queue_id:
+            asyncio.create_task(schedule_queue(queue_id))
     except Exception as e:
         with get_connection() as conn:
             conn.execute(
@@ -1140,10 +1292,14 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
             )
         _status_cache.pop(instance_id, None)
         print(f"[start] 实例 {instance_id} 启动失败: {e}")
+        # 同上：队列任务启动失败也要放行后面的排队任务
+        queue_id = inst.get("queue_id")
+        if queue_id:
+            asyncio.create_task(schedule_queue(queue_id))
 
 
 @router.post("/{instance_id}/stop")
-def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
+async def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
@@ -1165,13 +1321,21 @@ def stop_instance(instance_id: str, user: dict = Depends(require_operator)):
 
     _status_cache.pop(instance_id, None)
 
+    # 停止的语义（设计要求）：退出当前队列，不再参与排队。
+    # 保留 queue_id 作为「队列归属」（用户不必重新选队列），但 stopped 状态既不占用
+    # 槽位、也不作为排队候选，因此不会再挡后面的任务；下一次「启动」时重新排到队尾。
     with get_connection() as conn:
         conn.execute(
             "UPDATE task_instances SET status='stopped', stopped_at=? WHERE id=?",
             (datetime.now().isoformat(), instance_id),
         )
 
-    return {"message": "实例已停止"}
+    # 任务停止后，触发队列调度：它腾出了槽位，让下一个排队任务继续
+    queue_id = inst.get("queue_id")
+    if queue_id:
+        asyncio.create_task(schedule_queue(queue_id))
+
+    return {"message": "实例已停止，已退出队列排队"}
 
 
 @router.get("/{instance_id}/overview", response_model=InstanceOverview)
@@ -1575,7 +1739,12 @@ def _refresh_running_once():
     那一刻 `if inst["status"] == "running"` 的分支会错过最后一次写入；且运行窗口内若
     后台没跑到该实例，task_records 会永久缺行。用 task_done_sync 标记兜底：
     终态且 task_done_sync=0 的实例，每轮重扫直至写入成功后置位，缺行实例据此补齐。
+
+    Returns:
+        set[str]：本轮「running → 终态」的实例所属队列 id，供调用方触发队列调度。
+        （任务的完成是在这里被发现的，所以队列续跑必须挂在这个返回上。）
     """
+    queues_to_schedule = set()
     try:
         with get_connection() as conn:
             rows = conn.execute(
@@ -1584,11 +1753,12 @@ def _refresh_running_once():
                 "OR (status IN ('completed','finished') AND task_done_sync=0)"
             ).fetchall()
     except Exception:
-        return
+        return queues_to_schedule
 
     for row in rows:
         inst = dict(row)
         try:
+            prev_status = inst["status"]
             inst = _sync_instance_status(inst, persist=True)
             if inst["status"] == "running":
                 _compute_analyze(inst["config_path"], inst["total_tasks"])
@@ -1598,6 +1768,9 @@ def _refresh_running_once():
                 except Exception:
                     pass
             elif inst["status"] in ("completed", "finished"):
+                # 队列续跑：本实例刚跑完，放行同队列的下一排队任务
+                if prev_status in ("running", "preparing") and inst.get("queue_id"):
+                    queues_to_schedule.add(inst["queue_id"])
                 # 终态最后同步：在线同步只在 running 期间跑，完成那一刻/运行窗口内漏跑的
                 # 实例 task_records 会永久缺行。task_done_sync=0 的终态实例在此补网——
                 # 仅当 task_records 整体为空(0 行)时才需要 full 重扫；行已完整的实例
@@ -1621,6 +1794,8 @@ def _refresh_running_once():
         except Exception:
             continue
 
+    return queues_to_schedule
+
 
 async def background_cache_refresher(interval: float = 8.0):
     """
@@ -1630,14 +1805,16 @@ async def background_cache_refresher(interval: float = 8.0):
     global _bg_refresh_active
     # 先同步预热一轮，再开启「请求只读缓存」模式，避免首轮请求撞冷扫描
     try:
-        await async_execute(_refresh_running_once)
+        for qid in (await async_execute(_refresh_running_once) or ()):
+            asyncio.create_task(schedule_queue(qid))
     except Exception:
         pass
     _bg_refresh_active = True
     while True:
         await asyncio.sleep(interval)
         try:
-            await async_execute(_refresh_running_once)
+            for qid in (await async_execute(_refresh_running_once) or ()):
+                asyncio.create_task(schedule_queue(qid))
         except Exception:
             pass
 

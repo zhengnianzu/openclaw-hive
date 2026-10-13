@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
+    # 队列调度配置
+    MAX_TOTAL_SANDBOXES: int = 100
+
+    # 空跑模式（调试队列用）：True 时用「sleep N 秒后写 complete.jsonl」的空跑进程
+    # 替代真实 hive.py，准备阶段仍走真实流程，因此 pid/停止/完成检测/队列续跑
+    # 全部走生产路径，只有任务执行本身是空的。
+    MOCK_TASK_RUN: bool = False
+    MOCK_TASK_SECONDS: int = 10
+
     # 对话导出服务（模型配置面板「浏览/导出」对接，.env 配置）
     EXPORT_BASE: str = ""
     EXPORT_ACCESS_KEY: str = ""

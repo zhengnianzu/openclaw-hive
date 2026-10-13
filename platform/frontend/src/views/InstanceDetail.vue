@@ -5,8 +5,12 @@
         <template #content>{{ inst.name || '实例详情' }}</template>
       </el-page-header>
       <div style="display:flex;gap:8px">
-        <el-button type="success" v-if="authStore.isOperator && !['running','preparing'].includes(inst.status)" @click="startInstance">启动</el-button>
-        <el-button type="danger" v-if="authStore.isOperator && inst.status === 'running'" @click="stopInstance">停止</el-button>
+        <el-button type="success" v-if="authStore.isOperator && !['running','preparing'].includes(inst.status)" @click="startInstance">
+          {{ inst.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
+        </el-button>
+        <el-button type="danger" v-if="authStore.isOperator && ['running','queued'].includes(inst.status)" @click="stopInstance">
+          {{ inst.status === 'queued' ? '停止（退出队列）' : '停止' }}
+        </el-button>
         <el-button type="warning" v-if="authStore.isOperator && inst.failed_tasks > 0 && !['running','preparing'].includes(inst.status)" @click="retryFailed">重跑失败</el-button>
       </div>
     </div>
@@ -555,6 +559,47 @@
           </div>
         </el-card>
       </el-tab-pane>
+
+      <!-- ================= 队列信息 ================= -->
+      <el-tab-pane v-if="inst.queue_id" label="队列信息" name="queue">
+        <div class="glass-card" style="padding:20px">
+          <el-descriptions :column="3" border>
+            <el-descriptions-item label="所属队列">
+              <el-tag size="small" effect="plain">{{ inst.queue_id }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="队列并发量">{{ queueInfo.max_concurrent }}</el-descriptions-item>
+            <el-descriptions-item label="当前状态">
+              <el-tag :type="queueStatusType(inst.status)" size="small">{{ statusText(inst.status) }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="队列位置">
+              {{ inst.status === 'queued' ? `${myQueueRank} (等待中)` : '-' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="前方等待任务数">
+              {{ inst.status === 'queued' ? Math.max(0, myQueueRank - 1) : 0 }}
+            </el-descriptions-item>
+            <el-descriptions-item label="预计开始时间">
+              {{ myEstimatedStart || '-' }}
+            </el-descriptions-item>
+          </el-descriptions>
+
+          <el-alert type="info" :closable="false" show-icon style="margin-top:16px"
+            title="停止：退出当前队列，不再参与队列排队；启动：重新加入队列排队。" />
+
+          <div style="margin-top:20px;font-weight:600">当前队列任务列表</div>
+          <el-table :data="queueTasks" v-loading="loadingQueueTasks" size="small" style="width:100%;margin-top:10px">
+            <el-table-column prop="queue_position" label="入队序号" width="90" align="center" />
+            <el-table-column prop="name" label="任务名称" min-width="160" show-overflow-tooltip />
+            <el-table-column label="状态" width="100">
+              <template #default="{row}">
+                <el-tag :type="queueStatusType(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="创建时间" width="170">
+              <template #default="{row}"><span class="mono-num">{{ fmtTime(row.created_at) }}</span></template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
     </el-tabs>
 
     <!-- 会话详情弹窗（深层加载：轨迹 / Log / 评测） -->
@@ -756,8 +801,51 @@ const progressStatus = computed(() => {
   return ''
 })
 
-function statusColor(s) { return { running: 'success', preparing: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
-function statusText(s) { return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
+function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
+function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
+function queueStatusType(s) {
+  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger' }[s] || ''
+}
+function fmtTime(t) {
+  if (!t) return '-'
+  const d = new Date(t)
+  if (isNaN(d)) return String(t).slice(0, 16).replace('T', ' ')
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// ---- 队列信息 tab ----
+const queueInfo = ref({})
+const queueTasks = ref([])
+const loadingQueueTasks = ref(false)
+const myEstimatedStart = computed(() => {
+  const me = queueTasks.value.find(t => t.id === inst.value.id)
+  return me?.estimated_start_at ? fmtTime(me.estimated_start_at) : ''
+})
+
+// 排队名次：本实例在同队列 queued 任务里排第几（不是绝对 queue_position）。
+// queue_position 只增不减、会有空洞，直接显示会误导。
+const myQueueRank = computed(() => {
+  const waiting = queueTasks.value
+    .filter(t => t.status === 'queued')
+    .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0))
+  return waiting.findIndex(t => t.id === inst.value.id) + 1
+})
+
+async function loadQueueInfo() {
+  if (!inst.value.queue_id) return
+  loadingQueueTasks.value = true
+  try {
+    const [qs, tasks] = await Promise.all([
+      api.get('/queues'),
+      api.get(`/queues/${encodeURIComponent(inst.value.queue_id)}/tasks`),
+    ])
+    queueInfo.value = qs.find(q => q.id === inst.value.queue_id) || {}
+    queueTasks.value = tasks
+  } catch {
+    queueTasks.value = []
+  } finally { loadingQueueTasks.value = false }
+}
 function harnessColor(t) { return harnessStore.color(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
 function taskTagType(category) {
@@ -821,6 +909,7 @@ async function loadData() {
   if (inst.value.status === 'preparing') {
     try { prepareInfo.value = await api.get(`/instances/${id}/prepare-progress`) } catch {}
   }
+  loadQueueInfo()
 }
 async function loadCreateParams() { try { createParams.value = await api.get(`/instances/${id}/create-params`) } catch {} }
 async function startInstance() { await api.post(`/instances/${id}/start`); ElMessage.success('已启动'); loadData() }

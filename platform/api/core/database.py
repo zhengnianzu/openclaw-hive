@@ -166,6 +166,47 @@ def init_db():
                 pass
         conn.execute("UPDATE users SET role = 'admin' WHERE username = ?", (settings.ADMIN_USERNAME,))
 
+        # 创建队列表
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS task_queues (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                max_concurrent INTEGER NOT NULL DEFAULT 1,
+                description TEXT DEFAULT '',
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # migrate: 队列表补列（IF NOT EXISTS 不会给已存在的表加列）
+        # max_concurrent: 队列并发量，仅作展示/记录（当前调度仍是严格串行）
+        for col in [
+            "max_concurrent INTEGER NOT NULL DEFAULT 1",
+            "description TEXT DEFAULT ''",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE task_queues ADD COLUMN {col}")
+            except Exception:
+                pass
+
+        # 扩展 task_instances 表以支持队列
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN queue_id TEXT DEFAULT NULL")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN queue_position INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+        # 创建队列索引
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_task_queue ON task_instances(queue_id, queue_position)")
+        except Exception:
+            pass
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

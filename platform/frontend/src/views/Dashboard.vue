@@ -46,13 +46,20 @@
     </div>
 
     <div class="filter-bar">
-      <el-select v-model="statusFilter" placeholder="状态筛选" clearable size="default" style="width:140px">
+      <el-select v-model="statusFilter" placeholder="状态" size="default" style="width:140px">
+        <el-option label="全部" value="" />
         <el-option label="运行中" value="running" />
         <el-option label="准备中" value="preparing" />
+        <el-option label="排队中" value="queued" />
         <el-option label="已完成" value="completed" />
         <el-option label="已结束" value="finished" />
         <el-option label="已停止" value="stopped" />
         <el-option label="待启动" value="created" />
+      </el-select>
+      <el-select v-model="queueFilter" placeholder="任务队列" size="default" style="width:170px">
+        <el-option label="全部" value="" />
+        <el-option label="未入队" value="__none__" />
+        <el-option v-for="q in queueOptions" :key="q.id" :label="q.id" :value="q.id" />
       </el-select>
       <el-select v-model="harnessFilter" placeholder="Harness筛选" clearable size="default" style="width:140px">
         <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
@@ -79,6 +86,20 @@
         <el-table-column prop="status" label="状态" width="90" resizable>
           <template #default="{row}">
             <el-tag :type="statusColor(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="任务队列" width="110" resizable>
+          <template #default="{row}">
+            <el-tag v-if="row.queue_id" size="small" effect="plain">{{ row.queue_id }}</el-tag>
+            <span v-else style="color:var(--text-muted)">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="队列位置" width="110" align="center" resizable>
+          <template #default="{row}">
+            <span v-if="row.status === 'queued'" class="mono-num" style="color:#e6a23c">
+              {{ queuePositionLabel(row) }}
+            </span>
+            <span v-else class="mono-num">-</span>
           </template>
         </el-table-column>
         <el-table-column label="进度" width="160" resizable>
@@ -124,8 +145,12 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="copy">复制</el-dropdown-item>
-                    <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="start">启动</el-dropdown-item>
-                    <el-dropdown-item v-if="row.status === 'running'" command="stop">停止</el-dropdown-item>
+                    <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="start">
+                      {{ row.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="['running','queued'].includes(row.status)" command="stop">
+                      {{ row.status === 'queued' ? '停止（退出队列）' : '停止' }}
+                    </el-dropdown-item>
                     <el-dropdown-item v-if="row.failed_tasks > 0 && !['running','preparing'].includes(row.status)" command="retry">重跑失败</el-dropdown-item>
                     <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="delete" divided>删除</el-dropdown-item>
                   </el-dropdown-menu>
@@ -165,6 +190,8 @@ const loading = ref(false)
 const timeEstimates = ref({})
 const prepareProgress = ref({})
 const statusFilter = ref('')
+const queueFilter = ref('')
+const queueOptions = ref([])
 const harnessFilter = ref('')
 const userFilter = ref('')
 const dateRange = ref(null)
@@ -192,6 +219,11 @@ const userOptions = computed(() => {
 const filteredInstances = computed(() => {
   let list = instances.value
   if (statusFilter.value) list = list.filter(i => i.status === statusFilter.value)
+  if (queueFilter.value) {
+    list = queueFilter.value === '__none__'
+      ? list.filter(i => !i.queue_id)
+      : list.filter(i => i.queue_id === queueFilter.value)
+  }
   if (harnessFilter.value) list = list.filter(i => (i.harness_type || 'openclaw') === harnessFilter.value)
   if (userFilter.value) list = list.filter(i => i.created_by === userFilter.value)
   if (dateRange.value && dateRange.value.length === 2) {
@@ -205,7 +237,15 @@ const filteredInstances = computed(() => {
     const keyword = nameSearch.value.toLowerCase()
     list = list.filter(i => i.name.toLowerCase().includes(keyword))
   }
-  return list
+  // 排序：按创建时间倒序，最新建立的任务排在最前。
+  // 注：这只是「列表显示顺序」。队列内的**执行**顺序另由 queue_position 升序决定，
+  // 因此同一队列在列表里会呈现为 queue_position 递减（最新创建的在最上面）。
+  return [...list].sort((a, b) => {
+    const ta = a.created_at || ''
+    const tb = b.created_at || ''
+    if (ta === tb) return 0
+    return ta < tb ? 1 : -1
+  })
 })
 
 const pagedInstances = computed(() => {
@@ -214,7 +254,7 @@ const pagedInstances = computed(() => {
 })
 
 // 筛选/每页条数变化时回到第一页；当前页因数据减少而越界时也回退，避免停在空白页
-watch([statusFilter, harnessFilter, userFilter, dateRange, nameSearch, pageSize], () => {
+watch([statusFilter, queueFilter, harnessFilter, userFilter, dateRange, nameSearch, pageSize], () => {
   if (restoring) return
   currentPage.value = 1
   syncQuery()
@@ -231,6 +271,7 @@ function syncQuery() {
   if (restoring) return
   const q = {}
   if (statusFilter.value) q.status = statusFilter.value
+  if (queueFilter.value) q.queue = queueFilter.value
   if (harnessFilter.value) q.harness = harnessFilter.value
   if (userFilter.value) q.user = userFilter.value
   if (dateRange.value && dateRange.value.length === 2) q.date = dateRange.value.join(',')
@@ -243,6 +284,7 @@ function restoreFromQuery() {
   restoring = true
   const q = route.query
   if (q.status) statusFilter.value = String(q.status)
+  if (q.queue) queueFilter.value = String(q.queue)
   if (q.harness) harnessFilter.value = String(q.harness)
   if (q.user) userFilter.value = String(q.user)
   if (q.date) dateRange.value = String(q.date).split(',')
@@ -262,6 +304,14 @@ async function loadInstances() {
     loadTimeEstimates()
     loadPrepareProgress()
   } finally { if (isFirstLoad) loading.value = false }
+}
+
+async function loadQueueOptions() {
+  try {
+    queueOptions.value = await api.get('/queues')
+  } catch {
+    queueOptions.value = []
+  }
 }
 
 async function loadTimeEstimates() {
@@ -297,10 +347,22 @@ function formatDuration(seconds) {
 }
 
 function statusColor(s) {
-  return { running: 'success', preparing: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || ''
+  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || ''
 }
 function statusText(s) {
-  return { running: '运行中', preparing: '准备中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+  return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+}
+
+// 队列位置：显示「在当前排队队列里的名次」，而不是绝对序号。
+// queue_position 是只增不减的序号（每次「启动」重新入队都会 +1），会有空洞，
+// 直接显示会误导（例如队里第 4 个任务却显示 9）。这里按同队列 queued 任务
+// 的 queue_position 排序后算出名次，与设计图的「1 (等待中)」一致。
+function queuePositionLabel(row) {
+  const waiting = instances.value
+    .filter(i => i.queue_id === row.queue_id && i.status === 'queued')
+    .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0))
+  const rank = waiting.findIndex(i => i.id === row.id) + 1
+  return rank > 0 ? `${rank} (等待中)` : '-'
 }
 function harnessColor(t) { return harnessStore.color(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
@@ -319,7 +381,7 @@ function handleCommand(cmd, row) {
   actions[cmd]?.()
 }
 
-onMounted(() => { restoreFromQuery(); harnessStore.load(); loadInstances(); timer = setInterval(loadInstances, 10000) })
+onMounted(() => { restoreFromQuery(); harnessStore.load(); loadInstances(); loadQueueOptions(); timer = setInterval(loadInstances, 10000) })
 onUnmounted(() => clearInterval(timer))
 </script>
 

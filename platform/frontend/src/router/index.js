@@ -10,6 +10,7 @@ const routes = [
     children: [
       { path: 'dashboard', name: 'Dashboard', component: () => import('../views/Dashboard.vue') },
       { path: 'create', name: 'Create', component: () => import('../views/CreateInstance.vue') },
+      { path: 'queues', name: 'Queues', component: () => import('../views/Queues.vue') },
       { path: 'instance/:id', name: 'InstanceDetail', component: () => import('../views/InstanceDetail.vue') },
       // 日志/输出已合并进 InstanceDetail 的 tab，旧链接重定向过去
       { path: 'logs/:id', redirect: to => ({ path: `/instance/${to.params.id}`, query: { tab: 'logs' } }) },

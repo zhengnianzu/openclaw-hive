@@ -13,7 +13,7 @@ from typing import Optional
 from api.core.config import settings
 from api.core.database import init_db, get_connection
 from api.core.security import get_current_user, get_password_hash
-from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta
+from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues
 from api.routers import batch_output
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
@@ -41,6 +41,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(instances.router)
 app.include_router(instances.key_router)
+app.include_router(queues.router)
 app.include_router(obs.router)
 app.include_router(logs.router)
 app.include_router(registrations.router)
@@ -80,6 +81,15 @@ async def _start_background_tasks():
     except Exception as e:
         print(f"[startup] recover_orphan_preparing error: {e}")
     asyncio.create_task(instances.background_cache_refresher())
+    # 调度是事件驱动的，重启后若整条队列都停在 queued，没有任何事件会再触发它，
+    # 任务会被永久搁死。启动时对所有含排队任务的队列兜底调度一次。
+    try:
+        from api.services.queue_scheduler import resume_all_queues
+        n = await resume_all_queues()
+        if n:
+            print(f"[startup] 恢复 {n} 个队列的排队任务")
+    except Exception as e:
+        print(f"[startup] resume_all_queues error: {e}")
 
 
 @app.post("/api/generate-api-key")
