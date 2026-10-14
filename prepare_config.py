@@ -73,7 +73,8 @@ _FRAMEWORK_LAYOUTS: dict = {
         "harness_local_config":   "uploads/opencode.json",
         "harness_sandbox_config": "/home/ma-user/.config/opencode/opencode.json",
         "upload_paths": [
-           "/home/ma-user/.local/share/opencode"
+            "/home/ma-user/.local/share/opencode/opencode.db",
+            "/home/ma-user/.local/share/opencode/log"
         ],
         "workspace_base": "/home/ma-user/.config/opencode/workspace",
         "skill_subdir": ".opencode/skills",

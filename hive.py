@@ -55,6 +55,36 @@ _current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
 
+
+def _suffix_api_keys(config_file: str, suffix: str) -> None:
+    """给模型 key 加上沙箱标识后缀, 改完再上传。
+
+    只动两类 key, 其余 (如 tools.web.search.apiKey / gateway token 等无关 key) 一律不动:
+      - openclaw.json:        models.providers.<name>.apiKey
+      - user_proxy_model.json: <agent>.api_key
+    """
+    path = Path(config_file)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+
+    # openclaw.json: models.providers.<name>.apiKey
+    for provider in ((data.get("models") or {}).get("providers") or {}).values():
+        if isinstance(provider, dict) and isinstance(provider.get("apiKey"), str):
+            provider["apiKey"] += f"_{suffix}"
+            changed = True
+
+    # user_proxy_model.json: <agent>.api_key
+    for agent in data.values():
+        if isinstance(agent, dict) and isinstance(agent.get("api_key"), str):
+            agent["api_key"] += f"_{suffix}"
+            changed = True
+
+    if changed:
+        path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+
 # ============================================================================
 # Error Catalog
 # ============================================================================
@@ -333,6 +363,7 @@ class TaskConfig:
     main_python_timeout: int = 7200
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
+    suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
@@ -431,6 +462,47 @@ class OpenClawDistillationTask:
         self.client_config = self._init_config(yaml_config)
         self.execution_client: Optional[ExecutionClient] = None
 
+        # 每个任务一个沙箱(=一个 env_id), 取 uuid 前 8 位作为 key 后缀。
+        # env_id = f"{sandbox_id_prefix}-{uuid4().hex}"
+        self.sandbox_suffix: str = self.client_config.env_make.env_id.rsplit("-", 1)[-1]
+        # 每个任务一份独立的本地配置副本, 避免并发 worker 共用同一文件互相覆盖
+        self._local_config_dir: str = os.path.join(
+            self.config.task_output_path, "local_configs", self.client_config.env_make.env_id
+        )
+        self._harness_local_config: str = ""
+        self._user_proxy_local_config: str = ""
+
+    def _prepare_local_configs(self) -> None:
+        """为本次任务拷贝独立的 openclaw.json / user_proxy_model.json 并打上 key 后缀。
+        仅 openclaw 走 per-task 副本: opencode 的配置由 worker 侧
+        prepare_local_agent_config 写共享文件, 换成本地副本会上传一份没注入
+        provider 的旧配置, 因此其它 framework 保持原有共享路径。
+        """
+        if not self.config.suffix_api_keys:
+            return
+        if AGENT_FRAMEWORK.strip().lower() != "openclaw":
+            return
+        sc = self.config.sandbox_config
+        Path(self._local_config_dir).mkdir(parents=True, exist_ok=True)
+        suffix = self.sandbox_suffix
+
+        for src, attr in (
+            (sc.harness_local_config_file, "_harness_local_config"),
+            (sc.user_proxy_model_local_file, "_user_proxy_local_config"),
+        ):
+            if not src or not os.path.exists(src):
+                setattr(self, attr, src)
+                continue
+            dst = os.path.join(self._local_config_dir, os.path.basename(src))
+            shutil.copy2(src, dst)
+            _suffix_api_keys(dst, suffix)
+            setattr(self, attr, dst)
+
+        self.logger.info(
+            f"本地配置已就绪: env_id={self.client_config.env_make.env_id} "
+            f"suffix={suffix} dir={self._local_config_dir}"
+        )
+
     def _init_config(self, yaml_config: DictConfig) -> DictConfig:
         """Initialize and return the client config with runtime values."""
         s3 = yaml_config.s3
@@ -478,7 +550,7 @@ class OpenClawDistillationTask:
     async def _copy_agent_config(self, data_config_file) -> None:
         """把本地 agent config 上传到 sandbox。"""
         remote_path = self.config.sandbox_config.harness_sandbox_config_file
-        local_path = self.config.sandbox_config.harness_local_config_file
+        local_path = self._harness_local_config or self.config.sandbox_config.harness_local_config_file
 
         if AGENT_FRAMEWORK == "opencode":
             # opencode 需要 per-task 的 agent system_prompt, 只能 worker 侧做
@@ -523,7 +595,8 @@ class OpenClawDistillationTask:
         self.logger.info(f"Uploaded data config: {config_file} -> {remote_path}")
 
     async def _upload_user_proxy_model_config(self) -> None:
-        local_path = self.config.sandbox_config.user_proxy_model_local_file
+        # 用本次任务的独立副本(已打上 key 后缀), 不动共享的 uploads/user_proxy_model.json
+        local_path = self._user_proxy_local_config or self.config.sandbox_config.user_proxy_model_local_file
         code_stem = Path(self.config.main_code_tar).stem
         remote_path = os.path.join(
             self.config.sandbox_config.workspace,
@@ -535,8 +608,8 @@ class OpenClawDistillationTask:
 
     async def _start_openclaw_gateway(self, config_file: str) -> None:
         """Start the OpenClaw gateway in the sandbox."""
-        # Read gateway port from local config
-        with open(self.config.sandbox_config.harness_local_config_file, "r", encoding="utf-8") as f:
+        # Read gateway port from local config (本次任务的副本, 不是共享模板)
+        with open(self._harness_local_config or self.config.sandbox_config.harness_local_config_file, "r", encoding="utf-8") as f:
             openclaw_config = json.load(f)
             original_port = openclaw_config.get("gateway", {}).get("port")
 
@@ -913,6 +986,7 @@ class OpenClawDistillationTask:
                     (没有 gateway 进程, AIAgent 进程内调用)
         其他步骤变量复用, 路径靠 config.yaml 覆写。
         """
+        self._prepare_local_configs()
         await self._upload_and_extract_code()
         await self._download_s3_skills(config_file)
         await self._download_s3_user_profile(config_file)
@@ -1326,5 +1400,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

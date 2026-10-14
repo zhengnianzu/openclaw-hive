@@ -1,9 +1,9 @@
 # ==================== 全局配置 ====================
 global:
   # 控制面服务地址，SDK 通过此地址与控制面通信
-  controlplane_base_url: http://192.168.20.109:30081
+  controlplane_base_url: http://192.168.11.87:30081
   # API 认证密钥，用于 SDK 与控制面之间的身份校验
-  api_key: "default-api-key"
+  api_key: "omni-env-default-api-key"
   logger:
     name: env_sdk_client
     level: INFO
@@ -25,66 +25,95 @@ sandbox:
   x86_cpu:
     architecture: x86           # CPU 架构: x86 或 arm64
     accelerator: null           # 加速器类型: null(无)/npu/gpu
-    ttl_seconds: 3600            # 沙箱生存时间（秒），超时后自动回收
-    wait_timeout_seconds: 300   # 等待沙箱就绪的超时时间（秒）
+    lease_ttl_seconds: 900         # 900s检测沙箱存活
+    max_ttl_second: 14400          # 沙箱最大存活时间，大于任务执行时间
+    wait_timeout_seconds: 1200   # 等待沙箱就绪的超时时间（秒）
+
     sandbox:
-      image: xxxxx
+      image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:26.9.24v1
       # 环境变量配置
       env:
-        - name: PIP_INDEX_URL     # pip 镜像源地址
-          value: https://mirrors.tools.huawei.com/pypi/simple
-        - name: PIP_TRUSTED_HOST  # pip 信任的主机名
-          value: mirrors.tools.huawei.com
-        - name: ADAPTOR_NAME      # 适配器名称，用于沙箱内的服务注册
-          value: deep_diver
-        - name: ADAPTOR_PORT      # 适配器监听端口
-          value: "8008"
+        - name: PIP_INDEX_URL
+          value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
+        - name: PIP_TRUSTED_HOST
+          value: "mirrors.huaweicloud.com"
         - name: NODE_TLS_REJECT_UNAUTHORIZED
-          value: 0
+          value: "0"
+        # serper 环境变量配置
         - name: SERPER_API_KEY
-          value: xxxx
+          value: sk-xxx
+        - name: SERPER_API_URL
+          value: https://yibuapi.com/serper/
+        - name: OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS
+          value: "off"
+        - name: SEARCH_API_KEY
+          value: sk-xxx
+        - name: SEARCH_BACKEND_URL
+          value: https://yibuapi.com
+        # dsh 最大token数
+        - name: DSH_MAX_TOKENS
+          value: 131072
+        # 工具playwright 启用开关
+        - name: MCP_PLAYWRIGHT
+          value: "off"
+        # 工具image_reading 启用开关：on时才生效VL_xx的环境配置，每个团队配置自己的VL变量
+        - name: IMAGE_READING
+          value: "on"
+        - name: IMAGE_READING_PATH
+          value: "/home/ma-user/claude_code_image_reading_tool/mcp-image-reading/server.js"
+        - name: VL_API_URL
+          value: http://115.33.106.57:8082/v1
+        - name: VL_API_KEY
+          value: sk-xxxx
+        - name: VL_MODEL_ID
+          value: gemini-3.7-flash
+
+
       # 资源请求与限制
       resources:
-        cpu_request: "1"          # CPU 请求量（核数）
-        cpu_limit: "1.5"          # CPU 上限（核数）
-        memory_request: "4Gi"     # 内存请求量
-        memory_limit: "4Gi"       # 内存上限
+        cpu_request: "2"          # CPU 请求量（核数）
+        cpu_limit: "3"          # CPU 上限（核数）
+        memory_request: "6Gi"     # 内存请求量
+        memory_limit: "8Gi"       # 内存上限
 
 
 s3:
   s3_uploader_script: /home/ma-user/obsutil/obsutil
   s3_download_script: /home/ma-user/obsutil/obsutil
-  bucket_name: "obs://rl-agentdata"
+  bucket_name: "obs://s3-asset-b-hd-cce-aifm-nlp-exp"
 
 sandbox_id_prefix: zx
+sandbox_namespace: omni-env-default-worker
 
 run_config:
   harness_type: openclaw
   start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
-  total_num: 3      # 任务总数, 0表示不限制任务数量
-  concurrent_num: 2   # 并发数 claude 100~150
+  total_num: 0      # 任务总数, 0表示不限制任务数量
+  concurrent_num: 3   # 并发数 claude 100~150
   sandbox:
     result_log: "run.log"
     openclaw_local_config_file: "uploads/openclaw.json"
-    # openclaw_api_key: sk-18842394415-api
     user_proxy_model_local_file: "uploads/user_proxy_model.json"
     openclaw_start_timeout: 80  # openclaw 镜像版本号大于0.0.6时 设大于60，启动有点慢
   task:
-    task_input_path: "task_configs"  # 任务输入路径
+    suffix_api_keys: true # true 对应自部署模型配置user_id，第三方模型置为false
+    task_input_path: "configs"  # 任务输入路径
     task_output_path: "outputs"  # 任务输出路径
     task_complete_record: "complete.jsonl"  # 完成任务记录文件
     task_failed_record: "failed.jsonl"  # 失败任务记录文件
     task_download_path: "downloads"
     main_code_tar: "uploads/openclaw-task.tar"
-    main_code_dir: ""  # 源码目录路径，非空时自动打包替代 main_code_tar，如 "openclaw-task"
+    main_code_dir: "/mnt/zengxiang/openclaw-task"  # 源码目录路径，非空时自动打包替代 main_code_tar，如 "openclaw-task"
     main_python_file: "harness_automation.py"  # start脚本文件
+    main_python_timeout: 14400
   obs:
     download_timeout: 1200
     upload_timeout: 900
-    traj_save_bucket: obs://rl-agentdata
+    traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
-    traj_save_path: openclaw_trajs/traj_0713_test
-    skill_download_path:
-    user_config_download_path: zengxiang/task_configs
+    traj_save_path:
+    skill_download_path: /home/ma-user/skills_library
+    user_config_download_path:
     user_profile_download_path:
     agents_download_path:
+    default_skills:
