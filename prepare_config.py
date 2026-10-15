@@ -159,9 +159,10 @@ def _read_agent_system_prompts(data_config_file: Optional[str]) -> dict:
 
 
 def prepare_local_agent_config(
-    sandbox_config,
     framework: str,
     data_config_file: Optional[str] = None,
+    local_path: Optional[str] = None,
+    local_user_proxy_model_path: Optional[str] = None
 ) -> None:
     """在 spawn worker 之前把本地 agent 配置文件按 framework 修改到位。
 
@@ -171,9 +172,7 @@ def prepare_local_agent_config(
         framework: 当前 agent 框架名 (openclaw/hermes/dsh/...)
         data_config_file: opencode 分支需要 data_config 里的 agent system_prompt
     """
-    local_path = sandbox_config.harness_local_config_file
-    local_model_path = sandbox_config.user_proxy_model_local_file
-    model_cfg = json.loads(Path(local_model_path).read_text(encoding="utf-8"))
+    model_cfg = json.loads(Path(local_user_proxy_model_path).read_text(encoding="utf-8"))
 
     if framework == "openjiuwen":
         # 1) openjiuwen.json: 归一化 default.provider 里的 anthropic -> Anthropic
@@ -188,7 +187,7 @@ def prepare_local_agent_config(
         for agent in model_cfg.values():
             if "anthropic" in agent.get("api", ""):
                 agent["api"] = "Anthropic"
-        Path(local_model_path).write_text(
+        Path(local_user_proxy_model_path).write_text(
             json.dumps(model_cfg, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
@@ -255,7 +254,7 @@ def prepare_local_agent_config(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        logging.info(f"Updated opencode.json with provider/agent from {local_model_path}")
+        logging.info(f"Updated opencode.json with provider/agent from {local_user_proxy_model_path}")
 
     elif framework == "pi":
         # models.json: 注入 provider
@@ -308,7 +307,7 @@ def prepare_local_agent_config(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        logging.info(f"Updated models.json with provider from {local_model_path}")
+        logging.info(f"Updated models.json with provider from {local_user_proxy_model_path}")
 
     elif framework == "codex":
         # [model_providers.<key>] 追加到 config.toml, 已存在则跳过
@@ -351,7 +350,7 @@ def prepare_local_agent_config(
             toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
             Path(local_path).write_text(toml_text, encoding="utf-8")
             logging.info(
-                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
+                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_user_proxy_model_path}"
             )
 
     elif framework == "grok":
@@ -395,7 +394,7 @@ def prepare_local_agent_config(
             toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
             Path(local_path).write_text(toml_text, encoding="utf-8")
             logging.info(
-                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
+                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_user_proxy_model_path}"
             )
 
     elif framework == "dsh":
@@ -444,7 +443,7 @@ def prepare_local_agent_config(
                         f"Added model {model_name} to existing dsh provider {provider_key}"
                     )
         OmegaConf.save(data, local_path)
-        logging.info(f"Updated settings.yaml with provider from {local_model_path}")
+        logging.info(f"Updated settings.yaml with provider from {local_user_proxy_model_path}")
 
     elif framework == "openclaw":
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))

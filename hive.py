@@ -56,35 +56,6 @@ OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
 
 
-def _suffix_api_keys(config_file: str, suffix: str) -> None:
-    """给模型 key 加上沙箱标识后缀, 改完再上传。
-
-    只动两类 key, 其余 (如 tools.web.search.apiKey / gateway token 等无关 key) 一律不动:
-      - openclaw.json:        models.providers.<name>.apiKey
-      - user_proxy_model.json: <agent>.api_key
-    """
-    path = Path(config_file)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    changed = False
-
-    # openclaw.json: models.providers.<name>.apiKey
-    for provider in ((data.get("models") or {}).get("providers") or {}).values():
-        if isinstance(provider, dict) and isinstance(provider.get("apiKey"), str):
-            provider["apiKey"] += f"_{suffix}"
-            changed = True
-
-    # user_proxy_model.json: <agent>.api_key
-    for agent in data.values():
-        if isinstance(agent, dict) and isinstance(agent.get("api_key"), str):
-            agent["api_key"] += f"_{suffix}"
-            changed = True
-
-    if changed:
-        path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
-
-
 # ============================================================================
 # Error Catalog
 # ============================================================================
@@ -364,6 +335,7 @@ class TaskConfig:
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
+    model_api_key: str = ""  # 主 agent 原始 key(平台传入), suffix_api_keys 时在 hive 里打后缀
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
@@ -462,46 +434,15 @@ class OpenClawDistillationTask:
         self.client_config = self._init_config(yaml_config)
         self.execution_client: Optional[ExecutionClient] = None
 
-        # 每个任务一个沙箱(=一个 env_id), 取 uuid 前 8 位作为 key 后缀。
+        # 每个任务一个沙箱(=一个 env_id), 取 uuid 作为 key 后缀。
         # env_id = f"{sandbox_id_prefix}-{uuid4().hex}"
         self.sandbox_suffix: str = self.client_config.env_make.env_id.rsplit("-", 1)[-1]
-        # 每个任务一份独立的本地配置副本, 避免并发 worker 共用同一文件互相覆盖
-        self._local_config_dir: str = os.path.join(
-            self.config.task_output_path, "local_configs", self.client_config.env_make.env_id
-        )
-        self._harness_local_config: str = ""
-        self._user_proxy_local_config: str = ""
+        # 主 agent 原始 key(平台传入), 保持原样; 后缀在 _prepare_local_configs 里做文件内容替换
+        self.model_api_key: str = self.config.model_api_key or ""
+        # 本地配置路径(共享模板)。每个任务复制成独立副本再改写上传, 副本路径由 _prepare_local_configs 生成。
+        self.local_config_file: str = self.config.sandbox_config.harness_local_config_file
+        self.local_model_config_file: str = self.config.sandbox_config.user_proxy_model_local_file
 
-    def _prepare_local_configs(self) -> None:
-        """为本次任务拷贝独立的 openclaw.json / user_proxy_model.json 并打上 key 后缀。
-        仅 openclaw 走 per-task 副本: opencode 的配置由 worker 侧
-        prepare_local_agent_config 写共享文件, 换成本地副本会上传一份没注入
-        provider 的旧配置, 因此其它 framework 保持原有共享路径。
-        """
-        if not self.config.suffix_api_keys:
-            return
-        if AGENT_FRAMEWORK.strip().lower() != "openclaw":
-            return
-        sc = self.config.sandbox_config
-        Path(self._local_config_dir).mkdir(parents=True, exist_ok=True)
-        suffix = self.sandbox_suffix
-
-        for src, attr in (
-            (sc.harness_local_config_file, "_harness_local_config"),
-            (sc.user_proxy_model_local_file, "_user_proxy_local_config"),
-        ):
-            if not src or not os.path.exists(src):
-                setattr(self, attr, src)
-                continue
-            dst = os.path.join(self._local_config_dir, os.path.basename(src))
-            shutil.copy2(src, dst)
-            _suffix_api_keys(dst, suffix)
-            setattr(self, attr, dst)
-
-        self.logger.info(
-            f"本地配置已就绪: env_id={self.client_config.env_make.env_id} "
-            f"suffix={suffix} dir={self._local_config_dir}"
-        )
 
     def _init_config(self, yaml_config: DictConfig) -> DictConfig:
         """Initialize and return the client config with runtime values."""
@@ -547,23 +488,60 @@ class OpenClawDistillationTask:
                                 result, level=logging.ERROR)
             raise HiveError("C002", detail=detail, sandbox_result=result)
 
-    async def _copy_agent_config(self, data_config_file) -> None:
-        """把本地 agent config 上传到 sandbox。"""
+    def _prepare_local_configs(self, data_config_file: Optional[str] = None, port: Optional[str] = None) -> None:
+        """每个任务复制出两份独立副本(harness 配置 + user_proxy_model.json), 再在副本上
+        打 key 后缀 / 写主 key / 写端口。副本按 env_id 隔离, 无需锁。
+        """
+        env_id = self.client_config.env_make.env_id
+        local_dir = Path(self.config.task_output_path) / "local_configs" / env_id
+        local_dir.mkdir(parents=True, exist_ok=True)
+        self.local_config_file = str(local_dir / Path(self.config.sandbox_config.harness_local_config_file).name)
+        self.local_model_config_file = str(local_dir / Path(self.config.sandbox_config.user_proxy_model_local_file).name)
+        shutil.copy2(self.config.sandbox_config.harness_local_config_file, self.local_config_file)
+        shutil.copy2(self.config.sandbox_config.user_proxy_model_local_file, self.local_model_config_file)
+
+        # 1) user_proxy_model.json 读取再追加后缀(provider 注入前做, 保证注入的 provider 也带后缀)
+        if bool(self.config.suffix_api_keys):
+            model_cfg = json.loads(Path(self.local_model_config_file).read_text(encoding="utf-8"))
+            for agent in model_cfg.values():
+                if isinstance(agent, dict) and agent.get("api_key"):
+                    agent["api_key"] = agent["api_key"] + f"_{self.sandbox_suffix}"
+            Path(self.local_model_config_file).write_text(
+                json.dumps(model_cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+
+        # 2) provider 注入走 prepare_config(与 main 一致), 通过 per-task 副本指到副本路径
+        prepare_local_agent_config(AGENT_FRAMEWORK, data_config_file, self.local_config_file, self.local_model_config_file)
+
+        # 3) 主 key 后缀: 用「原始 key + 后缀」直接替换文件里出现的原始 key, 不区分 harness
+        if self.model_api_key and bool(self.config.suffix_api_keys):
+            suffixed = self.model_api_key + f"_{self.sandbox_suffix}"
+            content = Path(self.local_config_file).read_text(encoding="utf-8")
+            content = content.replace(self.model_api_key, suffixed)
+            Path(self.local_config_file).write_text(content, encoding="utf-8")
+
+        # 4) 端口本地写进 openclaw.json 副本再上传
+        if port is not None:
+            data = json.loads(Path(self.local_config_file).read_text(encoding="utf-8"))
+            if "gateway" in data:
+                data["gateway"]["port"] = int(port)
+            Path(self.local_config_file).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        self.logger.info(
+            f"local config copies: agent={self.local_config_file}, model={self.local_model_config_file}"
+        )
+
+    async def _copy_agent_config(self, data_config_file, port: Optional[str] = None) -> None:
+        """复制两份独立副本 → 改写 → 上传 agent config + user_proxy_model。
+
+        每任务一份副本(env_id 隔离), 无需锁; port 不为 None(openclaw)时把端口写进副本。
+        """
+        await asyncio.to_thread(self._prepare_local_configs, data_config_file, port)
         remote_path = self.config.sandbox_config.harness_sandbox_config_file
-        local_path = self._harness_local_config or self.config.sandbox_config.harness_local_config_file
-
-        if AGENT_FRAMEWORK == "opencode":
-            # opencode 需要 per-task 的 agent system_prompt, 只能 worker 侧做
-            async with _file_lock:
-                await asyncio.to_thread(
-                    prepare_local_agent_config,
-                    self.config.sandbox_config,
-                    AGENT_FRAMEWORK,
-                    data_config_file,
-                )
-
-        await self._upload_file("agent config", local_path, remote_path)
-        self.logger.info(f"Copied agent config: {local_path} -> {remote_path}")
+        await self._upload_file("agent config", self.local_config_file, remote_path)
+        await self._upload_user_proxy_model_config()
+        self.logger.info(f"Copied agent config: {self.local_config_file} -> {remote_path}")
 
     async def _upload_and_extract_code(self) -> None:
         """Upload and extract the main code tarball in sandbox."""
@@ -586,17 +564,42 @@ class OpenClawDistillationTask:
                             sandbox_result=result)
         self.logger.info("Code extracted successfully")
 
-    async def _upload_data_config(self, config_file: str) -> None:
-        """Upload task data config file to sandbox."""
+    async def _upload_data_config(self, config_file: str, port: Optional[str] = None) -> None:
+        """Upload task data config file to sandbox.
+
+        port 不为 None 时: 把 gateway_ws_url 写入正确端口再上传, 上传后还原本地文件。
+        不管原文件里有没有 gateway_ws_url 字段, 都强制写入 —— 没有此字段时 task 代码
+        fallback 到硬编码的 18789, 导致连接失败。
+        port 为 None 时直接上传, 不修改内容。
+        """
         remote_path = os.path.join(
             self.config.sandbox_config.data_config_path, os.path.basename(config_file)
         )
-        await self._upload_file("data config", config_file, remote_path)
+        if port is not None:
+            original = Path(config_file).read_text(encoding="utf-8")
+            try:
+                data = json.loads(original)
+                data["gateway_ws_url"] = f"ws://127.0.0.1:{port}/gateway"
+                Path(config_file).write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                logger.info(
+                    f"data_config gateway_ws_url -> ws://127.0.0.1:{port}/gateway"
+                )
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"could not patch gateway_ws_url in {config_file}: {e}")
+            try:
+                await self._upload_file("data config", config_file, remote_path)
+            finally:
+                Path(config_file).write_text(original, encoding="utf-8")
+        else:
+            await self._upload_file("data config", config_file, remote_path)
         self.logger.info(f"Uploaded data config: {config_file} -> {remote_path}")
 
     async def _upload_user_proxy_model_config(self) -> None:
-        # 用本次任务的独立副本(已打上 key 后缀), 不动共享的 uploads/user_proxy_model.json
-        local_path = self._user_proxy_local_config or self.config.sandbox_config.user_proxy_model_local_file
+        # 上传per-task的 user_proxy_model.json 副本
+        local_path = self.local_model_config_file
         code_stem = Path(self.config.main_code_tar).stem
         remote_path = os.path.join(
             self.config.sandbox_config.workspace,
@@ -608,11 +611,6 @@ class OpenClawDistillationTask:
 
     async def _start_openclaw_gateway(self, config_file: str) -> None:
         """Start the OpenClaw gateway in the sandbox."""
-        # Read gateway port from local config (本次任务的副本, 不是共享模板)
-        with open(self._harness_local_config or self.config.sandbox_config.harness_local_config_file, "r", encoding="utf-8") as f:
-            openclaw_config = json.load(f)
-            original_port = openclaw_config.get("gateway", {}).get("port")
-
         start_time = asyncio.get_running_loop().time()
         max_wait = self.config.openclaw_gateway_timeout
 
@@ -627,22 +625,11 @@ class OpenClawDistillationTask:
                 self.config.sandbox_config.data_config_path, os.path.basename(config_file)
             )
 
-            # Re-copy original config before sed (needed because config may have been modified in previous retry)
-            await self._copy_agent_config(config_file)
+            # 每次尝试重新复制副本, 并把 gateway.port 本地写进 openclaw.json 副本再上传 
+            await self._copy_agent_config(config_file, port=port)
 
-            # Update port in remote config files
-            for remote_file in [self.config.sandbox_config.harness_sandbox_config_file, remote_config_path]:
-                sed_cmd = f"sed -i 's/{original_port}/{port}/g' {remote_file}"
-                exec_request = ExtendExecCommand(
-                    command=["/bin/bash", "-c", sed_cmd],
-                    timeout=self.config.simple_bash_timeout,
-                )
-                result = await self.execution_client.extend(args=exec_request.to_dict())
-                if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                    self.logger.error(f"[S004] port-update failed on {remote_file}")
-                    _log_sandbox_detail(self.logger, f"sed port update failed — {remote_file}",
-                                        result, level=logging.ERROR)
-                    raise HiveError("S004", detail=remote_file, sandbox_result=result)
+            # data config 的 gateway_ws_url 写入正确端口再上传
+            await self._upload_data_config(config_file, port=port)
 
             # Start gateway
             gateway_log_path = os.path.join(
@@ -986,16 +973,15 @@ class OpenClawDistillationTask:
                     (没有 gateway 进程, AIAgent 进程内调用)
         其他步骤变量复用, 路径靠 config.yaml 覆写。
         """
-        self._prepare_local_configs()
         await self._upload_and_extract_code()
         await self._download_s3_skills(config_file)
         await self._download_s3_user_profile(config_file)
         await self._download_s3_agents()
         await self._upload_data_config(config_file)
-        await self._upload_user_proxy_model_config()
         if AGENT_FRAMEWORK.strip().lower() == "openclaw":
             await self._start_openclaw_gateway(config_file)
         else:
+            # 就地改写 → 上传 agent config + user_proxy_model → 还原
             await self._copy_agent_config(config_file)
         await self._run_main_script(config_file, task_idx)
 
@@ -1352,6 +1338,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="OpenClaw Distillation Task Runner")
     parser.add_argument("--config", required=True, help="Configuration file path (YAML)")
     parser.add_argument("--failed", action="store_true", help="Run only previously failed tasks")
+    parser.add_argument("--model-api-key", default="", help="Model API key passed from the platform")
     args = parser.parse_args()
 
     config_obj = load_yaml_config(args.config)
@@ -1382,12 +1369,9 @@ def main() -> None:
         run_config_file=args.config,
         **task_dict,
         obs_config=ObsBucketConfig(**run_cfg.obs),
-        sandbox_config=SandboxConfig(**_compat_sandbox(run_cfg.sandbox))
+        sandbox_config=SandboxConfig(**_compat_sandbox(run_cfg.sandbox)),
+        model_api_key=args.model_api_key,
     )
-
-    # 在 spawn worker 之前, 把 harness-specific 的本地配置 mutate 集中做一次。
-    if AGENT_FRAMEWORK != "opencode":
-        prepare_local_agent_config(task_config.sandbox_config, AGENT_FRAMEWORK)
 
     asyncio.run(run_tasks(
         task_config=task_config,
