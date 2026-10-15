@@ -1264,9 +1264,14 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
         if settings.MOCK_TASK_RUN:
             proc = _launch_mock_task(output_dir, log_file)
         else:
+            create_params = json.loads(inst["create_params"]) if inst.get("create_params") else {}
+            model_api_key = (create_params.get("model_api_key") or "").strip()
+            hive_cmd = ["python", os.path.join(settings.HIVE_ROOT, "hive.py"), "--config", config_path]
+            if model_api_key:
+                hive_cmd += ["--model-api-key", model_api_key]
             with open(log_file, "a") as lf:
                 proc = subprocess.Popen(
-                    ["python", os.path.join(settings.HIVE_ROOT, "hive.py"), "--config", config_path],
+                    hive_cmd,
                     stdout=lf, stderr=lf,
                     cwd=settings.HIVE_ROOT,
                     env=env,
