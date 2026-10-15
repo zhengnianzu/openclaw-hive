@@ -6,13 +6,18 @@ hive.py 反向 import 它。新增 harness 只需在本文件修改两处:
   2. ``prepare_local_agent_config`` 加对应的 framework 分支(若需要本地 mutate)。
 """
 from __future__ import annotations
-
+import copy
 import json
 import logging
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
+import tomllib
+import tomli_w
 
 from omegaconf import OmegaConf
+
+logger = logging.getLogger("env_sdk_client")
 
 
 # 每框架的目录布局 — 用这个 dict 派生所有路径默认值。
@@ -123,6 +128,23 @@ _FRAMEWORK_LAYOUTS: dict = {
 }
 
 
+def adapt_layout_for_windows(layout: dict, win_home: str) -> dict:
+    """把 Linux 风格 layout 的 /home/ma-user/... 路径适配为 Windows 路径。"""
+    out = copy.deepcopy(layout)
+    for key in ("harness_dir", "harness_sandbox_config", "workspace_base"):
+        p = layout.get(key, "")
+        if p and p.startswith("/home/ma-user"):
+            out[key] = str(PureWindowsPath(win_home).joinpath(
+                PurePosixPath(p).relative_to("/home/ma-user")))
+    out["upload_paths"] = [
+        str(PureWindowsPath(win_home).joinpath(
+            PurePosixPath(p).relative_to("/home/ma-user")))
+        if p and p.startswith("/home/ma-user") else p
+        for p in layout.get("upload_paths", [])
+    ]
+    return out
+
+
 def normalize_base_url(base_url: str, api_kind: str = "openai-completions") -> str:
     """按 api_kind 归一化 base_url 的 /v1 后缀。"""
     base_url = base_url.rstrip("/")
@@ -150,7 +172,7 @@ def _read_agent_system_prompts(data_config_file: Optional[str]) -> dict:
         with open(data_config_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        logging.warning(f"read agent system_prompt failed: {e}")
+        logger.warning(f"read agent system_prompt failed: {e}")
         return {}
     return {
         agent.get("name", ""): agent.get("system_prompt", "")
@@ -162,6 +184,10 @@ def prepare_local_agent_config(
     sandbox_config,
     framework: str,
     data_config_file: Optional[str] = None,
+    local_config: Optional[str] = None,
+    local_model_config: Optional[str] = None,
+    suffix: str = "",
+    apply_suffix: bool = False,
 ) -> None:
     """在 spawn worker 之前把本地 agent 配置文件按 framework 修改到位。
 
@@ -170,16 +196,36 @@ def prepare_local_agent_config(
             user_proxy_model_local_file)
         framework: 当前 agent 框架名 (openclaw/hermes/dsh/...)
         data_config_file: opencode 分支需要 data_config 里的 agent system_prompt
+        local_config: 本次任务的 openclaw.json 独立副本 (空则回落 sandbox_config 里的共享路径)
+        local_model_config: 本次任务的 user_proxy_model.json 独立副本
+        suffix: 沙箱标识后缀 (env_id 的 uuid 段), apply_suffix 为真时追加到模型 key
+        apply_suffix: 是否给模型 key 追加后缀 (对应 task.suffix_api_keys)
     """
-    local_path = sandbox_config.harness_local_config_file
-    local_model_path = sandbox_config.user_proxy_model_local_file
+    local_path = local_config or sandbox_config.harness_local_config_file
+    local_model_path = local_model_config or sandbox_config.user_proxy_model_local_file
     model_cfg = json.loads(Path(local_model_path).read_text(encoding="utf-8"))
 
+    # 先改本地 user_proxy_model.json，api-key补全后缀
+    if apply_suffix:
+        for agent_name, agent in model_cfg.items():
+            agent["api_key"] += f"_{suffix}"
+            logger.info(
+                f"user_proxy_model.json#{agent_name} api_key changed to {agent['api_key']}"
+            )
+        Path(local_model_path).write_text(
+            json.dumps(model_cfg, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        
     if framework == "openjiuwen":
         # 1) openjiuwen.json: 归一化 default.provider 里的 anthropic -> Anthropic
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         if "anthropic" in data["default"]["provider"]:
             data["default"]["provider"] = "Anthropic"
+        # 模型 key 追加沙箱标识后缀
+        if apply_suffix:
+            data["default"]["api_key"] += f"_{suffix}"
+            logger.info(f"openjiuwen default api_key changed to {data["default"]["api_key"]}")
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -202,13 +248,23 @@ def prepare_local_agent_config(
         # opencode 需要把 data_config 里 agent.system_prompt 注入到 agent.prompt
         agent_sp = _read_agent_system_prompts(data_config_file)
 
+        # 更新主agent的api-key
+        if apply_suffix:
+            main_provider_key = "local-provider"
+            providers[main_provider_key]["options"]["apiKey"] += f"_{suffix}"
+            logger.info(f"opencode local-provider api_key changed to {providers[main_provider_key]["options"]["apiKey"]}")
+            Path(local_path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
         # 更新 provider 和 agent
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
             if not (cfg.get("model") and cfg.get("base_url")
                     and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
+                logger.warning(
                     f"agent {agent_name} missing model/base_url/api_key/provider, skip"
                 )
                 continue
@@ -231,31 +287,31 @@ def prepare_local_agent_config(
                     "options": {"baseURL": base_url, "apiKey": api_key},
                     "models": {model_name: {"name": model_name}},
                 }
-                logging.info(f"Added provider: {provider_key}")
+                logger.info(f"Added provider: {provider_key}")
             else:
                 existing_models = providers[provider_key].setdefault("models", {})
                 if model_name not in existing_models:
                     existing_models[model_name] = {"name": model_name}
-                    logging.info(f"Added model {model_name} to existing provider {provider_key}")
+                    logger.info(f"Added model {model_name} to existing provider {provider_key}")
 
             model_ref = f"{provider_key}/{model_name}"
             if agent_name in agents:
                 agents[agent_name]["model"] = model_ref
                 if agent_name in agent_sp:
                     agents[agent_name]["prompt"] = agent_sp.get(agent_name) or ""
-                logging.info(f"Updated agent {agent_name} with model {model_ref}")
+                logger.info(f"Updated agent {agent_name} with model {model_ref}")
             else:
                 agents[agent_name] = {
                     "model": model_ref,
                     "prompt": agent_sp.get(agent_name) or ""
                 }
-                logging.info(f"Added new agent {agent_name} with model {model_ref}")
+                logger.info(f"Added new agent {agent_name} with model {model_ref}")
 
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        logging.info(f"Updated opencode.json with provider/agent from {local_model_path}")
+        logger.info(f"Updated opencode.json with provider/agent from {local_model_path}")
 
     elif framework == "pi":
         # models.json: 注入 provider
@@ -267,7 +323,7 @@ def prepare_local_agent_config(
                 continue
             if not (cfg.get("model") and cfg.get("base_url")
                     and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
+                logger.warning(
                     f"agent {agent_name} missing model/base_url/api_key/provider, skip"
                 )
                 continue
@@ -294,40 +350,47 @@ def prepare_local_agent_config(
                         }
                     ],
                 }
-                logging.info(f"Added pi provider: {provider_key} ({model_name})")
+                logger.info(f"Added pi provider: {provider_key} ({model_name})")
             else:
                 existing_models = providers[provider_key].setdefault("models", [])
                 existing_ids = {m.get("id") for m in existing_models if isinstance(m, dict)}
                 if model_name not in existing_ids:
                     existing_models.append({"id": model_name})
-                    logging.info(
+                    logger.info(
                         f"Added model {model_name} to existing pi provider {provider_key}"
                     )
-
+        # 配置主agent
+        if apply_suffix:
+            main_provider_key = "custom"
+            providers[main_provider_key]["apiKey"] += f"_{suffix}"
+            logger.info(f"pi custom api_key changed to {providers[main_provider_key]["apiKey"]}")
+            
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        logging.info(f"Updated models.json with provider from {local_model_path}")
+        logger.info(f"Updated models.json with provider from {local_model_path}")
 
     elif framework == "codex":
-        # [model_providers.<key>] 追加到 config.toml, 已存在则跳过
-        toml_text = Path(local_path).read_text(encoding="utf-8")
-        new_blocks: List[str] = []
+        # [model_providers.<key>] 追加到 config.toml, 已存在则跳过。
+        # 走 tomllib 解析 + tomli_w 回写: 通过 dict 判断 provider 是否已存在,
+        data = tomllib.loads(Path(local_path).read_text(encoding="utf-8"))
+        providers = data.setdefault("model_providers", {})
+        new_providers: List[str] = []
 
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
             if not (cfg.get("model") and cfg.get("base_url")
                     and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
+                logger.warning(
                     f"agent {agent_name} missing model/base_url/api_key/provider, skip"
                 )
                 continue
 
             provider_key = cfg["provider"]
-            if f"[model_providers.{provider_key}]" in toml_text:
-                logging.info(
+            if provider_key in providers:
+                logger.info(
                     f"codex provider {provider_key} already exists in config.toml, skip"
                 )
                 continue
@@ -335,43 +398,45 @@ def prepare_local_agent_config(
             base_url = cfg["base_url"].rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url = base_url + "/v1"
-            api_key = cfg["api_key"]
 
-            block = (
-                f"[model_providers.{provider_key}]\n"
-                f'name     = "{provider_key}"\n'
-                f'base_url = "{base_url}"\n'
-                f'experimental_bearer_token = "{api_key}"\n'
-                f'wire_api = "responses"\n'
-            )
-            new_blocks.append(block)
-            logging.info(f"Added codex provider: {provider_key} (agent={agent_name})")
+            providers[provider_key] = {
+                "name": provider_key,
+                "base_url": base_url,
+                "experimental_bearer_token": cfg["api_key"],
+                "wire_api": "responses",
+            }
+            new_providers.append(provider_key)
+            logger.info(f"Added codex provider: {provider_key} (agent={agent_name})")
 
-        if new_blocks:
-            toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
-            Path(local_path).write_text(toml_text, encoding="utf-8")
-            logging.info(
-                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
-            )
+        # 配置主agent
+        if apply_suffix:
+            main_provider_key = "custom"
+            providers[main_provider_key]["experimental_bearer_token"] += f"_{suffix}"
+            logger.info(f"codex custom api_key changed to {providers[main_provider_key]["experimental_bearer_token"]}")
+        
+        if new_providers or apply_suffix:
+            with open(local_path, "wb") as f:
+                tomli_w.dump(data, f)
 
     elif framework == "grok":
-        # [model.<provider>] 追加到 config.toml, 已存在则跳过
-        toml_text = Path(local_path).read_text(encoding="utf-8")
-        new_blocks: List[str] = []
+        # [model.<provider>] 追加到 config.toml, 已存在则跳过。
+        data = tomllib.loads(Path(local_path).read_text(encoding="utf-8"))
+        models = data.setdefault("model", {})
+        new_providers: List[str] = []
 
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
             if not (cfg.get("model") and cfg.get("base_url")
                     and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
+                logger.warning(
                     f"agent {agent_name} missing model/base_url/api_key/provider, skip"
                 )
                 continue
 
             provider_key = cfg["provider"]
-            if f"[model.{provider_key}]" in toml_text:
-                logging.info(
+            if provider_key in models:
+                logger.info(
                     f"grok provider {provider_key} already exists in config.toml, skip"
                 )
                 continue
@@ -379,46 +444,50 @@ def prepare_local_agent_config(
             base_url = cfg["base_url"].rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url = base_url + "/v1"
-            api_key = cfg["api_key"]
 
-            block = (
-                f"[model.{provider_key}]\n"
-                f'model     = "{cfg.get("model")}"\n'
-                f'name      = "{cfg.get("model")}"\n'
-                f'base_url  = "{base_url}"\n'
-                f'api_key   = "{api_key}"\n'
-            )
-            new_blocks.append(block)
-            logging.info(f"Added grok provider: {provider_key} (agent={agent_name})")
+            model_name = cfg["model"]
+            models[provider_key] = {
+                "model": model_name,
+                "name": model_name,
+                "base_url": base_url,
+                "api_key": cfg["api_key"],
+            }
+            new_providers.append(provider_key)
+            logger.info(f"Added grok provider: {provider_key} (agent={agent_name})")
 
-        if new_blocks:
-            toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
-            Path(local_path).write_text(toml_text, encoding="utf-8")
-            logging.info(
-                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_model_path}"
-            )
+        # 配置主agent
+        if apply_suffix:
+            model_section = models["default-model"]
+            model_section["api_key"] += f"_{suffix}"
+            logger.info(f"grok default-model api_key changed to {model_section["api_key"]}")
+        
+        if new_providers or apply_suffix:
+            with open(local_path, "wb") as f:
+                tomli_w.dump(data, f)
 
     elif framework == "dsh":
         # llm-pi-ai.providers 追加 provider 到 settings.yaml, 已存在则跳过
         data = load_yaml_config(local_path)
+        # 循环体里赋值会让它在循环外变成局部未绑定(agent 全被 skip 时直接 UnboundLocalError),
+        # 且 apply_suffix 段要用同一份引用, 因此提到循环外只取一次。
+        providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
+        credentials = data.get("credentials") or {}
 
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
             if not (cfg.get("model") and cfg.get("base_url")
                     and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
+                logger.warning(
                     f"agent {agent_name} missing model/base_url/api_key/provider, skip"
                 )
                 continue
 
             provider_key = cfg["provider"]
-            providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
             api_kind = cfg.get("api", "openai-completions")
             base_url = normalize_base_url(cfg["base_url"], api_kind)
             api_key = cfg["api_key"]
             model_name = cfg["model"]
-            credentials = data.get("credentials") or {}
 
             if provider_key not in providers:
                 api_key_env = provider_key.replace('-', '_').upper() + "_API_KEY"
@@ -434,17 +503,24 @@ def prepare_local_agent_config(
                     ],
                 }
                 credentials[api_key_env] = api_key
-                logging.info(f"Added dsh provider: {provider_key} ({model_name})")
+                logger.info(f"Added dsh provider: {provider_key} ({model_name})")
             else:
                 existing_models = providers[provider_key].setdefault("models", [])
                 existing_ids = {m.get("id") for m in existing_models if hasattr(m, "get")}
                 if model_name not in existing_ids:
                     existing_models.append({"id": model_name})
-                    logging.info(
+                    logger.info(
                         f"Added model {model_name} to existing dsh provider {provider_key}"
                     )
+
+        if apply_suffix:
+            main_provider_key = "custom"
+            api_key_env = providers[main_provider_key]["apiKeyEnv"]
+            credentials[api_key_env] += f"_{suffix}"
+            logger.info(f"dsh {api_key_env} changed to {credentials[api_key_env]}")
+
         OmegaConf.save(data, local_path)
-        logging.info(f"Updated settings.yaml with provider from {local_model_path}")
+        logger.info(f"Updated settings.yaml with provider from {local_model_path}")
 
     elif framework == "openclaw":
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
@@ -458,7 +534,7 @@ def prepare_local_agent_config(
                 continue
             if not (cfg.get("model") and cfg.get("base_url")
                     and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
+                logger.warning(
                     f"agent {agent_name} missing model/base_url/api_key/provider, skip"
                 )
                 continue
@@ -505,11 +581,32 @@ def prepare_local_agent_config(
             else:
                 agents_list[idx] = {**agents_list[idx], **entry}
 
-            logging.info(
+            logger.info(
                 f"Injected provider={provider_key} model={model_ref} for agent {agent_name}"
             )
+
+        if apply_suffix:
+            data["models"]["providers"]["local"]["apiKey"] += f"_{suffix}"
+            logger.info(f"openclaw local provider apiKey changed to {data["models"]["providers"]["local"]["apiKey"]}")
 
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+
+    elif framework == "hermes":
+        if apply_suffix:
+            data = load_yaml_config(local_path)
+            data.model.api_key += f"_{suffix}"
+            logger.info(f"hermes api_key changed to {data.model.api_key}")
+            OmegaConf.save(data, local_path)
+    
+    elif framework == "claude-code":
+        if apply_suffix:
+            data = json.loads(Path(local_path).read_text(encoding="utf-8"))
+            data["env"]["ANTHROPIC_AUTH_TOKEN"] += f"_{suffix}"
+            logger.info(f"claude-code ANTHROPIC_AUTH_TOKEN changed to {data["env"]["ANTHROPIC_AUTH_TOKEN"]}")
+            Path(local_path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
