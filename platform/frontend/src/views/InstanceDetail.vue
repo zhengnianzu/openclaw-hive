@@ -54,6 +54,9 @@
               <el-descriptions :column="1" border>
                 <el-descriptions-item label="实例ID">{{ inst.id }}</el-descriptions-item>
                 <el-descriptions-item label="状态"><el-tag :type="statusColor(inst.status)">{{ statusText(inst.status) }}</el-tag></el-descriptions-item>
+                <el-descriptions-item v-if="inst.error_summary" label="失败原因">
+                  <span style="color:#ef4444;white-space:pre-wrap;word-break:break-all">{{ inst.error_summary }}</span>
+                </el-descriptions-item>
                 <el-descriptions-item label="PID">{{ inst.pid || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="配置文件">{{ inst.config_path }}</el-descriptions-item>
                 <el-descriptions-item label="并发数">{{ inst.concurrent_num }}</el-descriptions-item>
@@ -822,10 +825,10 @@ const progressStatus = computed(() => {
   return ''
 })
 
-function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || '' }
-function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s }
+function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger', created: '' }[s] || '' }
+function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s }
 function queueStatusType(s) {
-  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger' }[s] || ''
+  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger' }[s] || ''
 }
 function fmtTime(t) {
   if (!t) return '-'

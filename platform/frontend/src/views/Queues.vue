@@ -35,6 +35,14 @@
       <el-table-column label="状态" min-width="100" align="center">
         <template #default="{ row }">
           <el-tag :type="queueStatusType(row)" size="small">{{ queueStatusText(row) }}</el-tag>
+          <!-- 失败任务不计入 startable（避免「启动队列」反复重试同一个错误配置），
+               所以必须在这里单独提示，否则用户看不出队列里躺着失败任务。 -->
+          <el-tooltip v-if="row.failed_tasks_in_queue"
+            content="有任务准备/启动失败，需到任务列表里手动重试" placement="top">
+            <el-tag type="danger" size="small" effect="plain" style="margin-left:6px">
+              {{ row.failed_tasks_in_queue }} 失败
+            </el-tag>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column prop="description" label="描述" min-width="160" show-overflow-tooltip />
@@ -197,7 +205,9 @@ function resetFilters() {
 }
 
 function canStartQueue(q) {
-  return (q.queued_tasks || 0) === 0 && (q.active_tasks || 0) === 0
+  // 「启动队列」做的是 created/stopped → queued，与队列里是否已有任务在跑无关。
+  // 只要有可启动的任务就允许点（往运行中的队列追加任务是常见用法）。
+  return (q.startable_tasks || 0) > 0
 }
 
 function handleQueueCommand(cmd, row) {
@@ -278,7 +288,11 @@ async function startQueue(queue) {
       '启动队列', { type: 'info' }
     )
     const r = await api.post(`/queues/${queue.id}/start-all`)
-    ElMessage.success(r.message || '已启动队列')
+    if (!r.started_count) {
+      ElMessage.warning(r.message || '队列中没有待启动的任务')
+    } else {
+      ElMessage.success(r.message || '已启动队列')
+    }
     loadQueues()
   } catch (err) {
     if (err !== 'cancel') { /* error shown by interceptor */ }
@@ -332,6 +346,7 @@ function getStatusType(status) {
     queued: 'warning',
     created: 'info',
     stopped: 'danger',
+    failed: 'danger',
     completed: 'info',
     finished: 'warning',
   }
@@ -341,7 +356,7 @@ function getStatusType(status) {
 function statusText(status) {
   return {
     running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成',
-    finished: '已结束', stopped: '已停止', created: '待启动'
+    finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动'
   }[status] || status
 }
 

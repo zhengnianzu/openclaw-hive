@@ -22,6 +22,8 @@ class QueueInfo(BaseModel):
     created_at: str
     active_tasks: int = 0      # 派生字段：运行中的任务数
     queued_tasks: int = 0      # 派生字段：排队中的任务数
+    startable_tasks: int = 0   # 派生字段：待启动/已停止、可被「启动队列」拉起的任务数
+    failed_tasks_in_queue: int = 0  # 派生字段：准备/启动失败的任务数（需手动重试）
     task_count: int = 0        # 派生字段：该队列下的任务总数（用于判断能否删除）
 
 
@@ -106,6 +108,9 @@ class InstanceInfo(BaseModel):
     concurrent_num: int = 100
     harness_type: str = "openclaw"
     output_status: Optional[str] = None  # NULL=未做浅层/未输出, done=浅层完成可直接用
+    # 准备/拉起进程失败的原因（status='failed' 时展示给用户）。
+    # 用户点「启动」重试时会清空。
+    error_summary: Optional[str] = None
     queue_id: Optional[str] = None      # 所属队列ID
     queue_position: int = 0              # 在队列中的位置
 

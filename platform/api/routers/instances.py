@@ -20,7 +20,7 @@ from ..core.database import get_connection, async_execute, async_query, async_qu
 from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 from ..services.queue_scheduler import (
-    schedule_queue, check_global_sandbox_capacity, OCCUPYING_STATUSES,
+    schedule_queue, OCCUPYING_STATUSES,
 )
 from . import harness_meta
 from . import sandbox_configs
@@ -311,17 +311,24 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
         inst["status"] = "completed" if failed == 0 else "finished"
 
     # 只有后台刷新任务才写库；请求线程仅更新内存缓存，避免写锁争用
+    #
+    # 两条 UPDATE 都带 status IN ('running','preparing')：本函数的输入是读库时刻的快照，
+    # 期间用户可能已经「停止」（status='stopped'），或调度器已把队列里的下一个任务
+    # 领成 preparing。无条件写会把 stopped/preparing 覆盖成 completed，前者让停止失效、
+    # 后者让被领走的任务和另一个任务同时占槽位（串行被破坏）。
     if persist:
         if not pid_alive or all_done:
             with get_connection() as conn:
                 conn.execute(
-                    "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? WHERE id=?",
+                    "UPDATE task_instances SET status=?, completed_tasks=?, failed_tasks=?, stopped_at=? "
+                    "WHERE id=? AND status IN ('running','preparing')",
                     (inst["status"], completed, failed, datetime.now().isoformat(), inst["id"]),
                 )
         else:
             with get_connection() as conn:
                 conn.execute(
-                    "UPDATE task_instances SET completed_tasks=?, failed_tasks=? WHERE id=?",
+                    "UPDATE task_instances SET completed_tasks=?, failed_tasks=? "
+                    "WHERE id=? AND status IN ('running','preparing')",
                     (completed, failed, inst["id"]),
                 )
 
@@ -340,6 +347,17 @@ def _with_harness_type(d: dict) -> dict:
         except Exception:
             pass
     return d
+
+
+def _describe_error(e: Exception) -> str:
+    """把异常转成给用户看的一句话失败原因。
+
+    HTTPException 的 str() 是 "500: 具体原因"，前缀是状态码，对用户没有意义；
+    这里只取 detail，其余异常保留原始文本。
+    """
+    detail = getattr(e, "detail", None)
+    text = detail if isinstance(detail, str) else str(e)
+    return (text or e.__class__.__name__).strip()[:500]
 
 
 @router.get("", response_model=list[InstanceInfo])
@@ -1072,13 +1090,19 @@ async def _prepare_instance(instance_id: str, inst: dict):
             obs_src = f"{base.s3.bucket_name}/{user_config_dir}"
             if not obs_src.endswith("/"):
                 obs_src += "/"
-            returncode, _, stderr = await _async_subprocess_run(
+            returncode, stdout, stderr = await _async_subprocess_run(
                 [settings.OBSUTIL_PATH, "cp", obs_src, global_configs_cache, "-r", "-f"],
                 timeout=600,
             )
             if returncode != 0:
                 shutil.rmtree(global_configs_cache, ignore_errors=True)
-                raise HTTPException(status_code=500, detail=f"OBS下载用户配置失败: {stderr[:500]}")
+                # obsutil 把「NoSuchBucket」这类诊断信息打在 stdout 上，stderr 往往为空。
+                # 只截 stderr 会让用户看到一句没有下文的「OBS下载用户配置失败: 」。
+                detail = (stderr or stdout or "").strip()[:500]
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"OBS下载用户配置失败（{obs_src}，exit={returncode}）: {detail}",
+                )
 
             # 软链接到实例目录
             if os.path.exists(configs_dir):
@@ -1183,6 +1207,7 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
     if queue_id:
         # 「启动」= 重新加入队列排队：排到队尾。停止后再启动若沿用旧的 queue_position，
         # 会插回原来的位置，而不是按设计图「重新加入队列排队」。
+        # 重排与抢占放在同一事务里，避免并发启动拿到相同的 position。
         with get_connection() as conn:
             max_pos = conn.execute(
                 "SELECT MAX(queue_position) AS m FROM task_instances WHERE queue_id = ?",
@@ -1193,23 +1218,26 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
                 "UPDATE task_instances SET queue_position=? WHERE id=?",
                 (new_pos, instance_id)
             )
+
+            # 原子抢占：把「队列内无占用者」写成 UPDATE 的 WHERE 条件，
+            # 与 queue_scheduler._try_claim_next 采用同一写法。拆成
+            # 「查占用 → 判断 → UPDATE」时，两个并发请求会同时通过检查。
+            claimed = conn.execute(
+                f"""UPDATE task_instances
+                       SET status='preparing', pid=NULL, started_at=NULL,
+                           error_summary=NULL, prepare_started_at=datetime('now')
+                     WHERE id=?
+                       AND NOT EXISTS (
+                         SELECT 1 FROM task_instances
+                          WHERE queue_id = ? AND status IN ({_OCCUPYING_PLACEHOLDERS})
+                       )
+                 RETURNING id""",
+                (instance_id, queue_id, *_OCCUPYING_STATUSES)
+            ).fetchone()
         inst["queue_position"] = new_pos
         _status_cache.pop(instance_id, None)
 
-        # 检查队列中是否有占用槽位的任务。preparing 必须一起算：任务在
-        # _prepare_instance 期间（OBS 下载/打包）还不是 running，若只认 running，
-        # 同队列的第二个任务会被同时放行，串行就失效了。
-        with get_connection() as conn:
-            occupying = conn.execute(
-                f"SELECT id FROM task_instances WHERE queue_id = ? "
-                f"AND status IN ({_OCCUPYING_PLACEHOLDERS})",
-                (queue_id, *_OCCUPYING_STATUSES)
-            ).fetchall()
-
-        # 检查全局沙箱资源
-        available_capacity = await check_global_sandbox_capacity()
-
-        if len(occupying) > 0:
+        if not claimed:
             # 队列槽位被占用，进入排队状态
             with get_connection() as conn:
                 conn.execute(
@@ -1225,24 +1253,21 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
                 "queue_position": queue_position
             }
 
-        elif inst["concurrent_num"] > available_capacity:
-            # 资源不足，进入排队状态
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE task_instances SET status='queued' WHERE id=?",
-                    (instance_id,)
-                )
-            _status_cache.pop(instance_id, None)
-
-            return {
-                "message": f"沙箱资源不足（需要 {inst['concurrent_num']}, 可用 {available_capacity}），任务已排队",
-                "status": "queued"
-            }
+        asyncio.create_task(_prepare_and_launch(instance_id, inst))
+        return {"message": "实例准备中，正在后台下载配置并启动", "status": "preparing"}
 
     # 无队列或队列空闲，可以直接启动
-    # 标记为 preparing 状态
+    # 标记为 preparing 状态。
+    # 同时清空 pid/started_at：recover_orphan_preparing 用「两者都为 NULL」识别
+    # 「准备中后端重启」的孤儿实例。若沿用上一次运行留下的 started_at（非 NULL），
+    # 重启后该实例不会被回收，会永久卡在 preparing 堵死整条队列。
+    # 一并清空 error_summary：上一次失败的说明不该挂在这次重试上。
     with get_connection() as conn:
-        conn.execute("UPDATE task_instances SET status='preparing' WHERE id=?", (instance_id,))
+        conn.execute(
+            "UPDATE task_instances SET status='preparing', pid=NULL, started_at=NULL, "
+            "error_summary=NULL, prepare_started_at=datetime('now') WHERE id=?",
+            (instance_id,),
+        )
     _status_cache.pop(instance_id, None)
 
     # 准备（OBS下载、打包、统计任务数）+ 启动，全部放到后台执行，
@@ -1281,14 +1306,21 @@ def _launch_mock_task(output_dir: str, log_file: str):
 
 
 async def _prepare_and_launch(instance_id: str, inst: dict):
-    """后台执行准备与启动。失败时回写 created 状态和错误信息。"""
+    """后台执行准备与启动。准备失败时置 failed（区别于用户未启动的 created）。"""
     try:
         await _prepare_instance(instance_id, inst)
     except Exception as e:
         with get_connection() as conn:
+            # 只在仍处于 preparing 时回退。准备期间用户可能已点「停止」，
+            # 无条件改写会把 stopped 覆盖掉，导致 stop 看起来无效。
+            #
+            # 失败置为 failed 而不是 created：created 表示「用户还没启动」，
+            # 两者混在一起会让用户点了启动、看到状态变回「待启动」，却完全
+            # 不知道是配置错误（如 OBS 路径不存在），只能反复点、反复失败。
             conn.execute(
-                "UPDATE task_instances SET status='created', error_summary=? WHERE id=?",
-                (str(e)[:500], instance_id),
+                "UPDATE task_instances SET status='failed', error_summary=? "
+                "WHERE id=? AND status='preparing'",
+                (_describe_error(e), instance_id),
             )
         _status_cache.pop(instance_id, None)
         print(f"[start] 实例 {instance_id} 准备失败: {e}")
@@ -1296,6 +1328,16 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
         queue_id = inst.get("queue_id")
         if queue_id:
             asyncio.create_task(schedule_queue(queue_id))
+        return
+
+    # 准备期间可能已被用户停止/删除：此时这次启动已过期，不应再把状态写成 running。
+    with get_connection() as conn:
+        cur_row = conn.execute(
+            "SELECT status FROM task_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+    if not cur_row or cur_row["status"] != "preparing":
+        print(f"[start] 实例 {instance_id} 准备完成后状态已变为 "
+              f"{cur_row['status'] if cur_row else 'deleted'}，放弃启动")
         return
 
     # 启动 hive
@@ -1327,10 +1369,23 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
                 )
 
         with get_connection() as conn:
-            conn.execute(
-                "UPDATE task_instances SET status='running', pid=?, started_at=? WHERE id=?",
+            # 带状态保护：准备期间若用户点了「停止」，此刻状态已是 stopped，
+            # 这次启动作废 —— 不能把它写回 running（否则 stop 无效，且会与
+            # 已放行的下一个任务同时占队列槽位，破坏串行）。
+            cur = conn.execute(
+                "UPDATE task_instances SET status='running', pid=?, started_at=? "
+                "WHERE id=? AND status='preparing'",
                 (proc.pid, datetime.now().isoformat(), instance_id),
             )
+        if cur.rowcount == 0:
+            # 启动已过期：把刚拉起的进程组杀掉，避免留下孤儿进程继续跑
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            _status_cache.pop(instance_id, None)
+            print(f"[start] 实例 {instance_id} 启动已过期（已被停止），已终止进程 {proc.pid}")
+            return
         _status_cache.pop(instance_id, None)
 
         # 任务启动成功后，触发队列调度（如果在队列中）
@@ -1340,8 +1395,9 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
     except Exception as e:
         with get_connection() as conn:
             conn.execute(
-                "UPDATE task_instances SET status='created', error_summary=? WHERE id=?",
-                (str(e)[:500], instance_id),
+                "UPDATE task_instances SET status='failed', error_summary=? "
+                "WHERE id=? AND status='preparing'",
+                (_describe_error(e), instance_id),
             )
         _status_cache.pop(instance_id, None)
         print(f"[start] 实例 {instance_id} 启动失败: {e}")
@@ -1370,6 +1426,7 @@ async def stop_instance(instance_id: str, user: dict = Depends(require_operator)
     subprocess.Popen(
         ["python", os.path.join(settings.HIVE_ROOT, "run_clear.py"), "--config", config_path],
         cwd=settings.HIVE_ROOT,
+        start_new_session=True,
     )
 
     _status_cache.pop(instance_id, None)
@@ -1377,17 +1434,25 @@ async def stop_instance(instance_id: str, user: dict = Depends(require_operator)
     # 停止的语义（设计要求）：退出当前队列，不再参与排队。
     # 保留 queue_id 作为「队列归属」（用户不必重新选队列），但 stopped 状态既不占用
     # 槽位、也不作为排队候选，因此不会再挡后面的任务；下一次「启动」时重新排到队尾。
+    #
+    # 带状态条件：本请求读到的是快照，期间 refresher 可能已把实例判成 completed/finished
+    # （例如进程恰好在此刻退出）。不加条件会把终态改回 stopped，并触发一次多余的调度。
     with get_connection() as conn:
-        conn.execute(
-            "UPDATE task_instances SET status='stopped', stopped_at=? WHERE id=?",
+        cur = conn.execute(
+            "UPDATE task_instances SET status='stopped', stopped_at=?, pid=NULL, prepare_started_at=NULL "
+            "WHERE id=? AND status NOT IN ('completed','finished')",
             (datetime.now().isoformat(), instance_id),
         )
+        stopped = cur.rowcount > 0
 
     # 任务停止后，触发队列调度：它腾出了槽位，让下一个排队任务继续
+    # （即使本次未改写状态，也调度一次——若实例刚自然跑完，同样需要放行下一个）
     queue_id = inst.get("queue_id")
     if queue_id:
         asyncio.create_task(schedule_queue(queue_id))
 
+    if not stopped:
+        return {"message": "实例已结束，无需停止"}
     return {"message": "实例已停止，已退出队列排队"}
 
 
@@ -1762,10 +1827,14 @@ def recover_orphan_preparing() -> int:
     这里在 startup 时把这些孤儿一律退回 created，让用户重新点启动（配置已就绪，
     重启动会重新数 task 数并拉起进程）。
 
-    仅回退 pid 与 started_at 均为空的 preparing 实例——正在正常准备中、
-    或已经拿到 pid 的实例不动，避免误伤。返回回退的实例数。
-    幂等：多 worker 各调用一次也安全（第二次已无匹配行）。
+    必须带时间阈值：`preparing AND pid IS NULL AND started_at IS NULL` 也正是
+    「刚进入 preparing、还没拉起进程」的样子。多 worker 部署时，晚启动的 worker
+    会把其它 worker 正在 OBS 下载的实例一起打回 created（下载白跑）。
+    只回收超过 ORPHAN_GRACE_SECONDS 仍未拿到 pid 的实例。
+
+    返回回退的实例数。
     """
+    grace = int(settings.ORPHAN_PREPARING_GRACE_SECONDS)
     try:
         with get_connection() as conn:
             cur = conn.execute(
@@ -1774,7 +1843,10 @@ def recover_orphan_preparing() -> int:
                    SET status='created',
                        error_summary='准备中后端重启被中断，已自动退回 created，可重新启动'
                  WHERE status='preparing' AND pid IS NULL AND started_at IS NULL
-                """
+                   AND julianday(COALESCE(prepare_started_at, created_at))
+                       < julianday('now', ?)
+                """,
+                (f"-{grace} seconds",),
             )
             n = cur.rowcount or 0
         if n:
@@ -1867,6 +1939,23 @@ async def background_cache_refresher(interval: float = 8.0):
         await asyncio.sleep(interval)
         try:
             for qid in (await async_execute(_refresh_running_once) or ()):
+                asyncio.create_task(schedule_queue(qid))
+        except Exception:
+            pass
+        # 卡住的 preparing 看门狗：协程中途消失时实例会永久占着队列槽位，
+        # 这里超过阈值仍未拿到 pid 的标记为 failed 并放行同队列下一个任务。
+        try:
+            from ..services.queue_scheduler import recover_stuck_preparing
+            for qid in (await async_execute(recover_stuck_preparing) or ()):
+                asyncio.create_task(schedule_queue(qid))
+        except Exception:
+            pass
+        # 兜底扫描：有排队任务但队列内无占用者的队列，重新交给调度器。
+        # 调度是事件驱动的——某次调度丢失（SQLite busy、协程崩溃）或容量限制解除后，
+        # 没有任何事件会再唤醒这条队列，任务会静默卡在 queued。
+        try:
+            from ..services.queue_scheduler import find_schedulable_queues
+            for qid in (await async_execute(find_schedulable_queues) or ()):
                 asyncio.create_task(schedule_queue(qid))
         except Exception:
             pass

@@ -245,7 +245,10 @@ CREATE TABLE IF NOT EXISTS sandbox_configs (
 
 ### 4.3 队列调度（可选，二期）
 
-`check_global_sandbox_capacity` 目前用 `SUM(concurrent_num)`。若不改，Windows 的 16C32G 沙箱和 Linux 的 2C6G 沙箱在容量核算上等价。二期可让队列按 `sandbox_config_id` 读 CPU 规格加权。**一期先不做**，但表里预留字段。
+> 全局沙箱容量闸（`check_global_sandbox_capacity` / `MAX_TOTAL_SANDBOXES`）已取消：
+> 队列放行只取决于「同队列内是否已有 `preparing`/`running`」，`concurrent_num` 不再参与放行判断。
+> 若未来要按 CPU 规格做资源核算，需要重新引入该机制，届时可让队列按 `sandbox_config_id`
+> 读 CPU 规格加权。表里已预留字段。
 
 ---
 

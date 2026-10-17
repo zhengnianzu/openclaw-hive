@@ -3,8 +3,11 @@
 
 实现事件驱动的队列任务调度逻辑：
 1. 串行执行：同一队列内同时只有一个任务运行
-2. 全局资源限制：检查沙箱总量不超过 MAX_TOTAL_SANDBOXES
+2. 队列间并行：不同队列互不影响，各自独立调度
 3. 自动调度：任务启动/停止/完成时触发调度
+
+全局沙箱上限（原 MAX_TOTAL_SANDBOXES）已取消：队列调度只受「同队列串行」约束，
+concurrent_num 仅作为实例参数透传，不再参与放行判断。
 """
 import asyncio
 import logging
@@ -19,29 +22,6 @@ logger = logging.getLogger(__name__)
 # 占用队列槽位的状态：preparing 也算占用，因为任务在 _prepare_instance（OBS 下载、
 # 打包、统计任务数）期间还没变成 running，若此刻放行下一个任务，队列就不再串行了。
 OCCUPYING_STATUSES = ("preparing", "running")
-
-
-async def check_global_sandbox_capacity() -> int:
-    """
-    检查全局沙箱可用容量
-
-    Returns:
-        可用的沙箱数量（MAX_TOTAL_SANDBOXES - 当前已占用任务的 concurrent_num 总和）
-    """
-    # preparing 与 running 都已占住沙箱额度，两者都要计
-    placeholders = ",".join("?" * len(OCCUPYING_STATUSES))
-    result = await async_query_one(
-        f"SELECT SUM(concurrent_num) as total FROM task_instances "
-        f"WHERE status IN ({placeholders})",
-        OCCUPYING_STATUSES
-    )
-
-    used_sandboxes = result.get('total', 0) or 0
-    available = settings.MAX_TOTAL_SANDBOXES - used_sandboxes
-
-    logger.info(f"Global sandbox capacity: {available}/{settings.MAX_TOTAL_SANDBOXES} available (used: {used_sandboxes})")
-
-    return available
 
 
 def _try_claim_next(queue_id: str) -> dict | None:
@@ -60,7 +40,9 @@ def _try_claim_next(queue_id: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
             f"""UPDATE task_instances
-                   SET status = 'preparing'
+                   SET status = 'preparing', pid = NULL, started_at = NULL,
+                       error_summary = NULL,
+                       prepare_started_at = datetime('now')
                  WHERE id = (
                      SELECT id FROM task_instances
                       WHERE queue_id = ? AND status = 'queued'
@@ -88,10 +70,7 @@ async def schedule_queue(queue_id: str):
     """
     logger.info(f"Scheduling queue: {queue_id}")
 
-    # 1. 检查全局沙箱资源（低于需求时不必尝试抢占，省一次写）
-    available_capacity = await check_global_sandbox_capacity()
-
-    # 2. 原子抢占队首排队任务（内含「队列无占用者」判断，多 worker 安全）
+    # 原子抢占队首排队任务（内含「队列无占用者」判断，多 worker 安全）
     queued_task = await async_execute(_try_claim_next, queue_id)
 
     if not queued_task:
@@ -99,28 +78,18 @@ async def schedule_queue(queue_id: str):
         return
 
     task_id = queued_task['id']
-    task_concurrent = queued_task['concurrent_num']
 
-    # 3. 检查资源是否足够（任务已被占为 preparing，不足则退回 queued）
-    if task_concurrent > available_capacity:
-        logger.warning(
-            f"Insufficient sandbox capacity for task {task_id}: "
-            f"needs {task_concurrent}, available {available_capacity}"
-        )
-        await async_db_execute(
-            "UPDATE task_instances SET status = 'queued' WHERE id = ?",
-            (task_id,)
-        )
-        return
-
-    # 4. 启动任务：复用 instances 路由的后台准备+启动流程
+    # 启动任务：复用 instances 路由的后台准备+启动流程
     #（OBS 下载、任务数统计、PID 落库都在 _prepare_and_launch 里，不能绕开直接起 hive.sh）
     logger.info(f"Starting queued task {task_id} (queue_position: {queued_task['queue_position']})")
 
     try:
         from ..routers.instances import _prepare_and_launch
 
-        asyncio.create_task(_prepare_and_launch(task_id, queued_task))
+        # 保存句柄并挂 done callback：create_task 不会因协程内部异常而抛出，
+        # 否则协程崩溃只会留下 "Task exception was never retrieved"，队列静默卡住。
+        task = asyncio.create_task(_prepare_and_launch(task_id, queued_task))
+        task.add_done_callback(_log_task_failure(task_id))
         logger.info(f"Task {task_id} handed to _prepare_and_launch from queue {queue_id}")
 
     except Exception as e:
@@ -131,6 +100,105 @@ async def schedule_queue(queue_id: str):
             (task_id,)
         )
         return
+
+
+def _log_task_failure(task_id: str):
+    """create_task 的异常兜底：记录 + 把实例标为 failed。
+
+    协程内部异常不会传给 create_task 的调用方，只会留下
+    "Task exception was never retrieved"。置为 failed 后同队列不再被它占住，
+    find_schedulable_queues 的兜底扫描会放行下一个任务。
+    """
+    def _cb(task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error(f"Background launch of task {task_id} crashed: {exc}", exc_info=exc)
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE task_instances SET status='failed', error_summary=? "
+                    "WHERE id=? AND status='preparing'",
+                    (f"后台启动协程异常: {str(exc)[:400]}", task_id),
+                )
+        except Exception as e:
+            logger.error(f"Failed to reset crashed task {task_id}: {e}")
+    return _cb
+
+
+def find_schedulable_queues() -> list[str]:
+    """找出「有排队任务、但队列内没有任何占用者」的队列。
+
+    兜底用：调度是事件驱动的，若某次调度因异常丢失（SQLite busy、进程重启、
+    协程崩溃），整条队列会静默停在 queued 永远不会自己推进。refresher 每轮扫一次，
+    把这类队列重新交给 schedule_queue。幂等、多 worker 安全（schedule_queue 自身原子）。
+    """
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT q.queue_id
+                     FROM task_instances q
+                    WHERE q.status = 'queued' AND q.queue_id IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM task_instances o
+                         WHERE o.queue_id = q.queue_id
+                           AND o.status IN ('preparing','running')
+                      )"""
+            ).fetchall()
+        return [r["queue_id"] for r in rows]
+    except Exception as e:
+        logger.error(f"find_schedulable_queues failed: {e}")
+        return []
+
+
+def recover_stuck_preparing(timeout_seconds: int | None = None) -> set[str]:
+    """回收「卡住的 preparing」实例，返回需要重新调度的队列 id 集合。
+
+    与 recover_orphan_preparing 的区别：
+      - 那个只在**后端启动时**跑一次，且只认 pid/started_at 都为 NULL；
+      - 这个挂在后台 refresher 的每轮里持续跑，覆盖「协程中途消失」的场景
+        （worker 被 reload、事件循环异常、外部下载永久挂起）。
+
+    判定：status='preparing' 且 pid IS NULL（本次准备还没拉起进程），
+    且 prepare_started_at 距现在超过阈值。
+
+    prepare_started_at 由进入 preparing 的 UPDATE 用 SQLite 的 datetime('now')（UTC）写入，
+    与本函数的 datetime('now') 基准一致。**不能**用 created_at：它是任务创建时间（且由
+    Python 以本地时间写入），排队久的任务一进 preparing 就会被判超时，真正卡住的实例
+    反而要等 8 小时以上。
+
+    旧数据没有 prepare_started_at 时退回 created_at（这类行只可能是升级前遗留的卡住实例）。
+
+    幂等、多 worker 安全：UPDATE 带 status='preparing' 条件，重复执行只会命中一次。
+    """
+    from ..core.config import settings
+
+    limit = timeout_seconds if timeout_seconds is not None else settings.PREPARE_TIMEOUT_SECONDS
+    queues: set[str] = set()
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """SELECT id, queue_id, prepare_started_at FROM task_instances
+                    WHERE status='preparing' AND pid IS NULL
+                      AND julianday(COALESCE(prepare_started_at, created_at))
+                          < julianday('now', ?)""",
+                (f"-{int(limit)} seconds",),
+            ).fetchall()
+            for r in rows:
+                cur = conn.execute(
+                    "UPDATE task_instances SET status='failed', error_summary=? "
+                    "WHERE id=? AND status='preparing' AND pid IS NULL",
+                    (f"准备阶段超过 {limit}s 未完成（判定为卡住），已标记为失败", r["id"]),
+                )
+                if cur.rowcount and r["queue_id"]:
+                    queues.add(r["queue_id"])
+                if cur.rowcount:
+                    logger.warning(f"回收卡住的 preparing 实例 {r['id']} -> failed")
+    except Exception as e:
+        logger.error(f"recover_stuck_preparing failed: {e}")
+    return queues
 
 
 async def resume_all_queues():

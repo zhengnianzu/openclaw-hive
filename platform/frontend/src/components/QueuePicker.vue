@@ -192,10 +192,10 @@ function queueStatusText(q) {
   return q.active_tasks > 0 ? '运行中' : '空闲'
 }
 function taskStatusType(s) {
-  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger' }[s] || ''
+  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger' }[s] || ''
 }
 function taskStatusText(s) {
-  return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+  return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s
 }
 function fmtTime(t) {
   if (!t) return '-'

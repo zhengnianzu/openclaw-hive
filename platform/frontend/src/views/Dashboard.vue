@@ -54,6 +54,7 @@
         <el-option label="已完成" value="completed" />
         <el-option label="已结束" value="finished" />
         <el-option label="已停止" value="stopped" />
+        <el-option label="失败" value="failed" />
         <el-option label="待启动" value="created" />
       </el-select>
       <el-select v-model="queueFilter" placeholder="任务队列" size="default" style="width:170px">
@@ -347,10 +348,10 @@ function formatDuration(seconds) {
 }
 
 function statusColor(s) {
-  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', created: '' }[s] || ''
+  return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger', created: '' }[s] || ''
 }
 function statusText(s) {
-  return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', created: '待启动' }[s] || s
+  return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s
 }
 
 // 队列位置：显示「在当前排队队列里的名次」，而不是绝对序号。

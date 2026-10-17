@@ -201,6 +201,13 @@ def init_db():
         except Exception:
             pass
 
+        # preparing 阶段的开始时间（UTC），供 recover_stuck_preparing 判定超时。
+        # 不能用 created_at：那是任务创建时间，排队久的任务一进 preparing 就会被误判卡住。
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN prepare_started_at TIMESTAMP DEFAULT NULL")
+        except Exception:
+            pass
+
         # 创建队列索引
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_task_queue ON task_instances(queue_id, queue_position)")

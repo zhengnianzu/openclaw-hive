@@ -27,18 +27,28 @@ def _queue_info(queue: dict, counts: dict, totals: dict) -> QueueInfo:
         description=queue.get('description') or '',
         created_by=queue.get('created_by'),
         created_at=queue['created_at'],
-        active_tasks=c.get('running', 0),
+        # active 与调度器的「占用槽位」定义保持一致：preparing 同样占着队列，
+        # 只数 running 会让正在下载的队列显示「空闲」并被筛选器误选。
+        active_tasks=c.get('running', 0) + c.get('preparing', 0),
         queued_tasks=c.get('queued', 0),
+        startable_tasks=c.get('created', 0) + c.get('stopped', 0),
+        failed_tasks_in_queue=c.get('failed', 0),
         task_count=totals.get(queue['id'], 0),
     )
 
 
 async def _counts_by_queue() -> dict:
-    """一次聚合出所有队列的运行/排队计数，避免每队列两次查询。"""
+    """一次聚合出所有队列的运行/排队/可启动计数，避免每队列多次查询。
+
+    注意 failed 单独统计、不计入 startable：「启动队列」是批量操作，
+    若把 failed 也放进去，一条配置错误（如 OBS 路径不存在）的任务会被反复
+    拉起、反复失败，把整条队列卡死。failed 只允许用户手动点「启动」重试。
+    """
     stats = await async_query(
         """SELECT queue_id, status, COUNT(*) AS count
            FROM task_instances
-           WHERE queue_id IS NOT NULL AND status IN ('running', 'queued')
+           WHERE queue_id IS NOT NULL
+             AND status IN ('preparing', 'running', 'queued', 'created', 'stopped', 'failed')
            GROUP BY queue_id, status""",
         ()
     )
@@ -140,18 +150,42 @@ async def list_queue_tasks(
     )
 
     # 预计开始时间：在当前占用者之后，按剩余任务的估算耗时逐个顺推。
-    # 用队列内已完成任务的平均耗时作为单任务估算；没有历史数据则不给预计时间。
+    # 用队列内已完成任务的平均耗时作为单任务估算；没有历史数据则不给预计时间
+    # （avg_sec 为 None 时 est 一律为 None，避免显示成「立即开始」）。
+    # 平均耗时只取正常跑完的实例：被 stop 中断的行 started_at/stopped_at 也有值，
+    # 但时长没有参考意义。
     avg = await async_query_one(
         """SELECT AVG((julianday(stopped_at) - julianday(started_at)) * 86400.0) AS sec
            FROM task_instances
-           WHERE queue_id = ? AND started_at IS NOT NULL AND stopped_at IS NOT NULL""",
+           WHERE queue_id = ?
+             AND status IN ('completed','finished')
+             AND started_at IS NOT NULL AND stopped_at IS NOT NULL""",
         (queue_id,)
     )
     avg_sec = (avg or {}).get('sec') if avg else None
 
     items = []
-    wait_offset = 0
     rank = 0            # 排队名次：只统计 queued 任务，按 queue_position 升序递增
+    # 当前占用者（preparing/running）的已用时长先从估算里扣掉；没有占用者则为 0。
+    now = datetime.now()
+    wait_offset = 0.0
+    for r in rows:
+        if r['status'] not in ('preparing', 'running'):
+            continue
+        if avg_sec is None:
+            wait_offset = 0.0
+            break
+        started = r['started_at'] or r['prepare_started_at']
+        if started:
+            try:
+                elapsed = (now - datetime.fromisoformat(str(started).replace(' ', 'T'))).total_seconds()
+            except (ValueError, TypeError):
+                elapsed = 0.0
+            wait_offset += max(0.0, avg_sec - elapsed)
+        else:
+            wait_offset += avg_sec
+        break  # 串行队列最多一个占用者
+
     for r in rows:
         status = r['status']
         if status == 'running':
@@ -162,8 +196,11 @@ async def list_queue_tasks(
             # 会有空洞，直接显示绝对序号会误导（第 4 个排队的任务可能显示 9）。
             rank += 1
             label = f"{rank} (等待中)"
-            est = (datetime.now() + timedelta(seconds=wait_offset + (avg_sec or 0))).isoformat()
-            wait_offset += (avg_sec or 0)
+            if avg_sec is None:
+                est = None
+            else:
+                est = (now + timedelta(seconds=wait_offset + avg_sec)).isoformat()
+                wait_offset += avg_sec
         else:
             label, est = '-', None
 

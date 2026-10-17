@@ -23,8 +23,14 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
-    # 队列调度配置
-    MAX_TOTAL_SANDBOXES: int = 100
+    # 队列调度配置（已取消全局沙箱上限 MAX_TOTAL_SANDBOXES：队列只受「同队列串行」约束）
+    ORPHAN_PREPARING_GRACE_SECONDS: int = 120
+
+    # preparing 状态超时（秒）：准备阶段会做 OBS 下载（单次最长 600s，可能两次）
+    # 与打包（120s）。若协程异常消失（reload/事件循环错误），实例会永久卡在
+    # preparing 占住队列槽位；后台 refresher 超过此阈值仍未拿到 pid 的实例判为
+    # 卡住，标记 failed 并放行下一个任务。
+    PREPARE_TIMEOUT_SECONDS: int = 1800
 
     # 空跑模式（调试队列用）：True 时用「sleep N 秒后写 complete.jsonl」的空跑进程
     # 替代真实 hive.py，准备阶段仍走真实流程，因此 pid/停止/完成检测/队列续跑
