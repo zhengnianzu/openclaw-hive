@@ -449,7 +449,14 @@ class OpenClawDistillationTask:
         s3 = yaml_config.s3
         sandbox_id_prefix = yaml_config.sandbox_id_prefix
         config = copy.deepcopy(yaml_config)
-        config = build_make_config("x86_cpu", config=yaml_config)
+        # 沙箱块选择：优先读平台写入的 sandbox_active_key；否则取顶层 sandbox 下的第一个键；
+        # 都没有（旧模板/旧实例，无顶层 sandbox 段）时退回历史默认 "x86_cpu"。
+        sandbox_key = yaml_config.get("sandbox_active_key")
+        if not sandbox_key:
+            top_sandbox = yaml_config.get("sandbox")
+            if top_sandbox:
+                sandbox_key = next(iter(top_sandbox.keys()))
+        config = build_make_config(sandbox_key or "x86_cpu", config=yaml_config)
         config.s3 = s3
         config.env_make.env_id = f"{sandbox_id_prefix}-{uuid.uuid4().hex}"
 

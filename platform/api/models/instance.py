@@ -80,6 +80,9 @@ class InstanceCreate(BaseModel):
 
     harness_config_id: Optional[int] = None
 
+    # 沙箱配置（settings/sandbox/ 下的派生文件），不选则沿用模板默认
+    sandbox_config_id: Optional[int] = None
+
     # 重跑失败场景: 传入源实例 id,创建后把源实例 complete.jsonl 搬到新实例 output,
     copy_complete_from: Optional[str] = None
 

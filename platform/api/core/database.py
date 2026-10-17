@@ -293,6 +293,34 @@ def init_db():
             except Exception:
                 pass
 
+        # 沙箱配置索引表：**文件权威，DB 只存索引**。
+        # 真正的沙箱内容在 platform/settings/sandbox/*.yaml：
+        #   linux.yaml / windows.yaml            —— 模板（从 configs/*.yaml 抽出的沙箱段）
+        #   <type>_<id>.yaml                     —— 每条配置的派生文件（file 列记录）
+        # 创建任务时把派生文件的 global/sandbox/sandbox_namespace/s3 整段替换进实例 config.yaml。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sandbox_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,               -- 配置名称，如 default-windows
+                sandbox_type TEXT NOT NULL,              -- linux | windows
+                sandbox_key TEXT NOT NULL,               -- config.yaml 顶层 sandbox.<key>，如 x86_cpu / windows
+                file TEXT DEFAULT '',                    -- 派生文件名（settings/sandbox/ 下），如 windows_1.yaml
+                is_default INTEGER DEFAULT 0,            -- 同类型下唯一
+                enabled INTEGER DEFAULT 1,
+                description TEXT DEFAULT '',
+                created_by TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # migrate: 为已存在的 sandbox_configs 补索引列
+        for col in ["file TEXT DEFAULT ''", "enabled INTEGER DEFAULT 1", "description TEXT DEFAULT ''"]:
+            try:
+                conn.execute(f"ALTER TABLE sandbox_configs ADD COLUMN {col}")
+            except Exception:
+                pass
+
         # 每任务明细表：把散落在文件系统里的 per-task 状态/评分聚合进 DB，便于筛选与将来着色
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS task_records (

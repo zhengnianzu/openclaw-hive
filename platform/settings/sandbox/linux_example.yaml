@@ -1,0 +1,63 @@
+# ==================== 全局配置 ====================
+global:
+  # 控制面服务地址，SDK 通过此地址与控制面通信
+  controlplane_base_url: http://local_host:30081
+  # API 认证密钥，用于 SDK 与控制面之间的身份校验
+  api_key: "api-key"
+  logger:
+    name: test
+    level: INFO
+    dir: logs
+    console: true
+    file: true
+    stream: stdout
+    max_backup_count: 14
+    encoding: utf-8
+    format: "%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+    when: midnight
+    interval: 1
+
+
+# ==================== 沙箱环境配置 ====================
+# 定义不同架构/加速器类型的沙箱配置，每种配置对应一种运行环境:x86 CPU\ARM CPU\NPU\windows
+sandbox:
+  # ---------- x86 CPU 沙箱 ----------
+  x86_cpu:
+    architecture: x86           # CPU 架构: x86 或 arm64
+    accelerator: null           # 加速器类型: null(无)/npu/gpu
+    lease_ttl_seconds: 900         # 900s检测沙箱存活
+    max_ttl_second: 8000          # 沙箱最大存活时间，大于任务执行时间
+    wait_timeout_seconds: 1200   # 等待沙箱就绪的超时时间（秒）
+
+    sandbox:
+      image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:26.8.3
+      # 环境变量配置
+      env:
+        - name: PIP_INDEX_URL
+          value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
+        - name: PIP_TRUSTED_HOST
+          value: "mirrors.huaweicloud.com"
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: "0"
+        - name: SERPER_API_KEY
+          value: sk-key
+        - name: SERPER_API_URL
+          value: https://yibuapi.com/serper/
+        - name: OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS
+          value: "off"
+      # 资源请求与限制
+      resources:
+        cpu_request: "2"          # CPU 请求量（核数）
+        cpu_limit: "3"          # CPU 上限（核数）
+        memory_request: "6Gi"     # 内存请求量
+        memory_limit: "8Gi"       # 内存上限
+
+
+sandbox_namespace: omni-env-default-worker
+
+
+s3:
+  s3_uploader_script: /home/ma-user/obsutil/obsutil
+  s3_download_script: /home/ma-user/obsutil/obsutil
+  bucket_name: obs://s3-asset-b-hd-cce-aifm-nlp-exp

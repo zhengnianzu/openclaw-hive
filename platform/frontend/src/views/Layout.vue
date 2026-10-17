@@ -25,6 +25,10 @@
           <el-icon><Files /></el-icon>
           <span>Harness配置</span>
         </el-menu-item>
+        <el-menu-item v-if="authStore.isOperator" index="/sandbox-configs">
+          <el-icon><Grid /></el-icon>
+          <span>沙箱配置</span>
+        </el-menu-item>
         <el-menu-item v-if="authStore.isOperator" index="/images">
           <el-icon><Box /></el-icon>
           <span>镜像管理</span>

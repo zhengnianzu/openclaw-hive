@@ -158,7 +158,28 @@
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="起始索引">{{ createParams.start_index ?? 0 }}</el-descriptions-item>
                 <el-descriptions-item label="任务总数">{{ createParams.total_num ? createParams.total_num : '不限' }}</el-descriptions-item>
-                <el-descriptions-item label="镜像名称">{{ createParams.image_name || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="沙箱配置">
+                  <template v-if="createParams.sandbox_config_name">
+                    {{ createParams.sandbox_config_name }}
+                    <el-tag size="small" type="info" style="margin-left:6px">{{ createParams.sandbox_type === 'windows' ? 'Windows' : 'Linux' }}</el-tag>
+                  </template>
+                  <span v-else-if="createParams.sandbox_config_id">已删除（id={{ createParams.sandbox_config_id }}）</span>
+                  <span v-else>未选择（用模板默认）</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="沙箱标识">
+                  <span v-if="createParams.task_name">{{ createParams.task_name }}</span>
+                  <span v-else>-</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="沙箱块">
+                  <span v-if="createParams.sandbox_active_key">
+                    <code>{{ createParams.sandbox_active_key }}</code>
+                  </span>
+                  <span v-else>-</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="沙箱文件">{{ createParams.sandbox_file || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="镜像名称" :span="2">
+                  <span style="word-break:break-all">{{ createParams.sandbox_image || createParams.image_name || '-' }}</span>
+                </el-descriptions-item>
                 <el-descriptions-item label="代码仓ID">{{ createParams.code_repo_id || '-' }}</el-descriptions-item>
               </el-descriptions>
             </el-collapse-item>

@@ -23,6 +23,7 @@ from ..services.queue_scheduler import (
     schedule_queue, check_global_sandbox_capacity, OCCUPYING_STATUSES,
 )
 from . import harness_meta
+from . import sandbox_configs
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
@@ -409,6 +410,29 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     base.run_config.start_index = req.start_index
     base.run_config.total_num = req.total_num
 
+    # --- 沙箱配置：把派生文件的沙箱段整段替换进 config.yaml ---
+    # 派生文件在 settings/sandbox/<type>_<id>.yaml，其 global/sandbox/sandbox_namespace/s3
+    # 整段覆盖到 base 上。未选沙箱配置时只重排顺序，内容用模板原样。
+    if req.sandbox_config_id:
+        with get_connection() as conn:
+            sb_row = conn.execute(
+                "SELECT * FROM sandbox_configs WHERE id = ?", (req.sandbox_config_id,)
+            ).fetchone()
+        if not sb_row:
+            raise HTTPException(status_code=400, detail=f"沙箱配置不存在: {req.sandbox_config_id}")
+        sandbox_configs.apply_sandbox_to_config(base, dict(sb_row))
+    else:
+        # 未选沙箱配置：模板原样，只统一顶层顺序
+        key = sandbox_configs.active_sandbox_key(base)
+        if key:
+            base.sandbox_active_key = key
+        sandbox_configs.rewrite_config_sections(base)
+
+    # --- 镜像：独立于沙箱配置，只写当前实例 ---
+    # 无论有没有选沙箱配置，都按生效的 sandbox key 改写本实例 config.yaml，
+    # 不动任何模板/派生文件（选沙箱配置时该 key 由派生文件决定，否则取模板自带的）。
+    sandbox_configs.apply_image(base, req.image_name or "")
+
     if req.skill_dir:
         base.run_config.obs.skill_download_path = req.skill_dir
     if req.default_skills:
@@ -424,8 +448,6 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     else:
         traj_prefix = harness_meta.traj_prefix(req.harness_type)
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
-    if req.image_name:
-        base.sandbox.x86_cpu.sandbox.image = req.image_name.strip()
 
     # harness 配置文件路径: 由 harness_config.json 的 agent_config 派生。
     # 下方各 harness 配置生成分支仍按原变量名引用这些局部变量, 故在此集中定义。
@@ -966,6 +988,32 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
         try:
             snap = OmegaConf.create(row["config_snapshot"])
             params["obs_bucket"] = OmegaConf.select(snap, "s3.bucket_name")
+        except Exception:
+            pass
+    # 沙箱配置：create_params 只存了 id，这里补上名称/类型/文件，供详情页展示。
+    # 实例可能引用了已删除的沙箱配置，此时查不到，保持 sandbox_config_name 为空。
+    sb_id = params.get("sandbox_config_id")
+    if sb_id:
+        with get_connection() as conn:
+            sb = conn.execute(
+                "SELECT name, sandbox_type, sandbox_key, file FROM sandbox_configs WHERE id = ?",
+                (sb_id,),
+            ).fetchone()
+        if sb:
+            params["sandbox_config_name"] = sb["name"]
+            params["sandbox_type"] = sb["sandbox_type"]
+            params["sandbox_key"] = sb["sandbox_key"]
+            params["sandbox_file"] = sb["file"]
+    # 实际生效的 sandbox key / 镜像：从 config_snapshot 读（可能与当前沙箱配置不同，
+    # 因为实例创建时的值已固化进快照）
+    if row["config_snapshot"]:
+        try:
+            snap = OmegaConf.create(row["config_snapshot"])
+            key = OmegaConf.select(snap, "sandbox_active_key")
+            params["sandbox_active_key"] = key
+            img = OmegaConf.select(snap, f"sandbox.{key}.sandbox.image") if key else None
+            if img:
+                params["sandbox_image"] = img
         except Exception:
             pass
     return params

@@ -178,6 +178,22 @@
             </el-select>
           </el-form-item>
 
+          <el-form-item label="沙箱配置">
+            <el-select v-model="form.sandbox_config_id" placeholder="选择沙箱运行环境" style="width:100%">
+              <el-option label="默认（不替换，用模板原样）" :value="0" />
+              <el-option v-for="sb in sandboxList" :key="sb.id"
+                :label="`${sb.name}${sb.is_default ? ' (默认)' : ''}`" :value="sb.id">
+                <span>{{ sb.name }}<el-tag v-if="sb.is_default" size="small" type="info" style="margin-left:6px">默认</el-tag></span>
+                <span style="float:right;color:#999;font-size:12px">
+                  {{ sb.sandbox_type === 'windows' ? 'Windows' : 'Linux' }} · {{ sb.cpu_request }}/{{ sb.cpu_limit }} 核
+                </span>
+              </el-option>
+            </el-select>
+            <div style="font-size:12px;color:#999;margin-top:4px">
+              决定沙箱的资源规格、超时、环境变量与镜像；选「默认」则不替换，用 harness 模板原样
+            </div>
+          </el-form-item>
+
           <el-form-item label="代码仓">
             <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
               <el-option v-for="repo in codeRepoList" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
@@ -352,6 +368,7 @@ const form = ref({
   harness_config_id: null,
   copy_complete_from: null,
   queue_id: null,
+  sandbox_config_id: null,
   agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }],
 })
 
@@ -375,7 +392,19 @@ const imageList = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
 const queueList = ref([])
+const sandboxList = ref([])
 const queuePickerVisible = ref(false)
+
+async function loadSandboxConfigs() {
+  try {
+    sandboxList.value = await api.get('/sandbox-configs', { params: { enabled_only: true } })
+    // 默认选中标记为默认的那条（优先取与当前 task 同名类型的 linux 默认；无则取任意默认）
+    if (form.value.sandbox_config_id == null) {
+      const def = sandboxList.value.find(s => s.is_default)
+      if (def) form.value.sandbox_config_id = def.id
+    }
+  } catch { sandboxList.value = [] }
+}
 
 async function loadQueues() {
   try {
@@ -595,6 +624,7 @@ onMounted(async () => {
   loadCodeRepos()
   loadHarnessConfigs()
   loadQueues()
+  loadSandboxConfigs()
 })
 </script>
 

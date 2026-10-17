@@ -22,6 +22,7 @@ const routes = [
       { path: 'code-repos', name: 'CodeManagement', component: () => import('../views/CodeManagement.vue') },
       { path: 'config-templates', name: 'ConfigTemplates', component: () => import('../views/ConfigTemplates.vue') },
       { path: 'harness-configs', name: 'HarnessConfigs', component: () => import('../views/HarnessConfigs.vue') },
+      { path: 'sandbox-configs', name: 'SandboxConfigs', component: () => import('../views/SandboxConfigs.vue') },
     ],
   },
 ]
