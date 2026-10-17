@@ -1,0 +1,17 @@
+# 资源池总量（首页看板「当前资源使用情况」的分母）
+#
+# 资源池的唯一标识 = 沙箱配置里的 sandbox_namespace。
+# 同一 namespace 的沙箱跑在同一集群，共享同一份配额；controlplane_base_url
+# 只决定提交到哪个控制面，不参与归属判断。
+#
+# total_cpu 单位：核；total_memory_gb 单位：GiB。
+# 不在本文件里的 namespace，看板会显示「未配置」，已用量照常统计。
+
+# 默认池：历史实例（旧版 config，快照里没有 sandbox_namespace）统一归到
+# 这个 namespace，保证它们的占用不会落在所有池之外。必须同时出现在 pools 里。
+default: omni-env-default-worker
+
+pools:
+  omni-env-default-worker:
+    total_cpu: 256
+    total_memory_gb: 1024

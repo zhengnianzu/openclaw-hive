@@ -7,40 +7,100 @@
       </el-button>
     </div>
 
-    <div class="stat-grid">
-      <div class="stat-card">
-        <div class="stat-icon" style="background:#eef2ff"><el-icon :size="22" style="color:#6366f1"><Monitor /></el-icon></div>
-        <div class="stat-info">
-          <span class="stat-value">{{ instances.length }}</span>
-          <span class="stat-label">总实例</span>
-        </div>
+    <div class="resource-panel">
+      <div class="resource-panel-head">
+        <span class="resource-panel-title">当前资源使用情况</span>
+        <span class="resource-panel-hint">按当前并发数 × 沙箱配置计算</span>
       </div>
-      <div class="stat-card">
-        <div class="stat-icon" style="background:#ecfdf5"><el-icon :size="22" style="color:#10b981"><VideoPlay /></el-icon></div>
-        <div class="stat-info">
-          <span class="stat-value" style="color:#10b981">{{ runningInstances.length }}</span>
-          <span class="stat-label">运行中</span>
+
+      <div class="resource-panel-body">
+        <!-- CPU -->
+        <div class="resource-card">
+          <div class="resource-card-head">
+            <el-icon :size="18" style="color:#6366f1"><Cpu /></el-icon>
+            <span>CPU 核数</span>
+          </div>
+          <div class="resource-main">
+            <div class="resource-main-left">
+              <div class="resource-value">
+                <span class="resource-used">{{ fmtNum(usedCpu) }}</span>
+                <span class="resource-sep">/</span>
+                <span class="resource-total">{{ totalCpu ? fmtNum(totalCpu) : '—' }}</span>
+                <span class="resource-unit">核</span>
+              </div>
+              <div class="resource-sub">上限 {{ fmtNum(usedCpuLimit) }} 核</div>
+              <el-progress
+                :percentage="cpuPercent" :show-text="false" :stroke-width="10"
+                :color="percentColor(cpuPercent)" />
+              <div class="resource-percent">{{ totalCpu ? cpuPercent.toFixed(0) + '%' : '未配置总量' }}</div>
+            </div>
+            <div class="legend">
+              <div class="legend-row"><i class="dot" style="background:#6366f1"></i>运行中任务<b>{{ fmtNum(runningCpu) }} 核</b></div>
+              <div class="legend-row"><i class="dot" style="background:#f59e0b"></i>排队中任务<b>{{ fmtNum(queuedCpu) }} 核</b></div>
+              <div class="legend-row"><i class="dot" style="background:#cbd5e1"></i>可用<b>{{ totalCpu ? fmtNum(availCpu) + ' 核' : '—' }}</b></div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon" style="background:#f0fdf4"><el-icon :size="22" style="color:#059669"><CircleCheck /></el-icon></div>
-        <div class="stat-info">
-          <span class="stat-value">{{ instances.filter(i => ['completed','finished'].includes(i.status)).length }}</span>
-          <span class="stat-label">已完成</span>
+
+        <!-- 内存 -->
+        <div class="resource-card">
+          <div class="resource-card-head">
+            <el-icon :size="18" style="color:#8b5cf6"><Coin /></el-icon>
+            <span>内存</span>
+          </div>
+          <div class="resource-main">
+            <div class="resource-main-left">
+              <div class="resource-value">
+                <span class="resource-used">{{ fmtGi(usedMem) }}</span>
+                <span class="resource-sep">/</span>
+                <span class="resource-total">{{ totalMem ? fmtGi(totalMem) : '—' }}</span>
+              </div>
+              <div class="resource-sub">上限 {{ fmtGi(usedMemLimit) }}</div>
+              <el-progress
+                :percentage="memPercent" :show-text="false" :stroke-width="10"
+                :color="percentColor(memPercent)" />
+              <div class="resource-percent">{{ totalMem ? memPercent.toFixed(0) + '%' : '未配置总量' }}</div>
+            </div>
+            <div class="legend">
+              <div class="legend-row"><i class="dot" style="background:#8b5cf6"></i>运行中任务<b>{{ fmtGi(runningMem) }}</b></div>
+              <div class="legend-row"><i class="dot" style="background:#f59e0b"></i>排队中任务<b>{{ fmtGi(queuedMem) }}</b></div>
+              <div class="legend-row"><i class="dot" style="background:#cbd5e1"></i>可用<b>{{ totalMem ? fmtGi(availMem) : '—' }}</b></div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon" style="background:#fef2f2"><el-icon :size="22" style="color:#ef4444"><CircleClose /></el-icon></div>
-        <div class="stat-info">
-          <span class="stat-value">{{ instances.filter(i => i.status === 'stopped').length }}</span>
-          <span class="stat-label">已停止</span>
-        </div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon" style="background:#fffbeb"><el-icon :size="22" style="color:#f59e0b"><Box /></el-icon></div>
-        <div class="stat-info">
-          <span class="stat-value" style="color:#f59e0b">{{ totalRunningPods }}</span>
-          <span class="stat-label">运行中沙箱</span>
+
+        <!-- 任务统计 -->
+        <div class="resource-card task-card">
+          <div class="resource-card-head">
+            <el-icon :size="18" style="color:#64748b"><Histogram /></el-icon>
+            <span>任务统计</span>
+          </div>
+          <div class="task-stats">
+            <div class="task-stat">
+              <span class="task-stat-label"><i class="dot" style="background:#94a3b8"></i>全部</span>
+              <span class="task-stat-value">{{ instances.length }}</span>
+            </div>
+            <div class="task-stat">
+              <span class="task-stat-label"><i class="dot" style="background:#10b981"></i>运行中</span>
+              <span class="task-stat-value" style="color:#10b981">{{ runningInstances.length }}</span>
+            </div>
+            <div class="task-stat">
+              <span class="task-stat-label"><i class="dot" style="background:#3b82f6"></i>排队中</span>
+              <span class="task-stat-value" style="color:#3b82f6">{{ queuedInstances.length }}</span>
+            </div>
+            <div class="task-stat">
+              <span class="task-stat-label"><i class="dot" style="background:#059669"></i>已完成</span>
+              <span class="task-stat-value" style="color:#059669">{{ doneCount }}</span>
+            </div>
+            <div class="task-stat">
+              <span class="task-stat-label"><i class="dot" style="background:#ef4444"></i>失败</span>
+              <span class="task-stat-value" style="color:#ef4444">{{ failedCount }}</span>
+            </div>
+            <div class="task-stat">
+              <span class="task-stat-label"><i class="dot" style="background:#f59e0b"></i>运行中沙箱</span>
+              <span class="task-stat-value" style="color:#f59e0b">{{ totalRunningPods }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -179,7 +239,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, Search, Monitor, VideoPlay, CircleCheck, CircleClose, Box } from '@element-plus/icons-vue'
+import { ArrowDown, Search, Cpu, Coin, Histogram } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -210,6 +270,63 @@ const progressColor = [
 ]
 
 const runningInstances = computed(() => instances.value.filter(i => i.status === 'running'))
+
+// ===== 资源使用情况 =====
+// 口径与后端 check_global_sandbox_capacity 一致：preparing 期间已经占住额度，
+// 所以「已用」= running + preparing；「排队中」单列，不计入已用。
+const resourcePools = ref({ total_cpu: 0, total_memory_gb: 0, pools: [] })
+const activeInstances = computed(() => instances.value.filter(i => ['running', 'preparing'].includes(i.status)))
+const queuedInstances = computed(() => instances.value.filter(i => i.status === 'queued'))
+const doneCount = computed(() => instances.value.filter(i => ['completed', 'finished'].includes(i.status)).length)
+// 「运行中沙箱」= 运行中任务的并发数之和（原看板口径，保留）
+const totalRunningPods = computed(() => runningInstances.value.reduce((sum, inst) => sum + (inst.concurrent_num || 0), 0))
+const failedCount = computed(() => instances.value.filter(i => i.status === 'failed').length)
+
+// 每个实例占用 = 并发数 × 单沙箱资源
+function sumResources(list, field) {
+  return list.reduce((sum, i) => sum + (i.concurrent_num || 0) * (i[field] || 0), 0)
+}
+const runningCpu = computed(() => sumResources(activeInstances.value, 'cpu_request'))
+const runningCpuLimit = computed(() => sumResources(activeInstances.value, 'cpu_limit'))
+const runningMem = computed(() => sumResources(activeInstances.value, 'memory_request'))
+const runningMemLimit = computed(() => sumResources(activeInstances.value, 'memory_limit'))
+const queuedCpu = computed(() => sumResources(queuedInstances.value, 'cpu_request'))
+const queuedMem = computed(() => sumResources(queuedInstances.value, 'memory_request'))
+
+const usedCpu = runningCpu
+const usedCpuLimit = runningCpuLimit
+const usedMem = runningMem
+const usedMemLimit = runningMemLimit
+const totalCpu = computed(() => resourcePools.value.total_cpu || 0)
+const totalMem = computed(() => resourcePools.value.total_memory_gb || 0)
+
+// 可用 = 总量 - 已用 - 排队；夹到 0，避免三段图例出现负数
+const availCpu = computed(() => Math.max(0, totalCpu.value - runningCpu.value - queuedCpu.value))
+const availMem = computed(() => Math.max(0, totalMem.value - runningMem.value - queuedMem.value))
+
+// 进度条与主数值同口径（只算已用），排队中的量单独列在右侧图例里
+const cpuPercent = computed(() => calcPercent(runningCpu.value, totalCpu.value))
+const memPercent = computed(() => calcPercent(runningMem.value, totalMem.value))
+function calcPercent(used, total) {
+  if (!total) return 0
+  return Math.min(100, Math.max(0, (used / total) * 100))
+}
+
+function percentColor(p) {
+  if (p >= 90) return '#ef4444'
+  if (p >= 70) return '#f59e0b'
+  return '#6366f1'
+}
+
+function fmtNum(v) {
+  const n = Number(v) || 0
+  return n % 1 === 0 ? n.toLocaleString() : n.toFixed(1)
+}
+
+// 内存统一用 GiB 展示（与资源池配置同单位），大数值带千分位
+function fmtGi(v) {
+  return fmtNum(v) + ' GiB'
+}
 
 const userOptions = computed(() => {
   const set = new Set()
@@ -295,8 +412,6 @@ function restoreFromQuery() {
   restoring = false
 }
 
-const totalRunningPods = computed(() => runningInstances.value.reduce((sum, inst) => sum + inst.concurrent_num, 0))
-
 async function loadInstances() {
   const isFirstLoad = instances.value.length === 0
   if (isFirstLoad) loading.value = true
@@ -312,6 +427,16 @@ async function loadQueueOptions() {
     queueOptions.value = await api.get('/queues')
   } catch {
     queueOptions.value = []
+  }
+}
+
+// 资源池总量来自 settings/sandbox/resource_pools.yaml，只有配置文件变更才需要重读，
+// 因此挂载时加载一次即可，不跟着 10s 轮询。
+async function loadResourcePools() {
+  try {
+    resourcePools.value = await api.get('/resource-pools')
+  } catch {
+    resourcePools.value = { total_cpu: 0, total_memory_gb: 0, pools: [] }
   }
 }
 
@@ -382,7 +507,7 @@ function handleCommand(cmd, row) {
   actions[cmd]?.()
 }
 
-onMounted(() => { restoreFromQuery(); harnessStore.load(); loadInstances(); loadQueueOptions(); timer = setInterval(loadInstances, 10000) })
+onMounted(() => { restoreFromQuery(); harnessStore.load(); loadInstances(); loadQueueOptions(); loadResourcePools(); timer = setInterval(loadInstances, 10000) })
 onUnmounted(() => clearInterval(timer))
 </script>
 
@@ -390,36 +515,79 @@ onUnmounted(() => clearInterval(timer))
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
 h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 16px;
-  margin-bottom: 20px;
-}
-.stat-card {
+/* ===== 当前资源使用情况 ===== */
+.resource-panel {
   background: #fff;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  padding: 20px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
   box-shadow: var(--shadow-sm);
-  transition: box-shadow 0.2s ease;
+  padding: 16px 20px 18px;
+  margin-bottom: 20px;
 }
-.stat-card:hover { box-shadow: var(--shadow-md); }
-.stat-icon {
-  width: 48px; height: 48px;
+.resource-panel-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 14px;
+}
+.resource-panel-title { font-size: 15px; font-weight: 600; color: var(--text-primary); }
+.resource-panel-hint { font-size: 12px; color: var(--text-muted); }
+
+.resource-panel-body {
+  display: grid;
+  grid-template-columns: 1.45fr 1.45fr 1fr;
+  gap: 16px;
+}
+.resource-card {
+  border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
+  padding: 14px 16px;
+  min-width: 0;
 }
-.stat-info { display: flex; flex-direction: column; }
-.stat-value {
-  font-size: 28px; font-weight: 700; line-height: 1.2;
-  color: var(--text-primary); font-variant-numeric: tabular-nums;
+.resource-card-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 600; color: var(--text-secondary);
+  margin-bottom: 10px;
 }
-.stat-label { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
+.resource-main { display: flex; gap: 16px; align-items: flex-start; }
+.resource-main-left { flex: 1 1 auto; min-width: 0; }
+.resource-value {
+  display: flex; align-items: baseline; gap: 4px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.resource-used { font-size: 26px; font-weight: 700; color: var(--text-primary); line-height: 1.2; }
+.resource-sep { font-size: 18px; color: #cbd5e1; margin: 0 2px; }
+.resource-total { font-size: 18px; font-weight: 600; color: var(--text-secondary); }
+.resource-unit { font-size: 13px; color: var(--text-muted); margin-left: 2px; }
+.resource-sub { font-size: 12px; color: var(--text-muted); margin: 2px 0 8px; }
+.resource-percent { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+.resource-card :deep(.el-progress-bar__outer) { background: #eef2f7; }
+.resource-card .el-progress { margin-right: 4px; }
+
+.legend { flex: 0 0 auto; display: flex; flex-direction: column; gap: 7px; padding-top: 4px; min-width: 128px; }
+.legend-row {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-secondary); white-space: nowrap;
+}
+.legend-row b { margin-left: auto; font-weight: 600; color: var(--text-primary); padding-left: 10px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+
+.task-card .task-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px 12px;
+}
+.task-stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.task-stat-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-muted); white-space: nowrap;
+}
+.task-stat-value {
+  font-size: 22px; font-weight: 700; color: var(--text-primary);
+  font-variant-numeric: tabular-nums; padding-left: 13px;
+}
+
+@media (max-width: 1200px) {
+  .resource-panel-body { grid-template-columns: 1fr; }
+}
 
 .filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .mono-num { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-secondary); white-space: nowrap; }

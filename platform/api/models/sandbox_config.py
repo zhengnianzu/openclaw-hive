@@ -11,7 +11,7 @@ class SandboxConfigCreate(BaseModel):
     description: str = ""
 
     # 以下字段写进 settings/sandbox/<type>_<id>.yaml
-    resource_pool: str = ""
+    # 资源池 = sandbox_namespace（同一 namespace 共享一份配额）
     controlplane_base_url: str = ""
     controlplane_api_key: str = ""
     sandbox_namespace: str = "omni-env-default-worker"
@@ -33,7 +33,6 @@ class SandboxConfigUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     # 表单字段（写进派生文件）—— sandbox_type / sandbox_key 不可改
-    resource_pool: Optional[str] = None
     controlplane_base_url: Optional[str] = None
     controlplane_api_key: Optional[str] = None
     sandbox_namespace: Optional[str] = None
@@ -66,7 +65,6 @@ class SandboxConfigInfo(BaseModel):
     updated_at: str = ""
 
     # 由文件内容派生（只读，供列表与表单回填）
-    resource_pool: str = ""
     controlplane_base_url: str = ""
     controlplane_api_key: str = ""
     sandbox_namespace: str = "omni-env-default-worker"

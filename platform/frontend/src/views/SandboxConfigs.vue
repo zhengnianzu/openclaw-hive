@@ -39,7 +39,12 @@
             </span>
           </template>
         </el-table-column>
-        <el-table-column prop="resource_pool" label="资源池" min-width="120" show-overflow-tooltip />
+        <el-table-column label="资源池" min-width="140" show-overflow-tooltip>
+          <template #default="{row}">
+            <span v-if="row.sandbox_namespace">{{ row.sandbox_namespace }}</span>
+            <span v-else class="muted">未绑定</span>
+          </template>
+        </el-table-column>
         <el-table-column label="CPU 请求/限制" min-width="130">
           <template #default="{row}">{{ row.cpu_request }} / {{ row.cpu_limit }} 核</template>
         </el-table-column>
@@ -128,7 +133,7 @@
                 <el-input v-model="form.name" placeholder="输入唯一的配置名称" />
               </el-form-item>
               <el-form-item label="沙箱类型">
-                <el-radio-group v-model="form.sandbox_type" :disabled="isEditing">
+                <el-radio-group v-model="form.sandbox_type" :disabled="isEditing" @change="applyTypeDefaults">
                   <el-radio label="linux">
                     <span class="sb-type"><span class="sb-icon linux"></span> Linux</span>
                   </el-radio>
@@ -162,7 +167,8 @@
                 <el-input v-model="form.controlplane_api_key" type="password" show-password />
               </el-form-item>
               <el-form-item label="sandbox_namespace">
-                <el-input v-model="form.sandbox_namespace" />
+                <el-input v-model="form.sandbox_namespace" disabled />
+                <div class="hint">资源池由「资源配置」决定，此处只读</div>
               </el-form-item>
               <el-form-item label="默认镜像">
                 <el-input v-model="form.image" placeholder="留空则新建任务时从镜像下拉选择" />
@@ -176,10 +182,21 @@
             <p class="panel-sub">设置沙箱使用的资源池以及 CPU、内存规格</p>
             <el-form :model="form" label-position="top">
               <el-form-item label="资源池">
-                <el-select v-model="form.resource_pool" filterable allow-create default-first-option
-                  placeholder="选择或输入资源池" style="width:100%" @change="onPoolChange">
-                  <el-option v-for="p in poolOptions" :key="p.name" :label="p.name" :value="p.name" />
+                <el-select v-model="form.sandbox_namespace" filterable
+                  placeholder="选择资源池（K8s namespace）" style="width:100%">
+                  <el-option v-for="p in poolOptions" :key="p.namespace" :label="p.namespace" :value="p.namespace">
+                    <span class="pool-opt">
+                      <span>{{ p.namespace }}</span>
+                      <span class="pool-cap">{{ p.total_cpu }} 核 / {{ p.total_memory_gb }} GiB</span>
+                    </span>
+                  </el-option>
                 </el-select>
+                <div class="hint" v-if="selectedPool">
+                  资源池容量：{{ selectedPool.total_cpu }} 核 / {{ selectedPool.total_memory_gb }} GiB
+                </div>
+                <div class="hint warn" v-else-if="!poolOptions.length">
+                  尚未配置资源池，请先在 settings/sandbox/resource_pools.yaml 登记
+                </div>
               </el-form-item>
               <div class="grid-2">
                 <el-form-item label="CPU 请求（核）">
@@ -325,11 +342,23 @@ const search = ref('')
 const page = ref(1)
 const pageSize = ref(10)
 
-// 资源池预设：选中时联动填充控制面与命名空间
-const poolOptions = ref([
-  { name: 'windows-pool', controlplane_base_url: '', controlplane_api_key: '', sandbox_namespace: 'omni-env-default-worker' },
-  { name: 'linux-pool', controlplane_base_url: '', controlplane_api_key: '', sandbox_namespace: 'omni-env-default-worker' },
-])
+// 资源池 = sandbox_namespace，选项来自 settings/sandbox/resource_pools.yaml
+const poolOptions = ref([])
+const resourcePools = ref({})
+
+async function loadResourcePools() {
+  try {
+    const res = await api.get('/resource-pools')
+    poolOptions.value = res.pools || []
+    resourcePools.value = res
+  } catch {
+    poolOptions.value = []
+  }
+}
+// 默认池 = resource_pools.yaml 的 default；未配置时取第一个池
+const defaultPoolName = computed(() =>
+  resourcePools.value.default_namespace || poolOptions.value[0]?.namespace || ''
+)
 
 const filteredList = computed(() => {
   let arr = list.value
@@ -361,15 +390,29 @@ const formRef = ref(null)
 let editingId = null
 
 const emptyForm = () => ({
-  name: '', sandbox_type: 'linux', resource_pool: 'linux-pool',
+  name: '', sandbox_type: 'linux',
   controlplane_base_url: '', controlplane_api_key: '',
-  sandbox_namespace: 'omni-env-default-worker',
+  sandbox_namespace: '',
   cpu_request: '2', cpu_limit: '3', memory_request: '6Gi', memory_limit: '8Gi',
   env: [], ttl_seconds: 8000, lease_ttl_seconds: 3600, wait_timeout_seconds: 3600,
   image: '', s3_uploader_script: '', s3_download_script: '',
   is_default: 0, enabled: 1, file: '',
 })
 const form = ref(emptyForm())
+const selectedPool = computed(() =>
+  poolOptions.value.find(p => p.namespace === form.value.sandbox_namespace) || null
+)
+
+// 各类型模板的资源规格默认值。切换类型时联动，避免拿 Linux 的 2/3 核 6/8Gi
+// 覆盖 Windows 模板自带的 16 核 / 32Gi（会让看板少算约 8 倍）。
+const TYPE_DEFAULTS = {
+  linux: { cpu_request: '2', cpu_limit: '3', memory_request: '6Gi', memory_limit: '8Gi' },
+  windows: { cpu_request: '16', cpu_limit: '16', memory_request: '32Gi', memory_limit: '32Gi' },
+}
+function applyTypeDefaults() {
+  const d = TYPE_DEFAULTS[form.value.sandbox_type]
+  if (d) Object.assign(form.value, d)
+}
 
 const rules = {
   name: [{ required: true, message: '请输入配置名称', trigger: 'blur' },
@@ -378,6 +421,8 @@ const rules = {
 
 function openCreate() {
   form.value = emptyForm()
+  // 默认落在 resource_pools.yaml 指定的默认池，避免未选池就保存
+  form.value.sandbox_namespace = defaultPoolName.value
   isEditing.value = false
   readOnly.value = false
   editingId = null
@@ -398,9 +443,9 @@ function fillForm(row) {
   let env = []
   try { env = JSON.parse(row.env_json || '[]') } catch {}
   form.value = {
-    name: row.name, sandbox_type: row.sandbox_type, resource_pool: row.resource_pool,
+    name: row.name, sandbox_type: row.sandbox_type,
     controlplane_base_url: row.controlplane_base_url, controlplane_api_key: row.controlplane_api_key,
-    sandbox_namespace: row.sandbox_namespace,
+    sandbox_namespace: row.sandbox_namespace || '',
     cpu_request: row.cpu_request, cpu_limit: row.cpu_limit,
     memory_request: row.memory_request, memory_limit: row.memory_limit,
     env, ttl_seconds: row.ttl_seconds, lease_ttl_seconds: row.lease_ttl_seconds,
@@ -410,18 +455,18 @@ function fillForm(row) {
   }
 }
 
-function onPoolChange(name) {
-  const p = poolOptions.value.find(x => x.name === name)
-  if (p) {
-    form.value.controlplane_base_url = p.controlplane_base_url || form.value.controlplane_base_url
-    form.value.controlplane_api_key = p.controlplane_api_key || form.value.controlplane_api_key
-    form.value.sandbox_namespace = p.sandbox_namespace || form.value.sandbox_namespace
-  }
-}
-
 function validateForm() {
   const f = form.value
   if (!f.name) { ElMessage.warning('请输入配置名称'); return false }
+  if (!f.sandbox_namespace) { ElMessage.warning('请选择资源池'); return false }
+  if (!poolOptions.value.some(p => p.namespace === f.sandbox_namespace)) {
+    ElMessage.warning('该资源池未登记，请先在 resource_pools.yaml 中配置')
+    return false
+  }
+  if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(f.sandbox_namespace) || f.sandbox_namespace.length > 63) {
+    ElMessage.warning('资源池只能包含小写字母、数字和连字符，且必须以字母或数字开头结尾（≤63 字符）')
+    return false
+  }
   for (const [reqF, limF, label] of [['cpu_request', 'cpu_limit', 'CPU'], ['memory_request', 'memory_limit', '内存']]) {
     if (!f[reqF] || !f[limF]) { ElMessage.warning(`请填写${label}请求与限制`); return false }
     if (qty(f[reqF]) > qty(f[limF])) { ElMessage.warning(`${label} 请求不得大于限制`); return false }
@@ -553,7 +598,7 @@ async function deleteConfig(row) {
   await loadList()
 }
 
-onMounted(loadList)
+onMounted(() => { loadList(); loadResourcePools() })
 </script>
 
 <style scoped>
@@ -627,6 +672,10 @@ onMounted(loadList)
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
 .hint { font-size: 12px; color: #999; margin-top: 4px; }
+.hint.warn { color: #e6a23c; }
+.muted { color: #bbb; }
+.pool-opt { display: flex; justify-content: space-between; gap: 16px; }
+.pool-cap { color: #999; font-size: 12px; }
 /* 说明性文字（非报错）：中性灰底，避免被误读为校验错误 */
 .field-note {
   background: #f8fafc;

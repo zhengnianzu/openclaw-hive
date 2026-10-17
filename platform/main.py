@@ -14,7 +14,7 @@ from api.core.config import settings
 from api.core.database import init_db, get_connection
 from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues, sandbox_configs
-from api.routers import batch_output
+from api.routers import batch_output, resource_pools
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
@@ -51,6 +51,8 @@ app.include_router(config_templates.router)
 app.include_router(harness_configs.router)
 app.include_router(harness_meta.router)
 app.include_router(sandbox_configs.router)
+# 资源池总量（首页看板的分母），只读 settings/sandbox/resource_pools.yaml
+app.include_router(resource_pools.router)
 # 批跑作业「输出」页（task_records + task_traj_records；worker 独立进程，不起 co-routine）
 app.include_router(batch_output.router)
 

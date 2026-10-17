@@ -113,6 +113,13 @@ class InstanceInfo(BaseModel):
     error_summary: Optional[str] = None
     queue_id: Optional[str] = None      # 所属队列ID
     queue_position: int = 0              # 在队列中的位置
+    # 单沙箱资源（从 config_snapshot 解析；内存单位 GiB）。前端用
+    # concurrent_num × 这些值算首页看板的核数/内存占用。
+    cpu_request: float = 0.0
+    cpu_limit: float = 0.0
+    memory_request: float = 0.0
+    memory_limit: float = 0.0
+    sandbox_namespace: str = ""         # 资源池标识（= sandbox_namespace）
 
 
 class InstanceOverview(BaseModel):

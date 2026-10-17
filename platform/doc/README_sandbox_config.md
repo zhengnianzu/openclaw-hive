@@ -63,7 +63,7 @@ instances/<id>/config.yaml
 ## 已确认的产品决策
 
 - **镜像不放进沙箱配置** —— 新建任务页复用 `images` 表的下拉；派生文件里的 `image` 仅作默认值。
-- **「资源池」= 控制面集群**（`global.controlplane_base_url` + `api_key`）；`sandbox_namespace` 是独立字段。
+- **「资源池」= `sandbox_namespace`**（同一 namespace 共享一份配额，见 `settings/sandbox/resource_pools.yaml`）；`global.controlplane_base_url` / `api_key` 全局统一配置，池子之间只靠 namespace 区分。沙箱配置单选绑定一个资源池，落点就是派生文件的 `sandbox_namespace`，不额外新增字段。
 - **资源规格按 YAML 文件实际值**（Windows 16核/32Gi），不用设计图 mock 里的 2/3、6/8Gi。
 - **沙箱段 = global + sandbox + sandbox_namespace + s3**；`run_config` 归 harness 模板，不在沙箱范围。
 
@@ -270,7 +270,7 @@ CREATE TABLE IF NOT EXISTS sandbox_configs (
   |---|---|
   | 配置名称 | `name` + `is_default` 时跟一个「默认」tag |
   | 类型 | 图标 + `Linux`/`Windows`（Windows 用蓝色方块图标，Linux 用企鹅图标） |
-  | 资源池 | `resource_pool` |
+  | 资源池 | `sandbox_namespace`（空显示「未绑定」） |
   | CPU 请求/限制 | `2 / 3 核` |
   | 内存请求/限制 | `6 / 8 GiB` |
   | 状态 | `enabled ? 启用 : 停用`（绿点/灰点） |
@@ -306,12 +306,19 @@ Windows 类型额外显示一个「高级（Windows）」折叠面板，直接�
 
 ```
 沙箱配置 [下拉]  → 选项来自 GET /api/sandbox-configs?enabled_only=true
-                  显示 name + 类型标签；默认选中该类型 is_default 的配置
+                  第一项固定为「默认（不替换，用模板原样）」，值为 0，且是初始选中项
+                  显示 name + 类型标签
 ```
 
-- 选中 Windows 沙箱时，若当前 Harness 类型/镜像与之冲突，给一条提示（不强制阻断）。
+- **默认值为「默认（不替换，用模板原样）」**：不自动预选 `is_default` 的沙箱配置。
+  这样新建任务的行为与引入沙箱配置功能之前完全一致——模板里的 `global`/`sandbox`/
+  `sandbox_namespace`/`s3` 各段原样保留，只统一顶层键顺序。
+  只有在用户主动选择某条配置时，才走 `apply_sandbox_to_config` 整段覆盖。
+- 配置行上的「默认」标记只表示「该类型的默认配置」（用于删除保护、列表排序、
+  以及设默认时的互斥切换），**不**意味着新建任务会自动选中它。
+- 选 Windows 沙箱时，若当前 Harness 类型/镜像与之冲突，给一条提示（不强制阻断）。
 - 该字段进 `form`，随 `POST /api/instances` 提交 `sandbox_config_id`。
-- **与现有「镜像名称」字段的关系需要决策**（见 §8 待确认）。
+  值为 `0`/`null` 时后端走「不替换」分支。
 
 ---
 
@@ -344,7 +351,7 @@ P0–P2 是后端主干，先做能立刻验证 Windows 链路是否通；P3–P
 ## 8. 待确认问题（已全部定夺，见上方「已确认的产品决策」）
 
 1. **镜像字段归谁？** 现有 `CreateInstance` 有「镜像名称」下拉（来自 `images` 表），而沙箱配置里天然也有 `image`。二选一会让用户困惑。建议：**沙箱配置持有默认镜像，新建任务页的镜像下拉作为"本次覆盖"**，留空则用沙箱配置的。
-2. **资源池 = `sandbox_namespace` 吗？** `configs/*.yaml` 里叫 `sandbox_namespace: omni-env-default-worker`（两个文件同值），设计图里叫 `windows-pool` / `linux-pool`。需要确认资源池是另一个概念（如 K8s 集群/节点池）还是就是 namespace。
+2. **资源池 = `sandbox_namespace`。** 已定：`global` 统一配置，池子之间只靠 namespace 区分；`resource_pools.yaml` 只登记各池容量，不作为完整资源定义。
 3. **Windows 的 2/3 核、6/8Gi 是不是笔误？** 现有 `config_win.yaml` 是 16 核 / 32Gi，设计图 mock 里写的是 2/3、6/8Gi。种子数据按哪个？
 4. **谁能编辑沙箱配置？** 建议 operator 及以上；默认配置任何人都只能查看/复制。
 5. **`extra_json` 一期是否上表单？** 建议一期先用 JSON 文本框兜底，避免为 Windows 的 K8s 字段做大量表单工作。

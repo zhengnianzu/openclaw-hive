@@ -186,6 +186,7 @@
                 <span>{{ sb.name }}<el-tag v-if="sb.is_default" size="small" type="info" style="margin-left:6px">默认</el-tag></span>
                 <span style="float:right;color:#999;font-size:12px">
                   {{ sb.sandbox_type === 'windows' ? 'Windows' : 'Linux' }} · {{ sb.cpu_request }}/{{ sb.cpu_limit }} 核
+                  <template v-if="sb.sandbox_namespace"> · {{ sb.sandbox_namespace }}</template>
                 </span>
               </el-option>
             </el-select>
@@ -368,7 +369,7 @@ const form = ref({
   harness_config_id: null,
   copy_complete_from: null,
   queue_id: null,
-  sandbox_config_id: null,
+  sandbox_config_id: 0,
   agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }],
 })
 
@@ -398,10 +399,10 @@ const queuePickerVisible = ref(false)
 async function loadSandboxConfigs() {
   try {
     sandboxList.value = await api.get('/sandbox-configs', { params: { enabled_only: true } })
-    // 默认选中标记为默认的那条（优先取与当前 task 同名类型的 linux 默认；无则取任意默认）
+    // 默认保持「不替换，用模板原样」：只有用户主动选过沙箱配置才保留其选择。
+    // 不要自动预选 is_default 的那条——那会改变平台既有行为（模板里的沙箱段被整段覆盖）。
     if (form.value.sandbox_config_id == null) {
-      const def = sandboxList.value.find(s => s.is_default)
-      if (def) form.value.sandbox_config_id = def.id
+      form.value.sandbox_config_id = 0
     }
   } catch { sandboxList.value = [] }
 }

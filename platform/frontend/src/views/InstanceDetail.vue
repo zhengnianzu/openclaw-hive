@@ -180,6 +180,16 @@
                   <span v-else>-</span>
                 </el-descriptions-item>
                 <el-descriptions-item label="沙箱文件">{{ createParams.sandbox_file || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="资源池">
+                  <span v-if="inst.sandbox_namespace"><code>{{ inst.sandbox_namespace }}</code></span>
+                  <span v-else>-</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="单沙箱资源">
+                  <span v-if="inst.cpu_request">
+                    {{ inst.cpu_request }}/{{ inst.cpu_limit }} 核 · {{ inst.memory_request }}/{{ inst.memory_limit }} GiB
+                  </span>
+                  <span v-else>-</span>
+                </el-descriptions-item>
                 <el-descriptions-item label="镜像名称" :span="2">
                   <span style="word-break:break-all">{{ createParams.sandbox_image || createParams.image_name || '-' }}</span>
                 </el-descriptions-item>

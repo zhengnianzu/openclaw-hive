@@ -26,6 +26,7 @@ from ..core.security import get_current_user, require_operator
 from ..models.sandbox_config import (
     SandboxConfigCreate, SandboxConfigUpdate, SandboxConfigInfo, SandboxFileContent,
 )
+from . import resource_pools
 
 router = APIRouter(prefix="/api/sandbox-configs", tags=["sandbox-configs"])
 
@@ -34,6 +35,8 @@ _TEMPLATES = {"linux": ("linux.yaml", "x86_cpu"), "windows": ("windows.yaml", "w
 _ALLOWED_TYPES = set(_TEMPLATES)
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+# 资源池 = sandbox_namespace，遵循 K8s namespace 命名规则（RFC 1123 label）
+_NAMESPACE_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
 # 派生文件/模板所在目录
 SANDBOX_DIR = os.path.join(settings.SETTINGS_DIR, "sandbox")
@@ -49,6 +52,31 @@ def _validate_name(name: str) -> str:
             detail="配置名称只能包含字母、数字、点、下划线、连字符，且不能以点开头",
         )
     return name
+
+
+def _validate_namespace(ns: str) -> str:
+    """资源池 = sandbox_namespace，写进配置后会用于建沙箱，按 K8s 规则校验。
+
+    除了语法，还要求该 namespace 已在 settings/sandbox/resource_pools.yaml 登记：
+    未登记的池不会被首页看板计入总量，允许保存会让「已用」静默超过「总量」。
+    """
+    ns = (ns or "").strip()
+    if not ns:
+        raise HTTPException(status_code=400, detail="请选择资源池（sandbox_namespace 不能为空）")
+    if len(ns) > 63 or not _NAMESPACE_RE.match(ns):
+        raise HTTPException(
+            status_code=400,
+            detail="资源池（sandbox_namespace）只能包含小写字母、数字和连字符，"
+                   "且必须以字母或数字开头结尾、不超过 63 个字符",
+        )
+    registered = resource_pools.load_pools()
+    if ns not in registered:
+        available = "、".join(sorted(registered)) or "（当前没有任何资源池，请先配置 resource_pools.yaml）"
+        raise HTTPException(
+            status_code=400,
+            detail=f"资源池 {ns} 未在 settings/sandbox/resource_pools.yaml 登记。可用资源池：{available}",
+        )
+    return ns
 
 
 def _template_path(sandbox_type: str) -> str:
@@ -348,6 +376,7 @@ def get_sandbox_config(config_id: int, user: dict = Depends(get_current_user)):
 @router.post("", response_model=SandboxConfigInfo)
 def create_sandbox_config(req: SandboxConfigCreate, user: dict = Depends(require_operator)):
     name = _validate_name(req.name)
+    req.sandbox_namespace = _validate_namespace(req.sandbox_namespace)
     tpl_path = _template_path(req.sandbox_type)
     sandbox_key = req.sandbox_key or _TEMPLATES[req.sandbox_type][1]
     now = datetime.now().isoformat()
@@ -375,7 +404,11 @@ def create_sandbox_config(req: SandboxConfigCreate, user: dict = Depends(require
     if not os.path.isfile(tpl_path):
         with get_connection() as conn:
             conn.execute("DELETE FROM sandbox_configs WHERE id = ?", (new_id,))
-        raise HTTPException(status_code=500, detail=f"模板文件缺失: {tpl_path}")
+        # 不把服务端绝对路径暴露给前端
+        raise HTTPException(
+            status_code=400,
+            detail=f"{req.sandbox_type} 沙箱模板缺失，请联系管理员补齐 settings/sandbox/ 下的模板文件",
+        )
     shutil.copy2(tpl_path, dst)
 
     data = req.model_dump(exclude={"name", "sandbox_type", "sandbox_key", "description"})
@@ -410,6 +443,9 @@ def update_sandbox_config(
             ).fetchone()
         if dup:
             raise HTTPException(status_code=409, detail=f"配置名称 \"{data['name']}\" 已存在")
+
+    if "sandbox_namespace" in data:
+        data["sandbox_namespace"] = _validate_namespace(data["sandbox_namespace"])
 
     # 请求 ≤ 限制（前端已拦，后端兜底）
     for req_f, lim_f, label in [("cpu_request", "cpu_limit", "CPU"),
@@ -565,11 +601,29 @@ def save_sandbox_file(
 
 @router.post("/{config_id}/reset")
 def reset_sandbox_file(config_id: int, user: dict = Depends(require_operator)):
-    """从模板重新派生（丢弃文件上的手改）。"""
+    """从模板重新派生（丢弃文件上的手改）。
+
+    资源池（sandbox_namespace）是用户在表单里显式选的归属，不属于「手改」，
+    重置后保留原值，否则配置会静默跳回模板里的默认池。
+    """
     row = _get_row_or_404(config_id)
     tpl = _template_path(row["sandbox_type"])
     dst = _file_for(row)
+    if not os.path.isfile(tpl):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{row['sandbox_type']} 沙箱模板缺失，请联系管理员",
+        )
+    old_ns = ""
+    try:
+        old_ns = (_load_yaml(dst) or {}).get("sandbox_namespace") or ""
+    except HTTPException:
+        pass  # 原文件已损坏时没有可保留的池，按模板默认走
     shutil.copy2(tpl, dst)
+    if old_ns:
+        cfg = _load_yaml(dst)
+        cfg["sandbox_namespace"] = old_ns
+        _dump_yaml(cfg, dst)
     with get_connection() as conn:
         conn.execute("UPDATE sandbox_configs SET updated_at = ? WHERE id = ?",
                      (datetime.now().isoformat(), config_id))

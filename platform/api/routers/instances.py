@@ -24,6 +24,7 @@ from ..services.queue_scheduler import (
 )
 from . import harness_meta
 from . import sandbox_configs
+from . import resource_pools
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
@@ -349,6 +350,127 @@ def _with_harness_type(d: dict) -> dict:
     return d
 
 
+# ============================================================================
+# 沙箱资源：从实例的 config_snapshot 解析单沙箱核数/内存
+# ============================================================================
+
+# snapshot 是定值字符串，同一实例每次轮询都一样，按 hash 缓存解析结果，
+# 避免 10s 一次的 /instances 反复走 OmegaConf。
+_RES_CACHE = {}
+_RES_CACHE_MAX = 2000
+
+# 解析不出来时的兜底，与沙箱配置表单默认值一致
+_RES_FALLBACK = {"cpu_request": 2.0, "cpu_limit": 3.0, "memory_request": 6.0, "memory_limit": 8.0}
+
+
+def _gib(v) -> float:
+    """K8s 内存量 → GiB。复用沙箱配置的 _to_quantity（Gi→1024、Mi→1）。"""
+    return round(sandbox_configs._to_quantity(v) / 1024, 4)
+
+
+def _num(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_resources(cfg: dict) -> dict:
+    """按两套 config 形态解析单沙箱资源。"""
+    key = cfg.get("sandbox_active_key")
+    if key:
+        sb = (cfg.get("sandbox") or {}).get(key) or {}
+        res = (sb.get("sandbox") or {}).get("resources") or {}
+        if "requests" in res or "limits" in res:
+            # Windows 沙箱写法
+            req, lim = res.get("requests") or {}, res.get("limits") or {}
+            return {
+                "cpu_request": _num(req.get("cpu"), 2),
+                "cpu_limit": _num(lim.get("cpu"), 3),
+                "memory_request": _gib(req.get("memory") or "6Gi"),
+                "memory_limit": _gib(lim.get("memory") or "8Gi"),
+            }
+        # Linux 沙箱写法
+        return {
+            "cpu_request": _num(res.get("cpu_request"), 2),
+            "cpu_limit": _num(res.get("cpu_limit"), 3),
+            "memory_request": _gib(res.get("memory_request") or "6Gi"),
+            "memory_limit": _gib(res.get("memory_limit") or "8Gi"),
+        }
+
+    # 历史形态：env_make.args.resources
+    env_make = cfg.get("env_make") or {}
+    res = (env_make.get("args") or {}).get("resources") or {}
+    if res:
+        return {
+            "cpu_request": _num(res.get("cpu_request"), 2),
+            "cpu_limit": _num(res.get("cpu_limit"), 3),
+            "memory_request": _gib(res.get("memory_request") or "6Gi"),
+            "memory_limit": _gib(res.get("memory_limit") or "8Gi"),
+        }
+    return dict(_RES_FALLBACK)
+
+
+def _sandbox_resources(row: dict) -> dict:
+    """实例的单沙箱资源 + 所在资源池（= sandbox_namespace）。"""
+    snapshot = row.get("config_snapshot") or ""
+    cache_key = (row.get("id"), hash(snapshot))
+    hit = _RES_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
+    out = None
+    if snapshot:
+        try:
+            cfg = OmegaConf.to_container(OmegaConf.create(snapshot), resolve=True) or {}
+            out = _parse_resources(cfg)
+            out["sandbox_namespace"] = cfg.get("sandbox_namespace") or ""
+        except Exception:
+            out = None
+
+    if out is None:
+        # snapshot 缺失/损坏：回退到该实例引用的沙箱配置文件
+        out = dict(_RES_FALLBACK)
+        out["sandbox_namespace"] = ""
+        try:
+            params = json.loads(row.get("create_params") or "{}")
+            sb_id = params.get("sandbox_config_id")
+            if sb_id:
+                with get_connection() as conn:
+                    sb_row = conn.execute(
+                        "SELECT * FROM sandbox_configs WHERE id = ?", (sb_id,)
+                    ).fetchone()
+                if sb_row:
+                    summary = sandbox_configs._extract_summary(
+                        sandbox_configs._load_yaml(sandbox_configs._file_for(dict(sb_row))),
+                        sb_row["sandbox_key"],
+                    )
+                    out = {
+                        "cpu_request": _num(summary.get("cpu_request"), 2),
+                        "cpu_limit": _num(summary.get("cpu_limit"), 3),
+                        "memory_request": _gib(summary.get("memory_request") or "6Gi"),
+                        "memory_limit": _gib(summary.get("memory_limit") or "8Gi"),
+                        "sandbox_namespace": summary.get("sandbox_namespace") or "",
+                    }
+        except Exception:
+            pass
+
+    # 历史实例（形态 B 的 config，或快照里没写 sandbox_namespace）归入默认池，
+    # 否则它们的占用会落在所有池之外，看板上「已用 > 各池之和」。
+    if not out.get("sandbox_namespace"):
+        out["sandbox_namespace"] = resource_pools.default_namespace()
+
+    if len(_RES_CACHE) >= _RES_CACHE_MAX:
+        _RES_CACHE.clear()
+    _RES_CACHE[cache_key] = out
+    return out
+
+
+def _with_resources(d: dict) -> dict:
+    d.update(_sandbox_resources(d))
+    return d
+
+
 def _describe_error(e: Exception) -> str:
     """把异常转成给用户看的一句话失败原因。
 
@@ -364,7 +486,7 @@ def _describe_error(e: Exception) -> str:
 def list_instances(user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM task_instances ORDER BY created_at DESC").fetchall()
-    return [InstanceInfo(**_with_harness_type(_sync_instance_status(dict(r)))) for r in rows]
+    return [InstanceInfo(**_with_resources(_with_harness_type(_sync_instance_status(dict(r))))) for r in rows]
 
 
 @router.get("/{instance_id}", response_model=InstanceInfo)
@@ -373,7 +495,7 @@ def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="实例不存在")
-    return InstanceInfo(**_with_harness_type(_sync_instance_status(dict(row))))
+    return InstanceInfo(**_with_resources(_with_harness_type(_sync_instance_status(dict(row)))))
 
 
 async def _async_subprocess_run(cmd, *, cwd=None, timeout=600):
@@ -1032,6 +1154,9 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
             img = OmegaConf.select(snap, f"sandbox.{key}.sandbox.image") if key else None
             if img:
                 params["sandbox_image"] = img
+            # 资源池与单沙箱资源：与首页看板同源（config_snapshot），
+            # 沙箱配置事后被改/删也不影响这里显示的历史值。
+            params["sandbox_namespace"] = OmegaConf.select(snap, "sandbox_namespace") or ""
         except Exception:
             pass
     return params
