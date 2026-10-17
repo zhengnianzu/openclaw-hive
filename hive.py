@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import contextvars
 import copy
 import json
@@ -22,8 +21,6 @@ import re
 import random
 import shutil
 import subprocess
-import tarfile
-import tempfile
 import threading
 import time
 import traceback
@@ -47,10 +44,19 @@ from prepare_config import (
     _FRAMEWORK_LAYOUTS,
     load_yaml_config,
     prepare_local_agent_config,
-    adapt_layout_for_windows
+    adapt_layout_for_windows,
+    HiveError,
+    _log_sandbox_detail,
+    _classify_task_stdout,
+    ERROR_CATALOG,
 )
-from utils.win_util import ps_command, ps_read_file_b64, decode_remote_b64
-
+from utils.win_util import (
+    ps_command,
+    _setup_windows_obsutil,
+    _windows_env_assign,
+    _start_openclaw_gateway_windows,
+    _run_main_script_windows,
+)
 # Module-level logger
 logger = get_logger()
 
@@ -66,128 +72,33 @@ OBS_UPLOAD_TIMEOUT = 900
 
 
 # ============================================================================
-# Error Catalog
-# ============================================================================
-# 错误码前缀 = 错误来源, 一眼可辨:
-#   C0xx  Client 侧    — hive.py 自身流程 / 本地文件 / 配置解析
-#   S0xx  Server 侧    — 沙箱远端执行失败 / 网络 / OBS / gateway
-#   T0xx  Task/业务侧  — 主脚本自报失败
-# ============================================================================
-
-ERROR_CATALOG: dict = {
-    # -- Client-side (C0xx) --
-    "C001": "extract code failed",
-    "C002": "upload file failed",
-    "C003": "environment creation failed",
-    "C004": "agent config write failed",
-    # -- Server / sandbox-side (S0xx) --
-    "S001": "gateway start failed",
-    "S002": "gateway startup timeout",
-    "S003": "gateway unexpected output",
-    "S004": "sandbox port-update failed",
-    "S005": "skill download failed",
-    "S006": "user profile download failed",
-    "S007": "agents download failed",
-    "S008": "script execution failed",
-    "S009": "upload traj to OBS failed",
-    # -- Task / business-side (T0xx) --
-    "T001": "【Task_Failed】",
-    "T002": "达到最大轮次",
-    "T003": "连续3次未收到回复",
-    "T004": "AgentExecutionError",
-    "T005": "AssertionError",
-    "T006": "API call failed",
-    "T007": "TimeoutError",
-    "T008": "HarnessError",
-    "T010": "Uncategorized Traceback",
-    # -- Unclassified --
-    "X999": "unclassified exception",
-}
-
-
-def _strip_api_use_lines(text: str) -> str:
-    """去掉日志里的 'INFO:api_use:' 行 (api 用量记录, 与任务成败无关, 干扰判定/查看)。"""
-    if not text:
-        return text
-    return "\n".join(line for line in text.splitlines() if "INFO:api_use:" not in line)
-
-
-def _classify_task_stdout(stdout: str) -> tuple[str, str]:
-    """
-    从主脚本 stdout 里推断更具体的错误码（优先匹配最后出现的错误信息）。
-    """
-    stdout = _strip_api_use_lines(stdout)
-    if not stdout or "【Task_Done】" in stdout:
-        return "", ""
-
-    best_pos = -1
-    best_code = ""
-    best_phrase = ""
-
-    # 遍历错误目录，但仅处理以 'T' 开头且不等于 'T010' 的条目
-    for code, phrase in ERROR_CATALOG.items():
-        if not code.startswith("T") or code == "T010":
-            continue
-        if phrase:
-            pos = stdout.rfind(phrase)          # 从后往前查找该短语的最后出现位置
-            if pos > best_pos:                  # 取位置最靠后的（即最后出现的）
-                best_pos = pos
-                best_code = code
-                best_phrase = phrase
-
-    if best_pos != -1:
-        return best_code, best_phrase
-
-    # 若未匹配到任何 T 类错误，再检查是否含有 Traceback
-    if "Traceback" in stdout:
-        return "T010", "Traceback"
-
-    return "", ""
-
-class HiveError(Exception):
-    """
-    带错误码的流水线异常。
-    code:      C001 / S001 / T001 ...
-    detail:    简短单行原因
-    sandbox_result: 若为 sandbox 端失败, 附上原始 Result 便于详情落盘
-    """
-
-    def __init__(self, code: str, detail: str = "", sandbox_result=None):
-        self.code = code
-        self.short = ERROR_CATALOG.get(code, ERROR_CATALOG["X999"])
-        self.detail = detail or ""
-        self.sandbox_result = sandbox_result
-        super().__init__(f"[{code}] {self.short}"
-                         + (f": {self.detail}" if self.detail else ""))
-
-
-
-# ============================================================================
 # Agent framework — module-level switch
 # ============================================================================
 
-# 每框架的目录布局 — 数据源在 prepare_config._FRAMEWORK_LAYOUTS, 此处仅按
-# AGENT_FRAMEWORK 选取当前框架的布局快照 (运行时可变, set_agent_framework 切换)。
-AGENT_FRAMEWORK: str = "openclaw"  # 占位默认, main() 会覆盖
-_FW: dict = _FRAMEWORK_LAYOUTS[AGENT_FRAMEWORK]
+# 每框架的目录布局 — 数据源在 prepare_config._FRAMEWORK_LAYOUTS, 此处仅按当前框架
+# 选取布局快照 (运行时可变, set_agent_framework 切换)。框架名不再做模块级全局,
+# 由 main() 注入 SandboxConfig.harness_type (同 sandbox_type), 方法读
+# self.config.sandbox_config.harness_type。
+_FW: dict = _FRAMEWORK_LAYOUTS["openclaw"]
 
 
-def set_agent_framework(name: str, sandbox_type: str = "x86_cpu", home: str = "/home/ma-user") -> None:
-    """Set the module-level framework switch. Called from ``main()`` exactly once.
+def set_agent_framework(name: str, sandbox_type: str = "x86_cpu", home: str = "/home/ma-user") -> str:
+    """Set the module-level framework layout switch. Called from ``main()`` exactly once.
 
     sandbox_type == "windows" 时先对布局做 adapt_layout_for_windows 转换。
+    返回规范化后的框架名, 供 main() 注入 SandboxConfig.harness_type。
     """
-    global AGENT_FRAMEWORK, _FW
+    global _FW
     name = (name or "").strip().lower()
     if name not in _FRAMEWORK_LAYOUTS:
         raise RuntimeError(
             f"harness_type 必须是 {_FRAMEWORK_LAYOUTS.keys()}, got {name!r}"
         )
-    AGENT_FRAMEWORK = name
     layout = _FRAMEWORK_LAYOUTS[name]
     if sandbox_type == "windows":
         layout = adapt_layout_for_windows(layout, home)
     _FW = layout
+    return name
 
 
 def get_obsutil_downloader_command(s3_config, objects_storage_path, bucket_path):
@@ -198,58 +109,6 @@ def get_obsutil_downloader_command(s3_config, objects_storage_path, bucket_path)
 def get_obsutil_uploader_command(s3_config, local_folder_absolute_path, bucket_path):
     command = f"{s3_config.s3_download_script} cp {local_folder_absolute_path} {s3_config.bucket_name}/{bucket_path} -r -f"
     return command
-
-
-# Windows 沙箱辅助目录: (本地源目录, 相对 home 的 tar arcname)。
-# 打包后统一解压到 sandbox home, 三个目录即落到各自目标位置。
-_WINDOWS_AUX_DIRS = [
-    ("/root/sandbox-log/windows/skills/serper", ".openclaw/skills/serper"),
-    ("/root/sandbox-log/windows/xiaoyi-device-env", "xiaoyi-device-env"),
-    ("/root/sandbox-log/windows/claude_code_image_reading_tool", "claude_code_image_reading_tool"),
-]
-
-
-def _read_obs_credentials() -> tuple[str, str, str]:
-    """从 <project>/platform/.env 读 obsutil 凭据 IK/KK/EK, 缺 .env 时回落 .env.example。
-
-    返回 (ik, kk, ek) 对应 obsutil config 的 -i/-k/-e。缺任一键抛 C001。
-    """
-    base = Path(__file__).resolve().parent / "platform"
-    values: dict[str, str] = {}
-    for name in (".env", ".env.example"):
-        env_file = base / name
-        if not env_file.is_file():
-            continue
-        try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                values.setdefault(key.strip(), val.strip().strip('"').strip("'"))
-        except OSError:
-            continue
-        if {"IK", "KK", "EK"} <= values.keys():
-            break
-    ik, kk, ek = values.get("IK", ""), values.get("KK", ""), values.get("EK", "")
-    if not (ik and kk and ek):
-        raise HiveError("C001", detail="obsutil 凭据 (IK/KK/EK) 在 platform/.env 缺失")
-    return ik, kk, ek
-
-
-def _build_windows_aux_tar() -> str:
-    """把 _WINDOWS_AUX_DIRS 打成一个 tar (arcname 相对 home), 返回本地 tar 路径。"""
-    fd, tar_path = tempfile.mkstemp(suffix=".tar")
-    os.close(fd)
-    try:
-        with tarfile.open(tar_path, "w") as tar:
-            for src, arc in _WINDOWS_AUX_DIRS:
-                if os.path.isdir(src):
-                    tar.add(src, arcname=arc, recursive=True)
-    except Exception:
-        os.unlink(tar_path)
-        raise
-    return tar_path
 
 
 class TaskFileHandler(logging.Handler):
@@ -291,89 +150,6 @@ class DropSandboxDetailFilter(logging.Filter):
         return not getattr(record, "sandbox_detail", False)
 
 
-class _DetailResult:
-    """最小 Result 替身: 只为把本地拼好的文本交给 _fmt_sandbox_block 展示。"""
-
-    def __init__(self, code=0, msg: str = "", exit_code: int = 0,
-                 stdout: str = "", stderr: str = "") -> None:
-        self.code = code
-        self.msg = msg
-        self.data = {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
-
-
-def _fmt_sandbox_block(title: str, result, extra_stdout: str = "",
-                       extra_label: str = "") -> str:
-    """
-    把 sandbox 返回的 Result 对象格式化成美观的多行块, 供 task-<idx>.log 展示。
-    extra_stdout: 额外附带的文件内容 (如 gateway.log), 由 extra_label 标注来源。
-    只格式化, 不打印。返回值末尾无换行。
-    """
-    def _boxed(text: str) -> str:
-        bar = "─" * 78
-        return f"┌{bar}┐\n{text}\n└{bar}┘"
-
-    def _dedupe_pip_noise(lines: list[str]) -> list[str]:
-        """折叠 'Requirement already satisfied:' 行, 保留其它内容原样。"""
-        out: list[str] = []
-        skipped: int = 0
-        for ln in lines:
-            #   "Requirement already satisfied: openclaw-sdk==2.1.0 in /home/ma-user/..."
-            if ln.lstrip().startswith("Requirement already satisfied:"):
-                skipped += 1
-                continue
-            out.append(ln)
-        if skipped:
-            out.append(f"[… {skipped} 'Requirement already satisfied' lines suppressed]")
-        return out
-
-    try:
-        code = getattr(result, "code", None)
-        msg  = getattr(result, "msg", "") or ""
-        data = getattr(result, "data", None) or {}
-        exit_code = data.get("exit_code") if isinstance(data, dict) else None
-        stdout    = (data.get("stdout") if isinstance(data, dict) else "") or ""
-        stderr    = (data.get("stderr") if isinstance(data, dict) else "") or ""
-    except Exception as e:
-        return _boxed(f" ▎{title}\n ▎<failed to format Result: {e}>")
-
-    header = (
-        f" ▎{title}\n"
-        f" ▎ code={code}  exit_code={exit_code}  msg={msg!r}"
-    )
-    parts = [header]
-    if stdout:
-        parts.append(" ▎── stdout ────────────────────────────────────")
-        for line in _dedupe_pip_noise(stdout.rstrip().splitlines()):
-            parts.append(f" │ {line}")
-    if stderr:
-        parts.append(" ▎── stderr ────────────────────────────────────")
-        for line in _dedupe_pip_noise(stderr.rstrip().splitlines()):
-            parts.append(f" │ {line}")
-    if extra_stdout:
-        label = (extra_label or "file").strip()
-        # 让标签行宽度与 78 列边框对齐: " ▎── <label> " + 补足横线
-        prefix = f" ▎── {label} "
-        pad = max(3, 86 - len(prefix))
-        parts.append(prefix + "─" * pad)
-        for line in extra_stdout.rstrip().splitlines():
-            parts.append(f" │ {line}")
-    if not stdout and not stderr and not extra_stdout:
-        parts.append(" ▎ <no stdout/stderr captured>")
-    return _boxed("\n".join(parts))
-
-
-def _log_sandbox_detail(log: logging.Logger, title: str, result, level: int = logging.INFO,
-                        extra_stdout: str = "", extra_label: str = "") -> None:
-    """
-    将 sandbox Result 的 stdout/stderr 详情 **只写入 task-<idx>.log**,
-    main.log 通过 DropSandboxDetailFilter 过滤掉。
-    extra_stdout / extra_label: 额外附带沙箱内文件内容 (如 gateway.log)。
-    """
-    block = _fmt_sandbox_block(title, result, extra_stdout=extra_stdout,
-                               extra_label=extra_label)
-    log.log(level, "sandbox_detail:\n" + block, extra={"sandbox_detail": True})
-
-
 # ============================================================================
 # Configuration Dataclasses
 # ============================================================================
@@ -403,6 +179,7 @@ class ObsBucketConfig:
 class SandboxConfig:
     """Sandbox environment configuration."""
     sandbox_type: str = "x86_cpu"   # "x86_cpu"(Linux) | "windows" — 决定路径/命令形态
+    harness_type: str = "openclaw"  # 框架名(openclaw/hermes/opencode/...), 注入自 run_cfg.harness_type
     home: str = "/home/ma-user"
     workspace: str = ""
     result_workdir: str = ""
@@ -538,6 +315,12 @@ def check_bucket_path(bucket_path: str) -> str:
 class OpenClawDistillationTask:
     """Executes a single distillation task in a sandboxed environment."""
 
+    # Windows 专属方法: 函数体在 utils/win_util.py, 这里挂成类属性让 self 自动绑定。
+    _setup_windows_obsutil = _setup_windows_obsutil
+    _windows_env_assign = _windows_env_assign
+    _start_openclaw_gateway_windows = _start_openclaw_gateway_windows
+    _run_main_script_windows = _run_main_script_windows
+
     def __init__(self, config: TaskConfig):
         self.logger = logger
         self.config = config
@@ -631,11 +414,11 @@ class OpenClawDistillationTask:
         # 交给 prepare_config 补进 agents.list), 其余 framework 传空。
         oc_agent_names = (
             self._derive_agent_names(data_config_file)
-            if AGENT_FRAMEWORK == "openclaw" and data_config_file else []
+            if self.config.sandbox_config.harness_type == "openclaw" and data_config_file else []
         )
         sandbox_cfg = self.config.sandbox_config
         prepare_local_agent_config(
-            AGENT_FRAMEWORK,
+            self.config.sandbox_config.harness_type,
             data_config_file,
             self.local_config_file,
             self.local_model_config_file,
@@ -766,9 +549,6 @@ class OpenClawDistillationTask:
 
     async def _start_openclaw_gateway(self, config_file: str) -> None:
         """Start the OpenClaw gateway in the sandbox."""
-        if self.config.sandbox_config.sandbox_type == "windows":
-            await self._start_openclaw_gateway_windows(config_file)
-            return
         start_time = asyncio.get_running_loop().time()
         max_wait = self.config.openclaw_gateway_timeout
 
@@ -828,92 +608,8 @@ class OpenClawDistillationTask:
         self.logger.info(f"Gateway started on port {port}")
 
 
-    async def _start_openclaw_gateway_windows(self, config_file: str) -> None:
-        """在 Windows 沙箱里启动 OpenClaw gateway (PowerShell -EncodedCommand 版)。
-
-        端口模型与 Linux 分支一致: 本地把随机端口写进 openclaw.json (gateway.port)
-        和 data config (gateway_ws_url) 再上传, 不远程 sed。启动方式参照 win_demo.py
-        第 200 行: Start-Process 后台起 `openclaw gateway`, 再 Test-NetConnection
-        轮询随机端口就绪 (openclaw gateway 读配置里的 gateway.port, 不带 --port)。
-        """
-        start_time = asyncio.get_running_loop().time()
-        max_wait = self.config.openclaw_gateway_timeout
-        sandbox_cfg = self.config.sandbox_config
-
-        # 前向斜杠路径 (win_demo / xiaoying.sh 的写法); openclaw.json 上传到了 ~/.openclaw
-        config_dir = str(PureWindowsPath(sandbox_cfg.harness_sandbox_config_file).parent).replace("\\", "/")
-        workdir = sandbox_cfg.result_workdir.replace("\\", "/")
-        gateway_log = f"{workdir}/{sandbox_cfg.gateway_log}"
-
-        while True:
-            elapsed = asyncio.get_running_loop().time() - start_time
-            if elapsed > max_wait:
-                self.logger.error(f"[S002] gateway startup timeout ({max_wait}s)")
-                raise HiveError("S002", detail=f"{max_wait}s / config={os.path.basename(config_file)}")
-
-            port = str(generate_random_port())
-
-            # 每次重试重新写端口再上传 (与 Linux 分支一致)
-            await self._copy_agent_config(config_file, port=port)
-            await self._upload_data_config(config_file, port=port)
-
-            # Start-Process 后台起 openclaw gateway + Test-NetConnection 轮询就绪
-            # 就绪后把 gateway.log 以 base64 读回 (见 ps_read_file_b64 的说明),
-            # 由 Python 端解码后落进 task-<idx>.log —— 与 Linux 分支的 cat 对齐。
-            # 注意顺序: base64 必须在 throw 之前输出, 否则启动失败时反而拿不到日志。
-            launch_script = (
-                self._windows_env_assign() + " "
-                f"New-Item -ItemType Directory -Force '{workdir}' | Out-Null; "
-                f"$p=Start-Process cmd.exe -ArgumentList '/d /s /c {sandbox_cfg.openclaw_bash} gateway 1> {gateway_log} 2>&1' "
-                f"-PassThru -WindowStyle Hidden; "
-                f"$p.Id | Set-Content '{workdir}/gateway.pid'; "
-                f"$ready=$false; "
-                f"for($i=0;$i -lt 90;$i++) {{ "
-                f"if (Test-NetConnection 127.0.0.1 -Port {port} -InformationLevel Quiet -WarningAction SilentlyContinue) "
-                f"{{$ready=$true;break}}; Start-Sleep 2 }}; "
-                f"if($ready) {{Write-Output 'gateway-ready'}}; "
-                + ps_read_file_b64(gateway_log) + "; "
-                f"if(!$ready) {{throw 'gateway not ready'}}"
-            )
-            exec_request = ExtendExecCommand(
-                command=ps_command(launch_script, config_dir),
-                timeout=self.config.sandbox_config.openclaw_start_timeout,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-
-            gateway_content = decode_remote_b64(
-                (result.data or {}).get("stdout", "") or ""
-            ) if result.data else ""
-
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                self.logger.error(f"[S001] gateway start failed on port {port}")
-                _log_sandbox_detail(self.logger, f"gateway start failed — port {port}",
-                                    result, level=logging.ERROR,
-                                    extra_stdout=gateway_content,
-                                    extra_label=f"{sandbox_cfg.gateway_log} (tail)")
-                raise HiveError("S001", detail=f"port={port}", sandbox_result=result)
-
-            stdout = result.data.get("stdout", "")
-            if "gateway-ready" in stdout:
-                _log_sandbox_detail(self.logger, f"gateway startup OK — port {port}", result,
-                                    extra_stdout=gateway_content,
-                                    extra_label=f"{sandbox_cfg.gateway_log} (tail)")
-                break
-            else:
-                self.logger.error(f"[S003] gateway unexpected output on port {port}")
-                _log_sandbox_detail(self.logger, f"gateway unexpected output — port {port}",
-                                    result, level=logging.ERROR,
-                                    extra_stdout=gateway_content,
-                                    extra_label=f"{sandbox_cfg.gateway_log} (tail)")
-                raise HiveError("S003", detail=f"port={port}", sandbox_result=result)
-
-        self.logger.info(f"Gateway started on port {port}")
-
     async def _run_main_script(self, config_file: str, task_idx: int) -> None:
         """Execute the main Python script in the sandbox."""
-        if self.config.sandbox_config.sandbox_type == "windows":
-            await self._run_main_script_windows(config_file, task_idx)
-            return
         python_file = os.path.basename(self.config.main_python_file)
         config_path = os.path.join(
             self.config.sandbox_config.data_config_path, os.path.basename(config_file)
@@ -925,7 +621,7 @@ class OpenClawDistillationTask:
             f"cd {self.config.sandbox_config.workspace} && "
             f"mkdir -p {log_path} && cd {code_stem} && "
             f"pip install -r requirements.txt && "
-            f"python {python_file} --config {config_path} --harness {AGENT_FRAMEWORK} 2>&1 | "
+            f"python {python_file} --config {config_path} --harness {self.config.sandbox_config.harness_type} 2>&1 | "
             f"tee {log_path}/{self.config.sandbox_config.result_log}"
         )
 
@@ -961,188 +657,6 @@ class OpenClawDistillationTask:
             raise HiveError("S008", detail=python_file, sandbox_result=result)
         self.logger.info(f"Script completed: {python_file}")
 
-    async def _run_main_script_windows(self, config_file: str, task_idx: int) -> None:
-        """在 Windows 沙箱里执行主脚本 (PowerShell -EncodedCommand 版)。
-
-        参照 win_demo.py 的 admin-scope(202) / scope-patch(206) / launch(207) /
-        poll(208-216): openclaw 先批 gateway admin scope、再给 openclaw_client.py 打
-        operator_scopes 补丁, 然后写 run.cmd 用 Start-Process 后台起 harness, 轮询
-        exit-code.txt 直到结束, 最后读 run.log 用 _classify_task_stdout 分类(与 Linux
-        分支一致)。路径用 hive 已知的 workspace/code_stem 与 data_config, 不再做
-        win_demo 的 task-path.txt/config-path.txt 间接层。
-        """
-        sandbox_cfg = self.config.sandbox_config
-        python_file = os.path.basename(self.config.main_python_file)
-        code_stem = Path(self.config.main_code_tar).stem
-
-        # 前向斜杠路径 (win_demo / xiaoying.sh 的写法)
-        task_dir = str(PureWindowsPath(sandbox_cfg.workspace, code_stem)).replace("\\", "/")
-        config_path = str(PureWindowsPath(
-            sandbox_cfg.data_config_path, os.path.basename(config_file)
-        )).replace("\\", "/")
-        workdir = sandbox_cfg.result_workdir.replace("\\", "/")
-        config_dir = str(PureWindowsPath(sandbox_cfg.harness_sandbox_config_file).parent).replace("\\", "/")
-        log_path = f"{workdir}/{sandbox_cfg.result_log}"
-
-        # ---- openclaw 前置: admin scope 批准 + operator_scopes 补丁 (win_demo 202/206) ----
-        if AGENT_FRAMEWORK.strip().lower() == "openclaw":
-            utils_dir = Path(__file__).parent / "utils"
-
-            approve_remote = f"{workdir}/approve_openclaw_admin.py"
-            await self._upload_file("approve_openclaw_admin",
-                                    str(utils_dir / "approve_openclaw_admin.py"),
-                                    approve_remote)
-            exec_request = ExtendExecCommand(
-                command=ps_command(
-                    f"python '{approve_remote}'; "
-                    f"if($LASTEXITCODE -ne 0) {{throw 'admin scope approval failed'}}",
-                    config_dir,
-                ),
-                timeout=180,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                _log_sandbox_detail(self.logger, "admin scope approval failed",
-                                    result, level=logging.ERROR)
-                raise HiveError("S008", detail="admin scope approval", sandbox_result=result)
-
-            patch_remote = f"{workdir}/patch_openclaw_scope.py"
-            await self._upload_file("patch_openclaw_scope",
-                                    str(utils_dir / "patch_openclaw_scope.py"),
-                                    patch_remote)
-            exec_request = ExtendExecCommand(
-                command=ps_command(
-                    f"python '{patch_remote}' '{task_dir}/src/openclaw_client.py'; "
-                    f"if($LASTEXITCODE -ne 0) {{throw 'scope patch failed'}}; "
-                    f"Select-String -Path '{task_dir}/src/openclaw_client.py' -Pattern 'operator.admin'",
-                    config_dir,
-                ),
-                timeout=180,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                _log_sandbox_detail(self.logger, "scope patch failed",
-                                    result, level=logging.ERROR)
-                raise HiveError("S008", detail="scope patch", sandbox_result=result)
-
-        # ---- 预建 agents 目录: harness 只在 create_agent 时才落 agentDir ----
-        # 本流程把 agent 预注册进了 openclaw.json, setup_agent 的 list_agents 命中后
-        # 直接跳过 create_agent, 于是 <home>\.openclaw\agents\<name> 谁都不创建;
-        # 而 upload_paths 指向 <home>\.openclaw\agents, 上传时源目录不存在 →
-        # 被静默跳过, 桶里就一直没有 agents/ 这一层 (Linux 侧由 create_agent 建出来,
-        # 所以 Linux 有、Windows 没有)。这里按 task config 的 agent 名单显式建目录,
-        # 与 upload_paths / prepare_config 注入的 agentDir 同一套 home 派生路径。
-        if AGENT_FRAMEWORK.strip().lower() == "openclaw":
-            agents_root = str(PureWindowsPath(sandbox_cfg.home, ".openclaw", "agents"))
-            ensure_dirs = [agents_root] + self._derive_per_agent_workspaces(config_file)
-            ensure_dirs += [
-                str(PureWindowsPath(agents_root, n))
-                for n in self._derive_agent_names(config_file)
-            ]
-            ensure_script = "".join(
-                f"New-Item -ItemType Directory -Force '{d}' | Out-Null; "
-                for d in dict.fromkeys(ensure_dirs)  # 去重保序
-            )
-            exec_request = ExtendExecCommand(
-                command=ps_command(ensure_script, config_dir),
-                timeout=self.config.simple_bash_timeout,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                self.logger.warning(
-                    f"pre-create agents dirs failed (upload_traj will skip agents/): "
-                    f"{ensure_dirs}"
-                )
-            else:
-                self.logger.info(f"pre-created agents dirs: {ensure_dirs}")
-
-        # ---- 写 run.cmd + Start-Process 后台起 harness (win_demo 207) ----
-        run_cmd_remote = f"{workdir}/run.cmd"
-        exit_code_remote = f"{workdir}/exit-code.txt"
-        launch_script = (
-            self._windows_env_assign() + " "
-            f"New-Item -ItemType Directory -Force '{workdir}' | Out-Null; "
-            f"$bat='@echo off'+[Environment]::NewLine"
-            f"+'cd /d \"{task_dir}\"'+[Environment]::NewLine"
-            f"+'set PYTHONIOENCODING=utf-8'+[Environment]::NewLine"
-            # harness 用 "~/.openclaw/workspace" 决定 agent workspace, 而 `~` 由
-            # USERPROFILE 决定 (ntpath.expanduser 优先取它)。本进程以 SYSTEM 跑,
-            # 默认 USERPROFILE 指向 systemprofile, 会把 workspace 落到那里, 与
-            # 配置/home 派生的路径对不上; 显式指到 sandbox home 让两边一致。
-            f"+'set USERPROFILE={sandbox_cfg.home}'+[Environment]::NewLine"
-            f"+'pip install -r requirements.txt > nul 2>&1'+[Environment]::NewLine"
-            f"+'python {python_file} --config \"{config_path}\" --harness {AGENT_FRAMEWORK} > \"{log_path}\" 2>&1'+[Environment]::NewLine"
-            f"+'echo %errorlevel% > \"{exit_code_remote}\"'; "
-            f"Set-Content -Path '{run_cmd_remote}' -Value $bat -Encoding ASCII; "
-            f"Start-Process cmd.exe -ArgumentList '/d /c {run_cmd_remote}' -WorkingDirectory '{task_dir}' -WindowStyle Hidden; "
-            f"Write-Output 'harness-started'"
-        )
-        exec_request = ExtendExecCommand(
-            command=ps_command(launch_script, config_dir),
-            timeout=120,
-        )
-        result = await self.execution_client.extend(args=exec_request.to_dict())
-        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            _log_sandbox_detail(self.logger, "harness launch failed",
-                                result, level=logging.ERROR)
-            raise HiveError("S008", detail="harness launch", sandbox_result=result)
-
-        # ---- 轮询 exit-code.txt (win_demo 208-216) ----
-        deadline = time.monotonic() + self.config.main_python_timeout
-        exit_code = None
-        while time.monotonic() < deadline:
-            exec_request = ExtendExecCommand(
-                command=ps_command(
-                    f"if(Test-Path '{exit_code_remote}') "
-                    f"{{Write-Output ('DONE:'+(Get-Content '{exit_code_remote}').Trim())}} "
-                    f"else {{Write-Output 'RUNNING'}}",
-                    config_dir,
-                ),
-                timeout=120,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            stdout = (result.data or {}).get("stdout", "") or ""
-            if "DONE:" in stdout:
-                exit_code = int(stdout.split("DONE:", 1)[1].strip())
-                break
-            await asyncio.sleep(20)
-        else:
-            self.logger.error(f"[S008] harness exceeded timeout ({self.config.main_python_timeout}s)")
-            raise HiveError("S008", detail=f"timeout={self.config.main_python_timeout}s")
-
-        # ---- 读 run.log 分类 (与 Linux 分支一致) ----
-        # Get-Content -Raw 会把内容按控制台代码页重新编码写回 stdout, 中文必乱;
-        # 改走 base64 原始字节通道, 在 Python 端按 UTF-8 解码。
-        exec_request = ExtendExecCommand(
-            command=ps_command(ps_read_file_b64(log_path), config_dir),
-            timeout=120,
-        )
-        result = await self.execution_client.extend(args=exec_request.to_dict())
-        stdout = decode_remote_b64((result.data or {}).get("stdout", "") or "")
-        sandbox_failed = exit_code != 0
-
-        title = ("script execution failed" if sandbox_failed else "script execution OK")
-        _log_sandbox_detail(self.logger, f"{title} — {python_file}",
-                            _DetailResult(
-                                code=result.code,
-                                msg=getattr(result, "msg", "") or "",
-                                exit_code=exit_code,
-                            ),
-                            level=(logging.ERROR if sandbox_failed else logging.INFO),
-                            extra_stdout=stdout,
-                            extra_label=f"{sandbox_cfg.result_log} ({log_path})")
-
-        t_code, phrase = _classify_task_stdout(stdout)
-        if t_code:
-            self.logger.error(
-                f"[{t_code}] task failure — {ERROR_CATALOG[t_code]}"
-                + (f" — matched: {phrase!r}" if phrase else "")
-            )
-            raise HiveError(t_code, detail=phrase or python_file, sandbox_result=result)
-        if sandbox_failed:
-            self.logger.error(f"[S008] script execution failed: {python_file}")
-            raise HiveError("S008", detail=python_file, sandbox_result=result)
-        self.logger.info(f"Script completed: {python_file}")
 
     async def _download_s3_skills(self, data_config_file: str, sandbox_type: str) -> None:
         """Fetch task/default skills into the sandbox.
@@ -1422,13 +936,13 @@ class OpenClawDistillationTask:
             purge_targets = [
                 str(PathCls(ws, d))
                 for ws in per_agent_workspaces
-                for d in ([skill_subdir, ".opencode"] if AGENT_FRAMEWORK == "opencode" else [skill_subdir])
+                for d in ([skill_subdir, ".opencode"] if self.config.sandbox_config.harness_type == "opencode" else [skill_subdir])
             ]
         else:
             purge_targets = [
                 str(PurePosixPath(ws, d))
                 for ws in per_agent_workspaces
-                for d in ([skill_subdir, ".opencode"] if AGENT_FRAMEWORK == "opencode" else [skill_subdir])
+                for d in ([skill_subdir, ".opencode"] if self.config.sandbox_config.harness_type == "opencode" else [skill_subdir])
             ]
 
         # 固定路径直接落到 bucket_path 下（workdir / logs / per-agent workspace）。
@@ -1438,7 +952,7 @@ class OpenClawDistillationTask:
         ]
         uploads += [(ws, bucket_path) for ws in per_agent_workspaces]
 
-        if AGENT_FRAMEWORK == "hermes":
+        if self.config.sandbox_config.harness_type == "hermes":
             # hermes 每个 profile(<agent-name>) 下都有同名 sessions/logs/workspace，保留 profiles/<name>/ 层
             for pattern in _FW["upload_paths"]:
                 for n in self._derive_agent_names(config_file):
@@ -1499,77 +1013,6 @@ class OpenClawDistillationTask:
             return False
         return True
 
-    async def _setup_windows_obsutil(self) -> None:
-        """配置 Windows 沙箱内 obsutil 的 OBS 凭据, 并上传三个辅助目录到 home。
-
-        1. obsutil config 的 -i/-k/-e 从 <project>/platform/.env 读 (IK/KK/EK),
-           .env 不存在时回落 .env.example, 不再硬编码。
-        2. 三个辅助目录 (tar 打包 + 沙箱内 tar -xf, 与 _upload_and_extract_code 同
-           套路 —— ExtendUploadFile 传目录只会把 zip 字节写成一个文件, 不解压):
-              /root/sandbox-log/windows/skills/serper/            -> ~/.openclaw/skills/serper/
-              /root/sandbox-log/windows/xiaoyi-device-env/        -> ~/xiaoyi-device-env/
-              /root/sandbox-log/windows/claude_code_image_reading_tool/ -> ~/claude_code_image_reading_tool/
-        """
-        s3 = self.client_config.s3
-        obsutil_exe = s3.s3_download_script
-
-        # ---- 1. obsutil 凭据 ----
-        ik, kk, ek = _read_obs_credentials()
-        config_cmd = f"{obsutil_exe} config -i={ik} -k={kk} -e={ek}"
-        exec_request = ExtendExecCommand(
-            command=["cmd.exe", "/c", config_cmd],
-            timeout=self.config.simple_bash_timeout,
-        )
-        result = await self.execution_client.extend(args=exec_request.to_dict())
-        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            _log_sandbox_detail(self.logger, "obsutil config failed", result, level=logging.ERROR)
-            raise HiveError("C001", detail="obsutil config", sandbox_result=result)
-        self.logger.info(f"obsutil configured successfully: {obsutil_exe}")
-
-        # ---- 2. 上传三个辅助目录 ----
-        if not any(os.path.isdir(src) for src, _ in _WINDOWS_AUX_DIRS):
-            self.logger.warning("no windows aux dirs found, skip upload")
-            return
-        home = self.config.sandbox_config.home
-        tar_name = "hive_aux_dirs.tar"
-        tar_local = _build_windows_aux_tar()
-        try:
-            tar_remote = str(PureWindowsPath(home, tar_name))
-            await self._upload_file("windows aux dirs", tar_local, tar_remote)
-            exec_request = ExtendExecCommand(
-                command=["cmd.exe", "/c",
-                         f"cd /d {home} && tar -xf {tar_name} && del {tar_name}"],
-                timeout=self.config.simple_bash_timeout,
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                _log_sandbox_detail(self.logger, "extract aux dirs failed", result, level=logging.ERROR)
-                raise HiveError("C001", detail="extract aux dirs", sandbox_result=result)
-            self.logger.info(f"uploaded aux dirs -> {home}")
-        finally:
-            os.unlink(tar_local)
-
-
-    def _windows_env_assign(self) -> str:
-        """把 config 的 sandbox.windows.sandbox.env 拼成 PowerShell 进程级赋值串。
-
-        config_win.yaml 里 sandbox.windows.sandbox.env 只作用在跑 QEMU Win11 的
-        Linux Pod 上; 而 gateway / harness / serper 技能进程都跑在 Win11 VM 内,
-        Pod 级 env 进不来。且 VM guest agent 以固定 env 派生子进程(不重读注册表),
-        机器级 SetEnvironmentVariable 也传不进去 —— 所以只能在起 gateway/harness
-        的 PowerShell 脚本里显式 $env:NAME='...' 注入, 让 Start-Process 起的子
-        进程继承 (如 SERPER_API_KEY / SEARCH_API_KEY / SEARCH_BACKEND_URL)。
-        """
-        env = self.global_config.sandbox.windows.sandbox.env
-        if not env:
-            return ""
-        parts = []
-        for item in env:
-            name = str(item.name).replace("'", "''")
-            value = (str(item.value) if item.value is not None else "").replace("'", "''")
-            parts.append(f"$env:{name}='{value}'")
-        return "; ".join(parts) + ";"
-
 
     async def _execute_task(self, config_file: str, task_idx: int) -> None:
         """Execute the full task pipeline.
@@ -1589,12 +1032,18 @@ class OpenClawDistillationTask:
         await self._download_s3_user_profile(config_file, sandbox_type)
         await self._download_s3_agents(sandbox_type)
         await self._upload_data_config(config_file)
-        if AGENT_FRAMEWORK.strip().lower() == "openclaw":
-            await self._start_openclaw_gateway(config_file)
+        if self.config.sandbox_config.harness_type.strip().lower() == "openclaw":
+            if sandbox_type == "windows":
+                await self._start_openclaw_gateway_windows(config_file)
+            else:
+                await self._start_openclaw_gateway(config_file)
         else:
             # 就地改写 → 上传 agent config + user_proxy_model → 还原
             await self._copy_agent_config(config_file)
-        await self._run_main_script(config_file, task_idx)
+        if sandbox_type == "windows":
+             await self._run_main_script_windows(config_file, task_idx)
+        else:
+            await self._run_main_script(config_file, task_idx)
 
     async def run(self, config_file: str, task_idx: int = 0) -> None:
         """Run a single distillation task.
@@ -1611,7 +1060,7 @@ class OpenClawDistillationTask:
         env_ready: bool = False
         self.logger.info(
             f"===== BEGIN config={os.path.basename(config_file)} "
-            f"framework={AGENT_FRAMEWORK} ====="
+            f"framework={self.config.sandbox_config.harness_type} ====="
         )
 
         try:
@@ -1688,13 +1137,13 @@ class OpenClawDistillationTask:
                 self.logger.error(f"save_record failed: {e}\n{traceback.format_exc()}")
 
             # ---- 关闭 execution_client ----
-            # if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
-            #     try:
-            #         await self.execution_client.close()
-            #     except Exception as e:
-            #         self.logger.error(
-            #             f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
-            #         )
+            if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
+                try:
+                    await self.execution_client.close()
+                except Exception as e:
+                    self.logger.error(
+                        f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
+                    )
 
             # ---- task-<idx>.log 结尾: 打印任务执行状态 ----
             elapsed = time.perf_counter() - start_time
@@ -1957,8 +1406,8 @@ def main() -> None:
     sandbox_keys = list(config_obj.sandbox.keys())
     sandbox_type = sandbox_keys[0] if sandbox_keys else "x86_cpu"
     sandbox_home = run_cfg.sandbox.get("home") or "/home/ma-user"
-    set_agent_framework(run_cfg.harness_type, sandbox_type, sandbox_home)
-    print(f"  Framework: {AGENT_FRAMEWORK}")
+    harness_type = set_agent_framework(run_cfg.harness_type, sandbox_type, sandbox_home)
+    print(f"  Framework: {harness_type}")
 
     # Isolate output/download paths by config name to avoid cross-contamination
     config_basename = Path(args.config).stem
@@ -1986,6 +1435,7 @@ def main() -> None:
         sandbox_config=SandboxConfig(
             **_compat_sandbox(run_cfg.sandbox),
             sandbox_type=sandbox_type,
+            harness_type=harness_type,
         ),
         model_api_key=args.model_api_key,
     )
