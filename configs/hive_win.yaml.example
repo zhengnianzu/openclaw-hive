@@ -1,0 +1,132 @@
+# ==================== 全局配置 ====================
+global:
+  # 控制面服务地址，SDK 通过此地址与控制面通信
+  controlplane_base_url: http://192.168.11.87:30081
+  # API 认证密钥，用于 SDK 与控制面之间的身份校验
+  api_key: "xxxxxxxx"
+  logger:
+    name: env_sdk_client
+    level: INFO
+    dir: logs/current_architecture
+    console: true
+    file: true
+    stream: stdout
+    max_backup_count: 14
+    encoding: utf-8
+    format: "%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+    when: midnight
+    interval: 1
+
+# ==================== 沙箱环境配置 ====================
+# 定义不同架构/加速器类型的沙箱配置，每种配置对应一种运行环境:x86 CPU\ARM CPU\NPU\windows
+sandbox:
+  # ---------- windows 沙箱 ----------
+  windows:
+    runtime_type: windows
+    architecture: x86           # CPU 架构: x86 或 arm64
+    accelerator: null           # 加速器类型: null(无)/npu/gpu
+    lease_ttl_seconds: 3600         # 900s检测沙箱存活
+    max_ttl_second: 8000          # 沙箱最大存活时间，大于任务执行时间
+    wait_timeout_seconds: 3600   # 等待沙箱就绪的超时时间（秒）
+
+    sandbox:
+      image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:windows-openclaw-2026.6.6-harness-20261010-2177eeb0-defaultpy-noagentd-v2
+      node_name: null
+      boot_source:
+          type: image
+          ref: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:windows-openclaw-2026.6.6-harness-20261010-2177eeb0-defaultpy-noagentd-v2
+      resources:
+          requests:
+            cpu: "16"
+            memory: "32Gi"
+          limits:
+            cpu: "16"
+            memory: "32Gi"
+      security_context:
+          privileged: true
+      volumes:
+          - name: kvm-device
+            hostPath:
+              path: /dev/kvm
+              type: CharDevice
+      volume_mounts:
+        - name: kvm-device
+          mountPath: /dev/kvm
+      pod_spec:
+        nodeSelector:
+          node.kubernetes.io/baremetal: "true"
+      wait_ready: true
+
+      # 环境变量配置
+      env:
+        - name: PIP_INDEX_URL
+          value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
+        - name: PIP_TRUSTED_HOST
+          value: "mirrors.huaweicloud.com"
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: "0"
+        - name: SERPER_API_KEY
+          value: sk-xxx
+        - name: SERPER_API_URL
+          value: https://yibuapi.com/serper/
+        - name: OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS
+          value: "off"
+        - name: SEARCH_API_KEY
+          value: sk-xxx
+        - name: SEARCH_BACKEND_URL
+          value: https://yibuapi.com
+        - name: DSH_MAX_TOKENS
+          value: 131072
+        - name: WIN11_LEGACY_API_SECRET
+          value: xxxx
+        - name: WIN11_GO_AGENT_VERSION
+          value: v1.3.0-64-g1d3af4f-dirty
+        - name: WIN11_GO_AGENT_BUILD_SHA
+          value: 1d3af4f
+        - name: WIN11_GUEST_HTTP_PORTS
+          value: 8888,17901
+
+
+s3:
+  s3_uploader_script: C:\ProgramData\OmniEnv\tools\obsutil\obsutil.exe
+  s3_download_script: C:\ProgramData\OmniEnv\tools\obsutil\obsutil.exe
+  bucket_name: "obs://s3-asset-b-hd-cce-aifm-nlp-exp"
+
+
+sandbox_id_prefix: zxtest1015
+sandbox_namespace: omni-env-default-worker
+
+run_config:
+  harness_type: openclaw
+  start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
+  total_num: 0      # 任务总数, 0表示不限制任务数量
+  concurrent_num: 5  # 并发数 claude 100~150
+  sandbox:
+    result_log: "run.log"
+    openclaw_local_config_file: "uploads/openclaw.json"
+    user_proxy_model_local_file: "uploads/user_proxy_model.json"
+    openclaw_start_timeout: 360  # Windows openclaw 启动有点慢
+    home: C:\Users\win11admin
+  task:
+    suffix_api_keys: false
+    task_input_path: /root/zengxiang/task_configs_v1009
+    task_output_path: "outputs"  # 任务输出路径
+    task_complete_record: "complete.jsonl"  # 完成任务记录文件
+    task_failed_record: "failed.jsonl"  # 失败任务记录文件
+    task_download_path: "downloads"
+    main_code_tar:
+    main_code_dir: /root/zengxiang/openclaw-task
+    main_python_file: "harness_automation.py"  # start脚本文件
+    main_python_timeout: 7200
+  obs:
+    download_timeout: 1200
+    upload_timeout: 900
+    traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp
+    # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
+    traj_save_path:
+    skill_download_path:
+    user_config_download_path:
+    user_profile_download_path:
+    agents_download_path:
+    default_skills:

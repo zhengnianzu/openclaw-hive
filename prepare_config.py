@@ -7,9 +7,10 @@ hive.py 反向 import 它。新增 harness 只需在本文件修改两处:
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
 from omegaconf import OmegaConf
@@ -122,6 +123,28 @@ _FRAMEWORK_LAYOUTS: dict = {
 
 }
 
+def adapt_layout_for_windows(layout: dict, win_home: str) -> dict:
+    """把 Linux 风格 layout 的 /home/ma-user/... 路径适配为 Windows 路径。
+
+    用 PurePosixPath 拆出相对部分, 再用 PureWindowsPath 拼回去。
+    win_home 是沙箱 Windows home (config 的 run_config.sandbox.home),
+    不再硬编码, 换镜像/换用户时只改配置。
+    harness_local_config 是本地侧路径, skill_subdir 是相对路径, 均不变。
+    """
+    out = copy.deepcopy(layout)
+    for key in ("harness_dir", "harness_sandbox_config", "workspace_base"):
+        p = layout.get(key, "")
+        if p and p.startswith("/home/ma-user"):
+            out[key] = str(PureWindowsPath(win_home).joinpath(
+                PurePosixPath(p).relative_to("/home/ma-user")))
+    out["upload_paths"] = [
+        str(PureWindowsPath(win_home).joinpath(
+            PurePosixPath(p).relative_to("/home/ma-user")))
+        if p and p.startswith("/home/ma-user") else p
+        for p in layout.get("upload_paths", [])
+    ]
+    return out
+
 
 def normalize_base_url(base_url: str, api_kind: str = "openai-completions") -> str:
     """按 api_kind 归一化 base_url 的 /v1 后缀。"""
@@ -162,15 +185,18 @@ def prepare_local_agent_config(
     framework: str,
     data_config_file: Optional[str] = None,
     local_path: Optional[str] = None,
-    local_user_proxy_model_path: Optional[str] = None
+    local_user_proxy_model_path: Optional[str] = None,
+    home: str = "/home/ma-user",
+    sandbox_type: str = "x86_cpu",
+    oc_agent_names: Optional[list] = [],
 ) -> None:
     """在 spawn worker 之前把本地 agent 配置文件按 framework 修改到位。
 
     Args:
-        sandbox_config: SandboxConfig 实例 (harness_local_config_file /
-            user_proxy_model_local_file)
         framework: 当前 agent 框架名 (openclaw/hermes/dsh/...)
-        data_config_file: opencode 分支需要 data_config 里的 agent system_prompt
+        data_config_file: opencode/openclaw 分支需要读 data_config 里的 agents
+        home: 沙箱内的 home 根
+        sandbox_type: 沙箱类型 ("windows" | "x86_cpu"), 决定 home 路径归一化形态
     """
     model_cfg = json.loads(Path(local_user_proxy_model_path).read_text(encoding="utf-8"))
 
@@ -452,6 +478,9 @@ def prepare_local_agent_config(
         agents_section = data.setdefault("agents", {})
         agents_list = agents_section.setdefault("list", [])
 
+        # 按 sandbox_type 归一化 home 路径: windows 用 PureWindowsPath(反斜杠), 其余用 PurePosixPath
+        path_cls = PureWindowsPath if sandbox_type == "windows" else PurePosixPath
+
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
@@ -489,8 +518,8 @@ def prepare_local_agent_config(
             entry = {
                 "id": agent_name,
                 "name": agent_name,
-                "workspace": f"/home/ma-user/.openclaw/workspace-{agent_name}",
-                "agentDir": f"/home/ma-user/.openclaw/agents/{agent_name}",
+                "workspace": str(path_cls(home, ".openclaw", f"workspace-{agent_name}")),
+                "agentDir": str(path_cls(home, ".openclaw", "agents", agent_name)),
                 "model": {"primary": model_ref},
                 "models": {model_ref: {}},
             }
@@ -507,6 +536,38 @@ def prepare_local_agent_config(
             logging.info(
                 f"Injected provider={provider_key} model={model_ref} for agent {agent_name}"
             )
+
+        # 补注册 oc_agent_names 里传入但 agents_list 中还没有的 agent。
+        # 只为缺号条目补 id + workspace(agentDir 统一在下方归一化补齐)。
+        # workspace 仍按 <base>-<name> 派生, 与 harness 的命名规则一致。
+        existing_ids = {
+            str(e.get("id", "")) for e in agents_list if isinstance(e, dict)
+        }
+        added: List[str] = []
+        for name in (oc_agent_names or []):
+            name = str(name).strip()
+            if not name or name in existing_ids:
+                continue
+            agents_list.append({
+                "id": name,
+                "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
+            })
+            existing_ids.add(name)
+            added.append(name)
+        if added:
+            logging.info(f"Registered agents from oc_agent_names: {added}")
+
+        # 归一化 agentDir: 每个条目都要有 agentDir。缺了它, gateway 会用自己进程的
+        # home 派生默认路径(Windows 上 gateway 以 SYSTEM 跑, home=systemprofile)落
+        # session 状态, 而不是 home 派生的路径 → upload_paths 指向的
+        # ~/.openclaw/agents 一直是空的, 且跨 query 续聊(session 复用)会报
+        # "Session history or replay state is invalid"。统一按 home 派生补齐。
+        for e in agents_list:
+            if not isinstance(e, dict):
+                continue
+            name = (e.get("id") or e.get("name") or "").strip()
+            if name and not e.get("agentDir"):
+                e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
 
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
