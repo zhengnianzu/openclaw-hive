@@ -1855,6 +1855,9 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     已完成的任务日志不再变化，后续轮询直接复用上次结果，
     使耗时正比于「本轮新增/变化的文件数」而非日志总数。
     """
+    # 后台刷新器直接调本函数，不经过 _analyze_task_status；重启后第一次扫描前
+    # 必须先把落盘的签名灌进来，否则 11.7 万份日志会被整篇重读（实测 129s）。
+    _load_file_state()
     output_dir = _get_output_dir(config_path)
     logs_dir = os.path.join(output_dir, "logs")
 
@@ -1867,6 +1870,7 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
             entries = os.scandir(logs_dir)
         except OSError:
             entries = []
+        to_read = []
         for entry in entries:
             fname = entry.name
             if not (fname.startswith("task-") and fname.endswith(".log")):
@@ -1882,9 +1886,21 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
                 # 文件未变化，复用上次解析结果，跳过读取
                 new_state[fname] = cached
             else:
-                status, code, cfg = _scan_task_file(entry.path)
-                new_state[fname] = (sig[0], sig[1], status, code, cfg)
+                to_read.append((fname, entry.path, sig))
                 changed.add(fname)
+
+        # 冷启动（首次部署 / 状态文件丢失）要读上万份小文件。这些是 NFS 上的
+        # 独立读取，串行时全被网络往返拖住；并发能显著压缩这段一次性耗时。
+        if to_read:
+            if len(to_read) < 64:
+                results = [(f, p, s, _scan_task_file(p)) for f, p, s in to_read]
+            else:
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=16) as pool:
+                    scanned = list(pool.map(lambda t: _scan_task_file(t[1]), to_read))
+                results = [(f, p, s, r) for (f, p, s), r in zip(to_read, scanned)]
+            for fname, _path, sig, (status, code, cfg) in results:
+                new_state[fname] = (sig[0], sig[1], status, code, cfg)
 
     _analyze_file_state[config_path] = new_state
     _analyze_changed[config_path] = changed
@@ -2219,6 +2235,7 @@ async def background_cache_refresher(interval: float = 8.0):
     except Exception:
         pass
     _save_shared_caches()
+    _save_file_state(force=True)
     _bg_refresh_active = True
     while True:
         await asyncio.sleep(interval)
@@ -2228,6 +2245,7 @@ async def background_cache_refresher(interval: float = 8.0):
         except Exception:
             pass
         _save_shared_caches()
+        _save_file_state()
         # 卡住的 preparing 看门狗：协程中途消失时实例会永久占着队列槽位，
         # 这里超过阈值仍未拿到 pid 的标记为 failed 并放行同队列下一个任务。
         try:
@@ -2254,6 +2272,14 @@ def _shared_cache_path() -> str:
 _shared_loaded_mtime = [0.0]
 _shared_last_check = [0.0]
 _SHARED_CACHE_ENTRY_CAP = 500
+
+# 每文件扫描签名（mtime/size + 解析结果）持久化文件。
+# 不持久化的话，进程重启后 _analyze_file_state 是空的，_compute_analyze 会把
+# 所有 task 日志整篇重读一遍——实测 37 个 running 实例共 11.7 万份日志、136 秒。
+# 落盘后重启只需 stat 一遍核对签名（约 5 秒），未变化的文件直接复用结果。
+_file_state_last_save = [0.0]
+_FILE_STATE_SAVE_INTERVAL = 120.0
+_FILE_STATE_LOADED = [False]
 
 
 def _save_shared_caches() -> None:
@@ -2306,7 +2332,51 @@ def _load_shared_caches() -> None:
         pass
 
 
+def _file_state_path() -> str:
+    return os.path.join(os.path.dirname(settings.DB_PATH), "analyze_file_state.json.gz")
+
+
+def _load_file_state() -> None:
+    """启动时灌入上次的 per-file 扫描签名，避免重启后把 10 万+ 份日志重读一遍。
+
+    只加载一次；之后由 leader 每 2 分钟覆盖写回。签名按 (mtime, size) 核对，
+    日志有任何追加都会自然失效并重读，不存在读到陈旧内容的风险。
+    """
+    if _FILE_STATE_LOADED[0]:
+        return
+    _FILE_STATE_LOADED[0] = True
+    try:
+        import gzip
+        with gzip.open(_file_state_path(), "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+        for k, v in (payload or {}).items():
+            _analyze_file_state[k] = {
+                fname: tuple(rec) for fname, rec in v.items()
+            }
+    except Exception:
+        pass
+
+
+def _save_file_state(force: bool = False) -> None:
+    """把 per-file 签名落盘（leader 调用）。节流 2 分钟，11 万条约几 MB gzip。"""
+    now = time.time()
+    if not force and now - _file_state_last_save[0] < _FILE_STATE_SAVE_INTERVAL:
+        return
+    _file_state_last_save[0] = now
+    try:
+        import gzip
+        payload = {k: v for k, v in _analyze_file_state.items()}
+        path = _file_state_path()
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running") -> dict:
+    _load_file_state()
     now = time.time()
     cache_key = config_path
     cached = _analyze_cache.get(cache_key)

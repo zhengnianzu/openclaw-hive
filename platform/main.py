@@ -130,4 +130,15 @@ async def generate_api_key(
 # 静态文件 fallback（无 Nginx 时使用）
 static_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 if os.path.isdir(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")
+    # StaticFiles 默认不给 HTML 发 Cache-Control，浏览器可能长期沿用旧的 index.html，
+    # 进而继续加载旧的 hash 化 JS —— 发版后用户端一直跑旧前端（曾出现新版批量接口
+    # 只被调用 39 次、旧式逐个 /overview 却被调用 4478 次）。
+    # 这里显式给 index.html 加 no-cache（每次回源校验），带 hash 的 assets 保持不变。
+    class NoCacheHTMLStaticFiles(StaticFiles):
+        async def get_response(self, path, scope):
+            resp = await super().get_response(path, scope)
+            if path in ("", "index.html") or (path or "").endswith("/"):
+                resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+            return resp
+
+    app.mount("/", NoCacheHTMLStaticFiles(directory=static_dir, html=True), name="frontend")

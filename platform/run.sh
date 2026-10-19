@@ -10,6 +10,33 @@ HOST="${2:-0.0.0.0}"
 PORT="${3:-8087}"
 NGINX_PORT="${4:-80}"
 
+# 释放端口：上次启动的 uvicorn 若没被记录在 platform.pid（手动 nohup、PID 文件丢失、
+# 或 stop 时只杀了父进程而 worker 仍持有监听），再次 start 会直接
+# "ERROR: [Errno 98] Address already in use"。启动前统一清掉占用者。
+# 先 TERM 给进程自己收尾的机会，1 秒后仍在则 KILL。
+free_port() {
+    local port="$1" pids
+    pids=$( { lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || fuser -n tcp "$port" 2>/dev/null; } | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u )
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+    echo "端口 $port 被占用 (PID: $(echo $pids | tr '\n' ' '))，正在释放..."
+    kill $pids 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        sleep 0.2
+        pids=$( { lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || fuser -n tcp "$port" 2>/dev/null; } | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u )
+        [ -z "$pids" ] && { echo "端口 $port 已释放"; return 0; }
+    done
+    kill -9 $pids 2>/dev/null
+    sleep 0.3
+    pidof_check=$( { lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || fuser -n tcp "$port" 2>/dev/null; } | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u )
+    if [ -n "$pidof_check" ]; then
+        echo "警告: 端口 $port 仍被占用 (PID: $(echo $pidof_check | tr '\n' ' '))"
+        return 1
+    fi
+    echo "端口 $port 已释放"
+}
+
 # 输出分析 worker：浅层（分级/补全）+ 深层（下载/回填）两个独立进程
 #  - 浅层: pid worker.pid / 日志 worker.log
 #  - 深层: pid deep_worker.pid / 日志 deep_worker.log
@@ -76,6 +103,7 @@ case "$ACTION" in
         echo ""
         echo "请在另一个终端执行: cd frontend && npm run dev"
         echo ""
+        free_port "$PORT"
         uvicorn main:app --host "$HOST" --port "$PORT" --reload
         ;;
 
@@ -89,6 +117,7 @@ case "$ACTION" in
 
         echo "启动 uvicorn (workers=4)..."
         echo "服务地址: http://${HOST}:${PORT} (API直连)"
+        free_port "$PORT"
         nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
@@ -153,6 +182,7 @@ case "$ACTION" in
         fi
 
         echo "启动 uvicorn (workers=4)..."
+        free_port "$PORT"
         nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
