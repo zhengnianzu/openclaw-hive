@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -384,6 +385,96 @@ def _with_harness_type(d: dict) -> dict:
 _RES_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _RES_CACHE_MAX = 4000
 
+
+def _res_digest(text: str) -> str:
+    """快照/参数的稳定摘要。
+
+    不能用内置 hash()：CPython 对 str 的哈希带进程级随机盐（PYTHONHASHSEED），
+    多 worker 下同一份快照算出的键各不相同，落盘分片就永远互相命不中。
+    """
+    return hashlib.md5(text.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+# 解析结果按实例落盘成每 worker 一个分片，其它 worker 撞冷缓存时直接读，不必重解析
+# YAML。快照一经创建不再变化（create_params 变了 digest 也会变），所以分片无需 TTL。
+_RES_SHARD_LAST_CHECK = [0.0]
+_RES_SHARD_LAST_SAVE = [0.0]
+_RES_SHARD_SAVE_INTERVAL = 30.0
+# 只按时间节流会让分片长期停在「刚解析几条」的状态：一次 /stats 请求解析 300+ 条
+# 全落在节流窗口内，另一个 worker 冷启动时读到的还是空分片。新增条数到量就立即落盘。
+_RES_SHARD_SAVE_MIN_NEW = 64
+_RES_SHARD_SAVED_COUNT = [0]
+
+
+def _res_shard_dir() -> str:
+    return os.path.dirname(settings.DB_PATH)
+
+
+def _res_shard_path(pid: int) -> str:
+    return os.path.join(_res_shard_dir(), f".res_cache.{pid}.json")
+
+
+def _save_res_shard(force: bool = False) -> None:
+    """把本进程最近访问的解析结果写到自己的分片。
+
+    时间节流之外再看「新增条数」：批量解析一次就能把冷启动的结果共享出去。
+    """
+    now = time.time()
+    new_items = len(_RES_CACHE) - _RES_SHARD_SAVED_COUNT[0]
+    if not force and new_items < _RES_SHARD_SAVE_MIN_NEW \
+            and now - _RES_SHARD_LAST_SAVE[0] < _RES_SHARD_SAVE_INTERVAL:
+        return
+    _RES_SHARD_LAST_SAVE[0] = now
+    _RES_SHARD_SAVED_COUNT[0] = len(_RES_CACHE)
+    try:
+        payload = {
+            f"{k[0]}|{k[1]}|{k[2]}": v
+            for k, v in list(_RES_CACHE.items())[-_SHARED_CACHE_ENTRY_CAP:]
+        }
+        path = _res_shard_path(os.getpid())
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _load_res_shards() -> None:
+    """把其它 worker 的分片灌进本进程缓存。按 2s 节流，命中路径开销可忽略。"""
+    now = time.time()
+    if now - _RES_SHARD_LAST_CHECK[0] < 2:
+        return
+    _RES_SHARD_LAST_CHECK[0] = now
+    try:
+        d = _res_shard_dir()
+        me = os.getpid()
+        for name in os.listdir(d):
+            if not (name.startswith(".res_cache.") and name.endswith(".json")):
+                continue
+            try:
+                pid = int(name[len(".res_cache."):-len(".json")])
+            except ValueError:
+                continue
+            if pid == me:
+                continue
+            try:
+                with open(os.path.join(d, name), "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            for key, val in (payload or {}).items():
+                parts = key.split("|")
+                if len(parts) != 3:
+                    continue
+                cache_key = (parts[0], parts[1], parts[2])
+                if cache_key not in _RES_CACHE:
+                    _RES_CACHE[cache_key] = val
+        while len(_RES_CACHE) > _RES_CACHE_MAX:
+            _RES_CACHE.popitem(last=False)
+    except Exception:
+        pass
+
 # 解析不出来时的兜底，与沙箱配置表单默认值一致
 _RES_FALLBACK = {"cpu_request": 2.0, "cpu_limit": 3.0, "memory_request": 6.0, "memory_limit": 8.0}
 
@@ -459,9 +550,14 @@ def _sandbox_resources(row: dict) -> dict:
     """实例的单沙箱资源 + 所在资源池（= sandbox_namespace）+ 沙箱 OS。"""
     snapshot = row.get("config_snapshot") or ""
     create_params = row.get("create_params") or ""
-    # create_params 也参与缓存键：重选沙箱配置后 sandbox_type 会变，只 hash 快照会命中旧值
-    cache_key = (row.get("id"), hash(snapshot), hash(create_params))
+    # create_params 也参与缓存键：重选沙箱配置后 sandbox_type 会变，只 hash 快照会命中旧值。
+    # 用 md5 而不是内置 hash()：后者带进程级随机盐，跨 worker 落盘的分片对不上。
+    cache_key = (row.get("id"), _res_digest(snapshot), _res_digest(create_params))
     hit = _RES_CACHE.get(cache_key)
+    if hit is None:
+        # 本进程没算过：先看其它 worker 落盘的分片，能命中就不必自己解析 YAML
+        _load_res_shards()
+        hit = _RES_CACHE.get(cache_key)
     if hit is not None:
         _RES_CACHE.move_to_end(cache_key)
         return hit
@@ -521,6 +617,7 @@ def _sandbox_resources(row: dict) -> dict:
     _RES_CACHE.move_to_end(cache_key)
     while len(_RES_CACHE) > _RES_CACHE_MAX:
         _RES_CACHE.popitem(last=False)
+    _save_res_shard()
     return out
 
 

@@ -139,6 +139,11 @@ if os.path.isdir(static_dir):
             resp = await super().get_response(path, scope)
             if path in ("", "index.html") or (path or "").endswith("/"):
                 resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+            elif (path or "").startswith("assets/"):
+                # Vite 产出的文件名带内容 hash，内容变了名字就变，可以放心长期缓存。
+                # 没有这行时每次进入资源看板都要回源协商（日志里成片的 304），
+                # 536KB 的 Analytics chunk 拿不到磁盘缓存。
+                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
             return resp
 
     app.mount("/", NoCacheHTMLStaticFiles(directory=static_dir, html=True), name="frontend")
