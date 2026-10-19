@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     MOCK_TASK_RUN: bool = False
     MOCK_TASK_SECONDS: int = 10
 
+    # obsutil 凭据（Windows 辅助 tar 打包用）。utils/win_util.py 直接解析
+    # .env 读取这三个键；这里必须声明，否则 pydantic-settings 的 extra=forbid
+    # 会让带 IK/KK/EK 的 .env 在 import 阶段直接报错。
+    IK: str = ""
+    KK: str = ""
+    EK: str = ""
+
     # 对话导出服务（模型配置面板「浏览/导出」对接，.env 配置）
     EXPORT_BASE: str = ""
     EXPORT_ACCESS_KEY: str = ""
