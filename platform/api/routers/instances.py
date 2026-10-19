@@ -343,29 +343,32 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
 # CRUD
 # ============================================================================
 
-# suffix_api_keys 的解析结果按 (path, mtime, size) 缓存：列表页 10s 一轮，
-# 每次只 stat 一次，不重复解析 YAML。
+# suffix_api_keys 的解析结果按快照内容缓存：列表页 10s 一轮，同一实例的快照
+# 是不变字符串，解析一次即可。**不做任何磁盘 IO** —— 实例目录可能极大（成千上万个
+# 任务目录），逐个 stat/load config.yaml 会把列表页拖垮。
 _SUFFIX_CACHE = {}
 _SUFFIX_CACHE_MAX = 2000
 
 
-def _suffix_from_config_file(path: str) -> Optional[bool]:
-    """从实例的 config.yaml 读 run_config.task.suffix_api_keys（hive 实际消费的值）。"""
-    if not path:
+def _suffix_from_snapshot(snapshot: str) -> Optional[bool]:
+    """从 config_snapshot（创建时的 config.yaml 全文）读 suffix_api_keys。
+
+    只做按行扫描，不走 OmegaConf/yaml 解析：快照是本平台生成的 YAML，键一定
+    出现在 run_config.task 下且独占一行；完整解析在实例多时会让列表页明显变慢。
+    结果按快照内容 hash 缓存，同一实例只扫一次。
+    """
+    if not snapshot:
         return None
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    cache_key = (path, st.st_mtime_ns, st.st_size)
+    cache_key = hash(snapshot)
     if cache_key in _SUFFIX_CACHE:
         return _SUFFIX_CACHE[cache_key]
-    try:
-        cfg = OmegaConf.load(path)
-        val = OmegaConf.select(cfg, "run_config.task.suffix_api_keys", default=None)
-        value = None if val is None else bool(val)
-    except Exception:
-        value = None
+    value = None
+    for line in snapshot.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("suffix_api_keys:"):
+            raw = stripped.split(":", 1)[1].strip().lower()
+            value = raw in ("true", "yes", "on", "1")
+            break
     if len(_SUFFIX_CACHE) >= _SUFFIX_CACHE_MAX:
         _SUFFIX_CACHE.clear()
     _SUFFIX_CACHE[cache_key] = value
@@ -375,26 +378,12 @@ def _suffix_from_config_file(path: str) -> Optional[bool]:
 def _resolve_suffix_api_keys(d: dict, params: dict) -> bool:
     """该实例是否开启了 key 沙箱后缀。
 
-    优先级：config.yaml（实际生效）→ config_snapshot（创建时快照）→ 未开启。
-    create_params 只用于新实例的快速路径；历史实例没有该字段，走文件/快照兜底。
+    优先级：create_params（新实例，最省）→ config_snapshot（创建时快照，
+    历史实例）→ 未开启。快照缺失的历史实例一律按未开启处理。
     """
     if "suffix_api_keys" in params:
         return bool(params["suffix_api_keys"])
-
-    value = _suffix_from_config_file(d.get("config_path") or "")
-    if value is not None:
-        return value
-
-    snapshot = d.get("config_snapshot") or ""
-    if snapshot:
-        try:
-            snap = OmegaConf.create(snapshot)
-            val = OmegaConf.select(snap, "run_config.task.suffix_api_keys", default=None)
-            if val is not None:
-                return bool(val)
-        except Exception:
-            pass
-    return False
+    return bool(_suffix_from_snapshot(d.get("config_snapshot") or ""))
 
 
 def _with_harness_type(d: dict) -> dict:
