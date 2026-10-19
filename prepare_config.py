@@ -7,9 +7,10 @@ hive.py 反向 import 它。新增 harness 只需在本文件修改两处:
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
 from omegaconf import OmegaConf
@@ -122,6 +123,28 @@ _FRAMEWORK_LAYOUTS: dict = {
 
 }
 
+def adapt_layout_for_windows(layout: dict, win_home: str) -> dict:
+    """把 Linux 风格 layout 的 /home/ma-user/... 路径适配为 Windows 路径。
+
+    用 PurePosixPath 拆出相对部分, 再用 PureWindowsPath 拼回去。
+    win_home 是沙箱 Windows home (config 的 run_config.sandbox.home),
+    不再硬编码, 换镜像/换用户时只改配置。
+    harness_local_config 是本地侧路径, skill_subdir 是相对路径, 均不变。
+    """
+    out = copy.deepcopy(layout)
+    for key in ("harness_dir", "harness_sandbox_config", "workspace_base"):
+        p = layout.get(key, "")
+        if p and p.startswith("/home/ma-user"):
+            out[key] = str(PureWindowsPath(win_home).joinpath(
+                PurePosixPath(p).relative_to("/home/ma-user")))
+    out["upload_paths"] = [
+        str(PureWindowsPath(win_home).joinpath(
+            PurePosixPath(p).relative_to("/home/ma-user")))
+        if p and p.startswith("/home/ma-user") else p
+        for p in layout.get("upload_paths", [])
+    ]
+    return out
+
 
 def normalize_base_url(base_url: str, api_kind: str = "openai-completions") -> str:
     """按 api_kind 归一化 base_url 的 /v1 后缀。"""
@@ -162,15 +185,18 @@ def prepare_local_agent_config(
     framework: str,
     data_config_file: Optional[str] = None,
     local_path: Optional[str] = None,
-    local_user_proxy_model_path: Optional[str] = None
+    local_user_proxy_model_path: Optional[str] = None,
+    home: str = "/home/ma-user",
+    sandbox_type: str = "x86_cpu",
+    oc_agent_names: Optional[list] = [],
 ) -> None:
     """在 spawn worker 之前把本地 agent 配置文件按 framework 修改到位。
 
     Args:
-        sandbox_config: SandboxConfig 实例 (harness_local_config_file /
-            user_proxy_model_local_file)
         framework: 当前 agent 框架名 (openclaw/hermes/dsh/...)
-        data_config_file: opencode 分支需要 data_config 里的 agent system_prompt
+        data_config_file: opencode/openclaw 分支需要读 data_config 里的 agents
+        home: 沙箱内的 home 根
+        sandbox_type: 沙箱类型 ("windows" | "x86_cpu"), 决定 home 路径归一化形态
     """
     model_cfg = json.loads(Path(local_user_proxy_model_path).read_text(encoding="utf-8"))
 
@@ -452,6 +478,9 @@ def prepare_local_agent_config(
         agents_section = data.setdefault("agents", {})
         agents_list = agents_section.setdefault("list", [])
 
+        # 按 sandbox_type 归一化 home 路径: windows 用 PureWindowsPath(反斜杠), 其余用 PurePosixPath
+        path_cls = PureWindowsPath if sandbox_type == "windows" else PurePosixPath
+
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
@@ -489,8 +518,8 @@ def prepare_local_agent_config(
             entry = {
                 "id": agent_name,
                 "name": agent_name,
-                "workspace": f"/home/ma-user/.openclaw/workspace-{agent_name}",
-                "agentDir": f"/home/ma-user/.openclaw/agents/{agent_name}",
+                "workspace": str(path_cls(home, ".openclaw", f"workspace-{agent_name}")),
+                "agentDir": str(path_cls(home, ".openclaw", "agents", agent_name)),
                 "model": {"primary": model_ref},
                 "models": {model_ref: {}},
             }
@@ -508,7 +537,212 @@ def prepare_local_agent_config(
                 f"Injected provider={provider_key} model={model_ref} for agent {agent_name}"
             )
 
+        # 补注册 oc_agent_names 里传入但 agents_list 中还没有的 agent。
+        # 只为缺号条目补 id + workspace(agentDir 统一在下方归一化补齐)。
+        # workspace 仍按 <base>-<name> 派生, 与 harness 的命名规则一致。
+        existing_ids = {
+            str(e.get("id", "")) for e in agents_list if isinstance(e, dict)
+        }
+        added: List[str] = []
+        for name in (oc_agent_names or []):
+            name = str(name).strip()
+            if not name or name in existing_ids:
+                continue
+            agents_list.append({
+                "id": name,
+                "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
+            })
+            existing_ids.add(name)
+            added.append(name)
+        if added:
+            logging.info(f"Registered agents from oc_agent_names: {added}")
+
+        # 归一化 agentDir: 每个条目都要有 agentDir。缺了它, gateway 会用自己进程的
+        # home 派生默认路径(Windows 上 gateway 以 SYSTEM 跑, home=systemprofile)落
+        # session 状态, 而不是 home 派生的路径 → upload_paths 指向的
+        # ~/.openclaw/agents 一直是空的, 且跨 query 续聊(session 复用)会报
+        # "Session history or replay state is invalid"。统一按 home 派生补齐。
+        for e in agents_list:
+            if not isinstance(e, dict):
+                continue
+            name = (e.get("id") or e.get("name") or "").strip()
+            if name and not e.get("agentDir"):
+                e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
+
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+
+# ============================================================================
+# Error catalog / classification / log formatting (shared with utils/win_util.py)
+# ============================================================================
+
+# ============================================================================
+# Error Catalog
+# ============================================================================
+# 错误码前缀 = 错误来源, 一眼可辨:
+#   C0xx  Client 侧    — hive.py 自身流程 / 本地文件 / 配置解析
+#   S0xx  Server 侧    — 沙箱远端执行失败 / 网络 / OBS / gateway
+#   T0xx  Task/业务侧  — 主脚本自报失败
+# ============================================================================
+
+ERROR_CATALOG: dict = {
+    # -- Client-side (C0xx) --
+    "C001": "extract code failed",
+    "C002": "upload file failed",
+    "C003": "environment creation failed",
+    "C004": "agent config write failed",
+    # -- Server / sandbox-side (S0xx) --
+    "S001": "gateway start failed",
+    "S002": "gateway startup timeout",
+    "S003": "gateway unexpected output",
+    "S004": "sandbox port-update failed",
+    "S005": "skill download failed",
+    "S006": "user profile download failed",
+    "S007": "agents download failed",
+    "S008": "script execution failed",
+    "S009": "upload traj to OBS failed",
+    # -- Task / business-side (T0xx) --
+    "T001": "【Task_Failed】",
+    "T002": "达到最大轮次",
+    "T003": "连续3次未收到回复",
+    "T004": "AgentExecutionError",
+    "T005": "AssertionError",
+    "T006": "API call failed",
+    "T007": "TimeoutError",
+    "T008": "HarnessError",
+    "T010": "Uncategorized Traceback",
+    # -- Unclassified --
+    "X999": "unclassified exception",
+}
+
+
+def _strip_api_use_lines(text: str) -> str:
+    """去掉日志里的 'INFO:api_use:' 行 (api 用量记录, 与任务成败无关, 干扰判定/查看)。"""
+    if not text:
+        return text
+    return "\n".join(line for line in text.splitlines() if "INFO:api_use:" not in line)
+
+
+def _classify_task_stdout(stdout: str) -> tuple[str, str]:
+    """
+    从主脚本 stdout 里推断更具体的错误码（优先匹配最后出现的错误信息）。
+    """
+    stdout = _strip_api_use_lines(stdout)
+    if not stdout or "【Task_Done】" in stdout:
+        return "", ""
+
+    best_pos = -1
+    best_code = ""
+    best_phrase = ""
+
+    # 遍历错误目录，但仅处理以 'T' 开头且不等于 'T010' 的条目
+    for code, phrase in ERROR_CATALOG.items():
+        if not code.startswith("T") or code == "T010":
+            continue
+        if phrase:
+            pos = stdout.rfind(phrase)          # 从后往前查找该短语的最后出现位置
+            if pos > best_pos:                  # 取位置最靠后的（即最后出现的）
+                best_pos = pos
+                best_code = code
+                best_phrase = phrase
+
+    if best_pos != -1:
+        return best_code, best_phrase
+
+    # 若未匹配到任何 T 类错误，再检查是否含有 Traceback
+    if "Traceback" in stdout:
+        return "T010", "Traceback"
+
+    return "", ""
+
+class HiveError(Exception):
+    """
+    带错误码的流水线异常。
+    code:      C001 / S001 / T001 ...
+    detail:    简短单行原因
+    sandbox_result: 若为 sandbox 端失败, 附上原始 Result 便于详情落盘
+    """
+
+    def __init__(self, code: str, detail: str = "", sandbox_result=None):
+        self.code = code
+        self.short = ERROR_CATALOG.get(code, ERROR_CATALOG["X999"])
+        self.detail = detail or ""
+        self.sandbox_result = sandbox_result
+        super().__init__(f"[{code}] {self.short}"
+                         + (f": {self.detail}" if self.detail else ""))
+
+
+
+def _fmt_sandbox_block(title: str, result, extra_stdout: str = "",
+                       extra_label: str = "") -> str:
+    """
+    把 sandbox 返回的 Result 对象格式化成美观的多行块, 供 task-<idx>.log 展示。
+    extra_stdout: 额外附带的文件内容 (如 gateway.log), 由 extra_label 标注来源。
+    只格式化, 不打印。返回值末尾无换行。
+    """
+    def _boxed(text: str) -> str:
+        bar = "─" * 78
+        return f"┌{bar}┐\n{text}\n└{bar}┘"
+
+    def _dedupe_pip_noise(lines: list[str]) -> list[str]:
+        """折叠 'Requirement already satisfied:' 行, 保留其它内容原样。"""
+        out: list[str] = []
+        skipped: int = 0
+        for ln in lines:
+            #   "Requirement already satisfied: openclaw-sdk==2.1.0 in /home/ma-user/..."
+            if ln.lstrip().startswith("Requirement already satisfied:"):
+                skipped += 1
+                continue
+            out.append(ln)
+        if skipped:
+            out.append(f"[… {skipped} 'Requirement already satisfied' lines suppressed]")
+        return out
+
+    try:
+        code = getattr(result, "code", None)
+        msg  = getattr(result, "msg", "") or ""
+        data = getattr(result, "data", None) or {}
+        exit_code = data.get("exit_code") if isinstance(data, dict) else None
+        stdout    = (data.get("stdout") if isinstance(data, dict) else "") or ""
+        stderr    = (data.get("stderr") if isinstance(data, dict) else "") or ""
+    except Exception as e:
+        return _boxed(f" ▎{title}\n ▎<failed to format Result: {e}>")
+
+    header = (
+        f" ▎{title}\n"
+        f" ▎ code={code}  exit_code={exit_code}  msg={msg!r}"
+    )
+    parts = [header]
+    if stdout:
+        parts.append(" ▎── stdout ────────────────────────────────────")
+        for line in _dedupe_pip_noise(stdout.rstrip().splitlines()):
+            parts.append(f" │ {line}")
+    if stderr:
+        parts.append(" ▎── stderr ────────────────────────────────────")
+        for line in _dedupe_pip_noise(stderr.rstrip().splitlines()):
+            parts.append(f" │ {line}")
+    if extra_stdout:
+        label = (extra_label or "file").strip()
+        # 让标签行宽度与 78 列边框对齐: " ▎── <label> " + 补足横线
+        prefix = f" ▎── {label} "
+        pad = max(3, 86 - len(prefix))
+        parts.append(prefix + "─" * pad)
+        for line in extra_stdout.rstrip().splitlines():
+            parts.append(f" │ {line}")
+    if not stdout and not stderr and not extra_stdout:
+        parts.append(" ▎ <no stdout/stderr captured>")
+    return _boxed("\n".join(parts))
+
+
+def _log_sandbox_detail(log: logging.Logger, title: str, result, level: int = logging.INFO,
+                        extra_stdout: str = "", extra_label: str = "") -> None:
+    """
+    将 sandbox Result 的 stdout/stderr 详情 **只写入 task-<idx>.log**,
+    main.log 通过 DropSandboxDetailFilter 过滤掉。
+    extra_stdout / extra_label: 额外附带沙箱内文件内容 (如 gateway.log)。
+    """
+    block = _fmt_sandbox_block(title, result, extra_stdout=extra_stdout,
+                               extra_label=extra_label)
+    log.log(level, "sandbox_detail:\n" + block, extra={"sandbox_detail": True})
