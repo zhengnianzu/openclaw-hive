@@ -108,6 +108,7 @@ def init_db():
                 create_params TEXT,
                 output_status TEXT          -- 点击输出/浅层完成状态: NULL未输出, done浅层完成可直接用
                 , task_done_sync INTEGER NOT NULL DEFAULT 0   -- 终态(completed/finished)后最后扫描是否完成: 0待扫, 1已终扫
+                , suffix_api_keys INTEGER NOT NULL DEFAULT 0  -- 创建时是否开启 key 沙箱后缀(列表标识, 只写一次)
             );
 
             CREATE TABLE IF NOT EXISTS task_registrations (
@@ -140,6 +141,14 @@ def init_db():
         # migrate: add task_done_sync for existing databases（终态后最后扫描标记）
         try:
             conn.execute("ALTER TABLE task_instances ADD COLUMN task_done_sync INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        # migrate: add suffix_api_keys for existing databases（列表标识，只对新任务写入）
+        # 历史实例保持默认 0，不回填、不读快照。
+        try:
+            conn.execute(
+                "ALTER TABLE task_instances ADD COLUMN suffix_api_keys INTEGER NOT NULL DEFAULT 0"
+            )
         except Exception:
             pass
         # migrate: add role column for existing databases

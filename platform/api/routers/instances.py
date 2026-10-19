@@ -343,47 +343,13 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
 # CRUD
 # ============================================================================
 
-# suffix_api_keys 的解析结果按快照内容缓存：列表页 10s 一轮，同一实例的快照
-# 是不变字符串，解析一次即可。**不做任何磁盘 IO** —— 实例目录可能极大（成千上万个
-# 任务目录），逐个 stat/load config.yaml 会把列表页拖垮。
-_SUFFIX_CACHE = {}
-_SUFFIX_CACHE_MAX = 2000
-
-
-def _suffix_from_snapshot(snapshot: str) -> Optional[bool]:
-    """从 config_snapshot（创建时的 config.yaml 全文）读 suffix_api_keys。
-
-    只做按行扫描，不走 OmegaConf/yaml 解析：快照是本平台生成的 YAML，键一定
-    出现在 run_config.task 下且独占一行；完整解析在实例多时会让列表页明显变慢。
-    结果按快照内容 hash 缓存，同一实例只扫一次。
-    """
-    if not snapshot:
-        return None
-    cache_key = hash(snapshot)
-    if cache_key in _SUFFIX_CACHE:
-        return _SUFFIX_CACHE[cache_key]
-    value = None
-    for line in snapshot.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("suffix_api_keys:"):
-            raw = stripped.split(":", 1)[1].strip().lower()
-            value = raw in ("true", "yes", "on", "1")
-            break
-    if len(_SUFFIX_CACHE) >= _SUFFIX_CACHE_MAX:
-        _SUFFIX_CACHE.clear()
-    _SUFFIX_CACHE[cache_key] = value
-    return value
-
-
-def _resolve_suffix_api_keys(d: dict, params: dict) -> bool:
+def _resolve_suffix_api_keys(d: dict) -> bool:
     """该实例是否开启了 key 沙箱后缀。
 
-    优先级：create_params（新实例，最省）→ config_snapshot（创建时快照，
-    历史实例）→ 未开启。快照缺失的历史实例一律按未开启处理。
+    只读 DB 的 suffix_api_keys 列（创建/迁移时写入一次），不做任何快照解析
+    或磁盘 IO —— 列表接口 10s 一轮，历史实例再多也不增加开销。
     """
-    if "suffix_api_keys" in params:
-        return bool(params["suffix_api_keys"])
-    return bool(_suffix_from_snapshot(d.get("config_snapshot") or ""))
+    return bool(d.get("suffix_api_keys"))
 
 
 def _with_harness_type(d: dict) -> dict:
@@ -395,7 +361,7 @@ def _with_harness_type(d: dict) -> dict:
             params = {}
     d["harness_type"] = params.get("harness_type", "openclaw")
     # 列表/详情页的标识用：该实例创建时是否开启 key 沙箱后缀
-    d["suffix_api_keys"] = _resolve_suffix_api_keys(d, params)
+    d["suffix_api_keys"] = _resolve_suffix_api_keys(d)
     return d
 
 
@@ -1129,11 +1095,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         conn.execute(
             """INSERT INTO task_instances
                (id, name, config_path, status, created_by, total_tasks, concurrent_num,
-                config_snapshot, create_params, created_at, queue_id, queue_position)
-               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                config_snapshot, create_params, created_at, queue_id, queue_position,
+                suffix_api_keys)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], 0,
              req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json(),
-             datetime.now().isoformat(), req.queue_id, queue_position),
+             datetime.now().isoformat(), req.queue_id, queue_position,
+             1 if req.suffix_api_keys else 0),
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 
@@ -1205,8 +1173,8 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="该实例无创建参数记录")
     params = json.loads(row["create_params"])
     params.pop("copy_complete_from", None) # 不继承
-    # 历史实例的 create_params 里没有该字段，从 config.yaml/快照兜底，与列表口���一致
-    params["suffix_api_keys"] = _resolve_suffix_api_keys(dict(row), params)
+    # 以 DB 列为准（创建/迁移时已写入），历史实例同样有值
+    params["suffix_api_keys"] = _resolve_suffix_api_keys(dict(row))
     # OBS 桶名不在 create_params 里，从 config_snapshot(s3.bucket_name) 取出，
     # 供前端把各 OBS 目录字段拼成完整 obs:// 路径展示。
     if row["config_snapshot"]:
