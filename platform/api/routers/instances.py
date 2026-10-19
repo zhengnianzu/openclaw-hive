@@ -343,15 +343,70 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
 # CRUD
 # ============================================================================
 
+# suffix_api_keys 的解析结果按 (path, mtime, size) 缓存：列表页 10s 一轮，
+# 每次只 stat 一次，不重复解析 YAML。
+_SUFFIX_CACHE = {}
+_SUFFIX_CACHE_MAX = 2000
+
+
+def _suffix_from_config_file(path: str) -> Optional[bool]:
+    """从实例的 config.yaml 读 run_config.task.suffix_api_keys（hive 实际消费的值）。"""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cache_key = (path, st.st_mtime_ns, st.st_size)
+    if cache_key in _SUFFIX_CACHE:
+        return _SUFFIX_CACHE[cache_key]
+    try:
+        cfg = OmegaConf.load(path)
+        val = OmegaConf.select(cfg, "run_config.task.suffix_api_keys", default=None)
+        value = None if val is None else bool(val)
+    except Exception:
+        value = None
+    if len(_SUFFIX_CACHE) >= _SUFFIX_CACHE_MAX:
+        _SUFFIX_CACHE.clear()
+    _SUFFIX_CACHE[cache_key] = value
+    return value
+
+
+def _resolve_suffix_api_keys(d: dict, params: dict) -> bool:
+    """该实例是否开启了 key 沙箱后缀。
+
+    优先级：config.yaml（实际生效）→ config_snapshot（创建时快照）→ 未开启。
+    create_params 只用于新实例的快速路径；历史实例没有该字段，走文件/快照兜底。
+    """
+    if "suffix_api_keys" in params:
+        return bool(params["suffix_api_keys"])
+
+    value = _suffix_from_config_file(d.get("config_path") or "")
+    if value is not None:
+        return value
+
+    snapshot = d.get("config_snapshot") or ""
+    if snapshot:
+        try:
+            snap = OmegaConf.create(snapshot)
+            val = OmegaConf.select(snap, "run_config.task.suffix_api_keys", default=None)
+            if val is not None:
+                return bool(val)
+        except Exception:
+            pass
+    return False
+
+
 def _with_harness_type(d: dict) -> dict:
+    params = {}
     if d.get("create_params"):
         try:
             params = json.loads(d["create_params"])
-            d["harness_type"] = params.get("harness_type", "openclaw")
-            # 列表/详情页的标识用：该实例创建时是否开启 key 沙箱后缀
-            d["suffix_api_keys"] = bool(params.get("suffix_api_keys"))
         except Exception:
-            pass
+            params = {}
+    d["harness_type"] = params.get("harness_type", "openclaw")
+    # 列表/详情页的标识用：该实例创建时是否开启 key 沙箱后缀
+    d["suffix_api_keys"] = _resolve_suffix_api_keys(d, params)
     return d
 
 
@@ -1161,6 +1216,8 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="该实例无创建参数记录")
     params = json.loads(row["create_params"])
     params.pop("copy_complete_from", None) # 不继承
+    # 历史实例的 create_params 里没有该字段，从 config.yaml/快照兜底，与列表口���一致
+    params["suffix_api_keys"] = _resolve_suffix_api_keys(dict(row), params)
     # OBS 桶名不在 create_params 里，从 config_snapshot(s3.bucket_name) 取出，
     # 供前端把各 OBS 目录字段拼成完整 obs:// 路径展示。
     if row["config_snapshot"]:
