@@ -21,6 +21,8 @@ from ..core.security import get_current_user, require_operator
 from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
 from ..services.queue_scheduler import (
     schedule_queue, OCCUPYING_STATUSES,
+    slot_condition_sql as _slot_condition_sql,
+    slot_condition_params as _slot_condition_params,
 )
 from . import harness_meta
 from . import sandbox_configs
@@ -411,20 +413,44 @@ def _parse_resources(cfg: dict) -> dict:
     return dict(_RES_FALLBACK)
 
 
+# sandbox_active_key → assert 的沙箱 OS。模板键见 sandbox_configs._TEMPLATES
+_ACTIVE_KEY_TO_TYPE = {key: t for t, (_fn, key) in sandbox_configs._TEMPLATES.items()}
+
+
+def _derive_sandbox_type(active_key: Optional[str], config_type: Optional[str]) -> tuple:
+    """沙箱 OS（linux/windows）。返回 (type, inferred)。
+
+    优先级：快照的 sandbox_active_key（最贴近实际配置）→ 引用的沙箱配置类型
+    （create_params.sandbox_config_id）→ 兜底 linux + inferred。
+    """
+    if active_key:
+        if active_key in _ACTIVE_KEY_TO_TYPE:
+            return _ACTIVE_KEY_TO_TYPE[active_key], False
+        return ("windows" if "windows" in active_key.lower() else "linux"), True
+    if config_type in ("linux", "windows"):
+        return config_type, False
+    return "linux", True
+
+
 def _sandbox_resources(row: dict) -> dict:
-    """实例的单沙箱资源 + 所在资源池（= sandbox_namespace）。"""
+    """实例的单沙箱资源 + 所在资源池（= sandbox_namespace）+ 沙箱 OS。"""
     snapshot = row.get("config_snapshot") or ""
-    cache_key = (row.get("id"), hash(snapshot))
+    create_params = row.get("create_params") or ""
+    # create_params 也参与缓存键：重选沙箱配置后 sandbox_type 会变，只 hash 快照会命中旧值
+    cache_key = (row.get("id"), hash(snapshot), hash(create_params))
     hit = _RES_CACHE.get(cache_key)
     if hit is not None:
         return hit
 
     out = None
+    active_key = None
+    config_type = None
     if snapshot:
         try:
             cfg = OmegaConf.to_container(OmegaConf.create(snapshot), resolve=True) or {}
             out = _parse_resources(cfg)
             out["sandbox_namespace"] = cfg.get("sandbox_namespace") or ""
+            active_key = sandbox_configs.active_sandbox_key(cfg)
         except Exception:
             out = None
 
@@ -433,7 +459,7 @@ def _sandbox_resources(row: dict) -> dict:
         out = dict(_RES_FALLBACK)
         out["sandbox_namespace"] = ""
         try:
-            params = json.loads(row.get("create_params") or "{}")
+            params = json.loads(create_params or "{}")
             sb_id = params.get("sandbox_config_id")
             if sb_id:
                 with get_connection() as conn:
@@ -441,8 +467,10 @@ def _sandbox_resources(row: dict) -> dict:
                         "SELECT * FROM sandbox_configs WHERE id = ?", (sb_id,)
                     ).fetchone()
                 if sb_row:
+                    sb_row = dict(sb_row)
+                    config_type = sb_row.get("sandbox_type")
                     summary = sandbox_configs._extract_summary(
-                        sandbox_configs._load_yaml(sandbox_configs._file_for(dict(sb_row))),
+                        sandbox_configs._load_yaml(sandbox_configs._file_for(sb_row)),
                         sb_row["sandbox_key"],
                     )
                     out = {
@@ -452,6 +480,7 @@ def _sandbox_resources(row: dict) -> dict:
                         "memory_limit": _gib(summary.get("memory_limit") or "8Gi"),
                         "sandbox_namespace": summary.get("sandbox_namespace") or "",
                     }
+                    active_key = sb_row.get("sandbox_key")
         except Exception:
             pass
 
@@ -459,6 +488,10 @@ def _sandbox_resources(row: dict) -> dict:
     # 否则它们的占用会落在所有池之外，看板上「已用 > 各池之和」。
     if not out.get("sandbox_namespace"):
         out["sandbox_namespace"] = resource_pools.default_namespace()
+
+    sb_type, inferred = _derive_sandbox_type(active_key, config_type)
+    out["sandbox_type"] = sb_type
+    out["sandbox_type_inferred"] = inferred
 
     if len(_RES_CACHE) >= _RES_CACHE_MAX:
         _RES_CACHE.clear()
@@ -549,6 +582,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     base.run_config.concurrent_num = req.concurrent_num
     base.run_config.start_index = req.start_index
     base.run_config.total_num = req.total_num
+    # 任务级开关：hive 上传配置前给模型 key 追加 _<env_id uuid> 后缀。
+    # 模板里没有该键，这里显式写入；关闭时写 False，语义与缺失一致。
+    base.run_config.task.suffix_api_keys = bool(req.suffix_api_keys)
 
     # --- 沙箱配置：把派生文件的沙箱段整段替换进 config.yaml ---
     # 派生文件在 settings/sandbox/<type>_<id>.yaml，其 global/sandbox/sandbox_namespace/s3
@@ -1344,20 +1380,17 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
                 (new_pos, instance_id)
             )
 
-            # 原子抢占：把「队列内无占用者」写成 UPDATE 的 WHERE 条件，
-            # 与 queue_scheduler._try_claim_next 采用同一写法。拆成
-            # 「查占用 → 判断 → UPDATE」时，两个并发请求会同时通过检查。
+            # 原子抢占：把「队列是否有可用槽位」写成 UPDATE 的 WHERE 条件。
+            # 条件本身由 queue_scheduler.slot_condition_sql 生成，与自动调度完全同源，
+            # 避免两处规则分叉。拆成「查占用 → 判断 → UPDATE」时，两个并发请求会同时通过检查。
             claimed = conn.execute(
                 f"""UPDATE task_instances
                        SET status='preparing', pid=NULL, started_at=NULL,
                            error_summary=NULL, prepare_started_at=datetime('now')
                      WHERE id=?
-                       AND NOT EXISTS (
-                         SELECT 1 FROM task_instances
-                          WHERE queue_id = ? AND status IN ({_OCCUPYING_PLACEHOLDERS})
-                       )
+                       AND {_slot_condition_sql(_OCCUPYING_PLACEHOLDERS)}
                  RETURNING id""",
-                (instance_id, queue_id, *_OCCUPYING_STATUSES)
+                (instance_id, *_slot_condition_params())
             ).fetchone()
         inst["queue_position"] = new_pos
         _status_cache.pop(instance_id, None)
@@ -2017,6 +2050,11 @@ def _refresh_running_once():
                     _sync_task_records(inst["id"], inst["config_path"])
                 except Exception:
                     pass
+                # 长尾跳过：任务进入尾部窗口时不会产生任何状态变化事件，而调度是
+                # 事件驱动的。这里主动把该队列交给调度器，让它判定是否可以提前放行
+                # 下一个任务（_try_claim_next 内部有完整条件，重复触发是幂等的）。
+                if inst.get("queue_id"):
+                    queues_to_schedule.add(inst["queue_id"])
             elif inst["status"] in ("completed", "finished"):
                 # 队列续跑：本实例刚跑完，放行同队列的下一排队任务
                 if prev_status in ("running", "preparing") and inst.get("queue_id"):

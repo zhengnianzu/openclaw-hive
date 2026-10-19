@@ -2,9 +2,11 @@
 队列调度器服务
 
 实现事件驱动的队列任务调度逻辑：
-1. 串行执行：同一队列内同时只有一个任务运行
-2. 队列间并行：不同队列互不影响，各自独立调度
-3. 自动调度：任务启动/停止/完成时触发调度
+1. 串行执行：同一队列内默认同时只有一个任务运行
+2. 长尾跳过（可选）：跑着的任务进入尾部窗口（剩余量 <= 阈值）后，允许提前放行
+   后续任务，同一队列最多同时占用 `TAIL_SKIP_MAX_ACTIVE` + 1 个槽位
+3. 队列间并行：不同队列互不影响，各自独立调度
+4. 自动调度：任务启动/停止/完成时触发调度
 
 全局沙箱上限（原 MAX_TOTAL_SANDBOXES）已取消：队列调度只受「同队列串行」约束，
 concurrent_num 仅作为实例参数透传，不再参与放行判断。
@@ -24,19 +26,95 @@ logger = logging.getLogger(__name__)
 OCCUPYING_STATUSES = ("preparing", "running")
 
 
+def global_max_concurrent() -> int:
+    """全局并发上限（QUEUE_MAX_CONCURRENT，默认 2）。
+
+    任何队列的实际并发都不会超过它。设为 1 则所有队列严格串行。
+    """
+    try:
+        n = int(settings.QUEUE_MAX_CONCURRENT)
+    except (TypeError, ValueError):
+        n = 2
+    return max(1, n)
+
+
+def effective_concurrent(queue_max_concurrent) -> int:
+    """队列的实际并发 = min(全局上限, 队列自己的 max_concurrent)。
+
+    队列的 max_concurrent 是「这个队列想要多少」，全局值是「整个平台最多多少」，
+    取较小者。创建队列时的默认值是 1。
+    """
+    try:
+        q = int(queue_max_concurrent or 1)
+    except (TypeError, ValueError):
+        q = 1
+    return max(1, min(global_max_concurrent(), q))
+
+
+def slot_condition_sql(placeholders: str) -> str:
+    """构造「本队列还有可用槽位」的 SQL 条件。
+
+    两处入口共用这一份条件，避免规则分叉：
+      - `_try_claim_next`（队列自动放行）
+      - `instances.start_instance`（用户手动点「启动」）
+
+    额度规则（全部在 SQL 内完成，保持单语句原子性）：
+      基础额度 = min(QUEUE_MAX_CONCURRENT, 队列的 max_concurrent)
+      长尾额度 = 基础额度 + 1（仅当队列开启长尾跳过，且已有 running 任务
+                 的剩余量 <= tail_skip_percent% 时）
+    """
+    global_max = global_max_concurrent()
+    window = f"""EXISTS (
+        SELECT 1 FROM task_instances t
+         WHERE t.queue_id = task_instances.queue_id
+           AND t.status = 'running'
+           AND t.total_tasks > 0
+           AND (t.total_tasks - (t.completed_tasks + t.failed_tasks))
+               <= t.total_tasks * q.tail_skip_percent / 100.0
+    )"""
+    return f"""(
+        SELECT COUNT(*) FROM task_instances o
+         WHERE o.queue_id = task_instances.queue_id
+           AND o.status IN ({placeholders})
+    ) < COALESCE((
+        SELECT min({global_max}, max(1, COALESCE(q.max_concurrent, 1)))
+               + (
+                   CASE
+                     WHEN COALESCE(q.tail_skip_enabled, 0) = 1 AND {window}
+                     THEN 1
+                     ELSE 0
+                   END
+                 )
+          FROM task_queues q
+         WHERE q.id = task_instances.queue_id
+    ), 1)"""
+
+
+def slot_condition_params() -> list:
+    """`slot_condition_sql` 的绑定参数。"""
+    return list(OCCUPYING_STATUSES)
+
+
 def _try_claim_next(queue_id: str) -> dict | None:
     """原子地「选出队首排队任务并占住它」。
 
     必须做成单条语句：生产是 --workers 4，多个 worker 会同时调度同一队列。
     如果拆成「先查占用、再选任务、再 UPDATE」（各自都是独立语句），两个 worker 会
     同时通过占用检查，然后各自领走一个不同的任务，串行就被破坏（实测可复现）。
-    这里把「队列无占用者」当成 UPDATE 的 WHERE 条件，由 SQLite 的写锁保证原子：
-    只有 rowcount 命中 1 行的调用才是赢家，其余拿不到结果直接放弃。
+    这里把「队列是否还有可用槽位」当成 UPDATE 的 WHERE 条件，由 SQLite 的写锁保证
+    原子：只有 rowcount 命中一行的调用才是赢家，其余拿不到结果直接放弃。
+
+    槽位规则（读取任务队列行与全局配置，全部在 SQL 内判定以保持原子性）：
+      基础额度 = min(QUEUE_MAX_CONCURRENT, 队列的 max_concurrent)
+                 —— 全局上限封顶，队列自己的 max_concurrent 决定它想要多少
+      长尾额度 = 基础额度 + 1
+                 —— 仅当队列开启长尾跳过、且已有一个 running 任务进入尾部窗口
+                 窗口不存在时回落到基础额度。
 
     Returns:
         抢到的任务行（dict），未抢到返回 None。
     """
-    placeholders = ",".join("?" * len(OCCUPYING_STATUSES))
+    occ = ",".join("?" * len(OCCUPYING_STATUSES))
     with get_connection() as conn:
         row = conn.execute(
             f"""UPDATE task_instances
@@ -49,12 +127,9 @@ def _try_claim_next(queue_id: str) -> dict | None:
                       ORDER BY queue_position ASC
                       LIMIT 1
                  )
-                   AND NOT EXISTS (
-                     SELECT 1 FROM task_instances
-                      WHERE queue_id = ? AND status IN ({placeholders})
-                   )
+                   AND {slot_condition_sql(occ)}
              RETURNING *""",
-            (queue_id, queue_id, *OCCUPYING_STATUSES)
+            (queue_id, *slot_condition_params())
         ).fetchone()
         return dict(row) if row else None
 

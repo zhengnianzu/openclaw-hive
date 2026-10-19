@@ -13,12 +13,41 @@
 
 | 规则 | 说明 |
 |------|------|
-| **队列内串行** | 同一队列同一时刻**只有一个任务在跑**,后面的任务排队等待 |
+| **队列内并发** | 同一队列同时最多 `min(QUEUE_MAX_CONCURRENT, 队列的 max_concurrent)` 个任务 |
+| **长尾跳过(可选)** | 队列开启后,跑着的任务**剩余量 ≤ 阈值百分比**时再额外放行 1 个;峰值 = 基础并发 + 1 |
 | **队列间并行** | 不同队列互不影响,各自独立调度 |
-| **队列间并行** | 不同队列互不影响,各自独立调度 |
-| **无全局上限** | 不再有 `MAX_TOTAL_SANDBOXES` 之类的全局沙箱闸门;队列放行只取决于「本队列内是否已有 `preparing`/`running`」 |
+| **全局上限** | `QUEUE_MAX_CONCURRENT`(`.env`,默认 2)封顶所有队列的并发;沙箱总量(`MAX_TOTAL_SANDBOXES`)已取消 |
 | **顺序依据** | 队列内按 `queue_position` **升序**放行(数字越小越先跑) |
 | **入队顺序** | 创建任务并选队列时,`queue_position = MAX(同队列 position) + 1`(排到队尾) |
+
+### 1.1.1 长尾跳过
+
+**动机**:一批任务的耗时常呈长尾分布——最后几个任务可能比前面几十个都慢。
+严格串行时,这段时间只看得到「一个任务在跑」,任务量掉下来。
+
+**规则**:
+
+| 项 | 说明 |
+|---|---|
+| 配置位置 | `task_queues.tail_skip_enabled` / `tail_skip_percent`,队列新建或编辑时设置 |
+| 进度口径 | `(total_tasks - completed_tasks - failed_tasks) / total_tasks` ≤ `tail_skip_percent / 100` |
+| 触发条件 | 存在一个 `running` 的占用者处于尾部窗口 |
+| 基础并发 | `min(QUEUE_MAX_CONCURRENT, 队列 max_concurrent)`——与长尾窗口无关 |
+| 长尾额度 | 基础并发 **+1**(仅在尾部窗口内) |
+| 回落 | 长尾任务结束、下一个任务刚开始(剩余 100%)时,额度回落到基础并发 |
+| 队列级配置 | `task_queues.tail_skip_enabled` / `tail_skip_percent` / `max_concurrent` |
+| 全局配置 | `.env` 的 `QUEUE_MAX_CONCURRENT`(默认 2)只封顶,不抬高 |
+| 未知总量 | `total_tasks = 0`(任务数还没统计出来)时不触发 |
+| 阈值范围 | 1–50%,超出按边界截断 |
+
+`failed_tasks` 计入「已处理」,与终态判定 `completed + failed >= total_tasks` 的口径一致。
+
+**为什么用任务数而不是时间**:时间估算依赖历史平均耗时,冷启动无数据、任务间耗时差异又大;
+任务数比例是精确的、每 8s 刷新一次、不依赖任何预测模型。
+
+> **实现要点**:长尾窗口的进入不是状态变化事件,后台 refresher 在 `_running` 分支里
+> 每轮都会把该队列加入待调度集合(见 `_refresh_running_once`)。`_try_claim_next`
+> 内部的完整条件保证重复触发幂等。
 
 ### 1.2 「占用槽位」的状态
 
@@ -271,7 +300,9 @@ status='preparing' AND pid IS NULL
 |------|------|------|
 | `id` | TEXT PK | 队列 ID(用户输入,全局唯一,即队列名) |
 | `name` | TEXT | 显示名(当前与 id 相同) |
-| `max_concurrent` | INTEGER | 并发量,**默认 1,当前仅作展示**(调度仍严格串行) |
+| `max_concurrent` | INTEGER | 本队列并发上限,默认 1(仍受全局 `QUEUE_MAX_CONCURRENT` 封顶) |
+| `tail_skip_enabled` | INTEGER | 长尾跳过开关(0/1),默认 0 |
+| `tail_skip_percent` | INTEGER | 剩余任务数百分比阈值,默认 10(1–50) |
 | `description` | TEXT | 描述 |
 | `created_by` | TEXT | 创建者 |
 | `created_at` / `updated_at` | TIMESTAMP | 时间戳 |
@@ -302,7 +333,8 @@ status='preparing' AND pid IS NULL
 |------|------|------|
 | GET | `/api/queues` | 队列列表(含 `active_tasks` / `queued_tasks` / `startable_tasks` / `failed_tasks_in_queue` / `task_count`) |
 | GET | `/api/queues/check-id/{id}` | 队列名去重校验,返回 `{available: bool}` |
-| POST | `/api/queues` | 新建队列(重名返回 400) |
+| POST | `/api/queues` | 新建队列(重名返回 400),可带 `tail_skip_enabled` / `tail_skip_percent` |
+| PATCH | `/api/queues/{id}` | 编辑队列设置(并发量/描述/长尾跳过),立即生效 |
 | GET | `/api/queues/{id}/tasks` | 队列详情:按 `queue_position` 排序,含**排队名次**与预计开始时间 |
 | POST | `/api/queues/{id}/start-all` | 启动队列:`created`/`stopped` → `queued` |
 | POST | `/api/queues/{id}/stop-all` | 停止队列:`queued` → `created`(运行中的不动) |
@@ -371,7 +403,8 @@ MOCK_TASK_SECONDS=10
 | 位置 | 行为 |
 |------|------|
 | **创建任务 → 高级配置** | 「任务队列」下拉 + 「新建队列」按钮(打开加入队列窗口) |
-| **加入队列窗口** | 两个 tab:选择已有队列(带筛选/队列详情)/ 新建队列(名称去重校验、并发量、描述) |
+| **加入队列窗口** | 两个 tab:选择已有队列(带筛选/队列详情)/ 新建队列(名称去重校验、并发量、长尾跳过、描述) |
+| **队列管理页** | 「长尾跳过」列显示 `剩余 10%` 或「关闭」;行操作「更多 → 编辑设置」可随时改开关与阈值 |
 | **任务实例列表** | 队列筛选;「任务队列」「队列位置」列;`queued` 显示为**排队中** |
 | **列表排序** | 按 `created_at` **倒序**,最新创建的任务在最前 |
 | **排队名次** | 显示为该队列内 `queued` 任务的**第几名**(如 `1 (等待中)`),非绝对 `queue_position` |
@@ -381,12 +414,12 @@ MOCK_TASK_SECONDS=10
 
 ## 八、已知限制
 
-> **TODO(未来扩展)**:下述第 1、3 条为同一件事 —— 让 `max_concurrent` 真正参与调度
-> (多槽位放行)。实现时需同步更新本文「一、排队规则」与「二、调度流程」
-> 两章:`_try_claim_next` 的 `NOT EXISTS` 条件要从「无占用者」改为「占用数 < max_concurrent」,
-> 且需考虑多 worker 下按队列批量抢占的原子性。
+> **TODO(未来扩展)**:`max_concurrent` 仍不参与调度。若要支持 >2 的并行度,
+> 需把 `_try_claim_next` 中的常量 `2` 换成 `max(max_concurrent, 2)`,
+> 并为多槽位设计更细的放行条件(当前「剩余比例」只适合 2 槽位)。
 
-1. **仅串行**:`max_concurrent` 字段已存在但**不参与调度**,填 >1 也仍是串行。多槽位调度未实现。
+1. **队列并发受全局封顶**:实际并发 = `min(QUEUE_MAX_CONCURRENT, 队列 max_concurrent)`。
+   队列可以把 `max_concurrent` 调小,但无法突破全局值。长尾跳过在此基础上再 +1。
 2. **`queue_position` 有空洞**:只增不减,反复重启会跳号。UI 已改用「名次」规避,但原始序号仍不整洁。
 3. **并发量仅展示**:队列列表的「当前运行/并发量」中,`max_concurrent` 是用户填的展示值。
 4. **预估开始时间仅供参考**:用队列内**正常跑完**(`completed`/`finished`)实例的平均耗时顺推,
@@ -418,6 +451,22 @@ cd platform && python -m unittest discover -s test -p "test_queue_scheduler.py" 
 | 孤儿回收宽限 | `OrphanRecoveryTest.*` | 刚进入 preparing 的不被误伤;超过宽限期才退回 `created` |
 | 重启恢复 | `ResumeTest.*` | 只有含 queued 任务的队列被兜底调度 |
 | 终态写库保护 | `StatusWriteGuardTest.*` | 终态落库不覆盖 `stopped` |
+| 长尾跳过-关闭 | `TailSkipTest.test_disabled_keeps_strict_serial` | 即使剩余 0% 也不放行 |
+| 长尾跳过-窗口外 | `TailSkipTest.test_enabled_but_not_in_tail_window` | 剩余 20% > 阈值 10% 不放行 |
+| 长尾跳过-窗口内 | `TailSkipTest.test_enabled_and_in_tail_window` / `..._custom_percent_respected` | 到达/低于阈值时放行 |
+| 长尾跳过-失败计数 | `TailSkipTest.test_failed_tasks_count_toward_progress` | `failed` 也计入已处理 |
+| 队列并发=2 | `TailSkipTest.test_queue_max_concurrent_two_allows_two` / `..._blocks_third` | 队列 max_concurrent 决定基础并发 |
+| 队列 2 + 长尾 1 | `TailSkipTest.test_tail_skip_adds_one_on_top_of_queue_max` | 窗口内第 3 个放行 |
+| 峰值封顶 | `TailSkipTest.test_tail_skip_peak_blocked` | 第 4 个不放行 |
+| 窗口外 | `TailSkipTest.test_tail_skip_without_window_uses_queue_max` | 只按队列并发放行 |
+| 长尾关闭 | `TailSkipTest.test_tail_skip_disabled_ignores_window` | 窗口内也不额外放行 |
+| 队列 1 + 长尾 1 | `TailSkipTest.test_queue_max_one_tail_skip_two` | 峰值 2 |
+| 全局封顶队列值 | `TailSkipTest.test_global_cap_limits_queue_max` | 全局 1 时队列 5 也只能跑 1 个 |
+| 全局不封顶长尾 | `TailSkipTest.test_global_cap_limits_tail_peak` | 全局 2 + 队列 2 + 长尾 1 = 3 |
+| 全局 1 + 长尾 | `TailSkipTest.test_global_cap_one_blocks_even_in_window` | 基础 1，窗口内峰值 2 |
+| 长尾回落 | `TailSkipTest.test_after_tail_task_finishes_falls_back` | 长尾任务结束后额度回落 |
+| 未知总量 | `TailSkipTest.test_total_tasks_zero_does_not_trigger` | `total_tasks=0` 不触发 |
+| 调度链 | `ScheduleQueueTailSkipTest.*` | `schedule_queue` 走同一套规则 |
 
 仍未自动化:完成续跑(`background_cache_refresher` 的完整链路)、`stop_instance` 的进程终止、
 `start_instance` 的并发启动(需 HTTP 层桩)、前端展示。

@@ -23,8 +23,13 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
-    # 队列调度配置（已取消全局沙箱上限 MAX_TOTAL_SANDBOXES：队列只受「同队列串行」约束）
+    # 队列调度配置（已取消全局沙箱上限 MAX_TOTAL_SANDBOXES）
     ORPHAN_PREPARING_GRACE_SECONDS: int = 120
+
+    # 全局并发上限：任何队列同时占用的任务数都不能超过它。
+    # 队列实际并发 = min(QUEUE_MAX_CONCURRENT, 该队列的 max_concurrent)。
+    # 默认 2；设为 1 则所有队列都只能跑 1 个（严格串行）。
+    QUEUE_MAX_CONCURRENT: int = 2
 
     # preparing 状态超时（秒）：准备阶段会做 OBS 下载（单次最长 600s，可能两次）
     # 与打包（120s）。若协程异常消失（reload/事件循环错误），实例会永久卡在

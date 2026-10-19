@@ -23,7 +23,11 @@
       <el-table-column prop="id" label="队列名称" min-width="150" show-overflow-tooltip />
       <el-table-column label="当前运行/并发量" min-width="140" align="center">
         <template #default="{ row }">
-          <span class="mono">{{ row.active_tasks }} / {{ row.max_concurrent }}</span>
+          <span class="mono">{{ row.active_tasks }} / {{ row.effective_concurrent }}</span>
+          <el-tooltip v-if="row.effective_concurrent < row.max_concurrent"
+            :content="`队列设置为 ${row.max_concurrent}，受全局上限限制为 ${row.effective_concurrent}`" placement="top">
+            <el-tag type="warning" size="small" effect="plain" style="margin-left:6px">封顶</el-tag>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column label="排队任务数" min-width="110" align="center">
@@ -45,6 +49,14 @@
           </el-tooltip>
         </template>
       </el-table-column>
+      <el-table-column label="长尾跳过" min-width="120" align="center">
+        <template #default="{ row }">
+          <el-tag v-if="row.tail_skip_enabled" type="success" size="small" effect="plain">
+            剩余 {{ row.tail_skip_percent }}%
+          </el-tag>
+          <span v-else class="mono" style="color:#999">关闭</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="description" label="描述" min-width="160" show-overflow-tooltip />
       <el-table-column prop="created_by" label="创建人" min-width="110" show-overflow-tooltip />
       <el-table-column prop="created_at" label="创建时间" min-width="160">
@@ -62,6 +74,7 @@
               <el-button size="small">更多<el-icon style="margin-left:2px"><ArrowDown /></el-icon></el-button>
               <template #dropdown>
                 <el-dropdown-menu>
+                  <el-dropdown-item command="edit">编辑设置</el-dropdown-item>
                   <el-dropdown-item command="stop" :disabled="row.queued_tasks === 0">
                     停止队列
                     <span v-if="row.queued_tasks === 0" style="font-size:11px;color:#999">（无排队任务）</span>
@@ -98,7 +111,17 @@
         </el-form-item>
         <el-form-item label="并发量" required>
           <el-input-number v-model="createForm.max_concurrent" :min="1" :max="99" />
-          <div class="hint">同一时间允许运行的最大任务数</div>
+          <div class="hint">本队列同时运行的最大任务数；实际生效 = min(全局上限, 该值)</div>
+        </el-form-item>
+        <el-form-item label="长尾跳过">
+          <el-switch v-model="createForm.tail_skip_enabled" />
+          <el-input-number v-if="createForm.tail_skip_enabled"
+            v-model="createForm.tail_skip_percent" :min="1" :max="50" :step="5"
+            size="small" style="margin-left:10px" />
+          <span v-if="createForm.tail_skip_enabled" class="tail-unit">%</span>
+          <div class="hint">
+            开启后，当前任务剩余量 ≤ 阈值时提前启动下一个任务（同队列最多 2 个并行）
+          </div>
         </el-form-item>
         <el-form-item label="描述">
           <el-input v-model="createForm.description" type="textarea" :rows="3"
@@ -114,10 +137,37 @@
       </template>
     </el-dialog>
 
-    <!-- 队列任务列表对话框 -->
+    <!-- 编辑队列设置对话框 -->
+    <el-dialog v-model="showEditDialog" :title="`编辑队列：${editForm.id}`" width="520px">
+      <el-form :model="editForm" label-width="90px">
+        <el-form-item label="并发量">
+          <el-input-number v-model="editForm.max_concurrent" :min="1" :max="99" />
+          <div class="hint">本队列同时运行的最大任务数；实际生效 = min(全局上限, 该值)</div>
+        </el-form-item>
+        <el-form-item label="长尾跳过">
+          <el-switch v-model="editForm.tail_skip_enabled" />
+          <el-input-number v-if="editForm.tail_skip_enabled"
+            v-model="editForm.tail_skip_percent" :min="1" :max="50" :step="5"
+            size="small" style="margin-left:10px" />
+          <span v-if="editForm.tail_skip_enabled" class="tail-unit">%</span>
+          <div class="hint">
+            当前任务剩余量 ≤ 该百分比时提前启动下一个任务；同队列最多 2 个并行。
+            修改立即生效，正在排队的任务不需要重新入队。
+          </div>
+        </el-form-item>
+        <el-form-item label="描述">
+          <el-input v-model="editForm.description" type="textarea" :rows="3"
+            maxlength="200" show-word-limit />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showEditDialog = false">取消</el-button>
+        <el-button type="primary" @click="handleEditSave" :loading="saving">保存</el-button>
+      </template>
+    </el-dialog>
     <el-dialog v-model="showTasksDialog" :title="`队列详情：${currentQueue?.id}`" width="900px">
       <div class="detail-stats">
-        <span>并发量：<b>{{ currentQueue?.max_concurrent }}</b></span>
+        <span>并发量：<b>{{ currentQueue?.effective_concurrent }}</b><template v-if="currentQueue?.effective_concurrent < currentQueue?.max_concurrent">（队列设置 {{ currentQueue.max_concurrent }}，受全局上限限制）</template></span>
         <span>当前运行任务：<b>{{ currentQueue?.active_tasks }}</b></span>
         <span>排队中任务：<b>{{ currentQueue?.queued_tasks }}</b></span>
       </div>
@@ -156,8 +206,15 @@ const creating = ref(false)
 const createForm = ref({
   id: '',
   max_concurrent: 1,
-  description: ''
+  description: '',
+  tail_skip_enabled: false,
+  tail_skip_percent: 10,
 })
+
+// 编辑队列设置
+const showEditDialog = ref(false)
+const saving = ref(false)
+const editForm = ref({ id: '', max_concurrent: 1, description: '', tail_skip_enabled: false, tail_skip_percent: 10 })
 const createDup = ref(false)
 
 // 筛选 + 分页
@@ -177,7 +234,7 @@ const filteredQueues = computed(() => queues.value.filter(q => {
   if (nameSearch.value && !q.id.toLowerCase().includes(nameSearch.value.toLowerCase())) return false
   if (creatorFilter.value && q.created_by !== creatorFilter.value) return false
   if (statusFilter.value) {
-    const full = q.active_tasks >= q.max_concurrent
+    const full = q.active_tasks >= q.effective_concurrent
     if (statusFilter.value === 'full' && !full) return false
     if (statusFilter.value === 'running' && !(q.active_tasks > 0 && !full)) return false
     if (statusFilter.value === 'idle' && q.active_tasks !== 0) return false
@@ -213,6 +270,37 @@ function canStartQueue(q) {
 function handleQueueCommand(cmd, row) {
   if (cmd === 'delete') deleteQueue(row)
   else if (cmd === 'stop') stopQueue(row)
+  else if (cmd === 'edit') openEdit(row)
+}
+
+function openEdit(row) {
+  editForm.value = {
+    id: row.id,
+    max_concurrent: row.max_concurrent ?? 1,
+    description: row.description || '',
+    tail_skip_enabled: !!row.tail_skip_enabled,
+    tail_skip_percent: row.tail_skip_percent ?? 10,
+  }
+  showEditDialog.value = true
+}
+
+async function handleEditSave() {
+  saving.value = true
+  try {
+    await api.patch(`/queues/${encodeURIComponent(editForm.value.id)}`, {
+      max_concurrent: editForm.value.max_concurrent,
+      description: editForm.value.description,
+      tail_skip_enabled: editForm.value.tail_skip_enabled,
+      tail_skip_percent: editForm.value.tail_skip_percent,
+    })
+    ElMessage.success('队列设置已保存')
+    showEditDialog.value = false
+    loadQueues()
+  } catch (err) {
+    // error shown by interceptor
+  } finally {
+    saving.value = false
+  }
 }
 
 // 队列名去重：本地即时判定 + 后端权威校验
@@ -255,10 +343,12 @@ async function handleCreate() {
       name: createForm.value.id,
       max_concurrent: createForm.value.max_concurrent,
       description: createForm.value.description,
+      tail_skip_enabled: createForm.value.tail_skip_enabled,
+      tail_skip_percent: createForm.value.tail_skip_percent,
     })
     ElMessage.success('队列创建成功')
     showCreateDialog.value = false
-    createForm.value = { id: '', max_concurrent: 1, description: '' }
+    createForm.value = { id: '', max_concurrent: 1, description: '', tail_skip_enabled: false, tail_skip_percent: 10 }
     loadQueues()
   } catch (err) {
     // error shown by interceptor
@@ -362,11 +452,11 @@ function statusText(status) {
 
 // 队列状态：按「当前运行 / 并发量」派生，与设计图一致（已满 / 运行中 / 空闲）
 function queueStatusType(q) {
-  if (q.active_tasks >= q.max_concurrent) return 'danger'
+  if (q.active_tasks >= q.effective_concurrent) return 'danger'
   return q.active_tasks > 0 ? 'success' : 'info'
 }
 function queueStatusText(q) {
-  if (q.active_tasks >= q.max_concurrent) return '已满'
+  if (q.active_tasks >= q.effective_concurrent) return '已满'
   return q.active_tasks > 0 ? '运行中' : '空闲'
 }
 
@@ -386,6 +476,7 @@ onMounted(() => {
 .filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .pagination-bar { display: flex; justify-content: flex-end; margin-top: 16px; }
 .hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+.tail-unit { font-size: 13px; color: var(--text-secondary); margin-left: 4px; }
 .dup-error { font-size: 12px; color: #f56c6c; margin-top: 4px; display: flex; align-items: center; gap: 4px; }
 .dup-ok { font-size: 12px; color: #67c23a; margin-top: 4px; display: flex; align-items: center; gap: 4px; }
 .detail-stats { display: flex; gap: 24px; margin-bottom: 14px; font-size: 13px; color: var(--text-secondary); }

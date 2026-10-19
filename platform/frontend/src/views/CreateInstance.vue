@@ -195,6 +195,13 @@
             </div>
           </el-form-item>
 
+          <el-form-item label="Key 追加沙箱后缀">
+            <el-switch v-model="form.suffix_api_keys" active-text="开启" inactive-text="关闭" />
+            <div style="font-size:12px;color:#999;margin-top:4px">
+              仅自部署模型（网关按 user_id 计费）需要：上传前给模型 Key 追加 <code>_&lt;沙箱标识&gt;</code>。第三方模型请关闭，否则鉴权失败
+            </div>
+          </el-form-item>
+
           <el-form-item label="代码仓">
             <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
               <el-option v-for="repo in codeRepoList" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">

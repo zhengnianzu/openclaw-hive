@@ -26,7 +26,7 @@
           </el-table-column>
           <el-table-column prop="id" label="队列名称" min-width="120" />
           <el-table-column label="当前运行/并发量" width="130" align="center">
-            <template #default="{row}">{{ row.active_tasks }} / {{ row.max_concurrent }}</template>
+            <template #default="{row}">{{ row.active_tasks }} / {{ row.effective_concurrent }}</template>
           </el-table-column>
           <el-table-column label="排队任务数" width="100" align="center">
             <template #default="{row}">{{ row.queued_tasks }}</template>
@@ -46,7 +46,7 @@
         <div v-if="picked" class="q-detail">
           <div class="q-detail-title">队列详情：{{ picked.id }}</div>
           <div class="q-detail-stats">
-            <span>并发量：<b>{{ picked.max_concurrent }}</b></span>
+            <span>并发量：<b>{{ picked.effective_concurrent }}</b></span>
             <span>当前运行任务：<b>{{ picked.active_tasks }}</b></span>
             <span>排队中任务：<b>{{ picked.queued_tasks }}</b></span>
           </div>
@@ -84,7 +84,18 @@
           </el-form-item>
           <el-form-item label="并发量" required>
             <el-input-number v-model="newQueue.max_concurrent" :min="1" :max="99" />
-            <div class="q-hint">同一时间允许运行的最大任务数</div>
+            <div class="q-hint">本队列同时运行的最大任务数；实际生效 = min(全局上限, 该值)</div>
+          </el-form-item>
+          <el-form-item label="长尾跳过">
+            <el-switch v-model="newQueue.tail_skip_enabled" />
+            <el-input-number v-if="newQueue.tail_skip_enabled"
+              v-model="newQueue.tail_skip_percent" :min="1" :max="50" :step="5"
+              size="small" style="margin-left:10px" />
+            <span v-if="newQueue.tail_skip_enabled" class="q-tail-unit">%</span>
+            <div class="q-hint">
+              开启后，当前任务剩余量 ≤ 阈值时提前启动下一个任务（同队列最多 2 个并行）。
+              关闭则严格串行。
+            </div>
           </el-form-item>
           <el-form-item label="描述">
             <el-input v-model="newQueue.description" type="textarea" :rows="3" maxlength="200"
@@ -133,7 +144,7 @@ const picked = ref(null)
 const pickedTasks = ref([])
 const loadingTasks = ref(false)
 
-const newQueue = ref({ id: '', max_concurrent: 1, description: '' })
+const newQueue = ref({ id: '', max_concurrent: 1, description: '', tail_skip_enabled: false, tail_skip_percent: 10 })
 const creating = ref(false)
 const dupMsg = ref('')
 
@@ -143,7 +154,7 @@ watch(() => props.modelValue, (open) => {
     pickedId.value = props.selectedId || ''
     picked.value = null
     pickedTasks.value = []
-    newQueue.value = { id: '', max_concurrent: 1, description: '' }
+    newQueue.value = { id: '', max_concurrent: 1, description: '', tail_skip_enabled: false, tail_skip_percent: 10 }
     dupMsg.value = ''
     loadQueues()
   }
@@ -173,7 +184,7 @@ const filteredQueues = computed(() => queues.value.filter(q => {
   if (search.value && !q.id.toLowerCase().includes(search.value.toLowerCase())) return false
   if (creatorF.value && q.created_by !== creatorF.value) return false
   if (statusF.value) {
-    const full = q.active_tasks >= q.max_concurrent
+    const full = q.active_tasks >= q.effective_concurrent
     if (statusF.value === 'full' && !full) return false
     if (statusF.value === 'running' && !(q.active_tasks > 0 && !full)) return false
     if (statusF.value === 'idle' && q.active_tasks !== 0) return false
@@ -184,11 +195,11 @@ const filteredQueues = computed(() => queues.value.filter(q => {
 const canCreate = computed(() => !!newQueue.value.id && !dupMsg.value)
 
 function queueStatusType(q) {
-  if (q.active_tasks >= q.max_concurrent) return 'danger'
+  if (q.active_tasks >= q.effective_concurrent) return 'danger'
   return q.active_tasks > 0 ? 'success' : 'info'
 }
 function queueStatusText(q) {
-  if (q.active_tasks >= q.max_concurrent) return '已满'
+  if (q.active_tasks >= q.effective_concurrent) return '已满'
   return q.active_tasks > 0 ? '运行中' : '空闲'
 }
 function taskStatusType(s) {
@@ -248,6 +259,8 @@ async function createQueue() {
       name: newQueue.value.id,
       max_concurrent: newQueue.value.max_concurrent,
       description: newQueue.value.description,
+      tail_skip_enabled: newQueue.value.tail_skip_enabled,
+      tail_skip_percent: newQueue.value.tail_skip_percent,
     })
     ElMessage.success(`队列 ${newQueue.value.id} 创建成功`)
     emit('picked', newQueue.value.id)
@@ -269,6 +282,7 @@ function onClosed() {
 .q-detail-stats { display: flex; gap: 24px; margin-bottom: 12px; font-size: 13px; color: var(--text-secondary); }
 .q-detail-stats b { color: var(--text-primary); }
 .q-hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+.q-tail-unit { font-size: 13px; color: var(--text-secondary); margin-left: 4px; }
 .q-dup-error { font-size: 12px; color: #f56c6c; margin-top: 4px; display: flex; align-items: center; gap: 4px; }
 .q-dup-ok { font-size: 12px; color: #67c23a; margin-top: 4px; display: flex; align-items: center; gap: 4px; }
 .mono { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--text-secondary); }

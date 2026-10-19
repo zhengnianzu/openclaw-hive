@@ -181,9 +181,14 @@ def init_db():
 
         # migrate: 队列表补列（IF NOT EXISTS 不会给已存在的表加列）
         # max_concurrent: 队列并发量，仅作展示/记录（当前调度仍是严格串行）
+        # tail_skip_enabled / tail_skip_percent: 长尾跳过。前者打开后允许队列在
+        #   当前任务完成度达到 (100 - tail_skip_percent)% 时提前放行下一个任务，
+        #   同一队列最多 2 个任务占用槽位。
         for col in [
             "max_concurrent INTEGER NOT NULL DEFAULT 1",
             "description TEXT DEFAULT ''",
+            "tail_skip_enabled INTEGER NOT NULL DEFAULT 0",
+            "tail_skip_percent INTEGER NOT NULL DEFAULT 10",
         ]:
             try:
                 conn.execute(f"ALTER TABLE task_queues ADD COLUMN {col}")

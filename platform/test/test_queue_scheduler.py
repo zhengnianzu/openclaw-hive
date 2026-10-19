@@ -33,33 +33,57 @@ class QueueTestBase(unittest.TestCase):
         db.init_db()
         self._old_grace = db.settings.ORPHAN_PREPARING_GRACE_SECONDS
         db.settings.ORPHAN_PREPARING_GRACE_SECONDS = 120
+        # 默认让全局上限足够高，队列自己的 max_concurrent 决定并发；
+        # 验证全局封顶的用例会自己把 QUEUE_MAX_CONCURRENT 调低。
+        self._old_global_max = db.settings.QUEUE_MAX_CONCURRENT
+        db.settings.QUEUE_MAX_CONCURRENT = 10
         self._create_queue("q1")
 
     def tearDown(self):
         db.settings.DB_PATH = self._old_db_path
         db.settings.ORPHAN_PREPARING_GRACE_SECONDS = self._old_grace
+        db.settings.QUEUE_MAX_CONCURRENT = self._old_global_max
         self._tmpdir.cleanup()
 
     # ---- helpers ----
 
-    def _create_queue(self, queue_id):
+    def _create_queue(self, queue_id, max_concurrent=1):
         with db.get_connection() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO task_queues (id, name, max_concurrent, description) "
-                "VALUES (?, ?, 1, '')",
-                (queue_id, queue_id),
+                "VALUES (?, ?, ?, '')",
+                (queue_id, queue_id, max_concurrent),
             )
 
     def _add_task(self, task_id, status="queued", queue_id="q1", pos=1,
-                  concurrent_num=10, created_at=None):
+                  concurrent_num=10, created_at=None, total_tasks=0,
+                  completed_tasks=0, failed_tasks=0):
         with db.get_connection() as conn:
             conn.execute(
                 """INSERT INTO task_instances
-                   (id, name, config_path, status, total_tasks, concurrent_num,
-                    created_at, queue_id, queue_position)
-                   VALUES (?, ?, '/tmp/none.yaml', ?, 0, ?, ?, ?, ?)""",
-                (task_id, task_id, status, concurrent_num,
-                 created_at or datetime.now().isoformat(), queue_id, pos),
+                   (id, name, config_path, status, total_tasks, completed_tasks, failed_tasks,
+                    concurrent_num, created_at, queue_id, queue_position)
+                   VALUES (?, ?, '/tmp/none.yaml', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, task_id, status, total_tasks, completed_tasks, failed_tasks,
+                 concurrent_num, created_at or datetime.now().isoformat(), queue_id, pos),
+            )
+
+    def _set_queue_max(self, n, queue_id="q1"):
+        with db.get_connection() as conn:
+            conn.execute("UPDATE task_queues SET max_concurrent=? WHERE id=?", (n, queue_id))
+
+    def _set_tail_skip(self, enabled=True, percent=10, queue_id="q1"):
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE task_queues SET tail_skip_enabled=?, tail_skip_percent=? WHERE id=?",
+                (1 if enabled else 0, percent, queue_id),
+            )
+
+    def _set_progress(self, task_id, total, completed, failed=0):
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET total_tasks=?, completed_tasks=?, failed_tasks=? WHERE id=?",
+                (total, completed, failed, task_id),
             )
 
     def _status(self, task_id):
@@ -93,6 +117,180 @@ class QueueTestBase(unittest.TestCase):
         with patch.object(inst_mod, "_prepare_and_launch", _stub):
             asyncio.run(qs.schedule_queue(queue_id))
             asyncio.run(asyncio.sleep(0))  # 让 create_task 落地
+
+
+class TailSkipTest(QueueTestBase):
+    """长尾跳过：running 任务剩余量 <= 阈值时提前放行下一个，最多 2 个"""
+
+    def _running(self, completed, total=100):
+        self._add_task("a", status="running", pos=1)
+        self._set_progress("a", total=total, completed=completed)
+
+    def test_disabled_keeps_strict_serial(self):
+        """未开长尾跳过：即使剩余为 0 也不放行。"""
+        self._running(completed=100)
+        self._add_task("b", pos=2)
+        self.assertIsNone(self._claim())
+
+    def test_enabled_but_not_in_tail_window(self):
+        """剩余 20% > 阈值 10%：不放行。"""
+        self._set_tail_skip(True, 10)
+        self._running(completed=80)
+        self._add_task("b", pos=2)
+        self.assertIsNone(self._claim())
+
+    def test_enabled_and_in_tail_window(self):
+        """剩余正好 10%：放行下一个。"""
+        self._set_tail_skip(True, 10)
+        self._running(completed=90)
+        self._add_task("b", pos=2)
+        claimed = self._claim()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], "b")
+
+    def test_enabled_below_threshold(self):
+        self._set_tail_skip(True, 10)
+        self._running(completed=95)
+        self._add_task("b", pos=2)
+        self.assertEqual(self._claim()["id"], "b")
+
+    def test_custom_percent_respected(self):
+        """阈值 30% 时，剩余 20% 就该放行。"""
+        self._set_tail_skip(True, 30)
+        self._running(completed=80)
+        self._add_task("b", pos=2)
+        self.assertIsNotNone(self._claim())
+
+    def test_failed_tasks_count_toward_progress(self):
+        """失败的任务同样算「已处理」，与终态判定口径一致。"""
+        self._set_tail_skip(True, 10)
+        self._add_task("a", status="running", pos=1)
+        self._set_progress("a", total=100, completed=85, failed=8)
+        self._add_task("b", pos=2)
+        self.assertIsNotNone(self._claim())
+
+    def test_queue_max_concurrent_two_allows_two(self):
+        """队列 max_concurrent=2：平时就能同时跑 2 个。"""
+        self._set_queue_max(2)
+        self._add_task("a", status="running", pos=1)
+        self._add_task("b", pos=2)
+        self.assertEqual(self._claim()["id"], "b")
+
+    def test_queue_max_concurrent_two_blocks_third(self):
+        self._set_queue_max(2)
+        self._add_task("a", status="running", pos=1)
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", pos=3)
+        self.assertIsNone(self._claim())
+
+    def test_tail_skip_adds_one_on_top_of_queue_max(self):
+        """队列 2 + 长尾 1 = 峰值 3；窗口内第 3 个放行。"""
+        self._set_queue_max(2)
+        self._set_tail_skip(True, 50)
+        self._running(completed=50)
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", pos=3)
+        self.assertEqual(self._claim()["id"], "c")
+
+    def test_tail_skip_peak_blocked(self):
+        """队列 2 + 长尾 1 = 3，第 4 个不放行。"""
+        self._set_queue_max(2)
+        self._set_tail_skip(True, 50)
+        self._running(completed=50)
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", status="running", pos=3)
+        self._add_task("d", pos=4)
+        self.assertIsNone(self._claim())
+
+    def test_tail_skip_without_window_uses_queue_max(self):
+        """窗口外只允许队列并发 2，第 3 个不放行。"""
+        self._set_queue_max(2)
+        self._set_tail_skip(True, 10)
+        self._running(completed=10)  # 剩余 90%，不在窗口
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", pos=3)
+        self.assertIsNone(self._claim())
+
+    def test_tail_skip_disabled_ignores_window(self):
+        """关闭长尾跳过时，即使进入尾部窗口也只按队列并发放行。"""
+        self._set_queue_max(2)
+        self._set_tail_skip(False, 50)
+        self._running(completed=50)
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", pos=3)
+        self.assertIsNone(self._claim())
+
+    def test_queue_max_one_tail_skip_two(self):
+        """队列 1 + 长尾 1 = 峰值 2。"""
+        self._set_queue_max(1)
+        self._set_tail_skip(True, 50)
+        self._running(completed=50)
+        self._add_task("b", pos=2)
+        self.assertEqual(self._claim()["id"], "b")
+        self._add_task("c", pos=3)
+        self.assertIsNone(self._claim())
+
+    def test_global_cap_limits_queue_max(self):
+        """全局 QUEUE_MAX_CONCURRENT=1 时，队列 max_concurrent=5 也只能跑 1 个。"""
+        db.settings.QUEUE_MAX_CONCURRENT = 1
+        self._set_queue_max(5)
+        self._add_task("a", status="running", pos=1)
+        self._add_task("b", pos=2)
+        self.assertIsNone(self._claim())
+
+    def test_global_cap_limits_tail_peak(self):
+        """全局上限 2 + 队列 2 + 长尾 1 → 基础 min(2,2)=2，峰值 3；全局不封顶长尾。"""
+        db.settings.QUEUE_MAX_CONCURRENT = 2
+        self._set_queue_max(2)
+        self._set_tail_skip(True, 50)
+        self._running(completed=50)
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", pos=3)
+        self.assertEqual(self._claim()["id"], "c")
+
+    def test_global_cap_one_blocks_even_in_window(self):
+        """全局上限 1 + 长尾 1 → 基础 1，窗口内峰值 2。"""
+        db.settings.QUEUE_MAX_CONCURRENT = 1
+        self._set_queue_max(5)
+        self._set_tail_skip(True, 50)
+        self._running(completed=50)
+        self._add_task("b", pos=2)
+        self.assertEqual(self._claim()["id"], "b")
+        self._add_task("c", pos=3)
+        self.assertIsNone(self._claim())
+
+    def test_total_tasks_zero_does_not_trigger(self):
+        """总数未知（0）时无法计算比例，长尾窗口不成立，只按队列并发放行。"""
+        self._set_queue_max(1)
+        self._set_tail_skip(True, 50)
+        self._add_task("a", status="running", pos=1)  # total_tasks=0
+        self._add_task("b", pos=2)
+        self.assertIsNone(self._claim())
+
+    def test_after_tail_task_finishes_falls_back(self):
+        """长尾补位任务结束后，额度回落到队列并发。"""
+        self._set_queue_max(2)
+        self._set_tail_skip(True, 10)
+        self._running(completed=90)
+        self._add_task("b", status="running", pos=2)
+        self._add_task("c", status="running", pos=3)
+        self._add_task("d", pos=4)
+        # a 结束，b/c 都还在跑（剩余 100%）→ 额度回落为 2，但已有 2 个占用者，d 不放行
+        with db.get_connection() as conn:
+            conn.execute("UPDATE task_instances SET status='completed' WHERE id='a'")
+        self.assertIsNone(self._claim())
+
+
+class ScheduleQueueTailSkipTest(QueueTestBase):
+    """schedule_queue 走的是同一套抢占规则"""
+
+    def test_schedule_releases_next_in_tail_window(self):
+        self._set_tail_skip(True, 10)
+        self._add_task("a", status="running", pos=1)
+        self._set_progress("a", total=100, completed=92)
+        self._add_task("b", pos=2)
+        self._run_schedule_with_stub("q1")
+        self.assertEqual(self._status("b"), "preparing")
 
 
 class ClaimTest(QueueTestBase):

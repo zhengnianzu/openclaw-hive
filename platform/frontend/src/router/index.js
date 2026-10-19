@@ -9,6 +9,7 @@ const routes = [
     redirect: '/dashboard',
     children: [
       { path: 'dashboard', name: 'Dashboard', component: () => import('../views/Dashboard.vue') },
+      { path: 'analytics', name: 'Analytics', component: () => import('../views/Analytics.vue') },
       { path: 'create', name: 'Create', component: () => import('../views/CreateInstance.vue') },
       { path: 'queues', name: 'Queues', component: () => import('../views/Queues.vue') },
       { path: 'instance/:id', name: 'InstanceDetail', component: () => import('../views/InstanceDetail.vue') },

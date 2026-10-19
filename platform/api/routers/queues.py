@@ -8,12 +8,28 @@ from datetime import datetime, timedelta
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..core.security import get_current_user
+from ..core.security import get_current_user, require_operator
 from ..core.database import async_query, async_query_one, async_db_execute
-from ..models.instance import QueueInfo, QueueCreate, InstanceInfo, QueueTaskItem
+from ..models.instance import QueueInfo, QueueCreate, QueueUpdate, InstanceInfo, QueueTaskItem
 from .instances import _with_harness_type, _sync_instance_status
+from ..services.queue_scheduler import effective_concurrent, global_max_concurrent
 
 router = APIRouter(prefix="/api/queues", tags=["queues"])
+
+TAIL_SKIP_MIN_PERCENT = 1
+TAIL_SKIP_MAX_PERCENT = 50
+
+
+def _clamp_tail_percent(value: int | None) -> int:
+    """长尾阈值限制在 1-50%。
+
+    上限 50% 是有意的：再大就退化成常规并发，失去「只在长尾阶段补位」的意义。
+    """
+    try:
+        v = int(value if value is not None else 10)
+    except (TypeError, ValueError):
+        v = 10
+    return max(TAIL_SKIP_MIN_PERCENT, min(TAIL_SKIP_MAX_PERCENT, v))
 
 
 def _queue_info(queue: dict, counts: dict, totals: dict) -> QueueInfo:
@@ -24,7 +40,10 @@ def _queue_info(queue: dict, counts: dict, totals: dict) -> QueueInfo:
         id=queue['id'],
         name=name,
         max_concurrent=queue.get('max_concurrent') or 1,
+        effective_concurrent=effective_concurrent(queue.get('max_concurrent')),
         description=queue.get('description') or '',
+        tail_skip_enabled=bool(queue.get('tail_skip_enabled')),
+        tail_skip_percent=queue.get('tail_skip_percent') or 10,
         created_by=queue.get('created_by'),
         created_at=queue['created_at'],
         # active 与调度器的「占用槽位」定义保持一致：preparing 同样占着队列，
@@ -109,23 +128,72 @@ async def create_queue(
     now = datetime.now().isoformat()
     await async_db_execute(
         """
-        INSERT INTO task_queues (id, name, max_concurrent, description, created_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO task_queues
+            (id, name, max_concurrent, description, tail_skip_enabled, tail_skip_percent,
+             created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (queue.id, queue.name or queue.id, max(1, queue.max_concurrent),
-         queue.description, current_user.get('username'), now, now)
+         queue.description, 1 if queue.tail_skip_enabled else 0,
+         _clamp_tail_percent(queue.tail_skip_percent),
+         current_user.get('username'), now, now)
     )
 
     return QueueInfo(
         id=queue.id,
         name=queue.name or queue.id,
         max_concurrent=max(1, queue.max_concurrent),
+        effective_concurrent=effective_concurrent(queue.max_concurrent),
         description=queue.description,
+        tail_skip_enabled=queue.tail_skip_enabled,
+        tail_skip_percent=_clamp_tail_percent(queue.tail_skip_percent),
         created_by=current_user.get('username'),
         created_at=now,
         active_tasks=0,
         queued_tasks=0
     )
+
+
+@router.patch("/{queue_id}", response_model=QueueInfo)
+async def update_queue(
+    queue_id: str,
+    patch: QueueUpdate,
+    current_user: dict = Depends(require_operator),
+):
+    """更新队列设置（长尾跳过等）。
+
+    只允许更新已存在的队列；字段为 None 表示不改。改完立即生效——
+    调度器每次抢占都会重新读任务队列行，无需重启或重新入队。
+    """
+    row = await async_query_one("SELECT * FROM task_queues WHERE id = ?", (queue_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail=f"队列 '{queue_id}' 不存在")
+
+    fields = {}
+    if patch.name is not None:
+        fields["name"] = patch.name or queue_id
+    if patch.max_concurrent is not None:
+        fields["max_concurrent"] = max(1, patch.max_concurrent)
+    if patch.description is not None:
+        fields["description"] = patch.description
+    if patch.tail_skip_enabled is not None:
+        fields["tail_skip_enabled"] = 1 if patch.tail_skip_enabled else 0
+    if patch.tail_skip_percent is not None:
+        fields["tail_skip_percent"] = _clamp_tail_percent(patch.tail_skip_percent)
+
+    if fields:
+        fields["updated_at"] = datetime.now().isoformat()
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        await async_db_execute(
+            f"UPDATE task_queues SET {cols} WHERE id = ?",
+            (*fields.values(), queue_id),
+        )
+
+    merged = dict(row)
+    merged.update(fields)
+    counts = await _counts_by_queue()
+    totals = await _totals_by_queue()
+    return _queue_info(merged, counts, totals)
 
 @router.get("/{queue_id}/tasks", response_model=List[QueueTaskItem])
 async def list_queue_tasks(

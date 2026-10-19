@@ -9,6 +9,10 @@
           <el-icon><Monitor /></el-icon>
           <span>任务管理</span>
         </el-menu-item>
+        <el-menu-item v-if="authStore.isOperator" index="/analytics">
+          <el-icon><DataAnalysis /></el-icon>
+          <span>资源看板</span>
+        </el-menu-item>
         <el-menu-item v-if="authStore.isOperator" index="/queues">
           <el-icon><List /></el-icon>
           <span>队列管理</span>

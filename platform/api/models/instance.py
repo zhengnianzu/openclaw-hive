@@ -16,8 +16,11 @@ class QueueInfo(BaseModel):
     """队列信息模型"""
     id: str
     name: str
-    max_concurrent: int = 1    # 队列并发量（展示用；当前调度为严格串行）
+    max_concurrent: int = 1    # 队列自己设置的上限（1 = 串行）
+    effective_concurrent: int = 1  # 实际生效 = min(全局 QUEUE_MAX_CONCURRENT, max_concurrent)
     description: str = ""
+    tail_skip_enabled: bool = False   # 长尾跳过：任务剩余量 <= 阈值时额外放行一个
+    tail_skip_percent: int = 10       # 剩余任务数百分比阈值（1-50）
     created_by: Optional[str] = None
     created_at: str
     active_tasks: int = 0      # 派生字段：运行中的任务数
@@ -31,8 +34,19 @@ class QueueCreate(BaseModel):
     """创建队列请求模型"""
     id: str                        # 队列ID，用户输入，必须唯一
     name: str = ""                 # 队列显示名称（留空时用 id 兜底）
-    max_concurrent: int = 1        # 并发量，默认 1
+    max_concurrent: int = 1        # 本队列的并发上限（仍受全局 QUEUE_MAX_CONCURRENT 约束）
     description: str = ""
+    tail_skip_enabled: bool = False
+    tail_skip_percent: int = 10    # 剩余任务数 <= 该百分比时额外放行一个
+
+
+class QueueUpdate(BaseModel):
+    """更新队列请求模型（目前只开放长尾跳过与描述/并发量展示值）。"""
+    name: Optional[str] = None
+    max_concurrent: Optional[int] = None
+    description: Optional[str] = None
+    tail_skip_enabled: Optional[bool] = None
+    tail_skip_percent: Optional[int] = None
 
 
 class QueueTaskItem(BaseModel):
@@ -65,6 +79,7 @@ class InstanceCreate(BaseModel):
     model_base_url: str = ""
     model_id: str = ""
     model_api_type: str = ""          # anthropic-messages 或 openai-completions
+    suffix_api_keys: bool = False     # true: 模型 key 追加 _<沙箱标识>（仅自部署模型，第三方须关闭）
 
     # user_proxy_model.json 可配置项（兼容旧字段，映射到 user_simulator）
     user_proxy_model_name: str = ""
@@ -120,6 +135,10 @@ class InstanceInfo(BaseModel):
     memory_request: float = 0.0
     memory_limit: float = 0.0
     sandbox_namespace: str = ""         # 资源池标识（= sandbox_namespace）
+    # 沙箱 OS：'linux' | 'windows'。快照里没有识别依据时按 linux 兜底，
+    # inferred=True 表示这是推断值（历史 env_make 形态 / 快照缺失）。
+    sandbox_type: str = "linux"
+    sandbox_type_inferred: bool = False
 
 
 class InstanceOverview(BaseModel):
