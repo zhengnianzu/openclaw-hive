@@ -346,7 +346,10 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
 def _with_harness_type(d: dict) -> dict:
     if d.get("create_params"):
         try:
-            d["harness_type"] = json.loads(d["create_params"]).get("harness_type", "openclaw")
+            params = json.loads(d["create_params"])
+            d["harness_type"] = params.get("harness_type", "openclaw")
+            # 列表/详情页的标识用：该实例创建时是否开启 key 沙箱后缀
+            d["suffix_api_keys"] = bool(params.get("suffix_api_keys"))
         except Exception:
             pass
     return d

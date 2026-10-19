@@ -136,7 +136,14 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="pagedInstances" v-loading="loading" stripe style="width:100%" border>
-        <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable />
+        <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable>
+          <template #default="{row}">
+            <span>{{ row.name }}</span>
+            <el-tooltip v-if="row.suffix_api_keys" content="模型 Key 带沙箱后缀（自部署模型归因）" placement="top">
+              <span style="color:#f56c6c;margin-left:4px;cursor:help">✱</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="harness_type" label="Harness" width="160" align="center" resizable>
           <template #default="{row}">
             <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type), maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}" effect="dark" size="default">

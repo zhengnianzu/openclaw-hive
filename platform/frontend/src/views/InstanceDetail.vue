@@ -180,6 +180,11 @@
                   <span v-else>-</span>
                 </el-descriptions-item>
                 <el-descriptions-item label="沙箱文件">{{ createParams.sandbox_file || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="Key 沙箱后缀">
+                  <el-tag size="small" :type="createParams.suffix_api_keys ? 'success' : 'info'">
+                    {{ createParams.suffix_api_keys ? '已开启' : '未开启' }}
+                  </el-tag>
+                </el-descriptions-item>
                 <el-descriptions-item label="资源池">
                   <span v-if="inst.sandbox_namespace"><code>{{ inst.sandbox_namespace }}</code></span>
                   <span v-else>-</span>

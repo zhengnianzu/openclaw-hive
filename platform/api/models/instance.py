@@ -122,6 +122,7 @@ class InstanceInfo(BaseModel):
     failed_tasks: int = 0
     concurrent_num: int = 100
     harness_type: str = "openclaw"
+    suffix_api_keys: bool = False       # 创建时是否开启 key 沙箱后缀（列表标识用）
     output_status: Optional[str] = None  # NULL=未做浅层/未输出, done=浅层完成可直接用
     # 准备/拉起进程失败的原因（status='failed' 时展示给用户）。
     # 用户点「启动」重试时会清空。
