@@ -79,7 +79,7 @@ class InstanceCreate(BaseModel):
     model_base_url: str = ""
     model_id: str = ""
     model_api_type: str = ""          # anthropic-messages 或 openai-completions
-    suffix_api_keys: bool = False     # true: 模型 key 追加 _<沙箱标识>（仅自部署模型，第三方须关闭）
+    suffix_api_keys: bool = True      # true: 模型 key 追加 _<沙箱标识>（默认开启；用第三方模型时须手动关闭）
 
     # user_proxy_model.json 可配置项（兼容旧字段，映射到 user_simulator）
     user_proxy_model_name: str = ""
