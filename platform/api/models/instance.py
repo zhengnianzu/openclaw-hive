@@ -142,6 +142,11 @@ class InstanceInfo(BaseModel):
     sandbox_type_inferred: bool = False
 
 
+class OverviewBatchRequest(BaseModel):
+    """首页批量概览请求：一次拿回所有 running/preparing 实例的概览字段。"""
+    ids: List[str] = []
+
+
 class InstanceOverview(BaseModel):
     total: int
     completed: int

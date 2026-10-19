@@ -424,8 +424,7 @@ async function loadInstances() {
   if (isFirstLoad) loading.value = true
   try {
     instances.value = await api.get('/instances')
-    loadTimeEstimates()
-    loadPrepareProgress()
+    await loadOverviews()
   } finally { if (isFirstLoad) loading.value = false }
 }
 
@@ -447,26 +446,30 @@ async function loadResourcePools() {
   }
 }
 
-async function loadTimeEstimates() {
-  const running = instances.value.filter(i => i.status === 'running')
-  const results = await Promise.allSettled(running.map(inst => api.get(`/instances/${inst.id}/overview`)))
-  results.forEach((r, idx) => {
-    if (r.status === 'fulfilled' && r.value.estimated_remaining_seconds != null) {
-      timeEstimates.value[running[idx].id] = r.value
-    }
+// 运行中/准备中实例的概览（剩余时间、下载进度）走批量接口。
+// 之前每个实例单独发一次 /overview，30+ 个实例 → 每轮 30+ 个并发请求；
+// 现在一次请求拿全，后端也只做一遍扫描。
+async function loadOverviews() {
+  const ids = instances.value
+    .filter(i => i.status === 'running' || i.status === 'preparing')
+    .map(i => i.id)
+  if (!ids.length) {
+    timeEstimates.value = {}
+    prepareProgress.value = {}
+    return
+  }
+  let res
+  try {
+    res = await api.post('/instances/overview-batch', { ids }, { silent: true })
+  } catch {
+    return
+  }
+  const nextEstimates = {}
+  Object.entries(res.overviews || {}).forEach(([id, ov]) => {
+    if (ov.estimated_remaining_seconds != null) nextEstimates[id] = ov
   })
-}
-
-async function loadPrepareProgress() {
-  const preparing = instances.value.filter(i => i.status === 'preparing')
-  // 清掉已不在准备中的旧进度
-  Object.keys(prepareProgress.value).forEach(id => {
-    if (!preparing.some(i => i.id === id)) delete prepareProgress.value[id]
-  })
-  const results = await Promise.allSettled(preparing.map(inst => api.get(`/instances/${inst.id}/prepare-progress`)))
-  results.forEach((r, idx) => {
-    if (r.status === 'fulfilled') prepareProgress.value[preparing[idx].id] = r.value
-  })
+  timeEstimates.value = nextEstimates
+  prepareProgress.value = res.prepare_progress || {}
 }
 
 function formatDuration(seconds) {
@@ -514,8 +517,38 @@ function handleCommand(cmd, row) {
   actions[cmd]?.()
 }
 
-onMounted(() => { restoreFromQuery(); harnessStore.load(); loadInstances(); loadQueueOptions(); loadResourcePools(); timer = setInterval(loadInstances, 10000) })
-onUnmounted(() => clearInterval(timer))
+// 轮询间隔从 10s 放宽到 20s：首页数据本身不是秒级敏感，而每轮都要拉
+// 1000+ 条实例，间隔减半等于后端负载减半。标签页隐藏时暂停，切回时补拉一次。
+const POLL_INTERVAL = 20000
+function startPolling() {
+  stopPolling()
+  timer = setInterval(loadInstances, POLL_INTERVAL)
+}
+function stopPolling() {
+  if (timer) { clearInterval(timer); timer = null }
+}
+function handleVisibility() {
+  if (document.hidden) {
+    stopPolling()
+  } else {
+    loadInstances()
+    startPolling()
+  }
+}
+
+onMounted(() => {
+  restoreFromQuery()
+  document.addEventListener('visibilitychange', handleVisibility)
+  harnessStore.load()
+  loadInstances()
+  loadQueueOptions()
+  loadResourcePools()
+  startPolling()
+})
+onUnmounted(() => {
+  stopPolling()
+  document.removeEventListener('visibilitychange', handleVisibility)
+})
 </script>
 
 <style scoped>

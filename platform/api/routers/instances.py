@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -18,7 +19,9 @@ from omegaconf import OmegaConf
 from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
-from ..models.instance import InstanceCreate, InstanceInfo, InstanceOverview
+from ..models.instance import (
+    InstanceCreate, InstanceInfo, InstanceOverview, OverviewBatchRequest,
+)
 from ..services.queue_scheduler import (
     schedule_queue, OCCUPYING_STATUSES,
     slot_condition_sql as _slot_condition_sql,
@@ -286,6 +289,10 @@ def _sync_instance_status(instance: dict, persist: bool = False) -> dict:
     now = time.time()
     cache_key = inst["id"]
     cached = _status_cache.get(cache_key)
+    # 本进程没扫过：先尝试复用 leader 落盘的快照（_count_lines 要整读 NFS 上的 jsonl）
+    if cached is None:
+        _load_shared_caches()
+        cached = _status_cache.get(cache_key)
     if cached and (now - cached[1]) < _STATUS_CACHE_TTL:
         inst["completed_tasks"] = cached[0]["completed_tasks"]
         inst["failed_tasks"] = cached[0]["failed_tasks"]
@@ -371,8 +378,11 @@ def _with_harness_type(d: dict) -> dict:
 
 # snapshot 是定值字符串，同一实例每次轮询都一样，按 hash 缓存解析结果，
 # 避免 10s 一次的 /instances 反复走 OmegaConf。
-_RES_CACHE = {}
-_RES_CACHE_MAX = 2000
+# 单沙箱资源解析缓存。键是 (id, snapshot hash, create_params hash)，快照内容不变
+# 则永远命中。用 LRU 而不是「满了就整体 clear()」：实例总数约 1.1k、上限 2000，
+# 全清一次会让整表 1.1k 份 YAML 同时重新解析（实测约 8s），首页随之卡死。
+_RES_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_RES_CACHE_MAX = 4000
 
 # 解析不出来时的兜底，与沙箱配置表单默认值一致
 _RES_FALLBACK = {"cpu_request": 2.0, "cpu_limit": 3.0, "memory_request": 6.0, "memory_limit": 8.0}
@@ -453,6 +463,7 @@ def _sandbox_resources(row: dict) -> dict:
     cache_key = (row.get("id"), hash(snapshot), hash(create_params))
     hit = _RES_CACHE.get(cache_key)
     if hit is not None:
+        _RES_CACHE.move_to_end(cache_key)
         return hit
 
     out = None
@@ -506,9 +517,10 @@ def _sandbox_resources(row: dict) -> dict:
     out["sandbox_type"] = sb_type
     out["sandbox_type_inferred"] = inferred
 
-    if len(_RES_CACHE) >= _RES_CACHE_MAX:
-        _RES_CACHE.clear()
     _RES_CACHE[cache_key] = out
+    _RES_CACHE.move_to_end(cache_key)
+    while len(_RES_CACHE) > _RES_CACHE_MAX:
+        _RES_CACHE.popitem(last=False)
     return out
 
 
@@ -1697,6 +1709,66 @@ def _count_config_files(root: str) -> int:
         return 0
 
 
+@router.post("/overview-batch")
+def get_overview_batch(payload: OverviewBatchRequest, user: dict = Depends(get_current_user)):
+    """批量返回首页需要的概览字段。
+
+    首页原先对每个 running 实例单独发一次 /overview（当前 30+ 个），每 10s 一轮，
+    单客户端就是 30+ 个并发请求；多个客户端叠加后 overview 峰值约 18 次/秒，
+    每个都要走 _analyze_task_status 的目录扫描，把 worker 单核打满。
+    这里一次性处理，扫描结果在 _analyze_cache 里共享，重复 id 自动去重。
+    """
+    ids = list(dict.fromkeys(payload.ids or []))
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="单次最多查询 500 个实例")
+
+    out: dict = {"overviews": {}, "prepare_progress": {}}
+    if not ids:
+        return out
+
+    placeholders = ",".join("?" * len(ids))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM task_instances WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+    by_id = {dict(r)["id"]: dict(r) for r in rows}
+
+    for iid in ids:
+        row = by_id.get(iid)
+        if not row:
+            continue
+        inst = _sync_instance_status(row)
+        total = inst["total_tasks"]
+        finished = inst["completed_tasks"] + inst["failed_tasks"]
+        running_pods = 0
+        if inst["status"] == "running" and total > finished:
+            running_pods = min(inst["concurrent_num"], total - finished)
+        # overview 与 _sync_instance_status 共用缓存，无需在这里重复扫描
+        _analyze_task_status(inst["config_path"], total, inst["status"])
+        error_tree = _analyze_tree_cache.get(inst["config_path"], [])
+        out["overviews"][iid] = {
+            "total": total,
+            "completed": inst["completed_tasks"],
+            "failed": inst["failed_tasks"],
+            "running": running_pods,
+            "pending": max(0, total - finished - running_pods),
+            "success_rate": round(inst["completed_tasks"] / finished * 100, 1) if finished else 0.0,
+            "error_breakdown": _analyze_cache.get(inst["config_path"], ({}, 0))[0],
+            "error_tree": error_tree,
+            **_estimate_remaining_time(total, finished, inst.get("started_at"), inst["status"]),
+        }
+        if inst["status"] == "preparing":
+            out["prepare_progress"][iid] = {
+                "status": inst["status"],
+                "downloading": True,
+                "downloaded_configs": _count_config_files(
+                    os.path.join(_get_instance_dir(iid), "configs")
+                ),
+                "total_tasks": total or 0,
+            }
+    return out
+
+
 @router.get("/{instance_id}/prepare-progress")
 def get_prepare_progress(instance_id: str, user: dict = Depends(get_current_user)):
     """准备中实例的下载进度：返回已下载到实例 configs 目录的 config 文件数。
@@ -2102,18 +2174,51 @@ def _refresh_running_once():
     return queues_to_schedule
 
 
+def _acquire_refresher_leader():
+    """多 worker 下只让一个进程跑后台刷新。
+
+    uvicorn --workers 4 时每个 worker 都会执行 startup hook，原先 4 份
+    background_cache_refresher 各自扫描同一批实例、重复写同一张表，
+    CPU 直接翻 4 倍。这里用文件上的非阻塞 flock 做 leader 选举：
+    拿到锁的进程才跑刷新，其余进程只标记 _bg_refresh_active 后返回。
+
+    锁句柄必须一直持有到进程退出（进程死掉内核自动释放，新的 leader 下一轮启动时接上）。
+    """
+    try:
+        import fcntl
+        lock_path = os.path.join(os.path.dirname(settings.DB_PATH), ".refresher.lock")
+        fh = open(lock_path, "a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        # 故意不关闭 fh：关闭即释放锁
+        return fh
+    except Exception:
+        # 拿不到文件锁（只读目录等）时退化为「单 worker 假设」，保持旧行为
+        return True
+
+
 async def background_cache_refresher(interval: float = 8.0):
     """
     周期性在线程池里刷新缓存，使 overview/list 请求线程只读缓存、永不触发扫描，
     从根本上避免多客户端并发把 anyio 同步线程池打满。
     """
     global _bg_refresh_active
+    leader = _acquire_refresher_leader()
+    if leader is None:
+        # 非 leader 的 worker：不扫描、不写库，请求线程读 leader 落盘的快照
+        _load_shared_caches()
+        _bg_refresh_active = True
+        return
     # 先同步预热一轮，再开启「请求只读缓存」模式，避免首轮请求撞冷扫描
     try:
         for qid in (await async_execute(_refresh_running_once) or ()):
             asyncio.create_task(schedule_queue(qid))
     except Exception:
         pass
+    _save_shared_caches()
     _bg_refresh_active = True
     while True:
         await asyncio.sleep(interval)
@@ -2122,6 +2227,7 @@ async def background_cache_refresher(interval: float = 8.0):
                 asyncio.create_task(schedule_queue(qid))
         except Exception:
             pass
+        _save_shared_caches()
         # 卡住的 preparing 看门狗：协程中途消失时实例会永久占着队列槽位，
         # 这里超过阈值仍未拿到 pid 的标记为 failed 并放行同队列下一个任务。
         try:
@@ -2141,10 +2247,74 @@ async def background_cache_refresher(interval: float = 8.0):
             pass
 
 
+def _shared_cache_path() -> str:
+    return os.path.join(os.path.dirname(settings.DB_PATH), ".analyze_snapshot.json")
+
+
+_shared_loaded_mtime = [0.0]
+_shared_last_check = [0.0]
+_SHARED_CACHE_ENTRY_CAP = 500
+
+
+def _save_shared_caches() -> None:
+    """leader 把扫描结果落到磁盘，供其它 worker 直接读取。
+
+    uvicorn --workers 4 下每个进程的 _analyze_cache 是独立的。没有这个快照时，
+    非 leader 的 worker 收到 overview 请求会各自把上万份 task 日志重扫一遍
+    （实测 36 个运行中实例冷扫合计 ~115s），造成「时快时卡」。
+    """
+    try:
+        # 只带最近用到的条目：缓存按访问顺序滚动，超出上限的老实例不会再有请求
+        def _tail(d: dict) -> dict:
+            items = list(d.items())[-_SHARED_CACHE_ENTRY_CAP:]
+            return dict(items)
+
+        payload = {
+            "analyze": {k: [v[0], v[1]] for k, v in _tail(_analyze_cache).items()},
+            "tree": _tail(_analyze_tree_cache),
+            "status": {k: [v[0], v[1]] for k, v in _tail(_status_cache).items()},
+        }
+        path = _shared_cache_path()
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _load_shared_caches() -> None:
+    """把 leader 的扫描快照灌进本进程缓存。按 mtime 节流（2s），命中间隔可忽略。"""
+    try:
+        now = time.time()
+        if now - _shared_last_check[0] < 2:
+            return
+        _shared_last_check[0] = now
+        path = _shared_cache_path()
+        st = os.stat(path)
+        if st.st_mtime <= _shared_loaded_mtime[0]:
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        for k, v in (payload.get("analyze") or {}).items():
+            _analyze_cache[k] = (v[0], v[1])
+        _analyze_tree_cache.update(payload.get("tree") or {})
+        for k, v in (payload.get("status") or {}).items():
+            _status_cache[k] = (v[0], v[1])
+        _shared_loaded_mtime[0] = st.st_mtime
+    except Exception:
+        pass
+
+
 def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running") -> dict:
     now = time.time()
     cache_key = config_path
     cached = _analyze_cache.get(cache_key)
+
+    # 本进程没扫过：先看 leader 落盘的快照，能命中就不必自己扫
+    if cached is None:
+        _load_shared_caches()
+        cached = _analyze_cache.get(cache_key)
 
     # 非 running：状态已定，命中缓存直接返回，永不重扫
     if instance_status not in ("running",):

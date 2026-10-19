@@ -111,32 +111,47 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
     """
     inst = _get_instance(instance_id)
 
+    # 只做聚合：此前把该实例全部 task_records（单实例实测 6.4 万行）拉进 Python
+    # 再过滤四遍，本身就要 0.2s+ 且随实例规模线性增长；这个接口被输出页每 10s 调一次。
     with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT tr.traj_level, ttr.task_done AS ttr_task_done "
+        agg = conn.execute(
+            "SELECT tr.traj_level AS lvl, COUNT(*) AS n, "
+            "       SUM(CASE WHEN ttr.task_done THEN 1 ELSE 0 END) AS done_n "
             "FROM task_records tr "
             "LEFT JOIN task_traj_records ttr "
             "  ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name "
-            "WHERE tr.instance_id=? ORDER BY tr.task_idx",
+            "WHERE tr.instance_id=? GROUP BY tr.traj_level",
             (instance_id,),
         ).fetchall()
-        rows = [dict(r) for r in rows]
-        graded = [r for r in rows if r["traj_level"] in _TRAJ_LEVELS]
 
     summary = {lv: 0 for lv in _TRAJ_LEVELS}
-    for r in graded:
-        summary[r["traj_level"]] += 1
-    summary["graded"] = len(graded)
-    summary["total"] = len(rows)
-    summary["task_done"] = sum(1 for r in rows if r.get("ttr_task_done"))
+    total = 0
+    task_done = 0
+    unevaluated = 0
+    failed = 0
+    graded = 0
+    for r in agg:
+        n = r["n"] or 0
+        total += n
+        task_done += r["done_n"] or 0
+        lvl = r["lvl"]
+        if lvl is None:
+            unevaluated += n
+        elif lvl == "failed":
+            failed += n
+        if lvl in _TRAJ_LEVELS:
+            summary[lvl] += n
+            graded += n
+    summary["graded"] = graded
+    summary["total"] = total
+    summary["task_done"] = task_done
     # 未评估 = traj_level 为 NULL（未被浅层分析覆盖/队列未消费）
-    summary["unevaluated"] = sum(1 for r in rows if r["traj_level"] is None)
+    summary["unevaluated"] = unevaluated
 
     # 浅层进度：已分级 + failed 占位 = 处理完；残留 NULL = 未处理。
     # finished 实例已完成分级（历史堆积）时 both = total，进度条隐藏。
     # unaudited = 仍为 NULL 的行数（浅层分析未覆盖/队列未消费）。
-    unaudited = len(rows) - len(graded) - sum(
-        1 for r in rows if r["traj_level"] == "failed")
+    unaudited = total - graded - failed
     queued = False
     status = inst.get("status")
     if status in ("finished", "completed", "stopped"):
@@ -156,9 +171,9 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
         # 浅层进度：processed = graded + failed（已定级）；undone = total - processed；
         # queued = ended 实例且已登记（worker 待处理）；全部行处理后 undone=0。
         "progress": {
-            "approved": len(graded),
-            "failed": sum(1 for r in rows if r["traj_level"] == "failed"),
-            "total": len(rows),
+            "approved": graded,
+            "failed": failed,
+            "total": total,
             "undone": unaudited,
             "queued": queued,
         },

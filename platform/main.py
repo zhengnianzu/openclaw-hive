@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 import json
 import os
@@ -29,6 +30,10 @@ for name in SETTINGS_FILES:
             print(f"警告: {actual} 和 {example} 均不存在，请先创建配置文件", file=sys.stderr)
 
 app = FastAPI(title=settings.PROJECT_NAME)
+
+# 前端打包产物单文件 1.2MB、列表接口单次 650KB，gzip 后约降到 1/3。
+# 未挂这个中间件时，首屏和轮询都在传未压缩的 JSON/JS。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,

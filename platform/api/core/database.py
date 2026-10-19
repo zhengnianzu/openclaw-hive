@@ -228,6 +228,17 @@ def init_db():
         except Exception:
             pass
 
+        # 列表/后台刷新按状态筛选、按创建时间排序。没有索引时
+        # WHERE status IN (...) 与 ORDER BY created_at DESC 都是全表扫（实测 6.8s/次）。
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_instance_status ON task_instances(status)",
+            "CREATE INDEX IF NOT EXISTS idx_instance_created ON task_instances(created_at DESC)",
+        ):
+            try:
+                conn.execute(ddl)
+            except Exception:
+                pass
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

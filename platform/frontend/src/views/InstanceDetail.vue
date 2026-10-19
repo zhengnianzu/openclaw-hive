@@ -942,8 +942,14 @@ async function copyTrajPath() {
   }
 }
 
-async function loadData() {
-  try { const [i, o] = await Promise.all([api.get(`/instances/${id}`), api.get(`/instances/${id}/overview`)]); inst.value = i; overview.value = o } catch {}
+async function loadData(withOverview = true) {
+  try {
+    const reqs = [api.get(`/instances/${id}`)]
+    if (withOverview) reqs.push(api.get(`/instances/${id}/overview`))
+    const [i, o] = await Promise.all(reqs)
+    inst.value = i
+    if (o) overview.value = o
+  } catch {}
   // 准备中：拉下载进度（已下载多少个 config）
   if (inst.value.status === 'preparing') {
     try { prepareInfo.value = await api.get(`/instances/${id}/prepare-progress`) } catch {}
@@ -1709,8 +1715,9 @@ onMounted(async () => {
   // 点击驱动：打开详情页即登记浅层请求（仅 ended 实例；running 由 worker 持续分级，无需登记）。
   // 幂等登记，worker 处理完删登记出队；flag 防止同一会话重复 POST。漏斗进度由 10s 轮询反映。
   maybeTriggerShallow()
-  // config tab 常驻 10s 轮询（无论当前在哪个 tab，保持顶部进度条/状态最新）
-  timer = setInterval(loadData, 10000)
+  // 顶部状态条 10s 轮询；overview 只在「配置信息」tab 需要（汇总/错误树都在那），
+  // 其它 tab 只刷新实例本身，避免每个周期多打一次带目录扫描的 /overview。
+  timer = setInterval(() => loadData(activeTab.value === 'config'), 10000)
   ensureTabLoaded(activeTab.value)
   if (activeTab.value === 'logs') {
     nextTick(() => { if (logContainer.value) logContainer.value.addEventListener('scroll', onScroll) })
