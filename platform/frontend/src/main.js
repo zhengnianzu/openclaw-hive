@@ -3,9 +3,9 @@ import { createPinia } from 'pinia'
 import { ElLoading } from 'element-plus'
 import 'element-plus/dist/index.css'
 import {
-  ArrowDown, Box, CircleCheckFilled, CircleCloseFilled, Coin, Cpu, DataAnalysis,
+  ArrowDown, Bell, Box, CircleCheckFilled, CircleCloseFilled, Coin, Cpu, DataAnalysis,
   Delete, Document, EditPen, Files, Folder, FolderOpened, Grid, Histogram, List,
-  Loading, Monitor, Plus, Search, Setting, Timer, User,
+  Loading, Monitor, Notebook, Plus, Reading, Search, Setting, Timer, Tools, User,
 } from '@element-plus/icons-vue'
 import App from './App.vue'
 import router from './router'
@@ -28,9 +28,9 @@ app.use(router)
 app.use(ElLoading)
 
 const icons = {
-  ArrowDown, Box, CircleCheckFilled, CircleCloseFilled, Coin, Cpu, DataAnalysis,
+  ArrowDown, Bell, Box, CircleCheckFilled, CircleCloseFilled, Coin, Cpu, DataAnalysis,
   Delete, Document, EditPen, Files, Folder, FolderOpened, Grid, Histogram, List,
-  Loading, Monitor, Plus, Search, Setting, Timer, User,
+  Loading, Monitor, Notebook, Plus, Reading, Search, Setting, Timer, Tools, User,
 }
 for (const [key, component] of Object.entries(icons)) {
   app.component(key, component)

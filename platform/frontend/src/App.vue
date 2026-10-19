@@ -178,4 +178,108 @@ body {
 .el-page-header__content {
   font-weight: 600;
 }
+
+/* Markdown 渲染（Wiki / 通知正文）。
+   必须放在全局样式：<style scoped> 命不中 v-html 生成的节点。
+   所有选择器都挂在 .markdown-body 下，避免影响普通页面。 */
+.markdown-body {
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--text-primary);
+  word-wrap: break-word;
+}
+.markdown-body > *:first-child { margin-top: 0; }
+.markdown-body > *:last-child { margin-bottom: 0; }
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  font-weight: 700;
+  line-height: 1.35;
+  margin: 1.6em 0 0.6em;
+  color: var(--text-primary);
+}
+.markdown-body h1 { font-size: 26px; }
+.markdown-body h2 {
+  font-size: 21px;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border-color);
+}
+.markdown-body h3 { font-size: 17px; }
+.markdown-body h4 { font-size: 15px; }
+.markdown-body p { margin: 0 0 1em; }
+.markdown-body ul,
+.markdown-body ol { margin: 0 0 1em; padding-left: 1.6em; }
+.markdown-body li { margin: 0.25em 0; }
+.markdown-body li > p { margin-bottom: 0.35em; }
+.markdown-body a { color: var(--accent-purple); text-decoration: none; }
+.markdown-body a:hover { text-decoration: underline; }
+.markdown-body strong { font-weight: 600; }
+.markdown-body hr {
+  height: 1px;
+  border: 0;
+  background: var(--border-color);
+  margin: 1.6em 0;
+}
+.markdown-body blockquote {
+  margin: 0 0 1em;
+  padding: 0.6em 1em;
+  color: var(--text-secondary);
+  border-left: 3px solid #c7d2fe;
+  background: #f8fafc;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+.markdown-body blockquote > *:last-child { margin-bottom: 0; }
+.markdown-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.15em 0.4em;
+  background: #f1f5f9;
+  border-radius: 4px;
+  color: #be123c;
+}
+.markdown-body pre {
+  margin: 0 0 1em;
+  padding: 14px 16px;
+  background: #1e293b;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+.markdown-body pre code {
+  padding: 0;
+  background: none;
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 0 0 1em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.markdown-body table th,
+.markdown-body table td {
+  border: 1px solid var(--border-color);
+  padding: 8px 12px;
+  text-align: left;
+}
+.markdown-body table th {
+  background: #f8fafc;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.markdown-body img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+}
+.markdown-body .md-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
 </style>

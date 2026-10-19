@@ -16,6 +16,7 @@ from api.core.database import init_db, get_connection
 from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues, sandbox_configs
 from api.routers import batch_output, resource_pools, stats
+from api.routers import wiki, notifications, settings_overview
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
@@ -62,6 +63,12 @@ app.include_router(resource_pools.router)
 app.include_router(stats.router)
 # 批跑作业「输出」页（task_records + task_traj_records；worker 独立进程，不起 co-routine）
 app.include_router(batch_output.router)
+# 文档中心（Wiki）：管理员手写更新说明，可关联配置实体、发布为全局通知
+app.include_router(wiki.router)
+# 全局站内通知：广播 + 已读表（纯请求驱动，无后台循环）
+app.include_router(notifications.router)
+# 系统设置总览：一次返回所有配置实体入口 + 计数
+app.include_router(settings_overview.router)
 
 init_db()
 harness_configs.ensure_defaults()

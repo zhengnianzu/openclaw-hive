@@ -486,3 +486,102 @@ def init_db():
                 UNIQUE(instance_id, role)
             );
         """)
+
+        # 文档中心（Wiki）**索引表**。正文与元数据的真相是 platform/doc/wiki/*.md（Git 管理），
+        # 本表只是可随时从目录重建的派生索引（标题/标签/分类/关联实体/内容 hash/mtime）。
+        # 换机器、删库都不丢内容：api/services/wiki_store.sync_index() 重新扫描即可。
+        # 文件名即 slug，作为跨机器稳定的主键（不自增 id）。
+        # 注意：分类名存进 md 的 frontmatter，category_id 只是索引侧解析结果。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS wiki_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS wiki_documents (
+                slug TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                category_id INTEGER,                          -- 派生自 frontmatter 的 category 名称
+                tags TEXT NOT NULL DEFAULT '',                -- 逗号分隔
+                summary TEXT NOT NULL DEFAULT '',
+                linked_entity_type TEXT NOT NULL DEFAULT '',  -- image|code_repo|harness_config|...
+                linked_entity_key  TEXT NOT NULL DEFAULT '',
+                author TEXT NOT NULL DEFAULT '',
+                updated_by TEXT NOT NULL DEFAULT '',
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT NOT NULL DEFAULT '',        -- 文件全文 hash，用于跳过重复解析
+                file_mtime REAL NOT NULL DEFAULT 0,
+                last_notification_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_wiki_doc_category ON wiki_documents(category_id);
+            CREATE INDEX IF NOT EXISTS idx_wiki_doc_entity   ON wiki_documents(linked_entity_type, linked_entity_key);
+            CREATE INDEX IF NOT EXISTS idx_wiki_doc_updated  ON wiki_documents(updated_at DESC);
+        """)
+
+        # migrate: 早期版本把正文存在 DB（自增 id 主键）。改为文件权威后索引表结构不同，
+        # 旧表里没有 slug 列 —— 直接重建。正文本来就不在 DB，重建不丢任何内容。
+        try:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(wiki_documents)").fetchall()}
+            if "slug" not in cols:
+                conn.execute("DROP TABLE wiki_documents")
+                conn.executescript("""
+                    CREATE TABLE wiki_documents (
+                        slug TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        category_id INTEGER,
+                        tags TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        linked_entity_type TEXT NOT NULL DEFAULT '',
+                        linked_entity_key  TEXT NOT NULL DEFAULT '',
+                        author TEXT NOT NULL DEFAULT '',
+                        updated_by TEXT NOT NULL DEFAULT '',
+                        is_pinned INTEGER NOT NULL DEFAULT 0,
+                        content_hash TEXT NOT NULL DEFAULT '',
+                        file_mtime REAL NOT NULL DEFAULT 0,
+                        last_notification_id INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_wiki_doc_category ON wiki_documents(category_id);
+                    CREATE INDEX IF NOT EXISTS idx_wiki_doc_entity   ON wiki_documents(linked_entity_type, linked_entity_key);
+                    CREATE INDEX IF NOT EXISTS idx_wiki_doc_updated  ON wiki_documents(updated_at DESC);
+                """)
+        except Exception:
+            pass
+
+        # 全局站内通知：**广播表 + 已读表**，不按用户复制通知行。
+        # 发布一次只写 1 行 notifications，读状态按需往 notification_reads 插一行（天然稀疏），
+        # 撤回/改标题都是单行 UPDATE。未读数用 LEFT JOIN 即时算，几十人量级无需物化计数列。
+        # 将来要按角色/用户定向推送时，给 notifications 加 audience 字段即可，已读表不动。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content_md TEXT NOT NULL DEFAULT '',      -- 发布时快照，文档后续编辑不影响已发通知
+                level TEXT NOT NULL DEFAULT 'info',       -- info|success|warning|danger
+                doc_id INTEGER,                           -- 历史字段（早期自增 id 方案），新数据不再写
+                doc_slug TEXT,                            -- 关联文档的 slug；文档已删则前端降级为纯文本
+                created_by TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,       -- 撤回软删，保留已读记录
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS notification_reads (
+                notification_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (notification_id, username)
+            );
+            CREATE INDEX IF NOT EXISTS idx_notif_reads_user ON notification_reads(username);
+        """)
+
+        # migrate: 通知改为按 slug 关联文档（文件权威后不再有自增 id）
+        try:
+            conn.execute("ALTER TABLE notifications ADD COLUMN doc_slug TEXT")
+        except Exception:
+            pass

@@ -4,7 +4,7 @@
       <div class="logo">
         <span class="logo-text">Hive Platform</span>
       </div>
-      <el-menu :default-active="route.path" router class="sidebar-menu">
+      <el-menu :default-active="activeMenu" router class="sidebar-menu">
         <el-menu-item index="/dashboard">
           <el-icon><Monitor /></el-icon>
           <span>任务管理</span>
@@ -20,6 +20,10 @@
         <el-menu-item index="/registrations">
           <el-icon><Document /></el-icon>
           <span>任务登记</span>
+        </el-menu-item>
+        <el-menu-item index="/wiki">
+          <el-icon><Reading /></el-icon>
+          <span>文档中心</span>
         </el-menu-item>
         <el-menu-item index="/config-templates">
           <el-icon><Setting /></el-icon>
@@ -41,6 +45,10 @@
           <el-icon><FolderOpened /></el-icon>
           <span>代码管理</span>
         </el-menu-item>
+        <el-menu-item index="/settings">
+          <el-icon><Tools /></el-icon>
+          <span>系统设置</span>
+        </el-menu-item>
         <el-menu-item v-if="authStore.isAdmin" index="/users">
           <el-icon><User /></el-icon>
           <span>用户管理</span>
@@ -51,6 +59,7 @@
       <el-header class="topbar">
         <div></div>
         <div style="display:flex;align-items:center;gap:12px">
+          <NotificationBell />
           <span class="role-badge" :class="'role-' + authStore.role">{{ roleLabel }}</span>
           <span class="username">{{ authStore.username }}</span>
           <el-button text class="logout-btn" @click="logout">退出</el-button>
@@ -64,24 +73,42 @@
 </template>
 
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
+import { useNotificationStore } from '../stores/notification'
+import NotificationBell from '../components/NotificationBell.vue'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const harnessStore = useHarnessStore()
+const notificationStore = useNotificationStore()
 
 const roleLabel = computed(() => {
   const map = { admin: '管理员', operator: '运行者', viewer: '浏览者' }
   return map[authStore.role] || '浏览者'
 })
 
+// 侧栏高亮：详情页（/wiki/3、/instance/xxx）要让父菜单项亮起来。
+// 原先直接用 route.path，子路径时整条菜单都不高亮。
+const activeMenu = computed(() => {
+  const p = route.path
+  if (p.startsWith('/wiki')) return '/wiki'
+  if (p.startsWith('/instance') || p.startsWith('/logs') || p.startsWith('/outputs')) return '/dashboard'
+  if (p.startsWith('/task-register')) return '/registrations'
+  return p
+})
+
 onMounted(() => {
   if (authStore.token) authStore.fetchMe()
   harnessStore.load()
+  notificationStore.startPolling()
+})
+
+onUnmounted(() => {
+  notificationStore.stopPolling()
 })
 
 function logout() {

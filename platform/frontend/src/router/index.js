@@ -24,6 +24,14 @@ const routes = [
       { path: 'config-templates', name: 'ConfigTemplates', component: () => import('../views/ConfigTemplates.vue') },
       { path: 'harness-configs', name: 'HarnessConfigs', component: () => import('../views/HarnessConfigs.vue') },
       { path: 'sandbox-configs', name: 'SandboxConfigs', component: () => import('../views/SandboxConfigs.vue') },
+      // 文档中心。参数名是 slug（= 文件名），不是自增 id。
+      // wiki/new 必须排在 wiki/:slug 之前，否则 "new" 会被当成 slug
+      { path: 'wiki', name: 'WikiList', component: () => import('../views/WikiList.vue') },
+      { path: 'wiki/new', name: 'WikiNew', component: () => import('../views/WikiEdit.vue'), meta: { adminOnly: true } },
+      { path: 'wiki/:slug', name: 'WikiDetail', component: () => import('../views/WikiDetail.vue') },
+      { path: 'wiki/:slug/edit', name: 'WikiEdit', component: () => import('../views/WikiEdit.vue'), meta: { adminOnly: true } },
+      { path: 'notifications', name: 'NotificationCenter', component: () => import('../views/NotificationCenter.vue') },
+      { path: 'settings', name: 'SettingsOverview', component: () => import('../views/SettingsOverview.vue') },
     ],
   },
 ]
@@ -32,8 +40,17 @@ const router = createRouter({ history: createWebHashHistory(), routes })
 
 router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('token')
-  if (to.name !== 'Login' && to.name !== 'Register' && !token) next({ name: 'Login' })
-  else next()
+  if (to.name !== 'Login' && to.name !== 'Register' && !token) {
+    next({ name: 'Login' })
+    return
+  }
+  // 角色守卫只是防误触（role 取自 localStorage），真正的边界在后端 require_admin。
+  // 未登录时放过，交给上面的登录跳转。
+  if (to.meta?.adminOnly && token && localStorage.getItem('role') !== 'admin') {
+    next({ name: 'WikiList' })
+    return
+  }
+  next()
 })
 
 export default router

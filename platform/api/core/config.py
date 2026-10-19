@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     SETTINGS_DIR: str = ""
     OUTPUT_CACHE: str = ""
     INSTANCE_DIR: str = ""
+    # 文档中心的正文目录（Git 管理；SQLite 只存索引，可随时重建）
+    WIKI_DIR: str = ""
 
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
@@ -72,6 +74,8 @@ class Settings(BaseSettings):
             self.OUTPUT_CACHE = os.path.join(platform_dir, "output_cache")
         if not self.INSTANCE_DIR:
             self.INSTANCE_DIR = os.path.join(platform_dir, "instances")
+        if not self.WIKI_DIR:
+            self.WIKI_DIR = os.path.join(platform_dir, "doc", "wiki")
 
 
 settings = Settings()
