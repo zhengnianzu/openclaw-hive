@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+from collections.abc import MutableMapping
 from datetime import datetime
 from typing import Optional
 
@@ -113,6 +114,24 @@ def _dump_yaml(cfg: dict, path: str):
         f.write(OmegaConf.to_yaml(OmegaConf.create(cfg), resolve=True))
 
 
+def _set_inner_image(inner: dict, image: str) -> None:
+    """写 sandbox.<key>.sandbox.image，并同步 boot_source.ref。
+
+    Windows 配置把同一个镜像地址存了两份（image + boot_source.ref），控制面若读
+    boot_source，只改 image 就会静默启动旧镜像。仅在 boot_source.type == image 时同步，
+    snapshot/其他类型保持不变。
+
+    注意：apply_image() 传进来的 inner 是 OmegaConf 的 DictConfig，不是 dict，
+    所以这里用 MutableMapping 判断（isinstance(..., dict) 对 DictConfig 为 False）。
+    """
+    if not isinstance(inner, MutableMapping):
+        return
+    inner["image"] = image
+    bs = inner.get("boot_source")
+    if isinstance(bs, MutableMapping) and bs.get("type") == "image":
+        bs["ref"] = image
+
+
 # ============================================================================
 # 读取：从文件里抽出界面需要的字段（列表 + 表单回填共用）
 # ============================================================================
@@ -165,7 +184,7 @@ def _apply_summary(cfg: dict, sandbox_key: str, data: dict) -> dict:
         sb["wait_timeout_seconds"] = data["wait_timeout_seconds"]
 
     if "image" in data and data["image"]:
-        inner["image"] = data["image"]
+        _set_inner_image(inner, data["image"])
     if "env_json" in data and data["env_json"] is not None:
         inner["env"] = json.loads(data["env_json"] or "[]")
 
@@ -298,7 +317,8 @@ def apply_image(base, image: str) -> Optional[str]:
     sb = base.get("sandbox")
     if not sb or sb.get(key) is None:
         return None
-    sb[key].setdefault("sandbox", {})["image"] = image
+    sb[key].setdefault("sandbox", {})
+    _set_inner_image(sb[key]["sandbox"], image)
     return key
 
 
