@@ -562,6 +562,9 @@ onMounted(async () => {
     try {
       const params = await api.get(`/instances/${copyFrom}/create-params`)
       Object.assign(form.value, params)
+      // 历史实例的 suffix_api_keys 统一是 false（迁移默认值），直接继承会让
+      // 「复制」出来的新任务默认关闭后缀。复制时回到当前默认值，用户仍可手动改。
+      form.value.suffix_api_keys = true
       form.value.name = params.name + '-copy'
       form.value.task_name = genTaskId()
       // 重跑失败场景: 透传 copy_complete_from, 后端创建时搬源实例 complete.jsonl

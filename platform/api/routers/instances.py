@@ -1273,7 +1273,8 @@ def get_instance_config(instance_id: str, filename: str, user: dict = Depends(ge
 def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT create_params, config_snapshot FROM task_instances WHERE id=?",
+            "SELECT create_params, config_snapshot, suffix_api_keys "
+            "FROM task_instances WHERE id=?",
             (instance_id,),
         ).fetchone()
     if not row:
