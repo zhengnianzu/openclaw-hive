@@ -24,12 +24,10 @@ from fastapi.responses import Response
 from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
+from ..services import proxy as proxy_service
 
 router = APIRouter(prefix="/api/instances", tags=["batch-output"])
 
-# proxy_name.json：IP → 代理名映射（platform/settings/proxy_name.json），不存在则映射为空
-_PROXY_NAME_FILE = os.path.join(settings.SETTINGS_DIR, "proxy_name.json")
-_IP_RE = re.compile(r"https?://([0-9.]+)")
 
 # 面板角色：主Agent 取 create_params 顶层，用户模拟/Evaluator 取 agents[] 对应项
 _MAIN_AGENT_ROLE = "主Agent"
@@ -687,23 +685,13 @@ async def deep_extra_log(instance_id: str, traj_name: str,
 
 
 def _load_proxy_map() -> dict:
-    """读取 proxy_name.json（IP → 代理名）。文件缺失/解析失败/非 dict 时返回空字典（映射为空）。"""
-    try:
-        with open(_PROXY_NAME_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """读取 proxy_name.json（IP → 代理名）。映射缺失/损坏时返回空字典。"""
+    return proxy_service.load_proxy_map()
 
 
 def _proxy_name_for(baseurl: str, proxy_map: dict) -> str:
     """从 baseurl 提取 IP 查代理名；无 IP / 未命中 / 空映射 → 返回空串。"""
-    if not baseurl:
-        return ""
-    m = _IP_RE.search(baseurl)
-    if not m:
-        return ""
-    return proxy_map.get(m.group(1), "")
+    return proxy_service.proxy_identity(baseurl, proxy_map)["proxy_name"]
 
 
 def _key_suffix(api_key) -> str:

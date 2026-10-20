@@ -87,6 +87,17 @@ class PoolUsageItem(BaseModel):
     configured: bool = True
 
 
+class ProxyUsageItem(BaseModel):
+    role: str                   # 主Agent / 用户模拟 / Evaluator
+    host: str                   # 归并后的 IP；无配置时为「未配置」
+    proxy_name: str = ""        # proxy_name.json 命中值，未登记为空
+    baseurl: str = ""           # 归一化后的 URL，便于界面对照
+    instances: int = 0
+    pods: int = 0               # 并发沙箱数（负载口径）
+    cpu: float = 0.0
+    memory_gb: float = 0.0
+
+
 class TrendPoint(BaseModel):
     ts: str
     used_cpu: float = 0.0
@@ -119,4 +130,6 @@ class StatsResponse(BaseModel):
     os_resource_comparison: OsComparison = OsComparison()
     user_leaderboard: list[UserUsage] = []
     pool_usage: list[PoolUsageItem] = []
+    # 模型请求打到哪台代理（按角色拆：主Agent / 用户模拟 / Evaluator）
+    proxy_usage: list[ProxyUsageItem] = []
     trend: Trend = Trend()

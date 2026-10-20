@@ -218,6 +218,53 @@
         </div>
       </el-col>
 
+      <!-- 代理负载：按角色看模型请求压在哪台网关上 -->
+      <el-col :span="24">
+        <div class="glass-card panel">
+          <div class="panel-head">
+            <span class="panel-title">代理负载（按角色）</span>
+            <span class="panel-hint">仅统计运行中实例 · 负载 = 并发沙箱数</span>
+          </div>
+          <el-row :gutter="16">
+            <el-col v-for="role in PROXY_ROLES" :key="role" :xs="24" :md="8">
+              <div class="proxy-role">
+                <div class="proxy-role-head">
+                  <span class="proxy-role-name">{{ role }}</span>
+                  <span class="proxy-role-sum">{{ proxyRolePods(role) }} 沙箱</span>
+                </div>
+                <el-empty
+                  v-if="!proxyOfRole(role).length"
+                  description="暂无运行中实例" :image-size="50" />
+                <div v-for="p in proxyOfRole(role)" :key="p.host" class="proxy-item">
+                  <div class="proxy-head">
+                    <span class="proxy-name">
+                      {{ p.proxy_name || p.host }}
+                      <span v-if="p.proxy_name" class="proxy-ip">{{ p.host }}</span>
+                      <el-tag v-else size="small" type="info">未登记</el-tag>
+                    </span>
+                    <span class="proxy-inst">{{ p.instances }} 实例</span>
+                  </div>
+                  <div class="proxy-row">
+                    <el-progress
+                      :percentage="proxyPercent(role, p.pods)"
+                      :show-text="false" :stroke-width="8"
+                      :color="proxyColor(role)"
+                      class="pool-bar" />
+                    <span class="proxy-val">
+                      {{ p.pods }} 沙箱
+                      <span class="proxy-sub">{{ fmtNum(p.cpu) }} 核 · {{ fmtGi(p.memory_gb) }}</span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </el-col>
+          </el-row>
+          <div class="panel-foot">
+            代理名来自 settings/proxy_name.json（IP → 名称）；未登记的 IP 直接显示地址。结尾的 <code>/v1</code> 与尾斜杠已归并
+          </div>
+        </div>
+      </el-col>
+
       <!-- 趋势 -->
       <el-col :span="24">
         <div class="glass-card panel">
@@ -278,6 +325,7 @@ const sandboxDist = ref([])
 const osCompare = ref({ linux: {}, windows: {} })
 const leaderboard = ref([])
 const pools = ref([])
+const proxyUsage = ref([])
 const trend = ref({ points: [], truncated: false })
 const generatedAt = ref('')
 
@@ -303,6 +351,31 @@ function percentColor(p) {
   if (p >= 90) return '#d03b3b'
   if (p >= 70) return '#fab219'
   return '#2a78d6'
+}
+
+// ---------- 代理负载 ----------
+// 角色顺序与后端 PROXY_ROLES 一致，缺失的角色也要占一栏（避免列数随数据跳动）
+const PROXY_ROLES = ['主Agent', '用户模拟', 'Evaluator']
+const PROXY_ROLE_COLOR = {
+  '主Agent': '#6366f1',
+  '用户模拟': '#10b981',
+  'Evaluator': '#8b5cf6',
+}
+
+function proxyOfRole(role) {
+  return proxyUsage.value.filter(p => p.role === role)
+}
+function proxyRolePods(role) {
+  return proxyOfRole(role).reduce((s, p) => s + (p.pods || 0), 0)
+}
+// 百分比只在同一角色内比较，所以分母取本角色最大值：不同角色的总量量级差很大，
+// 共用一个分母会让小角色整条条形塌成看不见。
+function proxyPercent(role, pods) {
+  const max = Math.max(...proxyOfRole(role).map(p => p.pods || 0), 0)
+  return max ? Math.round((pods / max) * 100) : 0
+}
+function proxyColor(role) {
+  return PROXY_ROLE_COLOR[role] || '#2a78d6'
 }
 
 // ---------- 汇总 ----------
@@ -558,6 +631,7 @@ async function load({ silent = false } = {}) {
     osCompare.value = d.os_resource_comparison || { linux: {}, windows: {} }
     leaderboard.value = d.user_leaderboard || []
     pools.value = d.pool_usage || []
+    proxyUsage.value = d.proxy_usage || []
     trend.value = d.trend || { points: [], truncated: false }
     generatedAt.value = (d.generated_at || '').replace('T', ' ')
   } finally {
@@ -666,6 +740,29 @@ onBeforeUnmount(() => {
 .pool-val { width: 260px; white-space: nowrap; text-align: right; font-size: 12px; color: var(--text-secondary); flex: none; }
 .pool-queued { color: #eb6834; margin-left: 6px; }
 .pool-pct { color: var(--text-muted); margin-left: 6px; }
+
+/* 代理负载：每个角色一栏，栏内各代理按并发沙箱数降序 */
+.proxy-role { padding: 4px 0 12px; }
+.proxy-role-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding-bottom: 8px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--border-color-light);
+}
+.proxy-role-name { font-weight: 600; font-size: 13px; color: var(--text-primary); }
+.proxy-role-sum { font-size: 12px; color: var(--text-muted); }
+.proxy-item { padding: 8px 0; }
+.proxy-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.proxy-name { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+.proxy-ip { margin-left: 6px; font-size: 11px; color: var(--text-muted); font-weight: 400; }
+.proxy-inst { margin-left: auto; font-size: 12px; color: var(--text-muted); }
+.proxy-row { display: flex; align-items: center; gap: 10px; }
+.proxy-val { width: 150px; flex: none; text-align: right; font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+.proxy-sub { display: block; font-size: 11px; color: var(--text-muted); }
+
+@media (max-width: 768px) {
+  .proxy-row { flex-wrap: wrap; }
+  .proxy-val { width: auto; text-align: left; }
+}
 
 @media (max-width: 768px) {
   .pool-row { flex-wrap: wrap; }

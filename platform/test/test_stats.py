@@ -9,6 +9,7 @@
 
 运行：cd platform && python -m unittest test.test_stats -v
 """
+import json
 import os
 import sys
 import unittest
@@ -19,6 +20,7 @@ if PLATFORM_DIR not in sys.path:
     sys.path.insert(0, PLATFORM_DIR)
 
 from api.routers import instances  # noqa: E402
+from api.services import proxy  # noqa: E402
 from api.services import stats  # noqa: E402
 
 
@@ -237,6 +239,104 @@ class TrendTest(unittest.TestCase):
         self.assertIsNotNone(stats.parse_ts("2026-10-19 12:00:00"))
         self.assertIsNone(stats.parse_ts(None))
         self.assertIsNone(stats.parse_ts("nope"))
+
+
+class ProxyNormalizeTest(unittest.TestCase):
+    def test_strip_trailing_slash_and_v1(self):
+        self.assertEqual(proxy.normalize_base_url("http://1.2.3.4:8082/"), "http://1.2.3.4:8082")
+        self.assertEqual(proxy.normalize_base_url("http://1.2.3.4:8082/v1"), "http://1.2.3.4:8082")
+        self.assertEqual(proxy.normalize_base_url("http://1.2.3.4:8082/v1/"), "http://1.2.3.4:8082")
+        self.assertEqual(proxy.normalize_base_url("http://1.2.3.4:8082/V1"), "http://1.2.3.4:8082")
+        self.assertEqual(proxy.normalize_base_url(""), "")
+        self.assertEqual(proxy.normalize_base_url(None), "")
+
+    def test_identity_maps_ip(self):
+        m = {"1.2.3.4": "jumper001"}
+        got = proxy.proxy_identity("http://1.2.3.4:8082/v1", m)
+        self.assertEqual(got["host"], "1.2.3.4")
+        self.assertEqual(got["proxy_name"], "jumper001")
+        self.assertEqual(got["baseurl"], "http://1.2.3.4:8082")
+
+    def test_identity_unknown_ip_is_blank(self):
+        got = proxy.proxy_identity("http://9.9.9.9:8082", {"1.2.3.4": "jumper001"})
+        self.assertEqual(got["host"], "9.9.9.9")
+        self.assertEqual(got["proxy_name"], "")
+
+    def test_identity_non_ip_host_falls_back(self):
+        got = proxy.proxy_identity("http://gw.example.com:8082/v1", {})
+        self.assertEqual(got["host"], "gw.example.com")
+
+
+class ProxyLoadTest(unittest.TestCase):
+    MAP = {"1.2.3.4": "jumper001", "5.6.7.8": "jumper002"}
+
+    def _params(self, main_url="", agents=None):
+        return json.dumps({
+            "model_base_url": main_url,
+            "agents": agents or [],
+        })
+
+    def test_role_split_and_load(self):
+        rows = [
+            _inst(status="running", concurrent_num=100, create_params=self._params(
+                "http://1.2.3.4:8082",
+                [{"name": "user_simulator", "base_url": "http://1.2.3.4:8082/v1"},
+                 {"name": "evaluator", "base_url": "http://5.6.7.8:8082"}]))
+        ]
+        out = stats.proxy_load(rows, self.MAP)
+        by = {(x["role"], x["host"]): x for x in out}
+        self.assertEqual(by[("主Agent", "1.2.3.4")]["pods"], 100)
+        self.assertEqual(by[("用户模拟", "1.2.3.4")]["pods"], 100)
+        self.assertEqual(by[("Evaluator", "5.6.7.8")]["proxy_name"], "jumper002")
+
+    def test_v1_and_plain_merge_into_one_row(self):
+        rows = [
+            _inst(concurrent_num=10, create_params=self._params("http://1.2.3.4:8082")),
+            _inst(concurrent_num=10, create_params=self._params("http://1.2.3.4:8082/v1")),
+            _inst(concurrent_num=10, create_params=self._params("http://1.2.3.4:8082/")),
+        ]
+        out = [x for x in stats.proxy_load(rows, self.MAP) if x["role"] == "主Agent"]
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["pods"], 30)
+        self.assertEqual(out[0]["instances"], 3)
+
+    def test_only_running_counted(self):
+        rows = [
+            _inst(status="running", concurrent_num=10, create_params=self._params("http://1.2.3.4:8082")),
+            _inst(status="queued", concurrent_num=999, create_params=self._params("http://1.2.3.4:8082")),
+            _inst(status="preparing", concurrent_num=999, create_params=self._params("http://1.2.3.4:8082")),
+        ]
+        out = stats.proxy_load(rows, self.MAP)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["pods"], 10)
+
+    def test_missing_create_params_shows_unconfigured(self):
+        rows = [_inst(status="running", concurrent_num=5, create_params=None)]
+        out = stats.proxy_load(rows, self.MAP)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["host"], "未配置")
+        self.assertEqual(out[0]["role"], "主Agent")
+
+    def test_bad_json_does_not_raise(self):
+        rows = [_inst(status="running", create_params="{not json")]
+        out = stats.proxy_load(rows, self.MAP)
+        self.assertEqual(out[0]["host"], "未配置")
+
+    def test_sorted_by_role_then_pods(self):
+        rows = [
+            _inst(concurrent_num=5, create_params=self._params(
+                "http://1.2.3.4:8082",
+                [{"name": "user_simulator", "base_url": "http://5.6.7.8:8082/v1"}])),
+            _inst(concurrent_num=50, create_params=self._params(
+                "http://1.2.3.4:8082",
+                [{"name": "user_simulator", "base_url": "http://1.2.3.4:8082/v1"}])),
+        ]
+        out = stats.proxy_load(rows, self.MAP)
+        roles = [x["role"] for x in out]
+        self.assertEqual(roles, ["主Agent", "用户模拟", "用户模拟"])
+        # 同角色内按 pods 降序
+        self.assertEqual(out[1]["pods"], 50)
+        self.assertEqual(out[2]["pods"], 5)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ sandbox_type / harness_type / sandbox_namespace / started_at / stopped_at。
 
 这里不做 I/O、不碰 DB，便于单测；路由层负责取数。
 """
+import json
 from datetime import datetime, timedelta
 
 # 全量状态顺序（与 Dashboard.vue 的 statusText 一致，缺状态补 0 保证图例稳定）
@@ -240,6 +241,91 @@ def pool_usage(rows: list, pools: dict) -> list:
         for k in ("used_cpu", "used_memory_gb", "queued_cpu", "queued_memory_gb"):
             item[k] = round(item[k], 2)
     return sorted(out.values(), key=lambda x: (not x["configured"], x["namespace"]))
+
+
+# ============================================================================
+# 代理负载：模型请求打到哪台自部署网关（按角色拆分）
+# ============================================================================
+
+# 角色顺序固定，前端三栏布局依赖它（缺角色补空，避免面板列数跳动）
+PROXY_ROLES = ("主Agent", "用户模拟", "Evaluator")
+_PROXY_ROLE_UNCONFIGURED = "未配置"
+
+
+def _create_params(row: dict) -> dict:
+    """create_params 是 JSON 文本；损坏或缺失时当成空配置。"""
+    raw = row.get("create_params")
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _row_agent_urls(params: dict) -> list:
+    """从 create_params 取出 [(role, base_url), ...]。
+
+    主Agent = 顶层 model_base_url；agents[] 里 name == 'evaluator' 归 Evaluator，
+    其余（user_simulator 等）归用户模拟 —— 与 batch_output._build_proxy_rows 一致。
+    """
+    out = [("主Agent", params.get("model_base_url") or "")]
+    for a in (params.get("agents") or []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name") or ""
+        role = "Evaluator" if name == "evaluator" else "用户模拟"
+        out.append((role, a.get("base_url") or ""))
+    return out
+
+
+def proxy_load(rows: list, proxy_map: dict) -> list:
+    """按 (角色, 代理) 聚合运行中实例的并发负载。
+
+    口径：只统计 running；负载 = concurrent_num 累加（一个实例开 500 并发，
+    就是 500 个沙箱在打这台代理）。排队/准备中的实例还没发请求，不计入。
+    """
+    from . import proxy as proxy_service
+
+    agg = {}
+    for r in rows:
+        if r.get("status") != "running":
+            continue
+        pods = int(_num(r.get("concurrent_num")))
+        cpu, mem = instance_cpu(r), instance_mem(r)
+        for role, url in _row_agent_urls(_create_params(r)):
+            ident = proxy_service.proxy_identity(url, proxy_map)
+            key = (role, ident["host"])
+            item = agg.setdefault(key, {
+                "role": role,
+                "host": ident["host"],
+                "proxy_name": ident["proxy_name"],
+                "baseurl": ident["baseurl"],
+                "instances": 0,
+                "pods": 0,
+                "cpu": 0.0,
+                "memory_gb": 0.0,
+            })
+            item["instances"] += 1
+            item["pods"] += pods
+            item["cpu"] += cpu
+            item["memory_gb"] += mem
+
+    for item in agg.values():
+        item["cpu"] = round(item["cpu"], 2)
+        item["memory_gb"] = round(item["memory_gb"], 2)
+        if not item["host"]:
+            # 没有配 base_url 的实例也要露面，否则面板上的总量对不上实例数
+            item["host"] = _PROXY_ROLE_UNCONFIGURED
+
+    role_rank = {r: i for i, r in enumerate(PROXY_ROLES)}
+    return sorted(
+        agg.values(),
+        key=lambda x: (role_rank.get(x["role"], len(PROXY_ROLES)), -x["pods"], x["host"]),
+    )
 
 
 # ============================================================================

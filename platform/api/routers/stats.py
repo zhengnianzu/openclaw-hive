@@ -19,9 +19,10 @@ from ..core.database import async_query
 from ..core.security import require_operator
 from ..models.stats import (
     StatsResponse, StatsSummary, StatusCount, HarnessCount, SandboxTypeCount,
-    OsComparison, UserUsage, PoolUsageItem, Trend, TrendPoint,
+    OsComparison, UserUsage, PoolUsageItem, ProxyUsageItem, Trend, TrendPoint,
 )
 from ..services import stats as stats_service
+from ..services import proxy as proxy_service
 from . import instances, resource_pools
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -118,6 +119,10 @@ async def get_stats(
         ],
         pool_usage=[
             PoolUsageItem(**x) for x in pools
+        ],
+        proxy_usage=[
+            ProxyUsageItem(**x)
+            for x in stats_service.proxy_load(active, proxy_service.load_proxy_map())
         ],
         trend=Trend(
             source="estimated",
