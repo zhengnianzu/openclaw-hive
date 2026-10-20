@@ -190,9 +190,9 @@ def init_db():
 
         # migrate: 队列表补列（IF NOT EXISTS 不会给已存在的表加列）
         # max_concurrent: 队列并发量，仅作展示/记录（当前调度仍是严格串行）
-        # tail_skip_enabled / tail_skip_percent: 长尾跳过。前者打开后允许队列在
-        #   当前任务完成度达到 (100 - tail_skip_percent)% 时提前放行下一个任务，
-        #   同一队列最多 2 个任务占用槽位。
+        # tail_skip_enabled / tail_skip_percent: 长尾跳过。前者打开后，当 running
+        #   任务的剩余任务数 < concurrent_num * tail_skip_percent / 100 时，允许
+        #   队列在基础并发之上额外放行一个任务。
         for col in [
             "max_concurrent INTEGER NOT NULL DEFAULT 1",
             "description TEXT DEFAULT ''",
@@ -487,11 +487,9 @@ def init_db():
             );
         """)
 
-        # 文档中心（Wiki）**索引表**。正文与元数据的真相是 platform/doc/wiki/*.md（Git 管理），
-        # 本表只是可随时从目录重建的派生索引（标题/标签/分类/关联实体/内容 hash/mtime）。
-        # 换机器、删库都不丢内容：api/services/wiki_store.sync_index() 重新扫描即可。
-        # 文件名即 slug，作为跨机器稳定的主键（不自增 id）。
-        # 注意：分类名存进 md 的 frontmatter，category_id 只是索引侧解析结果。
+        # [已废弃] 文档中心索引表 —— 现由 platform/wiki/index.db 独立管理，
+        # 见 api/services/wiki_store.py。这两张表仅为旧库兼容保留，不再读写。
+        # 保留空表不影响任何功能；确认无用后可手工 DROP。
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS wiki_categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

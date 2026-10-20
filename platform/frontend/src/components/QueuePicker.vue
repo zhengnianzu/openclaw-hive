@@ -89,12 +89,12 @@
           <el-form-item label="长尾跳过">
             <el-switch v-model="newQueue.tail_skip_enabled" />
             <el-input-number v-if="newQueue.tail_skip_enabled"
-              v-model="newQueue.tail_skip_percent" :min="1" :max="50" :step="5"
+              v-model="newQueue.tail_skip_percent" :min="1" :max="20" :step="1"
               size="small" style="margin-left:10px" />
             <span v-if="newQueue.tail_skip_enabled" class="q-tail-unit">%</span>
             <div class="q-hint">
-              开启后，当前任务剩余量 ≤ 阈值时提前启动下一个任务（同队列最多 2 个并行）。
-              关闭则严格串行。
+              剩余任务数 &lt; 沙箱并发数 × 阈值% 时提前启动下一个任务。
+              例：并发 100、阈值 5% → 剩余不足 5 个任务时触发。关闭则不额外放行。
             </div>
           </el-form-item>
           <el-form-item label="描述">

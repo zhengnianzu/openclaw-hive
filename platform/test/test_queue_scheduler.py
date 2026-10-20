@@ -120,10 +120,14 @@ class QueueTestBase(unittest.TestCase):
 
 
 class TailSkipTest(QueueTestBase):
-    """长尾跳过：running 任务剩余量 <= 阈值时提前放行下一个，最多 2 个"""
+    """长尾跳过：剩余任务数 < 沙箱并发量 × 阈值% 时提前放行下一个
 
-    def _running(self, completed, total=100):
-        self._add_task("a", status="running", pos=1)
+    判定口径是「剩余工作量喂不满一轮并发」，分母是该任务的 concurrent_num，
+    不是任务总数。
+    """
+
+    def _running(self, completed, total=100, concurrent=100):
+        self._add_task("a", status="running", pos=1, concurrent_num=concurrent)
         self._set_progress("a", total=total, completed=completed)
 
     def test_disabled_keeps_strict_serial(self):
@@ -132,40 +136,84 @@ class TailSkipTest(QueueTestBase):
         self._add_task("b", pos=2)
         self.assertIsNone(self._claim())
 
-    def test_enabled_but_not_in_tail_window(self):
-        """剩余 20% > 阈值 10%：不放行。"""
-        self._set_tail_skip(True, 10)
-        self._running(completed=80)
+    def test_not_in_tail_window(self):
+        """并发 100、阈值 5 → 阈值 5；剩余 6 不放行。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=94)   # 剩余 6
         self._add_task("b", pos=2)
         self.assertIsNone(self._claim())
 
-    def test_enabled_and_in_tail_window(self):
-        """剩余正好 10%：放行下一个。"""
-        self._set_tail_skip(True, 10)
-        self._running(completed=90)
+    def test_in_tail_window(self):
+        """并发 100、阈值 5 → 阈值 5；剩余 4 放行。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=96)   # 剩余 4
         self._add_task("b", pos=2)
         claimed = self._claim()
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed["id"], "b")
 
-    def test_enabled_below_threshold(self):
-        self._set_tail_skip(True, 10)
-        self._running(completed=95)
+    def test_strictly_less_than(self):
+        """剩余正好等于阈值（5）时不放行——用户给定公式是严格小于。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=95)   # 剩余 5
         self._add_task("b", pos=2)
-        self.assertEqual(self._claim()["id"], "b")
+        self.assertIsNone(self._claim())
 
     def test_custom_percent_respected(self):
-        """阈值 30% 时，剩余 20% 就该放行。"""
-        self._set_tail_skip(True, 30)
-        self._running(completed=80)
+        """阈值 10 → 阈值 10；剩余 9 放行。"""
+        self._set_tail_skip(True, 10)
+        self._running(completed=91)   # 剩余 9
         self._add_task("b", pos=2)
+        self.assertIsNotNone(self._claim())
+
+    def test_same_progress_differs_by_percent(self):
+        """同一进度，阈值 10 放行、阈值 5 不放行。"""
+        self._running(completed=91)   # 剩余 9
+        self._add_task("b", pos=2)
+        self._set_tail_skip(True, 5)
+        self.assertIsNone(self._claim())
+        self._set_tail_skip(True, 10)
         self.assertIsNotNone(self._claim())
 
     def test_failed_tasks_count_toward_progress(self):
         """失败的任务同样算「已处理」，与终态判定口径一致。"""
-        self._set_tail_skip(True, 10)
-        self._add_task("a", status="running", pos=1)
-        self._set_progress("a", total=100, completed=85, failed=8)
+        self._set_tail_skip(True, 5)
+        self._add_task("a", status="running", pos=1, concurrent_num=100)
+        self._set_progress("a", total=100, completed=93, failed=4)  # 剩余 3 < 5
+        self._add_task("b", pos=2)
+        self.assertIsNotNone(self._claim())
+
+    def test_denominator_is_concurrency_not_total(self):
+        """总量 10000 时，剩余 500 在旧口径（5% of total）会放行；新口径不放行。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=9500, total=10000, concurrent=100)
+        self._add_task("b", pos=2)
+        self.assertIsNone(self._claim())
+
+    def test_large_total_small_remainder(self):
+        """总量很大也不影响触发点：剩余 4 < 5 就放行。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=9996, total=10000, concurrent=100)
+        self._add_task("b", pos=2)
+        self.assertIsNotNone(self._claim())
+
+    def test_small_concurrency_floor_one(self):
+        """并发 10、阈值 5 → 乘积 0.5，兜底下限为 1：剩余 1 不放行、剩余 0 放行。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=9, total=10, concurrent=10)   # 剩余 1
+        self._add_task("b", pos=2)
+        self.assertIsNone(self._claim())
+
+    def test_small_concurrency_triggers_at_zero_remaining(self):
+        self._set_tail_skip(True, 5)
+        self._running(completed=10, total=10, concurrent=10)  # 剩余 0
+        self._add_task("b", pos=2)
+        self.assertIsNotNone(self._claim())
+
+    def test_zero_concurrency_treated_as_one(self):
+        """并发量异常为 0 时按 1 处理，剩余 0 才触发。"""
+        self._set_tail_skip(True, 5)
+        self._running(completed=10, total=10, concurrent=0)
         self._add_task("b", pos=2)
         self.assertIsNotNone(self._claim())
 
@@ -186,8 +234,8 @@ class TailSkipTest(QueueTestBase):
     def test_tail_skip_adds_one_on_top_of_queue_max(self):
         """队列 2 + 长尾 1 = 峰值 3；窗口内第 3 个放行。"""
         self._set_queue_max(2)
-        self._set_tail_skip(True, 50)
-        self._running(completed=50)
+        self._set_tail_skip(True, 10)
+        self._running(completed=96)   # 剩余 4 < 100×10%
         self._add_task("b", status="running", pos=2)
         self._add_task("c", pos=3)
         self.assertEqual(self._claim()["id"], "c")
@@ -195,8 +243,8 @@ class TailSkipTest(QueueTestBase):
     def test_tail_skip_peak_blocked(self):
         """队列 2 + 长尾 1 = 3，第 4 个不放行。"""
         self._set_queue_max(2)
-        self._set_tail_skip(True, 50)
-        self._running(completed=50)
+        self._set_tail_skip(True, 10)
+        self._running(completed=96)
         self._add_task("b", status="running", pos=2)
         self._add_task("c", status="running", pos=3)
         self._add_task("d", pos=4)
@@ -206,7 +254,7 @@ class TailSkipTest(QueueTestBase):
         """窗口外只允许队列并发 2，第 3 个不放行。"""
         self._set_queue_max(2)
         self._set_tail_skip(True, 10)
-        self._running(completed=10)  # 剩余 90%，不在窗口
+        self._running(completed=10)  # 剩余 90，远不在窗口
         self._add_task("b", status="running", pos=2)
         self._add_task("c", pos=3)
         self.assertIsNone(self._claim())
@@ -214,8 +262,8 @@ class TailSkipTest(QueueTestBase):
     def test_tail_skip_disabled_ignores_window(self):
         """关闭长尾跳过时，即使进入尾部窗口也只按队列并发放行。"""
         self._set_queue_max(2)
-        self._set_tail_skip(False, 50)
-        self._running(completed=50)
+        self._set_tail_skip(False, 10)
+        self._running(completed=96)
         self._add_task("b", status="running", pos=2)
         self._add_task("c", pos=3)
         self.assertIsNone(self._claim())
@@ -223,8 +271,8 @@ class TailSkipTest(QueueTestBase):
     def test_queue_max_one_tail_skip_two(self):
         """队列 1 + 长尾 1 = 峰值 2。"""
         self._set_queue_max(1)
-        self._set_tail_skip(True, 50)
-        self._running(completed=50)
+        self._set_tail_skip(True, 10)
+        self._running(completed=96)
         self._add_task("b", pos=2)
         self.assertEqual(self._claim()["id"], "b")
         self._add_task("c", pos=3)
@@ -242,8 +290,8 @@ class TailSkipTest(QueueTestBase):
         """全局上限 2 + 队列 2 + 长尾 1 → 基础 min(2,2)=2，峰值 3；全局不封顶长尾。"""
         db.settings.QUEUE_MAX_CONCURRENT = 2
         self._set_queue_max(2)
-        self._set_tail_skip(True, 50)
-        self._running(completed=50)
+        self._set_tail_skip(True, 10)
+        self._running(completed=96)
         self._add_task("b", status="running", pos=2)
         self._add_task("c", pos=3)
         self.assertEqual(self._claim()["id"], "c")
@@ -252,8 +300,8 @@ class TailSkipTest(QueueTestBase):
         """全局上限 1 + 长尾 1 → 基础 1，窗口内峰值 2。"""
         db.settings.QUEUE_MAX_CONCURRENT = 1
         self._set_queue_max(5)
-        self._set_tail_skip(True, 50)
-        self._running(completed=50)
+        self._set_tail_skip(True, 10)
+        self._running(completed=96)
         self._add_task("b", pos=2)
         self.assertEqual(self._claim()["id"], "b")
         self._add_task("c", pos=3)
@@ -262,7 +310,7 @@ class TailSkipTest(QueueTestBase):
     def test_total_tasks_zero_does_not_trigger(self):
         """总数未知（0）时无法计算比例，长尾窗口不成立，只按队列并发放行。"""
         self._set_queue_max(1)
-        self._set_tail_skip(True, 50)
+        self._set_tail_skip(True, 10)
         self._add_task("a", status="running", pos=1)  # total_tasks=0
         self._add_task("b", pos=2)
         self.assertIsNone(self._claim())
@@ -271,7 +319,7 @@ class TailSkipTest(QueueTestBase):
         """长尾补位任务结束后，额度回落到队列并发。"""
         self._set_queue_max(2)
         self._set_tail_skip(True, 10)
-        self._running(completed=90)
+        self._running(completed=96)   # 剩余 4 < 10
         self._add_task("b", status="running", pos=2)
         self._add_task("c", status="running", pos=3)
         self._add_task("d", pos=4)
@@ -286,8 +334,8 @@ class ScheduleQueueTailSkipTest(QueueTestBase):
 
     def test_schedule_releases_next_in_tail_window(self):
         self._set_tail_skip(True, 10)
-        self._add_task("a", status="running", pos=1)
-        self._set_progress("a", total=100, completed=92)
+        self._add_task("a", status="running", pos=1, concurrent_num=100)
+        self._set_progress("a", total=100, completed=96)
         self._add_task("b", pos=2)
         self._run_schedule_with_stub("q1")
         self.assertEqual(self._status("b"), "preparing")

@@ -52,7 +52,7 @@
       <el-table-column label="长尾跳过" min-width="120" align="center">
         <template #default="{ row }">
           <el-tag v-if="row.tail_skip_enabled" type="success" size="small" effect="plain">
-            剩余 {{ row.tail_skip_percent }}%
+            并发 ×{{ row.tail_skip_percent }}%
           </el-tag>
           <span v-else class="mono" style="color:#999">关闭</span>
         </template>
@@ -116,11 +116,12 @@
         <el-form-item label="长尾跳过">
           <el-switch v-model="createForm.tail_skip_enabled" />
           <el-input-number v-if="createForm.tail_skip_enabled"
-            v-model="createForm.tail_skip_percent" :min="1" :max="50" :step="5"
+            v-model="createForm.tail_skip_percent" :min="1" :max="20" :step="1"
             size="small" style="margin-left:10px" />
           <span v-if="createForm.tail_skip_enabled" class="tail-unit">%</span>
           <div class="hint">
-            开启后，当前任务剩余量 ≤ 阈值时提前启动下一个任务（同队列最多 2 个并行）
+            剩余任务数 &lt; 沙箱并发数 × 阈值% 时提前启动下一个任务。
+            例：并发 100、阈值 5% → 剩余不足 5 个任务时触发
           </div>
         </el-form-item>
         <el-form-item label="描述">
@@ -147,11 +148,12 @@
         <el-form-item label="长尾跳过">
           <el-switch v-model="editForm.tail_skip_enabled" />
           <el-input-number v-if="editForm.tail_skip_enabled"
-            v-model="editForm.tail_skip_percent" :min="1" :max="50" :step="5"
+            v-model="editForm.tail_skip_percent" :min="1" :max="20" :step="1"
             size="small" style="margin-left:10px" />
           <span v-if="editForm.tail_skip_enabled" class="tail-unit">%</span>
           <div class="hint">
-            当前任务剩余量 ≤ 该百分比时提前启动下一个任务；同队列最多 2 个并行。
+            剩余任务数 &lt; 沙箱并发数 × 该百分比时提前启动下一个任务。
+            例：并发 100、阈值 5% → 剩余不足 5 个任务时触发。
             修改立即生效，正在排队的任务不需要重新入队。
           </div>
         </el-form-item>

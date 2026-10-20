@@ -61,16 +61,24 @@ def slot_condition_sql(placeholders: str) -> str:
     额度规则（全部在 SQL 内完成，保持单语句原子性）：
       基础额度 = min(QUEUE_MAX_CONCURRENT, 队列的 max_concurrent)
       长尾额度 = 基础额度 + 1（仅当队列开启长尾跳过，且已有 running 任务
-                 的剩余量 <= tail_skip_percent% 时）
+                 进入尾部窗口时）
+
+    尾部窗口的口径是**沙箱并发量**而非任务总数：
+      剩余任务数 < max(1, concurrent_num) * tail_skip_percent / 100
+    即「剩下的活已经喂不满一轮并发」。用 total_tasks 作分母时，总量大要等到
+    最后几百个任务才算尾部，早已不是长尾。
+
+    阈值下限 1：并发 10、阈值 5% 时乘积只有 0.5，严格小于会永远等不到；
+    兜底成 1 保证任何配置下「剩余 1 个任务」时都能触发。
     """
     global_max = global_max_concurrent()
-    window = f"""EXISTS (
+    window = """EXISTS (
         SELECT 1 FROM task_instances t
          WHERE t.queue_id = task_instances.queue_id
            AND t.status = 'running'
            AND t.total_tasks > 0
            AND (t.total_tasks - (t.completed_tasks + t.failed_tasks))
-               <= t.total_tasks * q.tail_skip_percent / 100.0
+               < max(1.0, max(1, COALESCE(t.concurrent_num, 1)) * q.tail_skip_percent / 100.0)
     )"""
     return f"""(
         SELECT COUNT(*) FROM task_instances o

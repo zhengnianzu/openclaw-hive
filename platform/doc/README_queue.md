@@ -30,7 +30,8 @@
 | 项 | 说明 |
 |---|---|
 | 配置位置 | `task_queues.tail_skip_enabled` / `tail_skip_percent`,队列新建或编辑时设置 |
-| 进度口径 | `(total_tasks - completed_tasks - failed_tasks) / total_tasks` ≤ `tail_skip_percent / 100` |
+| 进度口径 | `剩余任务数 < concurrent_num × tail_skip_percent / 100`(严格小于) |
+| 为什么不用总量 | 分母是该任务的**沙箱并发量**,不是 `total_tasks`。用总量作分母时,总量 10000 要等到最后 500 个才算「10%」,早已不是长尾;按并发量判定才是「剩下的活喂不满一轮并发」 |
 | 触发条件 | 存在一个 `running` 的占用者处于尾部窗口 |
 | 基础并发 | `min(QUEUE_MAX_CONCURRENT, 队列 max_concurrent)`——与长尾窗口无关 |
 | 长尾额度 | 基础并发 **+1**(仅在尾部窗口内) |
@@ -38,7 +39,9 @@
 | 队列级配置 | `task_queues.tail_skip_enabled` / `tail_skip_percent` / `max_concurrent` |
 | 全局配置 | `.env` 的 `QUEUE_MAX_CONCURRENT`(默认 2)只封顶,不抬高 |
 | 未知总量 | `total_tasks = 0`(任务数还没统计出来)时不触发 |
-| 阈值范围 | 1–50%,超出按边界截断 |
+| 阈值下限 | 乘积不足 1 时兜底为 1:并发 10、阈值 5% → 剩余 0 个才触发 |
+| 并发量为 0 | 按 1 处理(异常数据兜底) |
+| 阈值范围 | 1–20%,超出按边界截断 |
 
 `failed_tasks` 计入「已处理」,与终态判定 `completed + failed >= total_tasks` 的口径一致。
 
@@ -451,10 +454,16 @@ cd platform && python -m unittest discover -s test -p "test_queue_scheduler.py" 
 | 孤儿回收宽限 | `OrphanRecoveryTest.*` | 刚进入 preparing 的不被误伤;超过宽限期才退回 `created` |
 | 重启恢复 | `ResumeTest.*` | 只有含 queued 任务的队列被兜底调度 |
 | 终态写库保护 | `StatusWriteGuardTest.*` | 终态落库不覆盖 `stopped` |
-| 长尾跳过-关闭 | `TailSkipTest.test_disabled_keeps_strict_serial` | 即使剩余 0% 也不放行 |
-| 长尾跳过-窗口外 | `TailSkipTest.test_enabled_but_not_in_tail_window` | 剩余 20% > 阈值 10% 不放行 |
-| 长尾跳过-窗口内 | `TailSkipTest.test_enabled_and_in_tail_window` / `..._custom_percent_respected` | 到达/低于阈值时放行 |
-| 长尾跳过-失败计数 | `TailSkipTest.test_failed_tasks_count_toward_progress` | `failed` 也计入已处理 |
+| 长尾跳过-关闭 | `TailSkipTest.test_disabled_keeps_strict_serial` | 即使剩余 0 也不放行 |
+| 长尾窗口-窗口外 | `TailSkipTest.test_not_in_tail_window` | 并发 100/阈值 5,剩余 6 不放行 |
+| 长尾窗口-窗口内 | `TailSkipTest.test_in_tail_window` | 剩余 4 放行 |
+| 长尾窗口-严格小于 | `TailSkipTest.test_strictly_less_than` | 剩余正好 5 不放行 |
+| 长尾窗口-阈值生效 | `TailSkipTest.test_same_progress_differs_by_percent` | 同一进度 5% 不放行、10% 放行 |
+| 长尾窗口-失败计数 | `TailSkipTest.test_failed_tasks_count_toward_progress` | `failed` 也计入已处理 |
+| 长尾窗口-分母是并发量 | `TailSkipTest.test_denominator_is_concurrency_not_total` | 总量 10000/剩余 500 不放行(旧口径会放行) |
+| 长尾窗口-与总量无关 | `TailSkipTest.test_large_total_small_remainder` | 总量 10000/剩余 4 仍放行 |
+| 长尾窗口-小并发兜底 | `TailSkipTest.test_small_concurrency_floor_one` / `..._triggers_at_zero_remaining` | 并发 10/阈值 5 → 剩余 0 才触发 |
+| 长尾窗口-并发异常 | `TailSkipTest.test_zero_concurrency_treated_as_one` | 并发 0 按 1 处理 |
 | 队列并发=2 | `TailSkipTest.test_queue_max_concurrent_two_allows_two` / `..._blocks_third` | 队列 max_concurrent 决定基础并发 |
 | 队列 2 + 长尾 1 | `TailSkipTest.test_tail_skip_adds_one_on_top_of_queue_max` | 窗口内第 3 个放行 |
 | 峰值封顶 | `TailSkipTest.test_tail_skip_peak_blocked` | 第 4 个不放行 |

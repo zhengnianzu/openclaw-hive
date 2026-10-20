@@ -1,8 +1,9 @@
-"""文档中心（Wiki）—— 正文在 `platform/doc/wiki/*.md`（Git 管理），SQLite 只登索引。
+"""文档中心（Wiki）—— 正文在 `platform/wiki/md/*.md`，索引在 `platform/wiki/index.db`。
 
-- 读：所有登录用户。每次请求先 `sync_index()`（只重解析 mtime 变化的文件），再查索引；
-  正文永远从 `.md` 文件读，所以 git pull / IDE 手改都能立刻反映到界面。
+- 读：所有登录用户。每次请求先 `sync_index()`（按 content_hash 判断变化），再查索引；
+  正文永远从 `.md` 文件读，所以整体拷贝 / IDE 手改都能立刻反映到界面。
 - 写：仅 admin。编辑器保存时写回 `.md`，同时刷新索引。
+- 整个 `platform/wiki/` 目录可单独同步或备份，不涉及主库 `platform.db`。
 - 发布通知：把文档正文快照写进 `notifications`（DB），文档后续修改不影响已发公告。
 
 设计理由见 api/services/wiki_store.py 的模块注释。
@@ -14,6 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..core.database import get_connection
+from ..services.wiki_store import get_wiki_connection, _init_wiki_db
 from ..core.security import get_current_user, require_admin
 from ..models.wiki import (
     LINKED_ENTITY_TYPES,
@@ -59,7 +61,7 @@ def _check_slug(slug: str) -> str:
 
 
 def _category_names(conn) -> dict[int, str]:
-    return {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM wiki_categories")}
+    return {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM categories")}
 
 
 def _to_list_item(rec: dict, cat_names: dict) -> WikiDocumentListItem:
@@ -103,14 +105,17 @@ def _meta_for_file(rec: dict, cat_name: str) -> dict:
 @router.get("/categories", response_model=list[WikiCategoryInfo])
 def list_categories(user: dict = Depends(get_current_user)):
     wiki_store.sync_index()
-    with get_connection() as conn:
+    conn = get_wiki_connection()
+    try:
         rows = conn.execute(
             """SELECT c.id, c.name, c.sort_order, COUNT(d.slug) AS doc_count
-               FROM wiki_categories c
-               LEFT JOIN wiki_documents d ON d.category_id = c.id
+               FROM categories c
+               LEFT JOIN documents d ON d.category_id = c.id
                GROUP BY c.id, c.name, c.sort_order
                ORDER BY c.sort_order ASC, c.id ASC"""
         ).fetchall()
+    finally:
+        conn.close()
     return [WikiCategoryInfo(**dict(r)) for r in rows]
 
 
@@ -119,18 +124,22 @@ def create_category(req: WikiCategoryCreate, user: dict = Depends(WIKI_WRITE)):
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="分类名称不能为空")
-    with get_connection() as conn:
+    conn = get_wiki_connection()
+    try:
         try:
             cursor = conn.execute(
-                "INSERT INTO wiki_categories (name, sort_order) VALUES (?, ?)",
+                "INSERT INTO categories (name, sort_order) VALUES (?, ?)",
                 (name, req.sort_order),
             )
+            conn.commit()
         except Exception:
             raise HTTPException(status_code=400, detail="分类名称已存在")
         row = conn.execute(
-            "SELECT id, name, sort_order FROM wiki_categories WHERE id = ?",
+            "SELECT id, name, sort_order FROM categories WHERE id = ?",
             (cursor.lastrowid,),
         ).fetchone()
+    finally:
+        conn.close()
     return WikiCategoryInfo(**dict(row), doc_count=0)
 
 
@@ -141,44 +150,49 @@ def update_category(category_id: int, req: WikiCategoryUpdate, user: dict = Depe
         updates["name"] = str(updates["name"]).strip()
         if not updates["name"]:
             raise HTTPException(status_code=400, detail="分类名称不能为空")
-    with get_connection() as conn:
-        row0 = conn.execute("SELECT * FROM wiki_categories WHERE id = ?", (category_id,)).fetchone()
+
+    conn = get_wiki_connection()
+    try:
+        _init_wiki_db(conn)
+        row0 = conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone()
         if not row0:
             raise HTTPException(status_code=404, detail="分类不存在")
         old_name = row0["name"]
+        new_name = updates.get("name")
+        slugs = [
+            r["slug"] for r in conn.execute(
+                "SELECT slug FROM documents WHERE category_id = ?", (category_id,)
+            ).fetchall()
+        ]
         if updates:
             set_clause = ", ".join(f"{k} = ?" for k in updates)
             try:
                 conn.execute(
-                    f"UPDATE wiki_categories SET {set_clause} WHERE id = ?",
+                    f"UPDATE categories SET {set_clause} WHERE id = ?",
                     list(updates.values()) + [category_id],
                 )
+                conn.commit()
             except Exception:
                 raise HTTPException(status_code=400, detail="分类名称已存在")
-            # 分类名是写在每个 md 的 frontmatter 里的，改名要同步改写所有引用它的文件
-            new_name = updates.get("name")
-            if new_name and new_name != old_name:
-                rows = conn.execute(
-                    "SELECT slug FROM wiki_documents WHERE category_id = ?", (category_id,)
-                ).fetchall()
-        else:
-            rows = []
         row = conn.execute(
             """SELECT c.id, c.name, c.sort_order, COUNT(d.slug) AS doc_count
-               FROM wiki_categories c
-               LEFT JOIN wiki_documents d ON d.category_id = c.id
+               FROM categories c
+               LEFT JOIN documents d ON d.category_id = c.id
                WHERE c.id = ? GROUP BY c.id""",
             (category_id,),
         ).fetchone()
+    finally:
+        conn.close()
 
-    for r in rows:
-        _rewrite_category_in_file(r["slug"], old_name, updates.get("name"))
-    if rows:
+    # 分类名写在每个 md 的 frontmatter 里，改名要同步改写所有引用它的文件
+    if new_name and new_name != old_name:
+        for slug in slugs:
+            _rewrite_category_in_file(slug, new_name)
         wiki_store.sync_index(force=True)
     return WikiCategoryInfo(**dict(row))
 
 
-def _rewrite_category_in_file(slug: str, old: str, new: Optional[str]):
+def _rewrite_category_in_file(slug: str, new: str):
     parsed = wiki_store.parse_file(slug)
     if not parsed:
         return
@@ -188,25 +202,26 @@ def _rewrite_category_in_file(slug: str, old: str, new: Optional[str]):
 
 @router.delete("/categories/{category_id}")
 def delete_category(category_id: int, user: dict = Depends(WIKI_WRITE)):
-    with get_connection() as conn:
+    conn = get_wiki_connection()
+    try:
+        _init_wiki_db(conn)
         existing = conn.execute(
-            "SELECT id FROM wiki_categories WHERE id = ?", (category_id,)
-        ).fetchone()
+            "SELECT id FROM categories WHERE id = ?", (category_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="分类不存在")
         slugs = [
             r["slug"] for r in conn.execute(
-                "SELECT slug FROM wiki_documents WHERE category_id = ?", (category_id,)
+                "SELECT slug FROM documents WHERE category_id = ?", (category_id,)
             ).fetchall()
         ]
-        conn.execute("UPDATE wiki_documents SET category_id = NULL WHERE category_id = ?", (category_id,))
-        conn.execute("DELETE FROM wiki_categories WHERE id = ?", (category_id,))
+        conn.execute("UPDATE documents SET category_id = NULL WHERE category_id = ?", (category_id,))
+        conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        conn.commit()
+    finally:
+        conn.close()
     # 文档不删，只把 frontmatter 里的 category 去掉
     for slug in slugs:
-        parsed = wiki_store.parse_file(slug)
-        if parsed:
-            meta = _meta_for_file(parsed, "")
-            wiki_store.write_file(slug, meta, parsed["content_md"])
+        _rewrite_category_in_file(slug, "")
     if slugs:
         wiki_store.sync_index(force=True)
     return {"message": "分类已删除"}
@@ -252,18 +267,21 @@ def list_documents(
         params.append(1 if pinned else 0)
 
     where_sql = " AND ".join(where)
-    with get_connection() as conn:
+    conn = get_wiki_connection()
+    try:
         total = conn.execute(
-            f"SELECT COUNT(*) AS cnt FROM wiki_documents WHERE {where_sql}", params
+            f"SELECT COUNT(*) AS cnt FROM documents WHERE {where_sql}", params
         ).fetchone()["cnt"]
         rows = conn.execute(
-            f"""SELECT * FROM wiki_documents
+            f"""SELECT * FROM documents
                 WHERE {where_sql}
                 ORDER BY is_pinned DESC, updated_at DESC
                 LIMIT ? OFFSET ?""",
             params + [page_size, (page - 1) * page_size],
         ).fetchall()
         cat_names = _category_names(conn)
+    finally:
+        conn.close()
     return WikiDocumentList(
         items=[_to_list_item(dict(r), cat_names) for r in rows],
         total=total,
@@ -288,10 +306,10 @@ def _resolve_category(conn, name: str) -> Optional[int]:
     name = (name or "").strip()
     if not name:
         return None
-    row = conn.execute("SELECT id FROM wiki_categories WHERE name = ?", (name,)).fetchone()
+    row = conn.execute("SELECT id FROM categories WHERE name = ?", (name,)).fetchone()
     if row:
         return row["id"]
-    cur = conn.execute("INSERT INTO wiki_categories (name, sort_order) VALUES (?, 100)", (name,))
+    cur = conn.execute("INSERT INTO categories (name, sort_order) VALUES (?, 100)", (name,))
     return cur.lastrowid
 
 
@@ -308,16 +326,19 @@ def create_document(req: WikiDocumentCreate, user: dict = Depends(WIKI_WRITE)):
     if not wiki_store.SLUG_RE.match(slug):
         raise HTTPException(status_code=400, detail="文件名只能包含字母、数字、点、下划线和短横线")
     if wiki_store.parse_file(slug):
-        raise HTTPException(status_code=400, detail=f"文件 doc/wiki/{slug}.md 已存在")
+        raise HTTPException(status_code=400, detail=f"文件 wiki/md/{slug}.md 已存在")
 
     now = datetime.now().isoformat()
-    with get_connection() as conn:
-        cat_name = ""
-        if req.category_id:
+    cat_name = ""
+    if req.category_id:
+        conn = get_wiki_connection()
+        try:
             row = conn.execute(
-                "SELECT name FROM wiki_categories WHERE id = ?", (req.category_id,)
+                "SELECT name FROM categories WHERE id = ?", (req.category_id,)
             ).fetchone()
             cat_name = row["name"] if row else ""
+        finally:
+            conn.close()
     meta = {
         "title": title, "category": cat_name, "tags": req.tags, "summary": req.summary,
         "linked_entity_type": req.linked_entity_type, "linked_entity_key": req.linked_entity_key,
@@ -356,8 +377,11 @@ def update_document(slug: str, req: WikiDocumentUpdate, user: dict = Depends(WIK
     if "category_id" in req.model_dump(exclude_unset=True):
         cid = req.category_id
         if cid:
-            with get_connection() as conn:
-                row = conn.execute("SELECT name FROM wiki_categories WHERE id = ?", (cid,)).fetchone()
+            conn = get_wiki_connection()
+            try:
+                row = conn.execute("SELECT name FROM categories WHERE id = ?", (cid,)).fetchone()
+            finally:
+                conn.close()
             if not row:
                 raise HTTPException(status_code=400, detail="分类不存在")
             cat_name = row["name"]
@@ -389,8 +413,13 @@ def delete_document(slug: str, user: dict = Depends(WIKI_WRITE)):
         raise HTTPException(status_code=404, detail="文档不存在")
     # 文件是真相：删文件。已发通知保留（正文是发布时快照），前端遇到悬空 doc_slug 时降级为纯文本。
     os.remove(path)
-    with get_connection() as conn:
-        conn.execute("DELETE FROM wiki_documents WHERE slug = ?", (slug,))
+    conn = get_wiki_connection()
+    try:
+        _init_wiki_db(conn)
+        conn.execute("DELETE FROM documents WHERE slug = ?", (slug,))
+        conn.commit()
+    finally:
+        conn.close()
     return {"message": "文档已删除"}
 
 
@@ -420,8 +449,15 @@ def publish_document(slug: str, req: WikiPublishRequest, user: dict = Depends(WI
             (title, content_md, level, None, slug, user["username"]),
         )
         notification_id = cursor.lastrowid
-        conn.execute(
-            "UPDATE wiki_documents SET last_notification_id = ? WHERE slug = ?",
+    # 通知记录在主库（运行时数据），last_notification_id 只是索引侧的展示缓存
+    wconn = get_wiki_connection()
+    try:
+        _init_wiki_db(wconn)
+        wconn.execute(
+            "UPDATE documents SET last_notification_id = ? WHERE slug = ?",
             (notification_id, slug),
         )
+        wconn.commit()
+    finally:
+        wconn.close()
     return WikiPublishResponse(notification_id=notification_id)

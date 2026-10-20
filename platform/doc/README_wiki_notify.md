@@ -57,26 +57,32 @@ wiki_documents ──── POST /documents/{slug}/publish ─┐
 因此本模块硬约束：**不在 `main.py` 的 startup 里加任何通知逻辑**（含补发、定时清理），
 **不新增 `while True` 循环**。接收侧是拉取模型（铃铛 60s 轮询），与 worker 数量无关。
 
-**3. Markdown 文件是内容真相，SQLite 只是可重建的索引**
-正文与元数据在 `platform/doc/wiki/*.md`，由 Git 管理：有 commit 历史、diff、blame、回滚，
-也能在 IDE 里直接编辑。`wiki_documents` 表只存派生索引（标题/标签/分类/关联实体/hash/mtime），
-随时可以从目录重建，换机器、删库都不丢内容。
+**3. 文档全部放在 `platform/wiki/` 一个目录里**
+```
+platform/wiki/
+  ├── md/*.md       正文 + YAML frontmatter（唯一内容真相）
+  └── index.db      索引 SQLite（独立文件，不含用户/密码数据）
+```
+- `md/` 由 Git 管理：有 commit 历史、diff、blame、回滚，也能在 IDE 里直接编辑。
+- `index.db` 只存文档元数据与分类，**删掉后由 md 自动重建**。
+- 同步/备份只需拷贝整个 `platform/wiki/` 目录，不涉及主库 `platform.db`。
+- 界面显示的正文永远从 md 读，所以整体拷贝或手改都能立刻反映。
 
-代价是失去了「正文也在一张表里」的强一致 —— 但索引是幂等重建的，且 `load_doc()` 永远从文件读正文，
-所以界面显示的必然等于 Git 里的内容。通知记录与已读状态仍留在 DB：那是 per-user 运行时数据，
-天然不属于 Git。
+通知记录与已读状态仍在主库：那是 per-user 运行时数据，不属于文档目录，也不重建。
 
 ## 数据模型
 
 DDL 在 `api/core/database.py` 的 `init_db()` 末尾，全部为 `CREATE TABLE/INDEX IF NOT EXISTS`，
 多 worker 并发执行幂等。
 
-磁盘（真相）：
+磁盘（真相 + 索引，整目录可同步）：
 
 ```
-platform/doc/wiki/
-  ├── README.md                        ← slug = 文件名（不含 .md）
-  └── openclaw-v3-release.md           ← YAML frontmatter + Markdown 正文
+platform/wiki/
+  ├── md/
+  │   ├── README.md                    ← slug = 文件名（不含 .md）
+  │   └── openclaw-v3-release.md       ← YAML frontmatter + Markdown 正文
+  └── index.db                         ← 索引（categories / documents 两张表）
 ```
 
 ```markdown
@@ -96,29 +102,31 @@ updated_at: '2026-10-19T11:00:00'
 ## 变更
 ```
 
-DB（派生索引 + 运行时状态）：
+`platform/wiki/index.db`（派生索引，可整体删除重建）：
 
 ```sql
-wiki_categories(id, name UNIQUE, sort_order, created_at)
+categories(id, name UNIQUE, sort_order)
+documents(slug PRIMARY KEY, title, category_id, tags, summary,
+          linked_entity_type, linked_entity_key, author, updated_by,
+          is_pinned, content_hash, file_mtime, last_notification_id,
+          created_at, updated_at)
+```
 
--- 索引表，可从目录完整重建
-wiki_documents(slug PRIMARY KEY, title, category_id, tags, summary,
-               linked_entity_type, linked_entity_key,
-               author, updated_by, is_pinned,
-               content_hash, file_mtime, last_notification_id,
-               created_at, updated_at)
+主库 `platform.db`（运行时状态，不进文档目录）：
 
+```sql
 notifications(id, title, content_md, level, doc_id, doc_slug,
               created_by, revoked, created_at)
-
 notification_reads(notification_id, username, read_at,
                    PRIMARY KEY (notification_id, username))
 ```
 
-- **slug = 文件名**，作为跨机器稳定的路由参数（`#/wiki/openclaw-v3-release`），不像自增 id 会因重建顺序漂移。
+- **slug = 文件名**，作为跨机器稳定的路由参数（`#/wiki/openclaw-v3-release`）。
+- **用 `content_hash` 而不是 mtime 判断文件变化**：整体拷贝 / `git checkout` 都会改 mtime，hash 才可靠。
 - **category 在 frontmatter 里存分类名**，不是 id —— diff 可读。改分类名时后端会同步改写所有引用它的文件。
 - `sync_index()` 只重新解析 mtime 变化的文件；目录里没有的 slug 会从索引删除（响应 `git rm` / `git pull`）。
-- 索引表若缺失可直接 `DROP` 重建；正文不在 DB，重建不丢任何内容。
+- `index.db` 整个删掉也能重建；正文不在里面，重建不丢任何内容。
+- 主库里的旧 `wiki_documents` / `wiki_categories` 已废弃（保留空表，不读写）。
 - `tags` 逗号分隔（DB 侧）；按整词匹配用 `(',' || tags || ',') LIKE '%,x,%'`，避免 `harness` 命中 `harness2`。
 - `notifications.content_md` 是**发布时快照**，文档后续编辑不影响已发出的通知。
 - `revoked=1` 为软删，保留已读记录。

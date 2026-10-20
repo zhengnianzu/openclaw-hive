@@ -20,11 +20,11 @@
             v-model="form.slug"
             placeholder="留空则由标题自动生成，如 openclaw-v3-release"
           >
-            <template #prepend>doc/wiki/</template>
+            <template #prepend>wiki/md/</template>
             <template #append>.md</template>
           </el-input>
           <el-input v-else :model-value="route.params.slug" disabled>
-            <template #prepend>doc/wiki/</template>
+            <template #prepend>wiki/md/</template>
             <template #append>.md</template>
           </el-input>
           <div class="hint">

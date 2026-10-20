@@ -17,13 +17,14 @@ from ..services.queue_scheduler import effective_concurrent, global_max_concurre
 router = APIRouter(prefix="/api/queues", tags=["queues"])
 
 TAIL_SKIP_MIN_PERCENT = 1
-TAIL_SKIP_MAX_PERCENT = 50
+TAIL_SKIP_MAX_PERCENT = 20
 
 
 def _clamp_tail_percent(value: int | None) -> int:
-    """长尾阈值限制在 1-50%。
+    """长尾阈值限制在 1-20%。
 
-    上限 50% 是有意的：再大就退化成常规并发，失去「只在长尾阶段补位」的意义。
+    分母是任务的沙箱并发量（默认 100），所以 5% ≈ 剩余 5 个任务。上限收到 20%
+    是有意的：再大就相当于「还剩五分之一轮并发就补位」，退化成常规并发。
     """
     try:
         v = int(value if value is not None else 10)
