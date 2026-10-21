@@ -1438,23 +1438,6 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
 # 启动准备：OBS 下载、打包、任务数统计
 # ============================================================================
 
-def _inject_harness_type(actual_dir: str, harness_type: str):
-    """遍历目录下所有 JSON，注入 harness_type（幂等）。同步阻塞操作，应在线程中调用。"""
-    for _root, _dirs, _files in os.walk(actual_dir):
-        for _fname in _files:
-            if not _fname.endswith(".json"):
-                continue
-            _fpath = os.path.join(_root, _fname)
-            try:
-                with open(_fpath, "r", encoding="utf-8") as _f:
-                    _cfg = json.load(_f)
-                if _cfg.get("harness_type") != harness_type:
-                    _cfg["harness_type"] = harness_type
-                    with open(_fpath, "w", encoding="utf-8") as _f:
-                        json.dump(_cfg, _f, indent=2, ensure_ascii=False)
-            except (json.JSONDecodeError, OSError):
-                pass
-
 
 async def _prepare_instance(instance_id: str, inst: dict):
     """启动前的准备工作：下载用户配置、下载代码仓、打包、统计任务数。"""
@@ -1463,7 +1446,6 @@ async def _prepare_instance(instance_id: str, inst: dict):
     base = OmegaConf.load(config_path)
 
     create_params = json.loads(inst["create_params"]) if inst.get("create_params") else {}
-    harness_type = create_params.get("harness_type", "openclaw")
 
     # --- 下载用户配置（全局缓存，相同路径不重复下载） ---
     user_config_dir = create_params.get("user_config_dir", "")
@@ -1517,10 +1499,6 @@ async def _prepare_instance(instance_id: str, inst: dict):
                 actual_dir = os.path.join(actual_dir, entries[0])
             else:
                 break
-
-        # 注入 harness_type 到每个 JSON（幂等操作）；
-        # 大目录（可能上千个文件、数百 MB）的同步遍历放到线程里，避免阻塞事件循环
-        await asyncio.to_thread(_inject_harness_type, actual_dir, harness_type)
 
         # 更新配置中的 task_input_path
         base.run_config.task.task_input_path = actual_dir

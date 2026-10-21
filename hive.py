@@ -392,7 +392,7 @@ class OpenClawDistillationTask:
         打 key 后缀 / 写主 key / 写端口。副本按 env_id 隔离, 无需锁。
         """
         env_id = self.client_config.env_make.env_id
-        local_dir = Path(self.config.task_output_path) / "local_configs" / env_id
+        local_dir = Path(self.config.task_output_path) / "sandbox_harness_configs" / env_id
         local_dir.mkdir(parents=True, exist_ok=True)
         self.local_config_file = str(local_dir / Path(self.config.sandbox_config.harness_local_config_file).name)
         self.local_model_config_file = str(local_dir / Path(self.config.sandbox_config.user_proxy_model_local_file).name)
@@ -444,7 +444,7 @@ class OpenClawDistillationTask:
                 json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
         self.logger.info(
-            f"local config copies: agent={self.local_config_file}, model={self.local_model_config_file}"
+            f"local config copies: agent={self.local_config_file}\nmodel={self.local_model_config_file}"
         )
 
     async def _copy_agent_config(self, data_config_file, port: Optional[str] = None) -> None:
@@ -488,12 +488,16 @@ class OpenClawDistillationTask:
         self.logger.info("Code extracted successfully")
 
     async def _upload_data_config(self, config_file: str, port: Optional[str] = None) -> None:
-        """Upload task data config file to sandbox.
+        """集中改写 task config，保存独立副本后上传沙箱。
 
-        port 不为 None 时: 把 gateway_ws_url 写入正确端口再上传, 上传后还原本地文件。
-        不管原文件里有没有 gateway_ws_url 字段, 都强制写入 —— 没有此字段时 task 代码
-        fallback 到硬编码的 18789, 导致连接失败。
-        port 为 None 时直接上传, 不修改内容。
+        所有运行时字段都在这里注入：
+        - platform: sandbox_type == windows 时为 windows，否则为 linux；
+        - harness_type: 当前 run_config.harness_type；
+        - agents[].config: 把本地 harness_md 对应的 __default__ 路径插到首部；
+        - gateway_ws_url: port 不为空时写入本次 OpenClaw gateway 端口。
+
+        改写后的文件保存在 task_output_path/sandbox_task_configs/，
+        不修改原始 task config。
         """
         sandbox_type = self.config.sandbox_config.sandbox_type
         if sandbox_type == "windows":
@@ -504,27 +508,55 @@ class OpenClawDistillationTask:
             remote_path = os.path.join(
                 self.config.sandbox_config.data_config_path, os.path.basename(config_file)
             )
+
+        data = json.loads(Path(config_file).read_text(encoding="utf-8"))
+        data["platform"] = "windows" if sandbox_type == "windows" else "linux"
+        data["harness_type"] = self.config.sandbox_config.harness_type
+
+        harness_configs = [
+            f"__default__/{os.path.basename(md_path)}"
+            for md_path in (self.config.harness_md or [])
+            if md_path and os.path.isfile(md_path)
+        ]
+        # 去重并保持 harness_md 的配置顺序。
+        harness_configs = list(dict.fromkeys(harness_configs))
+        if harness_configs:
+            for agent in data.get("agents") or []:
+                if not isinstance(agent, dict):
+                    continue
+                agent_configs = agent.get("config") or []
+                if not isinstance(agent_configs, list):
+                    self.logger.warning(
+                        f"agent config is not a list, replace it: {agent.get('name', '')}"
+                    )
+                    agent_configs = []
+                # 重试上传时也保证幂等：先移除旧的同路径项，再统一放到首部。
+                agent["config"] = harness_configs + [
+                    item for item in agent_configs if item not in harness_configs
+                ]
+
         if port is not None:
-            original = Path(config_file).read_text(encoding="utf-8")
-            try:
-                data = json.loads(original)
-                data["gateway_ws_url"] = f"ws://127.0.0.1:{port}/gateway"
-                Path(config_file).write_text(
-                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                logger.info(
-                    f"data_config gateway_ws_url -> ws://127.0.0.1:{port}/gateway"
-                )
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"could not patch gateway_ws_url in {config_file}: {e}")
-            try:
-                await self._upload_file("data config", config_file, remote_path)
-            finally:
-                Path(config_file).write_text(original, encoding="utf-8")
-        else:
-            await self._upload_file("data config", config_file, remote_path)
-        self.logger.info(f"Uploaded data config: {config_file} -> {remote_path}")
+            data["gateway_ws_url"] = f"ws://127.0.0.1:{port}/gateway"
+
+        local_dir = Path(self.config.task_output_path) / "sandbox_task_configs"
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / Path(config_file).name
+        local_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        self.logger.info(
+            f"Patched data config: platform={data['platform']}, "
+            f"harness_type={data['harness_type']}, "
+            f"harness_md={len(harness_configs)}, port={port or '-'}"
+        )
+        self.logger.info(
+            f"Data config paths: source={Path(config_file).resolve()}, "
+            f"copy={local_path.resolve()}, remote={remote_path}"
+        )
+        await self._upload_file("data config", str(local_path), remote_path)
+        self.logger.info(f"Uploaded data config: {local_path} -> {remote_path}")
 
 
     async def _upload_user_proxy_model_config(self) -> None:
@@ -934,7 +966,8 @@ class OpenClawDistillationTask:
         """harness_md 非空时, 先把其 md 上传到沙箱 agent 源目录作兜底。
 
         run_config.harness_md 是平台选定的 harness 配置 md(AGENTS.md/SOUL.md/USER.md...)
-        的本地绝对路径。逐个上传到 workspace/<code_stem>/<agent_dir>/<basename>;
+        的本地绝对路径。逐个上传到
+        workspace/<code_stem>/<agent_dir>/__default__/<basename>;
         在 _download_s3_agents 之前执行, OBS agents 下载若有同名文件则覆盖之,
         之后各 harness 的 _copy_agent_configs 再把它拷进 agent workspace。空则完全跳过。
         """
@@ -953,11 +986,11 @@ class OpenClawDistillationTask:
         code_stem = Path(self.config.main_code_tar).stem
         if sandbox_type == "windows":
             target_dir = str(PureWindowsPath(
-                self.config.sandbox_config.workspace, code_stem, agent_dir
+                self.config.sandbox_config.workspace, code_stem, agent_dir, "__default__"
             ))
         else:
             target_dir = os.path.join(
-                self.config.sandbox_config.workspace, code_stem, agent_dir
+                self.config.sandbox_config.workspace, code_stem, agent_dir, "__default__"
             )
 
         uploaded = 0
