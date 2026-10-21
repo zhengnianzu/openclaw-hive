@@ -228,6 +228,7 @@ class TaskConfig:
     simple_bash_timeout: int = 10
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
     model_api_key: str = ""  # 主 agent 原始 key(平台传入), suffix_api_keys 时在 hive 里打后缀
+    harness_md: list = field(default_factory=list)  # 平台选定 harness 配置 md 的本地绝对路径列表
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
@@ -626,6 +627,7 @@ class OpenClawDistillationTask:
         )
         poll_interval = 5
         max_polls = max(1, self.config.sandbox_config.openclaw_start_timeout // poll_interval)
+        ready_marker = "__HIVE_JIUWENSWARM_READY__"
 
         start_time = asyncio.get_running_loop().time()
         max_wait = self.config.openclaw_gateway_timeout
@@ -644,9 +646,15 @@ class OpenClawDistillationTask:
                 f"mkdir -p {self.config.sandbox_config.result_workdir} && "
                 f"nohup {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
                 # 轮询就绪(每 5s grep 一次), 就绪即退出, 而非固定 sleep 180s
+                f"ready=0; "
                 f"for i in $(seq 1 {max_polls}); do sleep {poll_interval}; "
-                f"if grep -qE 'Gateway server started|服务已启动' {gateway_log_path}; then break; fi; done; "
-                f"cat {gateway_log_path}"
+                f"if grep -qE 'Gateway server started|服务已启动' {gateway_log_path}; "
+                f"then ready=1; break; fi; done; "
+                # 哨兵必须先于日志输出, 就绪后只打印到标识行为止(不 tail 全量)。
+                f"if [ \"$ready\" -eq 1 ]; then echo {ready_marker}; "
+                f"awk '/Gateway server started|服务已启动/ {{print; exit}} {{print}}' {gateway_log_path}; "
+                f"else echo __HIVE_JIUWENSWARM_NOT_READY__; "
+                f"tail -n 200 {gateway_log_path}; exit 124; fi"
             ]
             exec_request = ExtendExecCommand(
                 command=gateway_cmd,
@@ -654,14 +662,31 @@ class OpenClawDistillationTask:
             )
             result = await self.execution_client.extend(args=exec_request.to_dict())
 
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+            result_data = result.data or {}
+            stdout = result_data.get("stdout", "") or ""
+            exit_code = result_data.get("exit_code")
+
+            if result.code == ErrorCode.SUCCESS[0] and exit_code == 124:
+                self.logger.error(
+                    f"[S002] jiuwenswarm gateway startup timeout "
+                    f"({self.config.sandbox_config.openclaw_start_timeout}s)"
+                )
+                _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup timeout",
+                                    result, level=logging.ERROR)
+                raise HiveError(
+                    "S002",
+                    detail=(f"{self.config.sandbox_config.openclaw_start_timeout}s / "
+                            f"config={os.path.basename(config_file)}"),
+                    sandbox_result=result,
+                )
+
+            if result.code != ErrorCode.SUCCESS[0] or exit_code != 0:
                 self.logger.error("[S001] jiuwenswarm gateway start failed")
                 _log_sandbox_detail(self.logger, "jiuwenswarm gateway start failed",
                                     result, level=logging.ERROR)
                 raise HiveError("S001", detail=os.path.basename(config_file), sandbox_result=result)
 
-            stdout = result.data.get("stdout", "")
-            if "服务已启动" in stdout or "Gateway server started" in stdout:
+            if ready_marker in stdout:
                 _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup OK", result)
                 break
 
@@ -905,6 +930,52 @@ class OpenClawDistillationTask:
             raise HiveError("S007", detail=bucket_path, sandbox_result=result)
         self.logger.info(f"Downloaded agents in {time.time() - start_time:.1f}s")
 
+    async def _upload_harness_md(self, config_file: str, sandbox_type: str) -> None:
+        """harness_md 非空时, 先把其 md 上传到沙箱 agent 源目录作兜底。
+
+        run_config.harness_md 是平台选定的 harness 配置 md(AGENTS.md/SOUL.md/USER.md...)
+        的本地绝对路径。逐个上传到 workspace/<code_stem>/<agent_dir>/<basename>;
+        在 _download_s3_agents 之前执行, OBS agents 下载若有同名文件则覆盖之,
+        之后各 harness 的 _copy_agent_configs 再把它拷进 agent workspace。空则完全跳过。
+        """
+        harness_md = self.config.harness_md or []
+        if not harness_md:
+            return
+
+        data_cfg = parse_data_config(config_file)
+        agent_dir = (data_cfg.input_dir or {}).get("agent_dir") or ""
+        if not agent_dir:
+            self.logger.warning(
+                "harness_md set but task config has no input_dir.agent_dir, skip"
+            )
+            return
+
+        code_stem = Path(self.config.main_code_tar).stem
+        if sandbox_type == "windows":
+            target_dir = str(PureWindowsPath(
+                self.config.sandbox_config.workspace, code_stem, agent_dir
+            ))
+        else:
+            target_dir = os.path.join(
+                self.config.sandbox_config.workspace, code_stem, agent_dir
+            )
+
+        uploaded = 0
+        for md_path in harness_md:
+            if not md_path or not os.path.isfile(md_path):
+                self.logger.warning(f"harness_md file missing, skip: {md_path}")
+                continue
+            name = os.path.basename(md_path)
+            if sandbox_type == "windows":
+                remote_path = str(PureWindowsPath(target_dir, name))
+            else:
+                remote_path = os.path.join(target_dir, name)
+            await self._upload_file("harness md", md_path, remote_path)
+            uploaded += 1
+        self.logger.info(
+            f"Uploaded harness md ({uploaded}/{len(harness_md)}) -> {target_dir}"
+        )
+
     def _derive_agent_names(self, config_file: str) -> list[str]:
         """从 task config 的 agents[].name 提取去重后的 agent 名列表。"""
         data_cfg = parse_data_config(config_file)
@@ -1045,12 +1116,26 @@ class OpenClawDistillationTask:
                 self.logger.warning(f"[upload_traj] purge failed {target}: {e}")
 
         # ---- 上传: 每个源单独 exec, 各自判定 ok / missing / fail ----
+        # S009 多为 OBS/网络瞬时抖动, 失败源最多重试 3 次(共 4 次尝试), 重试间 sleep 退避。
+        upload_retries = 3
+        retry_delay = 5  # 秒
         uploaded_srcs: list[str] = []
         missing_srcs: list[str] = []
         failures: list[str] = []
-        try:
-            for src, dst in uploads:
-                outcome = await self._upload_one(src, dst, sandbox_type, config_dir)
+        pending = list(uploads)
+        for attempt in range(1, upload_retries + 2):  # 第 1 次为初试, 之后为重试
+            next_pending = []
+            attempt_failures: list[str] = []
+            for src, dst in pending:
+                try:
+                    outcome = await self._upload_one(src, dst, sandbox_type, config_dir)
+                except Exception as e:
+                    attempt_failures.append(f"{src} -> {dst} ({type(e).__name__}: {e})")
+                    next_pending.append((src, dst))
+                    self.logger.error(
+                        f"[upload_traj] FAILED {src} -> {dst} {type(e).__name__}: {e}"
+                    )
+                    continue
                 if outcome == "ok":
                     uploaded_srcs.append(src)
                 elif outcome == "missing":
@@ -1058,16 +1143,23 @@ class OpenClawDistillationTask:
                     missing_srcs.append(src)
                     self.logger.warning(f"[upload_traj] skip (src missing): {src}")
                 else:
-                    failures.append(f"{src} -> {dst} ({outcome})")
+                    attempt_failures.append(f"{src} -> {dst} ({outcome})")
+                    next_pending.append((src, dst))
                     self.logger.error(f"[upload_traj] FAILED {src} -> {dst} {outcome}")
-        except Exception as e:
-            self.logger.error(
-                f"[upload_traj] exception: {e}\n{traceback.format_exc()}"
-            )
-            raise HiveError("S009", detail=f"{type(e).__name__}: {e}") from e
+            failures = attempt_failures
+            if not next_pending:
+                break
+            if attempt <= upload_retries:
+                self.logger.warning(
+                    f"[upload_traj] retry {attempt}/{upload_retries}: "
+                    f"{len(next_pending)} source(s) still failing"
+                )
+                await asyncio.sleep(retry_delay)
+            pending = next_pending
 
         self.logger.info(
-            f"[upload_traj] bucket={bucket_path} uploaded={len(uploaded_srcs)} "
+            f"[upload_traj] bucket={self.client_config.s3.bucket_name}/{bucket_path} "
+            f"uploaded={len(uploaded_srcs)} "
             f"missing={len(missing_srcs)} failed={len(failures)}"
         )
         if failures:
@@ -1095,6 +1187,7 @@ class OpenClawDistillationTask:
         await self._upload_and_extract_code(sandbox_type)
         await self._download_s3_skills(config_file, sandbox_type)
         await self._download_s3_user_profile(config_file, sandbox_type)
+        await self._upload_harness_md(config_file, sandbox_type)
         await self._download_s3_agents(sandbox_type)
         await self._upload_data_config(config_file)
         if self.config.sandbox_config.harness_type.strip().lower() == "openclaw":
@@ -1506,6 +1599,7 @@ def main() -> None:
             harness_type=harness_type,
         ),
         model_api_key=args.model_api_key,
+        harness_md=list(run_cfg.get("harness_md") or []),
     )
 
     asyncio.run(run_tasks(
