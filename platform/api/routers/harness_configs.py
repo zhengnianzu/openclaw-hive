@@ -207,7 +207,12 @@ def _sync_harness_md(root_dir: str):
 
         for i in range(start + 1, end):
             if re.match(r"^  harness_md:", lines[i]):
-                lines[i] = f"  harness_md: {value}\n"
+                # 连带删掉该 key 的 block 列表项（"  - xxx"），否则会和
+                # 新写入的 flow 列表叠在一起，YAML 直接解析失败。
+                j = i + 1
+                while j < end and re.match(r"^\s+-\s", lines[j]):
+                    j += 1
+                lines[i:j] = [f"  harness_md: {value}\n"]
                 break
         else:
             if not lines[start].endswith("\n"):
