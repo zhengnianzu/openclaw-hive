@@ -102,18 +102,6 @@
             </div>
           </div>
 
-          <div class="harness-stats">
-            <div class="harness-stats-head">
-              <span>Harness 支持</span>
-              <span class="harness-stats-total">{{ harnessTypes.length }} 种</span>
-            </div>
-            <div class="harness-chips">
-              <span v-for="t in harnessTypes" :key="t" class="harness-chip"
-                :style="{ borderColor: harnessColor(t), color: harnessColor(t) }">
-                {{ harnessLabel(t) }}
-              </span>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -266,7 +254,6 @@ import { useHarnessStore } from '../stores/harness'
 
 const authStore = useAuthStore()
 const harnessStore = useHarnessStore()
-const harnessTypes = computed(() => harnessStore.types || [])
 const instances = ref([])
 const loading = ref(false)
 const timeEstimates = ref({})
@@ -578,22 +565,6 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
   padding: 16px 20px 18px;
   margin-bottom: 20px;
 }
-.harness-stats {
-  margin-top: 14px; padding-top: 12px;
-  border-top: 1px dashed var(--border-color);
-}
-.harness-stats-head {
-  display: flex; align-items: center; justify-content: space-between;
-  font-size: 12px; color: var(--text-muted); margin-bottom: 8px;
-}
-.harness-stats-total { font-weight: 600; color: var(--text-primary); }
-.harness-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.harness-chip {
-  font-size: 11px; line-height: 1;
-  padding: 4px 8px; border-radius: 10px;
-  border: 1px solid currentColor; opacity: .85;
-}
-
 .resource-panel-head {
   display: flex; align-items: baseline; justify-content: space-between;
   margin-bottom: 14px;

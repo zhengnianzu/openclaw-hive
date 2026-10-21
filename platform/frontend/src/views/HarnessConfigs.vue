@@ -25,15 +25,19 @@
         <div class="ov-num">{{ overview.publishedCount }}</div>
         <div class="ov-label">已发布</div>
       </div>
+      <div class="ov-card">
+        <div class="ov-num">{{ harnessStore.types.length }}</div>
+        <div class="ov-label">Harness 支持</div>
+      </div>
       <div class="ov-card ov-card-wide">
         <div class="ov-label" style="margin-bottom:6px">各 Harness 方案 / 版本</div>
         <div class="ov-types">
-          <div v-for="t in overview.byType" :key="t.type" class="ov-type">
+          <div v-for="t in overview.byType" :key="t.type" class="ov-type"
+            :class="{ 'ov-type-empty': !t.schemes }">
             <span class="ov-type-dot" :style="{ background: harnessColor(t.type) }"></span>
             <span class="ov-type-name">{{ typeLabel(t.type) }}</span>
             <span class="ov-type-num">{{ t.schemes }} / {{ t.versions }}</span>
           </div>
-          <div v-if="!overview.byType.length" class="muted" style="font-size:12px">暂无数据</div>
         </div>
       </div>
     </div>
@@ -206,7 +210,15 @@ const overview = computed(() => {
     versionCount += c.version_count || 0
     publishedCount += c.published_count || 0
   }
-  const byType = Array.from(map.values()).sort((a, b) => b.schemes - a.schemes)
+  // 覆盖全部支持的 harness 类型：没有方案的也列出来（显示 0 / 0）
+  for (const t of harnessStore.types) {
+    if (!map.has(t)) map.set(t, { type: t, schemes: 0, versions: 0 })
+  }
+  const order = harnessStore.types
+  const byType = Array.from(map.values()).sort((a, b) => {
+    const ia = order.indexOf(a.type), ib = order.indexOf(b.type)
+    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib)
+  })
   return { schemeCount, versionCount, publishedCount, byType }
 })
 
@@ -460,6 +472,7 @@ onMounted(() => { harnessStore.load(); loadList() })
 .ov-type-dot { width: 8px; height: 8px; border-radius: 2px; }
 .ov-type-name { color: var(--text-secondary); }
 .ov-type-num { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ov-type-empty { opacity: .45; }
 
 .filter-bar {
   display: flex;
