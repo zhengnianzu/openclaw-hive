@@ -177,15 +177,25 @@ def _sync_harness_md(root_dir: str):
 
     刻意用**文本行插入**而不是 YAML 库 round-trip：OmegaConf.save / ruamel.dump
     都会重排缩进、去掉 null、改动引号，用户手写的 config.yaml 会被整形成另一副
-    样子（注释块位置错乱、env 列表缩进变化）。这里只增/改 harness_md 一行，
+    样子（注释块位置错乱、env 列表缩进变化）。这里只增/改 harness_md 这一段，
     其余字节原样保留。
+
+    输出用 block 风格（与文件里 default_skills / env 等其它列表一致）：
+        harness_md:
+          - /path/AGENT.md
+          - /path/IDENTITY.md
+    空列表写成 flow 风格的 `harness_md: []`（block 风格无法表达空列表）。
     """
     cfg_path = os.path.join(root_dir, "config.yaml")
     if not os.path.isfile(cfg_path):
         return
     names = _scan_md_dir(root_dir)
     paths = [os.path.join(md_dir(root_dir), n) for n in names]
-    value = json.dumps(paths, ensure_ascii=False)
+
+    if paths:
+        new_lines = ["  harness_md:\n"] + [f"    - {p}\n" for p in paths]
+    else:
+        new_lines = ["  harness_md: []\n"]
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -207,17 +217,18 @@ def _sync_harness_md(root_dir: str):
 
         for i in range(start + 1, end):
             if re.match(r"^  harness_md:", lines[i]):
-                # 连带删掉该 key 的 block 列表项（"  - xxx"），否则会和
-                # 新写入的 flow 列表叠在一起，YAML 直接解析失败。
+                # 吞掉该 key 原有的 block 列表项（"  - xxx"）和继续缩进的续行，
+                # 否则新旧两层叠加会让 YAML 解析失败。
                 j = i + 1
-                while j < end and re.match(r"^\s+-\s", lines[j]):
+                while j < end and (re.match(r"^\s+-\s", lines[j])
+                                   or re.match(r"^\s{4,}\S", lines[j])):
                     j += 1
-                lines[i:j] = [f"  harness_md: {value}\n"]
+                lines[i:j] = new_lines
                 break
         else:
             if not lines[start].endswith("\n"):
                 lines[start] += "\n"
-            lines.insert(start + 1, f"  harness_md: {value}\n")
+            lines[start + 1:start + 1] = new_lines
 
         with open(cfg_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
