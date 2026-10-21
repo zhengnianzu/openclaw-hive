@@ -744,11 +744,11 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         base.run_config.obs.user_config_download_path = req.user_config_dir
     if req.user_profile_dir:
         base.run_config.obs.user_profile_download_path = req.user_profile_dir
-    if req.traj_save_path:
-        base.run_config.obs.traj_save_path = req.traj_save_path
-    else:
+    effective_traj_save_path = (req.traj_save_path or "").strip()
+    if not effective_traj_save_path:
         traj_prefix = harness_meta.traj_prefix(req.harness_type)
-        base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
+        effective_traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
+    base.run_config.obs.traj_save_path = effective_traj_save_path
 
     # harness md：从版本目录 md/ 拷到实例 workspace/，config 写实例内绝对路径。
     # 没有 md 的旧版本也要写空列表——下游读不到键和读到空列表是两回事。
@@ -1291,6 +1291,12 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         # create_params 里补上解析出的方案/版本标识，详情页可直接展示，
         # 不必依赖后来可能被删掉的版本行。
         _create_params = req.model_dump()
+        # 用户留空时 traj_save_path 由后端生成；create_params 必须保存最终生效值，
+        # 否则详情页/输出页只会拿到请求中的空值，导致轨迹路径不展示。
+        _create_params["traj_save_path"] = effective_traj_save_path
+        _create_params["traj_save_bucket"] = str(
+            base.run_config.obs.get("traj_save_bucket") or ""
+        )
         if harness_version_row:
             _create_params["harness_config_version_id"] = harness_version_row["id"]
             _create_params["harness_config_version"] = harness_version_row["version"]
@@ -1380,14 +1386,22 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
     params.pop("copy_complete_from", None) # 不继承
     # 以 DB 列为准（创建/迁移时已写入），历史实例同样有值
     params["suffix_api_keys"] = _resolve_suffix_api_keys(dict(row))
-    # OBS 桶名不在 create_params 里，从 config_snapshot(s3.bucket_name) 取出，
-    # 供前端把各 OBS 目录字段拼成完整 obs:// 路径展示。
+    # OBS 路径的最终生效值从 config_snapshot 回填：既兼容历史实例（自动生成的
+    # traj_save_path 未写入 create_params），也区分普通 OBS bucket 与轨迹 bucket。
+    snap = None
     if row["config_snapshot"]:
         try:
             snap = OmegaConf.create(row["config_snapshot"])
             params["obs_bucket"] = OmegaConf.select(snap, "s3.bucket_name")
+            traj_bucket = OmegaConf.select(snap, "run_config.obs.traj_save_bucket")
+            if traj_bucket:
+                params["traj_save_bucket"] = traj_bucket
+            if not params.get("traj_save_path"):
+                params["traj_save_path"] = (
+                    OmegaConf.select(snap, "run_config.obs.traj_save_path") or ""
+                )
         except Exception:
-            pass
+            snap = None
     # 沙箱配置：create_params 只存了 id，这里补上名称/类型/文件，供详情页展示。
     # 实例可能引用了已删除的沙箱配置，此时查不到，保持 sandbox_config_name 为空。
     sb_id = params.get("sandbox_config_id")
@@ -1418,9 +1432,8 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
             params["sandbox_file"] = sb["file"]
     # 实际生效的 sandbox key / 镜像：从 config_snapshot 读（可能与当前沙箱配置不同，
     # 因为实例创建时的值已固化进快照）
-    if row["config_snapshot"]:
+    if snap is not None:
         try:
-            snap = OmegaConf.create(row["config_snapshot"])
             key = OmegaConf.select(snap, "sandbox_active_key")
             params["sandbox_active_key"] = key
             img = OmegaConf.select(snap, f"sandbox.{key}.sandbox.image") if key else None

@@ -493,7 +493,8 @@ class OpenClawDistillationTask:
         所有运行时字段都在这里注入：
         - platform: sandbox_type == windows 时为 windows，否则为 linux；
         - harness_type: 当前 run_config.harness_type；
-        - agents[].config: 把本地 harness_md 对应的 __default__ 路径插到首部；
+        - agents[].config: 仅给 queries[].agent_name 对应的 agent 插入
+          harness_md 的 __default__ 路径；
         - gateway_ws_url: port 不为空时写入本次 OpenClaw gateway 端口。
 
         改写后的文件保存在 task_output_path/sandbox_task_configs/，
@@ -520,14 +521,23 @@ class OpenClawDistillationTask:
         ]
         # 去重并保持 harness_md 的配置顺序。
         harness_configs = list(dict.fromkeys(harness_configs))
+        query_agent_names = {
+            str(query.get("agent_name") or "").strip()
+            for query in (data.get("queries") or [])
+            if isinstance(query, dict)
+        }
+        query_agent_names.discard("")
         if harness_configs:
             for agent in data.get("agents") or []:
                 if not isinstance(agent, dict):
                     continue
+                agent_name = str(agent.get("name") or "").strip()
+                if agent_name not in query_agent_names:
+                    continue
                 agent_configs = agent.get("config") or []
                 if not isinstance(agent_configs, list):
                     self.logger.warning(
-                        f"agent config is not a list, replace it: {agent.get('name', '')}"
+                        f"agent config is not a list, replace it: {agent_name}"
                     )
                     agent_configs = []
                 # 重试上传时也保证幂等：先移除旧的同路径项，再统一放到首部。
@@ -549,7 +559,8 @@ class OpenClawDistillationTask:
         self.logger.info(
             f"Patched data config: platform={data['platform']}, "
             f"harness_type={data['harness_type']}, "
-            f"harness_md={len(harness_configs)}, port={port or '-'}"
+            f"harness_md={len(harness_configs)}, "
+            f"query_agents={sorted(query_agent_names)}, port={port or '-'}"
         )
         self.logger.info(
             f"Data config paths: source={Path(config_file).resolve()}, "
