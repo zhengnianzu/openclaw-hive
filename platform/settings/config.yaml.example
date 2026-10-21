@@ -49,6 +49,8 @@ sandbox_id_prefix: xxx
 
 
 run_config:
+  # 已初始化的 md 文件绝对路径，创建实例时自动填充
+  harness_md: []
   harness_type: openclaw        # openclaw / hermes / claude-code
   start_index: 0                # 开始执行任务的索引号
   total_num: 0                  # 任务总数, 0 表示不限

@@ -23,6 +23,7 @@ const routes = [
       { path: 'code-repos', name: 'CodeManagement', component: () => import('../views/CodeManagement.vue') },
       { path: 'config-templates', name: 'ConfigTemplates', component: () => import('../views/ConfigTemplates.vue') },
       { path: 'harness-configs', name: 'HarnessConfigs', component: () => import('../views/HarnessConfigs.vue') },
+      { path: 'harness-workbench', name: 'HarnessWorkbench', component: () => import('../views/HarnessWorkbench.vue') },
       { path: 'sandbox-configs', name: 'SandboxConfigs', component: () => import('../views/SandboxConfigs.vue') },
       // 文档中心。参数名是 slug（= 文件名），不是自增 id。
       // wiki/new 必须排在 wiki/:slug 之前，否则 "new" 会被当成 slug

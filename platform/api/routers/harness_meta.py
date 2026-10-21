@@ -83,6 +83,31 @@ def ALLOWED_CONFIG_FILES() -> set:
     return files
 
 
+# ---- harness md 模板 ----
+
+HARNESS_MDS_DIR = os.path.join(settings.SETTINGS_DIR, "harness_mds")
+
+
+def md_templates(harness_type: str) -> list[str]:
+    """该 harness 可用的 md 模板文件名。
+
+    只取顶层 *.md，不递归：jiuwenswarm/memory/MEMORY.md 这类子目录模板
+    本期不支持（历史上递归扫描曾把 settings/ 整个卷进去，产生过 404 层嵌套目录）。
+    """
+    d = os.path.join(HARNESS_MDS_DIR, harness_type)
+    if not os.path.isdir(d):
+        return []
+    return sorted(f for f in os.listdir(d)
+                  if f.lower().endswith(".md") and os.path.isfile(os.path.join(d, f)))
+
+
+def md_template_path(harness_type: str, filename: str) -> str | None:
+    """模板绝对路径；文件名不在白名单内返回 None（防穿越）。"""
+    if filename not in md_templates(harness_type):
+        return None
+    return os.path.join(HARNESS_MDS_DIR, harness_type, filename)
+
+
 def traj_prefix(harness_type: str) -> str:
     """代码派生: claude-code→cc_trajs, 其余 {id}_trajs, 兜底 openclaw_trajs。"""
     if harness_type in _TRAJ_SPECIAL:
@@ -98,6 +123,8 @@ class HarnessMeta(BaseModel):
     labels: dict[str, str]
     fileLabels: dict[str, str]
     agentConfig: dict[str, str | None]
+    # 每个 harness 可用的 md 模板文件名（来自 settings/harness_mds/<type>/）
+    mdFiles: dict[str, list[str]] = {}
 
 
 @router.get("", response_model=HarnessMeta)
@@ -109,4 +136,5 @@ def get_harness_meta(user: dict = Depends(get_current_user)):
         labels={k: v.get("name", k) for k, v in entries.items()},
         fileLabels={k: f"Harness ({v.get('agent_config', '')})" for k, v in entries.items()},
         agentConfig={k: v.get("agent_config") for k, v in entries.items()},
+        mdFiles={k: md_templates(k) for k in entries},
     )

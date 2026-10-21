@@ -54,7 +54,7 @@ def settings_overview(user: dict = Depends(get_current_user)):
          "desc": "代码仓库与版本（OBS 路径 + version）",
          "route": "/code-repos", "count": code_repos, "role": "operator"},
         {"key": "harness_configs", "group": "运行配置", "title": "Harness 配置",
-         "desc": "每种 harness 类型的各版本配置文件（settings/<type>/<version>/）",
+         "desc": "Harness 配置方案与版本快照（settings/<type>_<slug>/.versions/）",
          "route": "/harness-configs", "count": harness_configs, "role": "user"},
         {"key": "sandbox_configs", "group": "运行配置", "title": "沙箱配置",
          "desc": "沙箱模板派生文件（settings/sandbox/*.yaml），按类型设默认",

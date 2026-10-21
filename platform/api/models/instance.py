@@ -95,7 +95,12 @@ class InstanceCreate(BaseModel):
 
     invite_code: str = ""
 
+    # 配置方案（harness_configs.id）。新客户端应改用下面的版本 id；
+    # 仅传方案时后端取该方案最新的已发布版本（兼容旧客户端）。
     harness_config_id: Optional[int] = None
+
+    # 方案下的具体版本（harness_config_versions.id）。必须是已发布状态。
+    harness_config_version_id: Optional[int] = None
 
     # 沙箱配置（settings/sandbox/ 下的派生文件），不选则沿用模板默认
     sandbox_config_id: Optional[int] = None

@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     OBS_BUCKET: str = "obs://rl-agentdata"
     CONFIG_TEMPLATE: str = ""
     SETTINGS_DIR: str = ""
+    # Harness 配置目录的全局根。每个方案的相对路径存在 harness_configs.harness_dir，
+    # 实际路径 = HARNESS_DIR + 该相对路径。换机器/迁移目录只改这里。
+    HARNESS_DIR: str = ""
     OUTPUT_CACHE: str = ""
     INSTANCE_DIR: str = ""
     # 文档中心：platform/wiki/ 下 md/*.md 存正文，index.db 存索引（整个目录可单独同步）
@@ -71,6 +74,9 @@ class Settings(BaseSettings):
             self.OBSUTIL_PATH = os.path.join(platform_dir, "obsutil", "obsutil")
         if not self.SETTINGS_DIR:
             self.SETTINGS_DIR = os.path.join(platform_dir, "settings")
+        if not self.HARNESS_DIR:
+            # 默认与 SETTINGS_DIR 同根：老方案的 harness_dir 形如 "harness/openclaw/harness-5"
+            self.HARNESS_DIR = self.SETTINGS_DIR
         if not self.OUTPUT_CACHE:
             self.OUTPUT_CACHE = os.path.join(platform_dir, "output_cache")
         if not self.INSTANCE_DIR:

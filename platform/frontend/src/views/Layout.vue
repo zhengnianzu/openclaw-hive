@@ -95,6 +95,7 @@ const roleLabel = computed(() => {
 // 原先直接用 route.path，子路径时整条菜单都不高亮。
 const activeMenu = computed(() => {
   const p = route.path
+  if (p.startsWith('/harness')) return '/harness-configs'
   if (p.startsWith('/wiki')) return '/wiki'
   if (p.startsWith('/instance') || p.startsWith('/logs') || p.startsWith('/outputs')) return '/dashboard'
   if (p.startsWith('/task-register')) return '/registrations'

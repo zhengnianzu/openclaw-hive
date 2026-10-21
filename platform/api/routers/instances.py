@@ -29,6 +29,7 @@ from ..services.queue_scheduler import (
     slot_condition_params as _slot_condition_params,
 )
 from . import harness_meta
+from . import harness_configs
 from . import sandbox_configs
 from . import resource_pools
 
@@ -679,17 +680,18 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     os.makedirs(instance_dir, exist_ok=True)
 
     # --- 1. 生成 config.yaml ---
-    if req.harness_config_id:
-        with get_connection() as conn:
-            hc_row = conn.execute("SELECT harness_type, version FROM harness_configs WHERE id = ?", (req.harness_config_id,)).fetchone()
-        if hc_row and hc_row["version"] != "默认":
-            harness_settings_dir = os.path.join(settings.SETTINGS_DIR, hc_row["harness_type"], hc_row["version"])
-            if not os.path.isdir(harness_settings_dir):
-                harness_settings_dir = settings.SETTINGS_DIR
-        else:
-            harness_settings_dir = settings.SETTINGS_DIR
-    else:
-        harness_settings_dir = settings.SETTINGS_DIR
+    # 目录解析统一走 harness_configs.resolve_settings_dir：
+    # 优先具体版本（必须已发布），仅传方案时取最新已发布版本，都没有则用扁平 settings/。
+    harness_version_row = None
+    harness_version_label = ""
+    with get_connection() as conn:
+        harness_settings_dir, harness_version_row, harness_version_label = \
+            harness_configs.resolve_settings_dir(
+                conn,
+                req.harness_type,
+                getattr(req, "harness_config_version_id", None),
+                req.harness_config_id,
+            )
 
     config_template = os.path.join(harness_settings_dir, "config.yaml")
     if not os.path.exists(config_template):
@@ -746,6 +748,20 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     else:
         traj_prefix = harness_meta.traj_prefix(req.harness_type)
         base.run_config.obs.traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
+
+    # harness md：从版本目录 md/ 拷到实例 workspace/，config 写实例内绝对路径。
+    # 没有 md 的旧版本也要写空列表——下游读不到键和读到空列表是两回事。
+    _md_src = os.path.join(harness_settings_dir, "md")
+    _md_paths = []
+    if os.path.isdir(_md_src):
+        _ws_dir = os.path.join(instance_dir, "workspace")
+        for _f in sorted(os.listdir(_md_src)):
+            _fp = os.path.join(_md_src, _f)
+            if _f.lower().endswith(".md") and os.path.isfile(_fp):
+                os.makedirs(_ws_dir, exist_ok=True)
+                shutil.copy2(_fp, os.path.join(_ws_dir, _f))
+                _md_paths.append(os.path.join(_ws_dir, _f))
+    base.run_config.harness_md = _md_paths
 
     # harness 配置文件路径: 由 harness_config.json 的 agent_config 派生。
     # 下方各 harness 配置生成分支仍按原变量名引用这些局部变量, 故在此集中定义。
@@ -1201,6 +1217,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         queue_position = (max_pos['max_pos'] or 0) + 1
 
     with get_connection() as conn:
+        # create_params 里补上解析出的方案/版本标识，详情页可直接展示，
+        # 不必依赖后来可能被删掉的版本行。
+        _create_params = req.model_dump()
+        if harness_version_row:
+            _create_params["harness_config_version_id"] = harness_version_row["id"]
+            _create_params["harness_config_version"] = harness_version_row["version"]
+        _create_params["harness_config_label"] = harness_version_label
         conn.execute(
             """INSERT INTO task_instances
                (id, name, config_path, status, created_by, total_tasks, concurrent_num,
@@ -1208,7 +1231,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 suffix_api_keys)
                VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], 0,
-             req.concurrent_num, OmegaConf.to_yaml(base), req.model_dump_json(),
+             req.concurrent_num, OmegaConf.to_yaml(base),
+             json.dumps(_create_params, ensure_ascii=False),
              datetime.now().isoformat(), req.queue_id, queue_position,
              1 if req.suffix_api_keys else 0),
         )
@@ -1296,6 +1320,20 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
     # 沙箱配置：create_params 只存了 id，这里补上名称/类型/文件，供详情页展示。
     # 实例可能引用了已删除的沙箱配置，此时查不到，保持 sandbox_config_name 为空。
     sb_id = params.get("sandbox_config_id")
+    # Harness 配置：历史实例只有 harness_config_id，这里补上方案名/版本号；
+    # 版本行可能已被删除，能查到时才补。
+    hv_id = params.get("harness_config_version_id")
+    if hv_id:
+        with get_connection() as conn:
+            hv = conn.execute(
+                "SELECT v.version, c.name AS config_name FROM harness_config_versions v "
+                "LEFT JOIN harness_configs c ON c.id = v.config_id WHERE v.id = ?",
+                (hv_id,),
+            ).fetchone()
+        if hv:
+            params["harness_config_version"] = hv["version"]
+            if hv["config_name"]:
+                params["harness_config_name"] = hv["config_name"]
     if sb_id:
         with get_connection() as conn:
             sb = conn.execute(

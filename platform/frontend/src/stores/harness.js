@@ -8,6 +8,7 @@ export const useHarnessStore = defineStore('harness', () => {
   const labels = ref({})              // { openclaw: 'OpenClaw', ... }
   const fileLabels = ref({})          // { openclaw: 'Harness (openclaw.json)', ... }
   const agentConfig = ref({})         // { openclaw: 'openclaw.json', ... }
+  const mdFiles = ref({})             // { openclaw: ['AGENTS.md', ...], ... }
   const loaded = ref(false)
   let loadPromise = null
 
@@ -22,6 +23,7 @@ export const useHarnessStore = defineStore('harness', () => {
         labels.value = meta.labels || {}
         fileLabels.value = meta.fileLabels || {}
         agentConfig.value = meta.agentConfig || {}
+        mdFiles.value = meta.mdFiles || {}
         loaded.value = true
       } catch (e) {
         // 加载失败兜底: 空对象, 各 Vue 的 accessor 用默认色/原名
@@ -35,5 +37,7 @@ export const useHarnessStore = defineStore('harness', () => {
   function label(t) { return labels.value[t] || t || 'openclaw' }
   function fileLabel(t) { return fileLabels.value[t] || 'Harness 配置' }
 
-  return { types, colors, labels, fileLabels, agentConfig, loaded, load, color, label, fileLabel }
+  function mdList(t) { return mdFiles.value[t] || [] }
+
+  return { types, colors, labels, fileLabels, agentConfig, mdFiles, loaded, load, color, label, fileLabel, mdList }
 })

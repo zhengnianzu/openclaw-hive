@@ -19,12 +19,26 @@
         </el-select>
       </el-form-item>
 
-      <el-form-item label="Harness 配置">
-        <el-select v-model="form.harness_config_id" style="width:200px">
+      <el-form-item label="配置方案">
+        <el-select v-model="form.harness_config_id" style="width:240px" @change="onSchemeChange">
           <el-option v-for="hc in harnessConfigList" :key="hc.id"
-            :label="hc.version + (hc.is_default ? ' (默认)' : '')"
+            :label="hc.name + (hc.is_default ? ' (默认)' : '')"
             :value="hc.id" />
         </el-select>
+      </el-form-item>
+
+      <el-form-item label="配置版本">
+        <el-select v-model="form.harness_config_version_id" style="width:240px"
+          :placeholder="versionList.length ? '选择已发布版本' : '该方案暂无已发布版本'"
+          :loading="versionsLoading">
+          <el-option v-for="v in versionList" :key="v.id"
+            :label="`v${v.version}${v.published_at ? ' · ' + formatShortTime(v.published_at) + ' 发布' : ''}`"
+            :value="v.id" />
+        </el-select>
+        <div v-if="harnessConfigList.length && !versionList.length && !versionsLoading"
+          style="font-size:12px;color:#f59e0b;margin-top:4px">
+          该方案还没有已发布版本，请到「配置工作台」创建并发布版本
+        </div>
       </el-form-item>
 
       <el-form-item label="并发数">
@@ -375,6 +389,7 @@ const form = ref({
   code_repo_id: null,
   invite_code: '',
   harness_config_id: null,
+  harness_config_version_id: null,
   copy_complete_from: null,
   queue_id: null,
   sandbox_config_id: 0,
@@ -400,6 +415,8 @@ function removeAgentTab(tabName) {
 const imageList = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
+const versionList = ref([])
+const versionsLoading = ref(false)
 const queueList = ref([])
 const sandboxList = ref([])
 const queuePickerVisible = ref(false)
@@ -439,13 +456,40 @@ async function loadHarnessConfigs() {
       form.value.harness_config_id = def.id
     } else if (harnessConfigList.value.length) {
       form.value.harness_config_id = harnessConfigList.value[0].id
+    } else {
+      form.value.harness_config_id = null
     }
-  } catch { harnessConfigList.value = [] }
+    await loadVersions()
+  } catch {
+    harnessConfigList.value = []
+    versionList.value = []
+  }
+}
+
+// 只列已发布版本——实例只能引用发布过的快照
+async function loadVersions() {
+  versionList.value = []
+  form.value.harness_config_version_id = null
+  if (!form.value.harness_config_id) return
+  versionsLoading.value = true
+  try {
+    const all = await api.get(`/harness-configs/${form.value.harness_config_id}/versions`)
+    versionList.value = (all || []).filter(v => v.status === 'published')
+    if (versionList.value.length) {
+      form.value.harness_config_version_id = versionList.value[0].id
+    }
+  } catch { versionList.value = [] }
+  finally { versionsLoading.value = false }
+}
+
+function onSchemeChange() { loadVersions() }
+
+function formatShortTime(t) {
+  return String(t || '').replace('T', ' ').slice(5, 16)
 }
 
 function applyTemplate(tpl) {
-  if (!tpl) return
-  form.value.model_base_url = tpl.model_base_url || ''
+  if (!tpl) return  form.value.model_base_url = tpl.model_base_url || ''
   form.value.invite_code = tpl.invite_code || ''
   form.value.model_api_type = tpl.model_api_type || ''
   if (tpl.model_id) form.value.model_id = tpl.model_id
@@ -484,6 +528,8 @@ async function loadCodeRepos() {
 function onHarnessChange() {
   form.value.image_name = ''
   form.value.harness_config_id = null
+  form.value.harness_config_version_id = null
+  versionList.value = []
   loadImages()
   loadHarnessConfigs()
 }

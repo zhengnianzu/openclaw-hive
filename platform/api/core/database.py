@@ -301,6 +301,12 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 harness_type TEXT NOT NULL DEFAULT 'openclaw',
+                -- 方案标识：同一 harness_type 内唯一，用于拼磁盘目录 settings/<type>_<slug>/
+                slug TEXT DEFAULT '',
+                -- 方案目录相对 HARNESS_DIR 的路径，如 "harness/openclaw/harness-5"。
+                -- 为空时按 harness-<id> 推导（仓库历史默认布局）。
+                harness_dir TEXT DEFAULT '',
+                -- 兼容旧模型：老行用 version 当目录名；新行该列保留为"迁移前的版本"
                 version TEXT NOT NULL DEFAULT 'v1',
                 description TEXT DEFAULT '',
                 config_files_json TEXT DEFAULT '[]',
@@ -313,17 +319,48 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- 方案下的不可变版本快照。草稿在方案目录里可编辑，
+            -- 只有「创建版本」时才把草稿冻结成这里的一行 + .versions/<version>/ 目录。
+            CREATE TABLE IF NOT EXISTS harness_config_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_id INTEGER NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',   -- draft | testing | published
+                description TEXT DEFAULT '',
+                files_json TEXT DEFAULT '[]',
+                obs_harness_path TEXT DEFAULT '',
+                obs_task_path TEXT DEFAULT '',
+                obs_proxy_path TEXT DEFAULT '',
+                created_by TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                published_at TIMESTAMP,
+                published_by TEXT DEFAULT '',
+                UNIQUE(config_id, version)
+            );
         """)
 
         for col in [
             "obs_harness_path TEXT DEFAULT ''",
             "obs_task_path TEXT DEFAULT ''",
             "obs_proxy_path TEXT DEFAULT ''",
+            "slug TEXT DEFAULT ''",
+            "harness_dir TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(f"ALTER TABLE harness_configs ADD COLUMN {col}")
             except Exception:
                 pass
+
+        # UNIQUE 索引只能在表建好之后补；已有重复数据时建索引会失败，忽略即可
+        # （ensure_defaults 里的迁移会先修复重复的 is_default）
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_hcv_config_version "
+                "ON harness_config_versions(config_id, version)"
+            )
+        except Exception:
+            pass
 
         # 沙箱配置索引表：**文件权威，DB 只存索引**。
         # 真正的沙箱内容在 platform/settings/sandbox/*.yaml：

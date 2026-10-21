@@ -110,7 +110,18 @@
                   </el-tag>
                 </el-descriptions-item>
                 <el-descriptions-item label="Invite Code">{{ createParams.invite_code || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="Harness配置ID">{{ createParams.harness_config_id || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="Harness 配置">
+                  <template v-if="createParams.harness_config_name">
+                    {{ createParams.harness_config_name }}
+                    <span v-if="createParams.harness_config_version" class="muted">
+                      / v{{ createParams.harness_config_version }}
+                    </span>
+                  </template>
+                  <template v-else-if="createParams.harness_config_label">
+                    {{ createParams.harness_config_label }}
+                  </template>
+                  <span v-else>{{ createParams.harness_config_id || '-' }}</span>
+                </el-descriptions-item>
               </el-descriptions>
             </el-collapse-item>
 
