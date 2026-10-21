@@ -626,6 +626,7 @@ class OpenClawDistillationTask:
         )
         poll_interval = 5
         max_polls = max(1, self.config.sandbox_config.openclaw_start_timeout // poll_interval)
+        ready_marker = "__HIVE_JIUWENSWARM_READY__"
 
         start_time = asyncio.get_running_loop().time()
         max_wait = self.config.openclaw_gateway_timeout
@@ -644,9 +645,15 @@ class OpenClawDistillationTask:
                 f"mkdir -p {self.config.sandbox_config.result_workdir} && "
                 f"nohup {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
                 # 轮询就绪(每 5s grep 一次), 就绪即退出, 而非固定 sleep 180s
+                f"ready=0; "
                 f"for i in $(seq 1 {max_polls}); do sleep {poll_interval}; "
-                f"if grep -qE 'Gateway server started|服务已启动' {gateway_log_path}; then break; fi; done; "
-                f"cat {gateway_log_path}"
+                f"if grep -qE 'Gateway server started|服务已启动' {gateway_log_path}; "
+                f"then ready=1; break; fi; done; "
+                # 哨兵必须先于日志输出，避免 stdout 达到接口上限后被截掉。
+                f"if [ \"$ready\" -eq 1 ]; then echo {ready_marker}; "
+                f"tail -n 200 {gateway_log_path}; "
+                f"else echo __HIVE_JIUWENSWARM_NOT_READY__; "
+                f"tail -n 200 {gateway_log_path}; exit 124; fi"
             ]
             exec_request = ExtendExecCommand(
                 command=gateway_cmd,
@@ -654,14 +661,31 @@ class OpenClawDistillationTask:
             )
             result = await self.execution_client.extend(args=exec_request.to_dict())
 
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+            result_data = result.data or {}
+            stdout = result_data.get("stdout", "") or ""
+            exit_code = result_data.get("exit_code")
+
+            if result.code == ErrorCode.SUCCESS[0] and exit_code == 124:
+                self.logger.error(
+                    f"[S002] jiuwenswarm gateway startup timeout "
+                    f"({self.config.sandbox_config.openclaw_start_timeout}s)"
+                )
+                _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup timeout",
+                                    result, level=logging.ERROR)
+                raise HiveError(
+                    "S002",
+                    detail=(f"{self.config.sandbox_config.openclaw_start_timeout}s / "
+                            f"config={os.path.basename(config_file)}"),
+                    sandbox_result=result,
+                )
+
+            if result.code != ErrorCode.SUCCESS[0] or exit_code != 0:
                 self.logger.error("[S001] jiuwenswarm gateway start failed")
                 _log_sandbox_detail(self.logger, "jiuwenswarm gateway start failed",
                                     result, level=logging.ERROR)
                 raise HiveError("S001", detail=os.path.basename(config_file), sandbox_result=result)
 
-            stdout = result.data.get("stdout", "")
-            if "服务已启动" in stdout or "Gateway server started" in stdout:
+            if ready_marker in stdout:
                 _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup OK", result)
                 break
 
