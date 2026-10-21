@@ -9,6 +9,7 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="repos" v-loading="loading" stripe style="width:100%" border>
+        <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip resizable />
         <el-table-column prop="version" label="版本" width="80" align="center" resizable />
         <el-table-column prop="obs_path" label="OBS路径" min-width="260" show-overflow-tooltip resizable />

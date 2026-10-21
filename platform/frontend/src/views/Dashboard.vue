@@ -136,6 +136,7 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="pagedInstances" v-loading="loading" stripe style="width:100%" border>
+        <el-table-column prop="id" label="序号" width="190" align="center" fixed="left" show-overflow-tooltip resizable />
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable>
           <template #default="{row}">
             <span>{{ row.name }}</span>

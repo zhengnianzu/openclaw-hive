@@ -16,6 +16,7 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="configs" v-loading="loading" stripe style="width:100%" border>
+        <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="harness_type" label="类型" width="160">
           <template #default="{row}">
             <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="default" :style="{ border: 'none' }">{{ typeLabel(row.harness_type) }}</el-tag>

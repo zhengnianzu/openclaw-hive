@@ -16,6 +16,7 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="filteredImages" v-loading="loading" stripe style="width:100%" border>
+        <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="name" label="镜像名称" min-width="160" />
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
         <el-table-column prop="harness_type" label="Harness 类型" width="130" align="center">

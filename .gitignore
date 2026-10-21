@@ -50,7 +50,7 @@ hive_output.db-wal
 platform.db.bak.20260809101613
 settings/proxy_name.json
 worker.pid
-
+*.json
 
 # 实际配置文件，含密钥
 configs/hive_*.yaml
