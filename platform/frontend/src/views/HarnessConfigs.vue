@@ -190,10 +190,16 @@ function computeMappingHints() {
   if (fname === 'config.yaml') section = fieldMappings.value['config.yaml']
   else if (fname.includes('user_proxy')) section = fieldMappings.value['user_proxy_model']
   else {
-    // 按 agent_config 匹配 harness_type
+    // 先按 agent_config 文件名精确匹配, 再退化为关键词模糊匹配。
+    // 必须先精确后模糊: jw_config.yaml / grok_config.toml 都含 "config",
+    // 单轮循环里 codex 的 config.toml 会先被 fname.includes('config') 命中。
     for (const [htype, hfile] of Object.entries(harnessStore.agentConfig)) {
       if (hfile && fname === hfile) { section = fieldMappings.value[htype]; break }
-      if (hfile && fname.includes(hfile.split('.')[0])) { section = fieldMappings.value[htype]; break }
+    }
+    if (!section) {
+      for (const [htype, hfile] of Object.entries(harnessStore.agentConfig)) {
+        if (hfile && fname.includes(hfile.split('.')[0])) { section = fieldMappings.value[htype]; break }
+      }
     }
     // 兼容 hermes_config / cc_settings 等含关键词的
     if (!section) {
