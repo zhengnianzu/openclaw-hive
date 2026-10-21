@@ -1,0 +1,1032 @@
+config_version: 0.2.7
+preferred_language: zh
+progressive_tool_enabled: true
+setup_guide:
+  enabled: false
+auto_recap:
+  enabled: true
+a2ui:
+  enabled: false
+  protocol_version: "0.8"
+  stream_validation_enabled: true
+  non_web_fallback_enabled: false
+  dev_smoke_tools_enabled: false
+rsi:
+  enabled: true
+symphony:
+  enabled:
+  paths:
+    skills_root: ""
+    graph_dir: ""
+  fingerprint:
+    scan:
+      max_depth:
+    extraction:
+      workers: 4
+      batch_size: 2
+      body_limit:
+  build:
+    workers: 4
+    batch_size: 16
+    max_candidates_per_skill_relation: 32
+    require_consensus: false
+    min_edge_confidence: 0.5
+  evolution:
+    flow:
+      enabled:
+      min_successes: 3
+      min_pack_success_rate: 0.8
+  orchestration:
+    mode: fast
+    top_k: 3
+    max_depth: 4
+    min_edge_confidence: 0.5
+  skill_retrieval:
+    enabled: true
+    artifact_root: ${SYMPHONY_SKILL_RETRIEVAL_ROOT:-}
+    discovery:
+      max_output_chars: 12000
+      incremental_notice_max_chars: 4000
+      prompt_preferred_skills:
+        - skill-creator
+        - swarmskill-creator
+        - symphony-assistant
+    build:
+      preserve_previous_index_on_failure: true
+auto_memory_enabled: false
+logging:
+  level: INFO
+  console_level: INFO
+  gateway: INFO
+  channel: INFO
+  agent_server: INFO
+  full: INFO
+memory:
+  mode: ${MEMORY_MODE:-local}
+  engine: ${MEMORY_ENGINE:-builtin}
+  forbidden_memory_definition:
+    enabled: false
+    patterns: []
+    description:
+      zh: "以下内容禁止记忆：（用户自行补充，如身高、体重、姓名等，建议用逗号分隔）"
+      en: "The following content is forbidden to remember: (To be supplemented by users, e.g., height, weight, name, etc. Separate items with commas recommended)"
+  external:
+    provider: ${MEMORY_EXTERNAL_PROVIDER:-}
+    user_id: ${MEMORY_USER_ID:-__default__}
+    scope_id: ${MEMORY_SCOPE_ID:-__default__}
+    openjiuwen:
+      kv_type: shelve
+      kv_path: ${MEMORY_KV_PATH:-}
+      vector_type: chroma
+      vector_persist_dir: ${MEMORY_VECTOR_DIR:-}
+      db_type: sqlite
+      db_path: ${MEMORY_DB_PATH:-}
+    mem0:
+      api_key: ${MEM0_API_KEY:-}
+      user_id: ${MEM0_USER_ID:-jiuwenswarm-user}
+      agent_id: ${MEM0_AGENT_ID:-jiuwenswarm}
+      rerank: true
+    openviking:
+      endpoint: ${OPENVIKING_ENDPOINT:-http://127.0.0.1:1933}
+      api_key: ${OPENVIKING_API_KEY:-}
+      account: ${OPENVIKING_ACCOUNT:-root}
+      user: ${OPENVIKING_USER:-default}
+    lakebase:
+      api_key: ${LAKEBASE_API_KEY:-}
+      base_url: ${LAKEBASE_API_URL:-}
+      base_id: ${LAKEBASE_MEM_BASE_ID:-}
+      database_id: ${LAKEBASE_DATABASE_ID:-}
+    jiuwen:
+      mode: ${JIUWEN_MEMORY_MODE:-server}
+      tenant_id: ${JIUWEN_MEMORY_TENANT_ID:-default}
+      infer_turns: true
+      save_assistant_turns: false
+      server:
+        base_url: ${JIUWEN_MEMORY_BASE_URL:-http://127.0.0.1:8137}
+        api_key: ${JIUWEN_MEMORY_API_KEY:-}
+        read_timeout: 30.0
+        write_timeout: 120.0
+
+      # ---- sdk 模式专用（mode=sdk）----
+      # 进程内装配 agent-memory 内核，直连后端。
+      # 只需配三个后端的 type + url；LLM/embedding 复用 jiuwenswarm 顶层配置
+      # （models.defaults[is_default=true] + embed 段），不在此重复配。
+      # rerank/graph 等不开放，由 builder 写死关闭。
+      # 需要 agent-memory 已安装（pip install JiuwenMemory）。
+      sdk:
+        # KV 真源：sqlite（落盘文件） | redis（远程） | memory（进程内，重启丢）
+        kv_type: ${JIUWEN_KV_TYPE:-redis}
+        kv_url: ${JIUWEN_KV_URL:-redis://localhost:6379/0}   # sqlite=文件路径；redis=redis://host:port/db
+        # 向量索引：milvus（远程 ANN） | memory（进程内暴力余弦）
+        vector_type: ${JIUWEN_VECTOR_TYPE:-milvus}
+        vector_url: ${JIUWEN_VECTOR_URL:-http://localhost:19530}   # milvus=http://host:19530
+        # 全文/关系：elasticsearch（BM25） | memory（进程内倒排）
+        db_type: ${JIUWEN_DB_TYPE:-elasticsearch}
+        db_url: ${JIUWEN_DB_URL:-http://localhost:9200}   # elasticsearch=http://host:9200
+        # 可选覆盖（缺省复用顶层 embed 配置）
+        embedder_dim: ${JIUWEN_EMBEDDER_DIM:-1024}     # 须与向量库 dim 一致
+
+proactive_recommendation:
+  enabled: false
+  max_recommend_per_day: 10
+  max_rounds_per_tick: 20
+endpoint_profile_overrides:
+models:
+  defaults:
+    - model_client_config:
+        api_base: http://115.120.58.214:8082/v1
+        api_key: sk-xxxxx
+        model_name: claude-opus-4-6
+        client_provider: Anthropic
+        endpoint_profile: openai
+        timeout: 1800
+        stream_first_chunk_timeout: 300
+        stream_idle_timeout: 120
+        verify_ssl: true
+        custom_headers: {}
+      model_config_obj:
+        context_window: 262144
+      is_default: true
+
+  video:
+    model_client_config:
+      api_base: ${VIDEO_API_BASE}
+      api_key: ${VIDEO_API_KEY}
+      model_name: ${VIDEO_MODEL_NAME}
+      client_provider: ${VIDEO_PROVIDER}
+      endpoint_profile: ${VIDEO_ENDPOINT_PROFILE:-openai_compatible}
+      timeout: 1800
+      verify_ssl: true
+    model_config_obj: {}
+  audio:
+    model_client_config:
+      api_base: ${AUDIO_API_BASE}
+      api_key: ${AUDIO_API_KEY}
+      model_name: ${AUDIO_MODEL_NAME}
+      client_provider: ${AUDIO_PROVIDER}
+      endpoint_profile: ${AUDIO_ENDPOINT_PROFILE:-openai_compatible}
+      verify_ssl: true
+      timeout: 1800
+    model_config_obj: {}
+  vision:
+    model_client_config:
+      api_base: ${VISION_API_BASE}
+      api_key: ${VISION_API_KEY}
+      model_name: ${VISION_MODEL_NAME}
+      client_provider: ${VISION_PROVIDER}
+      endpoint_profile: ${VISION_ENDPOINT_PROFILE:-openai_compatible}
+      verify_ssl: true
+      timeout: 1800
+    model_config_obj: {}
+  image_gen:
+    model_client_config:
+      api_base: ${IMAGE_GEN_API_BASE}
+      api_key: ${IMAGE_GEN_API_KEY}
+      model_name: ${IMAGE_GEN_MODEL_NAME}
+      client_provider: ${IMAGE_GEN_PROVIDER}
+      endpoint_profile: ${IMAGE_GEN_ENDPOINT_PROFILE:-dashscope}
+      verify_ssl: true
+      timeout: 1800
+    model_config_obj: {}
+acp_agents:
+  codex:
+    command: npx
+    args: ["@zed-industries/codex-acp@latest"]
+    cwd:
+    env:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+agents:
+  agent_leader:
+    workspace:
+      stable_base: true
+    max_iterations: 200
+    completion_timeout: 6000.0
+  agent_teammate:
+    workspace:
+      stable_base: true
+    max_iterations: 200
+    completion_timeout: 6000.0
+telemetry:
+  enabled: false
+  exporter: otlp
+  endpoint: http://localhost:4317
+  protocol: grpc
+  headers: {}
+  log_messages: true
+  service_name: jiuwenswarm
+  provider_factory:
+  traces:
+    exporter:
+    endpoint:
+    protocol:
+    headers: {}
+  metrics:
+    exporter:
+    endpoint:
+    protocol:
+    headers: {}
+team_observability:
+  enabled: true
+  exporter: file
+  endpoint: http://localhost:4317
+  service_name: jiuwenswarm
+  sample_rate: 1.0
+  redact_prompts: false
+  redact_completions: false
+  attribute_value_max_length: 10240
+  langfuse_public_key: ""
+  langfuse_secret_key: ""
+  traces_dir: ""
+  file_retention_days: 7
+agent_observability:
+  enabled: false
+  exporter: file
+  endpoint: http://localhost:4317
+  service_name: jiuwenswarm-agent
+  sample_rate: 1.0
+  redact_prompts: false
+  redact_completions: false
+  attribute_value_max_length: 10240
+  langfuse_public_key: ""
+  langfuse_secret_key: ""
+  traces_dir: ""
+  file_retention_days: 7
+trajectory_ui:
+  enabled: false
+  db_path: ""
+  retention_days: 7
+  queue_size: 4096
+  batch_size: 64
+  flush_interval_ms: 200
+  detail_max_bytes: 4194304
+experimental:
+  task_full_duplex_enabled: false
+  task_asr_enabled: false
+debug_trace:
+  agent:
+    enabled: false
+    dump_enabled: true
+    otel_enabled: false
+    include_model_output: true
+    include_reasoning: true
+    include_tool_args: true
+    include_tool_result: true
+    include_subagent_flow: true
+  code:
+    enabled: false
+    dump_enabled: true
+    otel_enabled: false
+    include_model_output: true
+    include_reasoning: true
+    include_tool_args: true
+    include_tool_result: true
+    include_subagent_flow: true
+  limits:
+    tool_args_max_chars: 2000
+    tool_result_max_chars: 8000
+    generic_payload_max_chars: 4000
+    max_model_output_chars:
+  redaction:
+    redact_prompts: false
+    redact_completions: false
+kv_cache_affinity_config:
+  enable_kv_cache_affinity: false
+react:
+  agent_name: main_agent
+  enable_task_loop: true
+  enable_read_image_multimodal:
+  completion_timeout:
+  model_name: ${MODEL_NAME}
+  skill_mode: all
+  subagents:
+    statusline-setup:
+      enabled: true
+      max_iterations: 15
+    general_agent:
+      enabled: true
+    code_agent:
+      enabled: false
+    research_agent:
+      enabled: false
+    browser_agent:
+      enabled: true
+  subagent_runtime:
+    enabled: true
+  answer_chunk_size: 500
+  stream_chunk_threshold: 50
+  stream_character_threshold: 2000
+  context_engine_config:
+    enabled: true
+    enable_openrouter_model_context_window_tokens: false
+    enable_tiktoken_counter: false
+    tokenizer_cache_dir: tokenizers
+    tokenizer_offline: false
+    enable_context_debug: false
+    enable_reload: true
+    compression_recall_config:
+      enabled: false
+      chunk_size_tokens: 3000
+      chunk_overlap_tokens: 500
+    message_summary_offloader_config:
+      protected_tool_names: ["read_file", "read_pdf"]  # 这些工具的输出保持原文，不卸载
+      add_message_threshold_ratio: 0.1
+      ttl_seconds: 300
+      ttl_context_occupancy_ratio: 0.5
+      ttl_message_threshold_ratio: 0.05
+    session_memory_compressor_config:
+      enabled: false
+      trigger_context_ratio: 0.8
+      memory:
+        update_trigger_context_ratio: 0.1   # 上下文占用达到该比例时异步更新记忆
+
+    # 对话压缩器：整体对话历史超长时，把旧对话压缩成摘要
+    dialogue_compressor_config:
+      trigger_context_ratio: 0.8
+      min_target_context_ratio: 0.1
+    current_round_compressor_config:
+      trigger_context_ratio: 0.8
+      min_target_context_ratio: 0.1
+      keep_recent_messages: 4
+    round_level_compressor_config:
+      trigger_context_ratio: 0.8
+      min_target_context_ratio: 0.1
+      keep_recent_messages: 0
+  evolution:
+    skill_evolution: false
+    auto_save: false
+    review_feedback_min_confidence: 0.7
+  ttse:
+    enabled: false
+    evolve_enabled: true
+    inject_enabled: true
+    dream_enabled: true
+    consult_top_k: 8
+    consult_retrieve_mode: hybrid
+    embedding:
+      api_key: ${EMBED_API_KEY}
+      base_url: ${EMBED_API_BASE}
+      model: ${EMBED_MODEL}
+  a2x_registry:
+    base_url: "http://127.0.0.1:8000"
+    timeout: 30.0
+    api_key: ""
+    ownership_file:
+    role: "teammate"
+    dataset: "team_pool"
+    endpoint: ""
+tools:
+  - todo
+  - skill
+
+email_settings:
+  email_address: ${EMAIL_ADDRESS}
+  token: ${EMAIL_TOKEN}
+  smtp_server: ${SMTP_SERVER:-smtp.gmail.com}
+  port: ${EMAIL_PORT:-587}
+embed:
+  embed_api_key: ${EMBED_API_KEY}
+  embed_base_url: ${EMBED_API_BASE}
+  embed_model: ${EMBED_MODEL}
+task_memory:
+  enabled: true
+  llm_model: ${TASK_MEMORY_LLM_MODEL}
+  embedding_model: ${TASK_MEMORY_EMBED_MODEL}
+  api_key: ${TASK_MEMORY_API_KEY}
+  api_base: ${TASK_MEMORY_API_BASE}
+  retrieval_algo: ACE
+  summary_algo: ACE
+gateway:
+  session_map_scope: per_chat_bot
+  cron:
+    store_backend: ${CRON_STORE_BACKEND:-file}
+  agent_client:
+    type: websocket
+    frontend_endpoint:
+    function_version_urn:
+    concurrency: 1
+    invoke_timeout_s: 60
+    agent_timeout_s: 300
+    agent_namespace: default
+  agentos:
+    creating_timeout_seconds: 60
+    wait_running_timeout_seconds: 60
+    wait_running_interval_seconds: 1
+    probes:
+      startup:
+        initial_delay_seconds: 3
+        period_seconds: 3
+        timeout_seconds: 2
+        failure_threshold: 6
+      liveness:
+        timeout_seconds: 2
+        failure_threshold: 3
+    # Agent create 时宿主机 workspace 父目录；实际路径为 {workspace_root}/{user_id}
+    workspace_root: "/home/agentos/users"
+    agent_key_fields:
+      - user_id
+      - agent_type
+    # Web/TUI 连接建立后后台预热内置 jiuwenswarm 沙箱并打通 instance WS，
+    # 避免首条 chat 卡在 create + 冷启动 502 重试。失败不影响连接。
+    connect_warmup_enabled: true
+    registry:
+      endpoint:
+      request_timeout_s: 10
+      node:
+    ssh:
+      port: 2222
+      user_template: "yr:instance:{instance}:port=2222"
+      connect_timeout_s: 30
+      client_keys_dir: "/root/.ssh"
+    auth_service_url: ${AGENTOS_AUTH_SERVICE_URL:-http://iam-agentos:8090}
+    timeout: ${AGENTOS_AUTH_TIMEOUT:-10}
+    auth_enabled: false
+heartbeat:
+  jobs:
+    min_interval_seconds: 60
+    max_active_jobs_per_session: 5
+    max_active_jobs_global: 100
+    default_max_runs: 12
+    default_concurrency_policy: skip
+    default_session_deleted_policy: disable
+    execution_timeout_seconds: 300
+    user_preemption_timeout_seconds: 10
+health_check:
+  every: 3600
+  target: web
+  active_hours:
+    start: 08:00
+    end: 22:00
+execution_guard:
+  model_anomaly_detection_rail:
+    enabled: true
+    max_retries: 2
+    repeat_min_pattern_chars: 2
+    repeat_max_pattern_chars: 64
+    repeat_min_count: 6
+    repeat_min_total_chars: 160
+    repeat_window_chars: 1024
+    single_char_repeat_count: 90
+    tool_loop_compact:
+      enabled: true
+      consecutive_threshold: 4
+      bailout_threshold: 3
+  circuit_breaker:
+    enabled: false
+    warning_threshold: 10
+    critical_threshold: 20
+    global_breaker_threshold: 30
+    unknown_tool_threshold: 10
+channels:
+  web:
+    send_file_allowed: true
+  feishu:
+    send_file_allowed: true
+    apps:
+      - name: 飞书默认应用
+      # 飞书应用配置
+        app_id:
+        app_secret:
+        encrypt_key:
+        verification_token:
+        allow_from:
+        enable_streaming: false
+        enabled: false
+        # 群聊数字分身（默认关闭）
+        group_digital_avatar: false
+        my_user_id: ""
+        bot_name: ""
+        enable_memory: false
+        # 飞书开放平台 API 域名前缀（留空走官方默认，支持国际版/私有化切换）
+        api_base: https://open.feishu.cn
+  feishu_enterprise:
+  xiaoyi:
+    send_file_allowed: true
+    apps:
+      - name: 小艺默认应用
+        # 华为小艺 A2A 配置
+        app_id:
+        mode: xiaoyi_channel
+        ak:
+        sk:
+        api_id:
+        push_id:
+        agent_id:
+        ws_url1: wss://hag.cloud.huawei.com/openclaw/v1/ws/link
+        ws_url2: wss://116.63.174.231/openclaw/v1/ws/link
+        enable_streaming: true
+        enabled: false
+        # xiaoyi_claw配置
+        uid:
+        api_key:
+        push_url: https://hag.cloud.huawei.com/open-ability-agent/v1/agent-webhook
+        file_upload_url:
+        # 小艺手机端插件tools调用，会添加相关tools到系统提示词
+        phone_tools_enabled: false
+  dingtalk:
+    client_id:
+    client_secret:
+    allow_from: []
+    enabled: false
+    send_file_allowed: true
+    api_base: https://api.dingtalk.com
+    oapi_base: https://oapi.dingtalk.com
+  telegram:
+    bot_token:
+    allow_from: []
+    parse_mode: Markdown
+    group_chat_mode: mention
+    enabled: false
+  discord:
+    bot_token:
+    application_id:
+    guild_id:
+    channel_id:
+    allow_from: []
+    block_dm: false
+    enabled: false
+  slack:
+    bot_token:
+    app_token:
+    allow_from: []
+    allowed_channel_ids: []
+    default_channel_id:
+    reply_in_thread: true
+    enabled: false
+  whatsapp:
+    bridge_ws_url: ws://127.0.0.1:19600/ws
+    default_jid:
+    allow_from: []
+    enable_streaming: true
+    auto_start_bridge: false
+    bridge_command: node scripts/whatsapp-bridge.js
+    bridge_workdir:
+    enabled: false
+  wechat:
+    enable_streaming: false
+    base_url: https://ilinkai.weixin.qq.com
+    bot_token:
+    ilink_bot_id:
+    ilink_user_id:
+    allow_from: []
+    auto_login: true
+    qrcode_poll_interval_sec: 2.0
+    long_poll_timeout_sec: 45
+    backoff_base_sec: 1.0
+    backoff_max_sec: 30.0
+    credential_file: ~/.wx-ai-bridge/credentials.json
+    enabled: false
+  wecom:
+    bot_id:
+    secret:
+    ws_url: wss://openws.work.weixin.qq.com
+    allow_from: []
+    enable_streaming: true
+    send_thinking_message: false
+    enabled: false
+    send_file_allowed: true
+    group_digital_avatar: false
+    my_user_id: ""
+    bot_name: ""
+    enable_memory: false
+  ssh:
+    enabled: false
+    listen_host: "0.0.0.0"
+    listen_port: 2222
+    host_key_path: ~/.jiuwenswarm/config/ssh_host_key
+    relay_timeout_sec: 3600
+    auth:
+      enabled: true
+      ephemeral_key_ttl_sec: 300
+      ephemeral_key_type: "ssh-ed25519"
+      cleanup_interval_sec: 60
+permissions:
+  enabled: false
+  schema: tiered_policy
+  permission_mode: normal
+  package_builtin_rules: true
+  shell_guard:
+    unknown_structure: false
+    interpreter_sink: false
+  mode: manual
+  defaults:
+    "*": "allow"
+  tools:
+    bash: allow
+    powershell: allow
+    mcp_exec_command: allow
+    create_terminal: allow
+    write: allow
+    write_file: allow
+    edit_file: allow
+    search_replace: allow
+    ask_user: allow
+    write_memory: allow
+    edit_memory: allow
+    read_memory: allow
+    memory_search: allow
+    memory_get: allow
+    todo_create: allow
+    todo_insert: allow
+    todo_complete: allow
+    todo_remove: allow
+    todo_list: allow
+    coding_memory_write: allow
+    coding_memory_edit: allow
+    coding_memory_read: allow
+    ltm_search: allow
+    ltm_search_summary: allow
+    mem0_profile: allow
+    mem0_search: allow
+    mem0_conclude: allow
+    viking_search: allow
+    viking_read: allow
+    viking_browse: allow
+    viking_remember: allow
+    viking_add_resource: allow
+    mcp_free_search: allow
+    mcp_paid_search: allow
+    mcp_fetch_webpage: allow
+    cron_list_jobs: allow
+    cron_get_job: allow
+    cron_create_job: allow
+    cron_update_job: allow
+    cron_delete_job: allow
+    cron_toggle_job: allow
+    cron_preview_job: allow
+    acp_chat: ask
+  rules:
+    - id: shell_allow_dir
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "dir *"
+      severity: LOW
+    - id: shell_allow_ls
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "ls *"
+      severity: LOW
+    - id: shell_allow_pwd
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "pwd *"
+      severity: LOW
+    - id: shell_allow_cd
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "cd *"
+      severity: LOW
+    - id: shell_allow_echo
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "echo *"
+      severity: LOW
+    - id: shell_allow_cat
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "cat *"
+      severity: LOW
+    - id: shell_allow_type
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "type *"
+      severity: LOW
+    - id: shell_allow_head
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "head *"
+      severity: LOW
+    - id: shell_allow_tail
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "tail *"
+      severity: LOW
+    - id: shell_allow_git_status
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "git status *"
+      severity: LOW
+    - id: shell_allow_git_log
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "git log *"
+      severity: LOW
+    - id: shell_allow_git_diff
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "git diff *"
+      severity: LOW
+    - id: shell_allow_git_branch
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "git branch *"
+      severity: LOW
+    # PowerShell cmdlet / alias counterparts of cd, pwd, ls/dir, cat/type, echo, head/tail
+    - id: shell_allow_set_location
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Set-Location *"
+      severity: LOW
+    - id: shell_allow_push_location
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Push-Location *"
+      severity: LOW
+    - id: shell_allow_pop_location
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Pop-Location *"
+      severity: LOW
+    - id: shell_allow_sl
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "sl *"
+      severity: LOW
+    - id: shell_allow_chdir
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "chdir *"
+      severity: LOW
+    - id: shell_allow_get_location
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Get-Location *"
+      severity: LOW
+    - id: shell_allow_gl
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "gl *"
+      severity: LOW
+    - id: shell_allow_get_childitem
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Get-ChildItem *"
+      severity: LOW
+    - id: shell_allow_gci
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "gci *"
+      severity: LOW
+    - id: shell_allow_get_item
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Get-Item *"
+      severity: LOW
+    - id: shell_allow_gi
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "gi *"
+      severity: LOW
+    - id: shell_allow_get_content
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Get-Content *"
+      severity: LOW
+    - id: shell_allow_gc
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "gc *"
+      severity: LOW
+    - id: shell_allow_write_output
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Write-Output *"
+      severity: LOW
+    - id: shell_allow_write_host
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Write-Host *"
+      severity: LOW
+    - id: shell_allow_select_object
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: 're:(?i)^Select-Object\b'
+      severity: LOW
+    - id: shell_ask_rm
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "rm *"
+      severity: HIGH
+    - id: shell_ask_del
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "del *"
+      severity: HIGH
+    - id: shell_ask_rd
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "rd *"
+      severity: HIGH
+    - id: shell_ask_remove_item
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "Remove-Item *"
+      severity: HIGH
+    - id: shell_ask_ri
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "ri *"
+      severity: HIGH
+    - id: shell_ask_rmdir
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "rmdir *"
+      severity: HIGH
+    - id: shell_ask_erase
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: "erase *"
+      severity: HIGH
+    - id: shell_ask_sensitive_file_reads
+      tools: [bash, powershell, mcp_exec_command, create_terminal]
+      pattern: 're:(?i)(^|[\s;&|()])((cat|type|less|more|head|tail|grep|find|Get-Content|Select-String)\b[^;&|]*(id_rsa|id_ed25519|\.pem\b|\.pfx\b|\.key\b|\.kube/config|\.aws/(credentials|config)|\.npmrc\b|\.env(\.[A-Za-z0-9_-]+)?\b|authorized_keys|\.ssh/))'
+      severity: HIGH
+    # path_ask_* 已迁到 file_guard.paths（match: glob）；Pipeline A 不再重复匹配。
+    # - id: path_ask_ssh / path_ask_env → 见下方 file_guard.paths
+
+  # 数字分身 owner-scoped 权限（默认空，不生效）
+  owner_scopes: {}
+  deny_guidance_message: ""
+  file_guard:
+    enabled: true
+    defaults:
+      read: ask
+      write: ask
+      exec: ask
+    workspace:
+      read: allow
+      write: allow
+      exec: ask
+    paths:
+      - path: "**/.ssh/**"
+        match: glob
+        read: ask
+        write: ask
+        exec: ask
+      - path: "**/.env*"
+        match: glob
+        read: ask
+        write: ask
+        exec: ask
+
+  # Legacy external_directory：仅作兼容；启用上方 Native file_guard 后 "*" 不再驱动路径层。
+  # 新信任目录写入 file_guard.paths（/add-dir），勿再写本键具名 allow。
+  external_directory:
+    "*": "ask"
+browser:
+  chrome_path: ""
+  headless: true
+updater:
+  enabled: true
+  desktop_release_api_type: "gitcode"
+  repo_owner: openJiuwen
+  repo_name: jiuwenswarm
+  release_api_url: ""
+  asset_name_pattern_linux: "JiuwenSwarm-{version}.tar.gz"
+  timeout_seconds: 20
+  pypi_mirror: "https://mirrors.aliyun.com/pypi"
+extensions:
+  extension_dirs: ${EXTENSION_DIRS:-jiuwenswarm/extensions}
+hooks:
+  disable_all_hooks: false
+mcp:
+  servers: []
+modes:
+  agent:
+    memory:
+      enabled: true
+    rails:
+    tools:
+  code:
+    memory:
+      enabled: true
+    sdd:
+      enabled: false
+    rails:
+      - SkillUseRail
+      - WorktreeRail
+
+    # 动态 Tools — 列表中出现的 = 启用
+    # send_file_to_user 由运行时 _update_session_tools 注册，不在此配置
+    # coding_memory_read/write/edit 由 CodingMemoryRail 在 subagent 内部注册，不在此配置
+    tools:
+      - web_free_search
+      - web_fetch_webpage
+      - web_paid_search
+      - user_todos
+      - skill_toolkit
+      - skill_retrieval
+
+    embedding_config:
+      model_name:
+      base_url:
+      api_key:
+  team:
+    jiuwen_team:
+      team_name: jiuwen_team
+      lifecycle: persistent
+      teammate_mode: build_mode
+      spawn_mode: inprocess
+      enable_swarmflow: false
+      external_cli_agents: []
+      external_transport:
+      reliability:
+        enabled: true
+        monitor_roles:
+          - leader
+          - teammate
+
+        detectors:
+          tool_error:
+            enabled: true
+            window_seconds: 60.0
+            rate_threshold: 5
+            consecutive_threshold: 3
+
+          repeat_tool:
+            enabled: true
+            history_size: 30
+            repeat_warn: 10
+            pingpong_warn: 10
+            loop_block: 20
+            global_stop: 30
+
+          model_error:
+            enabled: true
+            window_seconds: 120.0
+            rate_threshold: 3
+            consecutive_threshold: 2
+
+          output_length:
+            enabled: true
+            text_threshold: 32000
+            thinking_threshold: 16000
+
+          compaction:
+            enabled: true
+            window_seconds: 300.0
+            frequency_threshold: 3
+            drop_ratio: 0.3
+
+          pingpong:
+            enabled: true
+            min_volleys: 6
+
+        policy:
+          severity_actions:
+            low:
+              - observe_only
+            medium:
+              - report_leader
+            high:
+              - local_steer
+              - report_leader
+            critical:
+              - local_steer
+              - escalate_user
+
+        restart_intensity:
+          intensity: 5
+          period_seconds: 60.0
+
+      # SwarmFlow per-Leader concurrency caps (three-layer governor).
+      # Only effective when enable_swarmflow is true.
+      #   max_workflows:    L1 — max concurrent workflow runs under one leader (>=1).
+      #   agents_per_run:   L2 — per-run agent admission cap (optional; None uses
+      #                          the engine's default agents-per-run resolution).
+      #   max_agents_total: L3 — global agent admission across all runs (>=1).
+      swarmflow_concurrency:
+        max_workflows: 16
+        agents_per_run:
+        max_agents_total: 64
+
+      # Enable the host-managed worktree capability used by team members and
+      # SwarmFlow agent calls with options.isolation="worktree".
+      worktree:
+        enabled: true
+
+      # 任务调度模式（TeamAgentSpec.dispatch_mode，静态配置，运行时不可切换）：
+      #   autonomous（默认）— 任务放到共享看板，成员按专长自行认领，
+      #                        leader 通过 send_message 广播启动。
+      #   scheduled        — leader 把每个任务预先指派给具名成员，
+      #                        F_62 调度运行时（agent/scheduling）统一处理
+      #                        start / 送审 / 返工 / 验收等 leader 身份的
+      #                        邮箱消息；成员失去 claim_task，改用
+      #                        member_complete_task。
+      dispatch_mode: autonomous
+      enable_task_verification: false
+      leader:
+        member_name: team-leader
+        display_name: 团队领导
+        persona: "天才项目管理专家，擅长任务分解和团队协调"
+
+      agents:
+        leader: $agent_leader
+
+      workspace:
+        enabled: true
+
+      transport:
+        type: inprocess
+
+      storage:
+        type: sqlite
+
+      # ============================================================
+      # Team 级共享记忆（TeamMemoryConfig）
+      # ============================================================
+      # 与常规 Agent 的 per-session 记忆不同，Team 记忆是一个独立的、
+      # 跨成员的共享记忆系统，由 TeamMemoryManager 统一管理。
+      #
+      # 启用后，每个 Team 成员的记忆操作不再是孤立的个人记忆，
+      # 而是读写同一份 TEAM_MEMORY.md（位于 team_memory_dir 下）。
+      # 这允许成员之间通过记忆文件共享上下文（如项目背景、决策记录等）。
+      # ============================================================
+      memory:
+        # ---------- 总开关 ----------
+        # 关闭时 TeamMemoryManager 不创建，成员记忆回退到各自独立的 MemoryRail
+        enabled: false
+
+        # ---------- 场景标识 ----------
+        # "general" — 通用场景，记忆提取 prompt 偏重项目背景与决策
+        # "coding"  — 编码场景，记忆提取 prompt 偏重技术方案与架构决策
+        scenario: "general"
+
+        # ---------- 自动提取 ----------
+        # true  — 每轮对话结束后，后台自动总结并写入 TEAM_MEMORY.md
+        # false — 仅当 LLM 主动调用记忆工具时才写入
+        # 仅在 lifecycle=persistent 时生效；temporary 团队不触发自动提取
+        auto_extract: true
+
+        # ---------- 共享记忆 ----------
+        # true  — 所有成员共享同一份 TEAM_MEMORY.md（默认）
+        # false — 每个成员维护独立记忆文件（按 member_name 分目录）
+        shared_memory: true
+
+        # ---------- 记忆注入模式 ----------
+        # 控制记忆内容如何注入到每个成员的 system prompt 中：
+        #   "proactive" — 每轮对话开始时主动注入最新记忆摘要
+        member_memory_prompt_mode: "proactive"

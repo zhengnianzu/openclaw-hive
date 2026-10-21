@@ -758,6 +758,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     pi_path = os.path.join(instance_dir, "models.json")
     grok_path = os.path.join(instance_dir, "grok_config.toml")
     dsh_path = os.path.join(instance_dir, "dsh_settings.yaml")
+    jw_config_path = os.path.join(instance_dir, "jw_config.yaml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     # harness_local_config_file: 直接用 agent_config 文件名拼路径, 兜底 openclaw.json
@@ -1036,6 +1037,56 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             credentials[api_key_env] = req.model_api_key
 
         OmegaConf.save(dsh_omega, dsh_path)
+    elif req.harness_type == "jiuwenswarm":
+        # jw_config.yaml: 模型真源是 models.defaults 列表, 默认模型由 is_default: true 标记。
+        # 注意该文件大量使用 ${VAR:-default} 占位符(jiuwenswarm 自己的 env 模板语法),
+        # OmegaConf 会当 interpolation 解析而抛 UnsupportedInterpolationType,
+        # 故用 pyyaml 原文往返(与 prepare_config.py 的 jiuwenswarm 分支一致)。
+        jw_template = os.path.join(harness_settings_dir, "jw_config.yaml")
+        if not os.path.exists(jw_template):
+            jw_template = os.path.join(settings.SETTINGS_DIR, "jw_config.yaml")
+        import yaml
+        with open(jw_template, "r", encoding="utf-8") as f:
+            jw_cfg = yaml.safe_load(f) or {}
+
+        defaults = jw_cfg.setdefault("models", {}).setdefault("defaults", [])
+        if not isinstance(defaults, list):
+            defaults = [defaults]
+            jw_cfg["models"]["defaults"] = defaults
+        # 主模型条目: 优先 is_default: true, 否则取第一条, 列表为空则新建
+        default_entry = next(
+            (e for e in defaults if isinstance(e, dict) and e.get("is_default")), None
+        )
+        if default_entry is None:
+            default_entry = defaults[0] if defaults and isinstance(defaults[0], dict) else None
+        if default_entry is None:
+            default_entry = {"is_default": True, "model_client_config": {}}
+            defaults.insert(0, default_entry)
+
+        mcc = default_entry.setdefault("model_client_config", {})
+
+        if req.model_id:
+            mcc["model_name"] = req.model_id
+        if req.model_api_key:
+            mcc["api_key"] = req.model_api_key
+        if req.model_api_type:
+            # 透传语义: anthropic-messages → Anthropic, openai-completions → OpenAI
+            # (与 prepare_config.py 的 client_provider 派生规则保持一致)
+            mcc["client_provider"] = (
+                "Anthropic" if "anthropic" in req.model_api_type.lower() else "OpenAI"
+            )
+        if req.model_base_url:
+            # jiuwenswarm 按 client_provider 归一化: openai 补 /v1, anthropic 去 /v1
+            base_url = req.model_base_url.rstrip("/")
+            if str(mcc.get("client_provider") or "").lower() == "anthropic":
+                if base_url.endswith("/v1"):
+                    base_url = base_url[:-3]
+            elif not base_url.endswith("/v1"):
+                base_url += "/v1"
+            mcc["api_base"] = base_url
+
+        with open(jw_config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(jw_cfg, f, allow_unicode=True, sort_keys=False)
     else:
         openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
         if not os.path.exists(openclaw_template):
@@ -1133,6 +1184,25 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 credentials = dsh_omega.setdefault("credentials", OmegaConf.create({}))
                 credentials[api_key_env] = req.model_api_key
                 OmegaConf.save(dsh_omega, dsh_path)
+            elif req.harness_type == "jiuwenswarm" and os.path.exists(jw_config_path):
+                import yaml
+                with open(jw_config_path, "r", encoding="utf-8") as f:
+                    jw_cfg = yaml.safe_load(f) or {}
+                defaults = jw_cfg.setdefault("models", {}).setdefault("defaults", [])
+                if not isinstance(defaults, list):
+                    defaults = [defaults]
+                    jw_cfg["models"]["defaults"] = defaults
+                default_entry = next(
+                    (e for e in defaults if isinstance(e, dict) and e.get("is_default")), None
+                )
+                if default_entry is None and defaults and isinstance(defaults[0], dict):
+                    default_entry = defaults[0]
+                if default_entry is None:
+                    default_entry = {"is_default": True, "model_client_config": {}}
+                    defaults.insert(0, default_entry)
+                default_entry.setdefault("model_client_config", {})["api_key"] = req.model_api_key
+                with open(jw_config_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(jw_cfg, f, allow_unicode=True, sort_keys=False)
             elif os.path.exists(openclaw_path):
                 with open(openclaw_path, "r", encoding="utf-8") as f:
                     openclaw_cfg = json.load(f)

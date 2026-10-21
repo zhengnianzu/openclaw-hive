@@ -13,6 +13,7 @@ import logging
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
+import yaml
 from omegaconf import OmegaConf
 
 
@@ -119,6 +120,17 @@ _FRAMEWORK_LAYOUTS: dict = {
         ],
         "workspace_base": "/home/ma-user/.dsh/workspace",
         "skill_subdir": ".agents/skills",
+    },
+    "jiuwenswarm": {
+        "harness_dir":            "/home/ma-user/.jiuwenswarm",
+        "harness_local_config":   "uploads/jw_config.yaml",
+        "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
+        "upload_paths": [
+            "/home/ma-user/.jiuwenswarm/agent/.logs",
+            "/home/ma-user/.jiuwenswarm/agent/sessions",
+        ],
+        "workspace_base": "/home/ma-user/.jiuwenswarm/agent/workspace",
+        "skill_subdir": "skills",
     },
 
 }
@@ -471,6 +483,69 @@ def prepare_local_agent_config(
         OmegaConf.save(data, local_path)
         logging.info(f"Updated settings.yaml with provider from {local_user_proxy_model_path}")
 
+    elif framework == "jiuwenswarm":
+        # jw_config.yaml: 把 user_proxy_model.json 的每个模型注入到 models.defaults。
+        # 注意 jw_config.yaml 大量使用 ${VAR:-default} 占位符，OmegaConf 会把它当
+        # interpolation 解析而失败，故用 pyyaml 原文往返，保留占位符字符串。
+        data = yaml.safe_load(Path(local_path).read_text(encoding="utf-8")) or {}
+        models = data.setdefault("models", {})
+        defaults = models.setdefault("defaults", [])
+        if not isinstance(defaults, list):
+            defaults = [defaults]
+            models["defaults"] = defaults
+
+        existing_aliases = {
+            e.get("alias") for e in defaults if isinstance(e, dict)
+        }
+
+        for agent_name, cfg in model_cfg.items():
+            if agent_name == "user_simulator":
+                continue
+            if agent_name in existing_aliases:
+                logging.info(
+                    f"jiuwenswarm model alias={agent_name} already exists, skip"
+                )
+                continue
+            if not (cfg.get("model") and cfg.get("base_url") and cfg.get("api_key")):
+                logging.warning(
+                    f"agent {agent_name} missing model/base_url/api_key, skip"
+                )
+                continue
+
+            api_kind = cfg.get("api", "openai-completions")
+            client_provider = (
+                "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
+            )
+            base_url = normalize_base_url(cfg["base_url"], api_kind)
+
+            entry = {
+                "model_client_config": {
+                    "api_base": base_url,
+                    "api_key": cfg["api_key"],
+                    "model_name": cfg["model"],
+                    "client_provider": client_provider,
+                    "timeout": 1800,
+                    "verify_ssl": True,
+                },
+                "model_config_obj": {"context_window": 262144},
+                "is_default": False,
+                "alias": agent_name,
+            }
+            defaults.append(entry)
+            existing_aliases.add(agent_name)
+            logging.info(
+                f"Added jiuwenswarm model: alias={agent_name} "
+                f"model={cfg['model']} provider={client_provider}"
+            )
+
+        Path(local_path).write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        logging.info(
+            f"Updated jw_config.yaml with models from {local_user_proxy_model_path}"
+        )
+
     elif framework == "openclaw":
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         data.setdefault("models", {}).setdefault("mode", "merge")
@@ -612,6 +687,7 @@ ERROR_CATALOG: dict = {
     "T006": "API call failed",
     "T007": "TimeoutError",
     "T008": "HarnessError",
+    "T009": "RuntimeError",
     "T010": "Uncategorized Traceback",
     # -- Unclassified --
     "X999": "unclassified exception",
