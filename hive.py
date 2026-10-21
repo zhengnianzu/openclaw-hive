@@ -650,9 +650,9 @@ class OpenClawDistillationTask:
                 f"for i in $(seq 1 {max_polls}); do sleep {poll_interval}; "
                 f"if grep -qE 'Gateway server started|服务已启动' {gateway_log_path}; "
                 f"then ready=1; break; fi; done; "
-                # 哨兵必须先于日志输出，避免 stdout 达到接口上限后被截掉。
+                # 哨兵必须先于日志输出, 就绪后只打印到标识行为止(不 tail 全量)。
                 f"if [ \"$ready\" -eq 1 ]; then echo {ready_marker}; "
-                f"tail -n 200 {gateway_log_path}; "
+                f"awk '/Gateway server started|服务已启动/ {{print; exit}} {{print}}' {gateway_log_path}; "
                 f"else echo __HIVE_JIUWENSWARM_NOT_READY__; "
                 f"tail -n 200 {gateway_log_path}; exit 124; fi"
             ]
@@ -931,12 +931,12 @@ class OpenClawDistillationTask:
         self.logger.info(f"Downloaded agents in {time.time() - start_time:.1f}s")
 
     async def _upload_harness_md(self, config_file: str, sandbox_type: str) -> None:
-        """harness_md 非空时, 用其 md 覆盖沙箱 agent 源目录下的同名 md。
+        """harness_md 非空时, 先把其 md 上传到沙箱 agent 源目录作兜底。
 
         run_config.harness_md 是平台选定的 harness 配置 md(AGENTS.md/SOUL.md/USER.md...)
-        的本地绝对路径。逐个上传到 workspace/<code_stem>/<agent_dir>/<basename>,
-        覆盖 _download_s3_agents 从 OBS 下载的同名 md, 之后各 harness 的
-        _copy_agent_configs 再把它拷进 agent workspace。空则完全跳过。
+        的本地绝对路径。逐个上传到 workspace/<code_stem>/<agent_dir>/<basename>;
+        在 _download_s3_agents 之前执行, OBS agents 下载若有同名文件则覆盖之,
+        之后各 harness 的 _copy_agent_configs 再把它拷进 agent workspace。空则完全跳过。
         """
         harness_md = self.config.harness_md or []
         if not harness_md:
@@ -1187,8 +1187,8 @@ class OpenClawDistillationTask:
         await self._upload_and_extract_code(sandbox_type)
         await self._download_s3_skills(config_file, sandbox_type)
         await self._download_s3_user_profile(config_file, sandbox_type)
-        await self._download_s3_agents(sandbox_type)
         await self._upload_harness_md(config_file, sandbox_type)
+        await self._download_s3_agents(sandbox_type)
         await self._upload_data_config(config_file)
         if self.config.sandbox_config.harness_type.strip().lower() == "openclaw":
             if sandbox_type == "windows":
@@ -1297,14 +1297,14 @@ class OpenClawDistillationTask:
             except Exception as e:
                 self.logger.error(f"save_record failed: {e}\n{traceback.format_exc()}")
 
-            # # ---- 关闭 execution_client ----
-            # if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
-            #     try:
-            #         await self.execution_client.close()
-            #     except Exception as e:
-            #         self.logger.error(
-            #             f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
-            #         )
+            # ---- 关闭 execution_client ----
+            if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
+                try:
+                    await self.execution_client.close()
+                except Exception as e:
+                    self.logger.error(
+                        f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
+                    )
 
             # ---- task-<idx>.log 结尾: 打印任务执行状态 ----
             elapsed = time.perf_counter() - start_time
