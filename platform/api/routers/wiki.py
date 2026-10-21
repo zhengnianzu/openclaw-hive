@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from ..core.database import get_connection
 from ..services.wiki_store import get_wiki_connection, _init_wiki_db
@@ -77,6 +78,7 @@ def _to_list_item(rec: dict, cat_names: dict) -> WikiDocumentListItem:
         author=rec.get("author") or "",
         updated_by=rec.get("updated_by") or "",
         is_pinned=rec.get("is_pinned") or 0,
+        sort_order=rec.get("sort_order", 100),
         last_notification_id=rec.get("last_notification_id"),
         created_at=str(rec.get("created_at") or ""),
         updated_at=str(rec.get("updated_at") or ""),
@@ -93,6 +95,7 @@ def _meta_for_file(rec: dict, cat_name: str) -> dict:
         "linked_entity_type": rec.get("linked_entity_type") or "",
         "linked_entity_key": rec.get("linked_entity_key") or "",
         "is_pinned": rec.get("is_pinned") or 0,
+        "sort_order": rec.get("sort_order", 100),
         "author": rec.get("author") or "",
         "created_at": str(rec.get("created_at") or ""),
         "updated_at": str(rec.get("updated_at") or ""),
@@ -275,7 +278,7 @@ def list_documents(
         rows = conn.execute(
             f"""SELECT * FROM documents
                 WHERE {where_sql}
-                ORDER BY is_pinned DESC, updated_at DESC
+                ORDER BY is_pinned DESC, sort_order ASC, updated_at DESC
                 LIMIT ? OFFSET ?""",
             params + [page_size, (page - 1) * page_size],
         ).fetchall()
@@ -396,6 +399,7 @@ def update_document(slug: str, req: WikiDocumentUpdate, user: dict = Depends(WIK
         "linked_entity_type": entity_type,
         "linked_entity_key": entity_key,
         "is_pinned": updates.get("is_pinned", rec.get("is_pinned")),
+        "sort_order": updates.get("sort_order", rec.get("sort_order", 100)),
         "author": rec.get("author") or user["username"],
         "created_at": rec.get("created_at") or datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
@@ -404,6 +408,47 @@ def update_document(slug: str, req: WikiDocumentUpdate, user: dict = Depends(WIK
     wiki_store.write_file(slug, meta, body)
     wiki_store.sync_index(force=True)
     return get_document(slug, user)
+
+
+class WikiReorderRequest(BaseModel):
+    """按给定顺序重排文档：列表顺序即新的展示顺序。"""
+    slugs: list[str]
+
+
+@router.post("/documents/reorder")
+def reorder_documents(req: WikiReorderRequest, user: dict = Depends(WIKI_WRITE)):
+    """把 slugs 按顺序写成 sort_order = 10, 20, 30…
+
+    只改 frontmatter 的 sort_order，不动正文与其它元数据。
+    排序值跟着 md 文件走，index.db 仍是可重建的缓存。
+    """
+    if not req.slugs:
+        raise HTTPException(status_code=400, detail="slugs 不能为空")
+
+    written = []
+    for idx, slug in enumerate(req.slugs, start=1):
+        _check_slug(slug)
+        parsed = wiki_store.parse_file(slug)
+        if not parsed:
+            continue
+        meta = {
+            "title": parsed.get("title") or "",
+            "category": parsed.get("category") or "",
+            "tags": parsed.get("tags") or "",
+            "summary": parsed.get("summary") or "",
+            "linked_entity_type": parsed.get("linked_entity_type") or "",
+            "linked_entity_key": parsed.get("linked_entity_key") or "",
+            "is_pinned": parsed.get("is_pinned") or 0,
+            "sort_order": idx * 10,
+            "author": parsed.get("author") or user["username"],
+            "created_at": parsed.get("created_at") or datetime.now().isoformat(),
+            # 只调顺序不算内容更新，保留原 updated_at
+            "updated_at": parsed.get("updated_at") or datetime.now().isoformat(),
+        }
+        wiki_store.write_file(slug, meta, parsed["content_md"])
+        written.append(slug)
+    wiki_store.sync_index(force=True)
+    return {"detail": f"已调整 {len(written)} 篇文档的顺序", "slugs": written}
 
 
 @router.delete("/documents/{slug}")

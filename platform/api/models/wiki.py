@@ -40,6 +40,7 @@ class WikiDocumentCreate(BaseModel):
     linked_entity_type: str = ""
     linked_entity_key: str = ""
     is_pinned: int = 0
+    sort_order: int = 100
 
 
 class WikiDocumentUpdate(BaseModel):
@@ -51,6 +52,7 @@ class WikiDocumentUpdate(BaseModel):
     linked_entity_type: Optional[str] = None
     linked_entity_key: Optional[str] = None
     is_pinned: Optional[int] = None
+    sort_order: Optional[int] = None
 
 
 class WikiDocumentListItem(BaseModel):
@@ -66,6 +68,7 @@ class WikiDocumentListItem(BaseModel):
     author: str = ""
     updated_by: str = ""
     is_pinned: int = 0
+    sort_order: int = 100
     last_notification_id: Optional[int] = None
     created_at: str = ""
     updated_at: str = ""

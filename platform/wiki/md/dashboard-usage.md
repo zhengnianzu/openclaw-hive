@@ -7,6 +7,7 @@ tags:
 - 入门
 summary: 首页资源面板与资源看板的统计口径、各项指标含义，以及趋势图为什么是估算值。
 is_pinned: false
+sort_order: 20
 author: admin
 created_at: '2026-10-20T00:00:00'
 updated_at: '2026-10-20T00:00:00'

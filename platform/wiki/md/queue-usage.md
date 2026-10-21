@@ -7,6 +7,7 @@ tags:
 - 入门
 summary: 多个任务如何串行排队、长尾跳过、启动与停止的语义，以及排队名次怎么看。
 is_pinned: false
+sort_order: 10
 author: admin
 created_at: '2026-10-20T00:00:00'
 updated_at: '2026-10-20T00:00:00'

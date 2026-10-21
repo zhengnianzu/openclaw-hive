@@ -61,10 +61,16 @@
         </el-table-column>
         <el-table-column prop="updated_by" label="更新人" width="110" />
         <el-table-column prop="updated_at" label="更新时间" width="180" />
-        <el-table-column label="操作" width="150" fixed="right" v-if="authStore.isAdmin">
-          <template #default="{ row }">
-            <el-button size="small" @click="$router.push(`/wiki/${row.slug}/edit`)">编辑</el-button>
-            <el-button size="small" type="danger" text @click="removeDoc(row)">删除</el-button>
+        <el-table-column label="操作" width="240" fixed="right" v-if="authStore.isAdmin">
+          <template #default="{ row, $index }">
+            <div class="op-cell">
+              <el-button size="small" text :disabled="$index === 0" title="上移"
+                @click="moveDoc($index, -1)"><el-icon><Top /></el-icon></el-button>
+              <el-button size="small" text :disabled="$index === docs.length - 1" title="下移"
+                @click="moveDoc($index, 1)"><el-icon><Bottom /></el-icon></el-button>
+              <el-button size="small" @click="$router.push(`/wiki/${row.slug}/edit`)">编辑</el-button>
+              <el-button size="small" type="danger" text @click="removeDoc(row)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -101,6 +107,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Top, Bottom } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 
@@ -170,6 +177,20 @@ function filterByTag(tag) {
   reload()
 }
 
+// 上下移动：按当前页顺序重排并提交
+async function moveDoc(index, delta) {
+  const target = index + delta
+  if (target < 0 || target >= docs.value.length) return
+  const list = docs.value.slice()
+  const [item] = list.splice(index, 1)
+  list.splice(target, 0, item)
+  docs.value = list
+  try {
+    await api.post('/wiki/documents/reorder', { slugs: list.map(d => d.slug) })
+    await loadDocs()
+  } catch { await loadDocs() }
+}
+
 async function removeDoc(row) {
   try {
     await ElMessageBox.confirm(`确定删除《${row.title}》？已发出的通知不会一并撤回。`, '删除文档', {
@@ -217,6 +238,8 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.op-cell { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; white-space: nowrap; }
+
 .header-row {
   display: flex;
   justify-content: space-between;

@@ -30,7 +30,7 @@ SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 FRONTMATTER_KEYS = (
     "title", "category", "tags", "summary",
     "linked_entity_type", "linked_entity_key",
-    "is_pinned", "author", "updated_by", "created_at", "updated_at",
+    "is_pinned", "sort_order", "author", "updated_by", "created_at", "updated_at",
 )
 
 
@@ -83,6 +83,7 @@ def _init_wiki_db(conn: sqlite3.Connection) -> None:
             author TEXT NOT NULL DEFAULT '',
             updated_by TEXT NOT NULL DEFAULT '',
             is_pinned INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 100,
             content_hash TEXT NOT NULL DEFAULT '',
             file_mtime REAL NOT NULL DEFAULT 0,
             last_notification_id INTEGER,           -- 当前展示用，纯缓存，md 里不存
@@ -94,7 +95,13 @@ def _init_wiki_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_documents_entity
             ON documents(linked_entity_type, linked_entity_key);
         CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_documents_sort ON documents(is_pinned DESC, sort_order ASC);
     """)
+    # 已有 index.db 补列（用 try/except 保持幂等，和主库迁移风格一致）
+    try:
+        conn.execute("ALTER TABLE documents ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 100")
+    except sqlite3.OperationalError:
+        pass
 
 
 # ---------------------------------------------------------------- md 解析 / 写入
@@ -114,6 +121,16 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
                 meta = {}
             return meta, "".join(lines[i + 1:]).lstrip("\n")
     return {}, text
+
+
+def _as_int(v, default: int = 100) -> int:
+    """frontmatter 里的 sort_order 可能是字符串/None，统一成 int。"""
+    try:
+        if v is None or v == "":
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _as_list(v) -> list[str]:
@@ -143,6 +160,7 @@ def parse_file(slug: str) -> Optional[dict]:
         "linked_entity_type": str(meta.get("linked_entity_type") or ""),
         "linked_entity_key": str(meta.get("linked_entity_key") or ""),
         "is_pinned": 1 if meta.get("is_pinned") else 0,
+        "sort_order": _as_int(meta.get("sort_order"), 100),
         "author": str(meta.get("author") or ""),
         "updated_by": str(meta.get("updated_by") or meta.get("author") or ""),
         "created_at": str(meta.get("created_at") or ""),
@@ -229,19 +247,20 @@ def sync_index(force: bool = False) -> int:
                 """INSERT INTO documents
                    (slug, title, category_id, tags, summary,
                     linked_entity_type, linked_entity_key,
-                    author, updated_by, is_pinned, content_hash, file_mtime,
+                    author, updated_by, is_pinned, sort_order, content_hash, file_mtime,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(slug) DO UPDATE SET
                      title=excluded.title, category_id=excluded.category_id, tags=excluded.tags,
                      summary=excluded.summary, linked_entity_type=excluded.linked_entity_type,
                      linked_entity_key=excluded.linked_entity_key, author=excluded.author,
                      updated_by=excluded.updated_by, is_pinned=excluded.is_pinned,
+                     sort_order=excluded.sort_order,
                      content_hash=excluded.content_hash, file_mtime=excluded.file_mtime,
                      created_at=excluded.created_at, updated_at=excluded.updated_at""",
                 (slug, rec["title"], cat_id, rec["tags"], rec["summary"],
                  rec["linked_entity_type"], rec["linked_entity_key"],
-                 rec["author"], rec["updated_by"], rec["is_pinned"],
+                 rec["author"], rec["updated_by"], rec["is_pinned"], rec["sort_order"],
                  rec["content_hash"], rec["file_mtime"],
                  rec["created_at"] or datetime.now().isoformat(),
                  rec["updated_at"] or datetime.now().isoformat()),
