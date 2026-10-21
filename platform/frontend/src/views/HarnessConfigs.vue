@@ -60,6 +60,7 @@
       <el-table :data="pagedConfigs" v-loading="loading" stripe style="width:100%" border
         row-key="id" highlight-current-row class="config-table"
         @row-click="onRowClick">
+        <el-table-column type="index" label="序号" width="70" align="center" />
         <el-table-column label="方案名称" min-width="200">
           <template #default="{row}">
             <div class="name-cell">

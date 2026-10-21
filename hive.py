@@ -608,6 +608,71 @@ class OpenClawDistillationTask:
         self.logger.info(f"Gateway started on port {port}")
 
 
+    async def _start_jiuwenswarm_gateway(self, config_file: str) -> None:
+        """在沙箱中启动 JiuwenSwarm 网关 (gateway + agent server)。
+
+        TUI 网关固定监听 19001 (客户端默认 JIUWENSWARM_GATEWAY_URL), 端口不随机。
+        先上传 jw_config.yaml (含注入的模型) 到 ~/.jiuwenswarm/config/config.yaml,
+        再 nohup 启动 jiuwenswarm-start app, 等其输出「服务已启动」或
+        「Gateway server started」后返回。
+        """
+        # 上传 jw_config.yaml → ~/.jiuwenswarm/config/config.yaml (含注入的模型配置)
+        await self._copy_agent_config(config_file)
+
+        # jiuwenswarm 是 pip install --user 装的, console script 在 ~/.local/bin/,
+        # 不在非交互 shell 的 PATH 里, 所以必须用全路径调用。
+        jiuwenswarm_bin = os.path.join(
+            self.config.sandbox_config.home, ".local", "bin", "jiuwenswarm-start"
+        )
+        poll_interval = 5
+        max_polls = max(1, self.config.sandbox_config.openclaw_start_timeout // poll_interval)
+
+        start_time = asyncio.get_running_loop().time()
+        max_wait = self.config.openclaw_gateway_timeout
+
+        while True:
+            elapsed = asyncio.get_running_loop().time() - start_time
+            if elapsed > max_wait:
+                self.logger.error(f"[S002] jiuwenswarm gateway startup timeout ({max_wait}s)")
+                raise HiveError("S002", detail=f"{max_wait}s / config={os.path.basename(config_file)}")
+
+            gateway_log_path = os.path.join(
+                self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
+            )
+            gateway_cmd = [
+                "/bin/bash", "-c",
+                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
+                f"nohup {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
+                # 轮询就绪(每 5s grep 一次), 就绪即退出, 而非固定 sleep 180s
+                f"for i in $(seq 1 {max_polls}); do sleep {poll_interval}; "
+                f"if grep -qE 'Gateway server started|服务已启动' {gateway_log_path}; then break; fi; done; "
+                f"cat {gateway_log_path}"
+            ]
+            exec_request = ExtendExecCommand(
+                command=gateway_cmd,
+                timeout=self.config.sandbox_config.openclaw_start_timeout + 5
+            )
+            result = await self.execution_client.extend(args=exec_request.to_dict())
+
+            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+                self.logger.error("[S001] jiuwenswarm gateway start failed")
+                _log_sandbox_detail(self.logger, "jiuwenswarm gateway start failed",
+                                    result, level=logging.ERROR)
+                raise HiveError("S001", detail=os.path.basename(config_file), sandbox_result=result)
+
+            stdout = result.data.get("stdout", "")
+            if "服务已启动" in stdout or "Gateway server started" in stdout:
+                _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup OK", result)
+                break
+
+            self.logger.error("[S003] jiuwenswarm gateway unexpected output")
+            _log_sandbox_detail(self.logger, "jiuwenswarm gateway unexpected output",
+                                result, level=logging.ERROR)
+            raise HiveError("S003", detail=os.path.basename(config_file), sandbox_result=result)
+
+        self.logger.info("JiuwenSwarm gateway started (TUI on 19001)")
+
+
     async def _run_main_script(self, config_file: str, task_idx: int) -> None:
         """Execute the main Python script in the sandbox."""
         python_file = os.path.basename(self.config.main_python_file)
@@ -1037,6 +1102,9 @@ class OpenClawDistillationTask:
                 await self._start_openclaw_gateway_windows(config_file)
             else:
                 await self._start_openclaw_gateway(config_file)
+        elif self.config.sandbox_config.harness_type.strip().lower() == "jiuwenswarm":
+            # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
+            await self._start_jiuwenswarm_gateway(config_file)
         else:
             # 就地改写 → 上传 agent config + user_proxy_model → 还原
             await self._copy_agent_config(config_file)

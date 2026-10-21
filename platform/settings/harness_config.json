@@ -75,6 +75,14 @@
         "agent_config": "dsh_settings.yaml",
         "ui_color": "#ff8c00"
     },
+    "jiuwenswarm": {
+        "id": "jiuwenswarm",
+        "name": "JiuwenSwarm",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "jw_config.yaml",
+        "ui_color": "#e91e63"
+    },
     "common": {
         "id": "common",
         "name": "通用",

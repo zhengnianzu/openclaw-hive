@@ -175,5 +175,6 @@ elif req.harness_type == "myharness":
 | codex | Codex | config.toml | #8e44ad | codex_trajs |
 | pi | Pi | models.json | #17a2b8 | pi_trajs |
 | grok | Grok | grok_config.toml | #00d084 | grok_trajs |
-| dsh | DSH | dsh_settings.yaml | #0A3D91 | dsh_trajs |
+| dsh | DeepSeek Harness | dsh_settings.yaml | #ff8c00 | dsh_trajs |
+| jiuwenswarm | JiuwenSwarm | jw_config.yaml | #e91e63 | jiuwenswarm_trajs |
 | common | 通用 | (无) | #c0c4cc | (兜底 openclaw_trajs) |
