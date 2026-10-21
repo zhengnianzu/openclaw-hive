@@ -447,37 +447,58 @@ async function onQueuePicked(queueId) {
   await loadQueues()
 }
 
+// 复制场景（?copy_from=xxx）下保留源实例的方案，不要被「默认方案」覆盖。
+// onMounted 里 copy_from 分支先填好 harness_config_id，最后才调本函数；
+// 若无条件按 is_default 赋值，复制 id=9 的实例会静默换成 id=63 的方案。
 async function loadHarnessConfigs() {
   try {
     harnessConfigList.value = await api.get('/harness-configs', {
       params: { harness_type: form.value.harness_type }
     })
-    const def = harnessConfigList.value.find(h => h.is_default)
-    if (def) {
-      form.value.harness_config_id = def.id
-    } else if (harnessConfigList.value.length) {
-      form.value.harness_config_id = harnessConfigList.value[0].id
-    } else {
-      form.value.harness_config_id = null
+    const inherited = form.value.harness_config_id &&
+      harnessConfigList.value.some(h => h.id === form.value.harness_config_id)
+    if (!inherited) {
+      const def = harnessConfigList.value.find(h => h.is_default)
+      if (def) {
+        form.value.harness_config_id = def.id
+      } else if (harnessConfigList.value.length) {
+        form.value.harness_config_id = harnessConfigList.value[0].id
+      } else {
+        form.value.harness_config_id = null
+      }
     }
-    await loadVersions()
+    await loadVersions({ keepSelection: true })
   } catch {
     harnessConfigList.value = []
     versionList.value = []
   }
 }
 
-// 只列已发布版本——实例只能引用发布过的快照
-async function loadVersions() {
+// 只列已发布版本——实例只能引用发布过的快照。
+// keepSelection=true 时保留当前已选版本（复制场景）：源实例用的是哪个版本就继续用哪个，
+// 不管该方案后来有没有发布新版本。历史实例没有记录版本号，则退到「初始发布版本」。
+async function loadVersions({ keepSelection = false } = {}) {
+  const prev = form.value.harness_config_version_id
   versionList.value = []
-  form.value.harness_config_version_id = null
-  if (!form.value.harness_config_id) return
+  if (!form.value.harness_config_id) {
+    form.value.harness_config_version_id = null
+    return
+  }
   versionsLoading.value = true
   try {
     const all = await api.get(`/harness-configs/${form.value.harness_config_id}/versions`)
     versionList.value = (all || []).filter(v => v.status === 'published')
-    if (versionList.value.length) {
-      form.value.harness_config_version_id = versionList.value[0].id
+    if (keepSelection && prev && versionList.value.some(v => v.id === prev)) {
+      // 源实例记录的版本仍在，原样沿用
+      form.value.harness_config_version_id = prev
+    } else if (versionList.value.length) {
+      // 接口按 created_at DESC 返回，[0] 是最新发布、末尾是初始发布。
+      // 复制时取初始发布版本；普通新建仍取最新。
+      const isCopy = keepSelection && !!route.query.copy_from
+      const idx = isCopy ? versionList.value.length - 1 : 0
+      form.value.harness_config_version_id = versionList.value[idx].id
+    } else {
+      form.value.harness_config_version_id = null
     }
   } catch { versionList.value = [] }
   finally { versionsLoading.value = false }

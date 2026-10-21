@@ -174,18 +174,48 @@ def _sync_harness_md(root_dir: str):
     """把 root_dir/config.yaml 的 run_config.harness_md 重写为当前 md/ 文件的绝对路径列表。
 
     失败只记日志不抛错——md 保存不该因为 config.yaml 格式问题而失败。
+
+    刻意用**文本行插入**而不是 YAML 库 round-trip：OmegaConf.save / ruamel.dump
+    都会重排缩进、去掉 null、改动引号，用户手写的 config.yaml 会被整形成另一副
+    样子（注释块位置错乱、env 列表缩进变化）。这里只增/改 harness_md 一行，
+    其余字节原样保留。
     """
     cfg_path = os.path.join(root_dir, "config.yaml")
     if not os.path.isfile(cfg_path):
         return
     names = _scan_md_dir(root_dir)
     paths = [os.path.join(md_dir(root_dir), n) for n in names]
+    value = json.dumps(paths, ensure_ascii=False)
     try:
-        cfg = OmegaConf.load(cfg_path)
-        if not OmegaConf.is_dict(cfg.get("run_config")):
-            cfg.run_config = {}
-        cfg.run_config.harness_md = paths
-        OmegaConf.save(cfg, cfg_path)
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        # 找顶层 run_config:（行首无缩进）
+        start = next(
+            (i for i, ln in enumerate(lines) if re.match(r"^run_config:\s*(#.*)?$", ln)),
+            None,
+        )
+        if start is None:
+            return
+
+        # run_config 块的范围：到下一个顶层键或文件尾
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if lines[i].strip() and not lines[i][0].isspace():
+                end = i
+                break
+
+        for i in range(start + 1, end):
+            if re.match(r"^  harness_md:", lines[i]):
+                lines[i] = f"  harness_md: {value}\n"
+                break
+        else:
+            if not lines[start].endswith("\n"):
+                lines[start] += "\n"
+            lines.insert(start + 1, f"  harness_md: {value}\n")
+
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
     except Exception as e:
         print(f"[harness_configs] 同步 harness_md 失败 {cfg_path}: {e}")
 
@@ -1196,13 +1226,10 @@ def ensure_defaults():
                 cfg_path = os.path.join(root, "config.yaml")
                 if not os.path.isfile(cfg_path):
                     continue
-                try:
-                    cfg = OmegaConf.load(cfg_path)
-                    if OmegaConf.select(cfg, "run_config.harness_md") is not None:
-                        continue
-                    _sync_harness_md(root)
-                except Exception:
-                    continue
+                # 直接走文本级同步：它自身幂等（有 harness_md 则替换、无则插入），
+                # 且不依赖 YAML 解析，能处理历史上语法已损坏的 config.yaml（如 id=81
+                # 的 token 换行越界）。不再用 OmegaConf 预检，否则坏文件会被整块跳过。
+                _sync_harness_md(root)
 
         # 4) 修复历史脏数据：同一类型下多个 is_default，只留第一条
         for htype in harness_meta.listable_types():
