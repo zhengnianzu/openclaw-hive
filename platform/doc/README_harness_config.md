@@ -9,7 +9,7 @@
 三层结构，从上到下：
 
 ```
-Harness 类型（openclaw / hermes / claude-code / dsh / codex / pi / grok / opencode / openjiuwen）
+Harness 类型（openclaw / openclaw-tui / hermes / claude-code / dsh / codex / pi / grok / opencode / openjiuwen）
     └── 配置方案（scheme）   例如「默认配置」「研究版本」「编码助手」
             └── 版本（version）  例如 1.0、1.1、2.0
 ```

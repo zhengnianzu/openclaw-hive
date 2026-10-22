@@ -30,6 +30,18 @@ _FRAMEWORK_LAYOUTS: dict = {
         "workspace_base": "/home/ma-user/.openclaw/workspace",
         "skill_subdir": "skills",
     },
+    # OpenClaw TUI 复用原生 ~/.openclaw 配置和会话目录，但不启动 Gateway。
+    # 本地模板使用独立文件名，避免平台配置方案与 gateway 型 openclaw 互相覆盖。
+    "openclaw-tui": {
+        "harness_dir":            "/home/ma-user/.openclaw",
+        "harness_local_config":   "uploads/openclaw_tui.json",
+        "harness_sandbox_config": "/home/ma-user/.openclaw/openclaw.json",
+        "upload_paths": [
+            "/home/ma-user/.openclaw/agents",
+        ],
+        "workspace_base": "/home/ma-user/.openclaw/workspace",
+        "skill_subdir": "skills",
+    },
     # 不支持TOOL.md
     "hermes": {
         "harness_dir":            "/home/ma-user/.hermes",
@@ -205,8 +217,8 @@ def prepare_local_agent_config(
     """在 spawn worker 之前把本地 agent 配置文件按 framework 修改到位。
 
     Args:
-        framework: 当前 agent 框架名 (openclaw/hermes/dsh/...)
-        data_config_file: opencode/openclaw 分支需要读 data_config 里的 agents
+        framework: 当前 agent 框架名 (openclaw/openclaw-tui/hermes/dsh/...)
+        data_config_file: opencode/openclaw/openclaw-tui 分支需要读 data_config 里的 agents
         home: 沙箱内的 home 根
         sandbox_type: 沙箱类型 ("windows" | "x86_cpu"), 决定 home 路径归一化形态
     """
@@ -546,7 +558,7 @@ def prepare_local_agent_config(
             f"Updated jw_config.yaml with models from {local_user_proxy_model_path}"
         )
 
-    elif framework == "openclaw":
+    elif framework in {"openclaw", "openclaw-tui"}:
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         data.setdefault("models", {}).setdefault("mode", "merge")
         providers = data["models"].setdefault("providers", {})

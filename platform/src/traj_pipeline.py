@@ -218,7 +218,7 @@ def harness_tsr_to_entries(d, task_obs=None):
         harness = "openclaw" if ".openclaw" in harness_home else "hermes"
     # openclaw 族（工具调用落 content parts）L1 = ≥3 工具调用 且 有纯轮；
     # hermes 族及其他（工具调用落顶层 tool_calls[]，旧统计得 0）L1 = 有产出即过。
-    _OPENCLAW_FAMILY = {"openclaw", "opencode", "claude-code"}
+    _OPENCLAW_FAMILY = {"openclaw", "openclaw-tui", "opencode", "claude-code"}
     sub = cache_subdir_for(task_obs) if task_obs else None
     entries = []
     for a in agents:

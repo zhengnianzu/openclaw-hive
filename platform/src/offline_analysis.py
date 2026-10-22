@@ -45,7 +45,7 @@ from src.traj_stats_light import has_task_done_marker  # noqa: E402
 
 # L1 门槛口径：openclaw 族（工具调用落 content parts）需 ≥3 工具调用 且 有纯轮；
 # 其余 harness（hermes/openjiuwen/codex/…，工具调用落顶层 tool_calls[]，旧统计常得 0）有产出即过。
-_OPENCLAW_FAMILY = {"openclaw", "opencode", "claude-code"}
+_OPENCLAW_FAMILY = {"openclaw", "openclaw-tui", "opencode", "claude-code"}
 
 # openjiuwen 轨迹文件名：logs/trajectories/<run_id>/query<N>.json（executor.Trajectory.save 落盘）
 _OPENJIUWEN_TRAJ_RE = re.compile(r"^query\d+\.json$")

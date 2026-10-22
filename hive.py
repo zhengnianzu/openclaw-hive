@@ -4,6 +4,7 @@ Agent Distillation Task Runner
 A configuration-driven task orchestration system for running AI Agent tasks
 in remote sandboxed environments (k8s/docker). 
 - openclaw
+- openclaw-tui
 - hermes
 - claude-code
 """
@@ -411,11 +412,12 @@ class OpenClawDistillationTask:
 
         # 2) provider 注入 + agent 预注册 + 路径本地化, 全部走 prepare_config
         #    (openclaw 分支内按 sandbox_type/home 派生, 无后处理)
-        # oc_agent_names: openclaw 专用, task config 里的 agent 名(host 已注册的
+        # oc_agent_names: OpenClaw 系 harness 专用, task config 里的 agent 名(host 已注册的
         # 交给 prepare_config 补进 agents.list), 其余 framework 传空。
         oc_agent_names = (
             self._derive_agent_names(data_config_file)
-            if self.config.sandbox_config.harness_type == "openclaw" and data_config_file else []
+            if self.config.sandbox_config.harness_type in {"openclaw", "openclaw-tui"}
+            and data_config_file else []
         )
         sandbox_cfg = self.config.sandbox_config
         prepare_local_agent_config(
@@ -1219,9 +1221,11 @@ class OpenClawDistillationTask:
     async def _execute_task(self, config_file: str, task_idx: int) -> None:
         """Execute the full task pipeline.
 
-        两种模式只差一步:
+        各模式主要差异:
           openclaw: 通过 _start_openclaw_gateway 启动 node gateway 进程
                     (内部会先 _copy_agent_config 把 openclaw.json 上传)
+          openclaw-tui: 只上传 openclaw.json，由 openclaw-task 在进程内通过
+                        ``agent --local --json`` 启动每轮 CLI，不启动 Gateway
           hermes:   只 _copy_agent_config 把 ~/.hermes/config.yaml 上传
                     (没有 gateway 进程, AIAgent 进程内调用)
         其他步骤变量复用, 路径靠 config.yaml 覆写。
@@ -1243,6 +1247,9 @@ class OpenClawDistillationTask:
         elif self.config.sandbox_config.harness_type.strip().lower() == "jiuwenswarm":
             # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
             await self._start_jiuwenswarm_gateway(config_file)
+        elif self.config.sandbox_config.harness_type.strip().lower() == "openclaw-tui":
+            # TUI 后端直接执行 ``openclaw agent --local --json``，无需常驻 Gateway。
+            await self._copy_agent_config(config_file)
         else:
             # 就地改写 → 上传 agent config + user_proxy_model → 还原
             await self._copy_agent_config(config_file)
