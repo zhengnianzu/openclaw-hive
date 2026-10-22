@@ -12,3 +12,5 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 websockets>=12.0
 tomli-w>=1.0.0
+# 文档中心图片上传：转 WebP 压缩
+Pillow>=10.0.0

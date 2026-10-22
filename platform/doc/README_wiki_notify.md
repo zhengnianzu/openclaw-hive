@@ -219,7 +219,7 @@ P1 若要放开给 operator，只改这一行 + 前端按钮的 `v-if`。
 - `validateLink` 默认拒绝 `javascript:` / `vbscript:` / 非图片 `data:`。
 - DOMPurify 作为第二道闸（管理员账号被借用的场景），并禁掉 `style/iframe/form/input/object/embed`。
 - `.markdown-body` 样式必须放 `App.vue` 的全局段 —— `<style scoped>` 命不中 `v-html` 生成的节点。
-- 图片只允许 http/https 外链。P0 没有附件上传（`frontend/dist` 每次 build 会清空）。
+- 图片可在编辑器里上传或粘贴，存 `platform/wiki/assets/`（不入 Git），自动转 WebP 压缩到最长边 1600px。
 
 ## 验证
 
@@ -260,7 +260,8 @@ curl -s $BASE/api/settings/overview -H "$AUTH" | python3 -m json.tool
 ## 已知限制 / 后续
 
 - **无文档版本历史**。P1：`wiki_document_revisions`（PUT 前写旧版）+ 详情页 diff/回滚。
-- **无附件上传**。P1：`POST /api/wiki/assets`（扩展名白名单 + 5MB），UUID 文件名 + 无鉴权 GET。
+- ~~无附件上传~~ 已实现：`POST /api/wiki/assets`（png/jpg/gif/webp，≤10MB，转 WebP）、
+  `GET /api/wiki/assets/{name}`（免登录，UUID 文件名 + 长缓存）。P1：孤儿图片清理。
 - **无定向推送**。P1：`notifications.audience` + 目标表。
 - **配置页无反查入口**。P1：Harness/代码管理列表行加「相关文档」，用
   `?linked_entity_type=&linked_entity_key=` 查询。

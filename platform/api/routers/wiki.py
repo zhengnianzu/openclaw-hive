@@ -9,14 +9,19 @@
 设计理由见 api/services/wiki_store.py 的模块注释。
 """
 import os
+import re
+import tempfile
+import uuid
 from datetime import datetime
+from io import BytesIO
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..core.database import get_connection
-from ..services.wiki_store import get_wiki_connection, _init_wiki_db
+from ..services.wiki_store import get_wiki_connection, _init_wiki_db, assets_dir
 from ..core.security import get_current_user, require_admin
 from ..models.wiki import (
     LINKED_ENTITY_TYPES,
@@ -506,3 +511,100 @@ def publish_document(slug: str, req: WikiPublishRequest, user: dict = Depends(WI
     finally:
         wconn.close()
     return WikiPublishResponse(notification_id=notification_id)
+
+
+# ---------------------------------------------------------------- 图片资源
+#
+# 图片存在 platform/wiki/assets/<uuid>.webp，不入 Git（仓库不背二进制历史）。
+# 文件名不可猜，GET 免登录 —— <img> 无法携带 Authorization 头，靠 UUID 兜底。
+
+ASSET_NAME_RE = re.compile(r"^[a-f0-9]{32}\.(webp|gif)$")
+MAX_ASSET_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_SIDE = 1600
+WEBP_QUALITY = 82
+ALLOWED_UPLOAD_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+class WikiAssetInfo(BaseModel):
+    url: str
+    name: str
+    width: int = 0
+    height: int = 0
+    size: int = 0
+
+
+def _check_asset_name(name: str) -> str:
+    if not ASSET_NAME_RE.match(name or ""):
+        raise HTTPException(status_code=400, detail="非法的图片文件名")
+    return name
+
+
+@router.post("/assets", response_model=WikiAssetInfo)
+async def upload_asset(file: UploadFile = File(...), user: dict = Depends(WIKI_WRITE)):
+    """上传文档配图。转 WebP 压缩到最长边 1600px；动画 GIF 原样保留。"""
+    from PIL import Image
+
+    if file.content_type not in ALLOWED_UPLOAD_TYPES:
+        raise HTTPException(status_code=400, detail="只支持 png / jpg / gif / webp 图片")
+
+    raw = await file.read()
+    if len(raw) > MAX_ASSET_BYTES:
+        raise HTTPException(status_code=400, detail="图片超过 10MB")
+    if not raw:
+        raise HTTPException(status_code=400, detail="空文件")
+
+    # 用实际解码判断是不是图片，不信任扩展名 / content-type
+    try:
+        img = Image.open(BytesIO(raw))
+        img.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="无法解析为图片")
+
+    is_animated = getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1
+
+    if is_animated:
+        # 转 WebP 会丢动画，原样保存
+        name = f"{uuid.uuid4().hex}.gif"
+        data = raw
+        width, height = img.size
+    else:
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+        img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="WEBP", quality=WEBP_QUALITY, method=4)
+        data = buf.getvalue()
+        name = f"{uuid.uuid4().hex}.webp"
+        width, height = img.size
+
+    path = os.path.join(assets_dir(), name)
+    fd, tmp = tempfile.mkstemp(dir=assets_dir(), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    return WikiAssetInfo(
+        url=f"/api/wiki/assets/{name}",
+        name=name,
+        width=width,
+        height=height,
+        size=len(data),
+    )
+
+
+@router.get("/assets/{name}")
+def get_asset(name: str):
+    """免登录读取。UUID 文件名内容不会再变，给长缓存。"""
+    name = _check_asset_name(name)
+    path = os.path.join(assets_dir(), name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return FileResponse(
+        path,
+        media_type="image/webp" if name.endswith(".webp") else "image/gif",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )

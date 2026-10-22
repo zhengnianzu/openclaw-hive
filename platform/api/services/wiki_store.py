@@ -48,6 +48,13 @@ def md_dir() -> str:
     return path
 
 
+def assets_dir() -> str:
+    """图片目录，不入 Git（见 .gitignore）。"""
+    path = os.path.join(wiki_root(), "assets")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def doc_path(slug: str) -> str:
     if not SLUG_RE.match(slug or "") or ".." in slug:
         raise ValueError(f"非法文件名: {slug}")
