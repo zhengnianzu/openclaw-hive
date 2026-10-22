@@ -119,8 +119,10 @@ class TestComputeLevel(unittest.TestCase):
         # L1 门槛: openclaw = tool_calls>=3 且 plain_rounds>0
         self.assertEqual(oa.compute_level("openclaw", 3, 1), "L1")
         self.assertEqual(oa.compute_level("openclaw", 5, 2), "L1")
+        self.assertEqual(oa.compute_level("openclaw-tui", 3, 1), "L1")
         # 未过门槛 → L0
         self.assertEqual(oa.compute_level("openclaw", 2, 1), "L0")
+        self.assertEqual(oa.compute_level("openclaw-tui", 2, 1), "L0")
         self.assertEqual(oa.compute_level("openclaw", 5, 0), "L0")
         self.assertEqual(oa.compute_level("openclaw", 0, 0), "L0")
 
@@ -466,7 +468,14 @@ class TestLogFallbackGrade(unittest.TestCase):
         # 家族门（tool_calls>=3）在兜底路径不适用：tool_calls 无从统计，不得打回 L0/L1
         with tempfile.TemporaryDirectory() as d:
             p = self._mklog(d, "【Task_Done】\n")
-            for ht in ("openclaw", "opencode", "claude-code", "hermes", "openjiuwen"):
+            for ht in (
+                "openclaw",
+                "openclaw-tui",
+                "opencode",
+                "claude-code",
+                "hermes",
+                "openjiuwen",
+            ):
                 _, lv = oa.log_fallback_grade(p, ht)
                 self.assertIn(lv, ("L1.5", "L2", "L3"),
                               msg=f"{ht} 兜底不得低于 L1.5，实际 {lv}")

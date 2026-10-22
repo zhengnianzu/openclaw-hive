@@ -168,6 +168,7 @@ elif req.harness_type == "myharness":
 | id | name | agent_config | ui_color | traj_prefix |
 |----|------|--------------|----------|-------------|
 | openclaw | OpenClaw | openclaw.json | #409eff | openclaw_trajs |
+| openclaw-tui | OpenClaw TUI | openclaw_tui.json | #2563eb | openclaw-tui_trajs |
 | hermes | Hermes | hermes_config.yaml | #e6a23c | hermes_trajs |
 | claude-code | Claude Code | cc_settings.json | #67c23a | cc_trajs |
 | openjiuwen | Jiuwen Claw | openjiuwen.json | #f56c6c | openjiuwen_trajs |

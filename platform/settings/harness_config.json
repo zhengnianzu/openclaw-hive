@@ -11,6 +11,14 @@
         "agent_config": "openclaw.json",
         "ui_color": "#409eff"
     },
+    "openclaw-tui": {
+        "id": "openclaw-tui",
+        "name": "OpenClaw TUI",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": "openclaw_tui.json",
+        "ui_color": "#2563eb"
+    },
     "hermes": {
         "id": "hermes",
         "name": "Hermes",

@@ -36,6 +36,26 @@
       }
     ]
   },
+  "openclaw-tui": {
+    "model_api_key": "models.providers.local.apiKey",
+    "model_base_url": "models.providers.local.baseUrl",
+    "model_api_type": [
+      "models.providers.local.api",
+      "models.providers.local.models[0].api"
+    ],
+    "model_id": [
+      "models.providers.local.models[0].id",
+      "models.providers.local.models[0].name",
+      {
+        "path": "agents.defaults.model.primary",
+        "transform": "prefix_local"
+      },
+      {
+        "path": "agents.defaults.models",
+        "transform": "model_map"
+      }
+    ]
+  },
   "hermes": {
     "model_id": [
       "model.default",
