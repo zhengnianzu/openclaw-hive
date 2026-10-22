@@ -1160,9 +1160,9 @@ class OpenClawDistillationTask:
                 self.logger.warning(f"[upload_traj] purge failed {target}: {e}")
 
         # ---- 上传: 每个源单独 exec, 各自判定 ok / missing / fail ----
-        # S009 多为 OBS/网络瞬时抖动, 失败源最多重试 3 次(共 4 次尝试), 重试间 sleep 退避。
+        # S009 多为 OBS/网络瞬时抖动, 失败源最多重试 3 次(共 4 次尝试)。
+        # 重试间加 random(0~60s) 时延, 让并发任务的重试错开, 均分 obsutil 流量。
         upload_retries = 3
-        retry_delay = 5  # 秒
         uploaded_srcs: list[str] = []
         missing_srcs: list[str] = []
         failures: list[str] = []
@@ -1194,11 +1194,12 @@ class OpenClawDistillationTask:
             if not next_pending:
                 break
             if attempt <= upload_retries:
+                delay = random.uniform(0, 60)  # 秒, 随机错开重试, 均分 obsutil 流量
                 self.logger.warning(
                     f"[upload_traj] retry {attempt}/{upload_retries}: "
-                    f"{len(next_pending)} source(s) still failing"
+                    f"{len(next_pending)} source(s) still failing, backoff {delay:.1f}s"
                 )
-                await asyncio.sleep(retry_delay)
+                await asyncio.sleep(delay)
             pending = next_pending
 
         self.logger.info(
