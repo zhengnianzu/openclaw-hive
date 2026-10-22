@@ -939,7 +939,7 @@ const trajSaveFullPath = computed(() => {
   const rawPath = cp.traj_save_path
   if (!rawPath) return ''
   if (String(rawPath).startsWith('obs://')) return rawPath
-  const bucket = cp.obs_bucket
+  const bucket = cp.traj_save_bucket || cp.obs_bucket
   if (!bucket) return rawPath
   return `${String(bucket).replace(/\/+$/, '')}/${String(rawPath).replace(/^\/+/, '')}`
 })
