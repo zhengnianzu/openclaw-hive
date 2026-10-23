@@ -17,6 +17,7 @@ from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues, sandbox_configs
 from api.routers import batch_output, resource_pools, stats
 from api.routers import wiki, notifications, settings_overview
+from api.routers import public_api
 
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
@@ -69,6 +70,8 @@ app.include_router(wiki.router)
 app.include_router(notifications.router)
 # 系统设置总览：一次返回所有配置实体入口 + 计数
 app.include_router(settings_overview.router)
+# 对外 API：固定 AK 鉴权（X-API-Key），不涉用户身份，见 routers/public_api.py
+app.include_router(public_api.router)
 
 init_db()
 harness_configs.ensure_defaults()

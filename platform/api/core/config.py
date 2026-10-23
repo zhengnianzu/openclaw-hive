@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
+    # 对外 API（/openapi/v1）的鉴权 key，逗号分隔可配多个。
+    # 留空 = 该接口整体不可用（返回 503），避免「没配 key 就等于无鉴权」。
+    PUBLIC_API_KEYS: str = ""
+
+    @property
+    def public_api_keys(self) -> set[str]:
+        return {k.strip() for k in self.PUBLIC_API_KEYS.split(",") if k.strip()}
+
     # 队列调度配置（已取消全局沙箱上限 MAX_TOTAL_SANDBOXES）
     ORPHAN_PREPARING_GRACE_SECONDS: int = 120
 
