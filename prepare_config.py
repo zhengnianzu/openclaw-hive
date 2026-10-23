@@ -138,10 +138,9 @@ _FRAMEWORK_LAYOUTS: dict = {
         "harness_local_config":   "uploads/jw_config.yaml",
         "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
         "upload_paths": [
-            "/home/ma-user/.jiuwenswarm/agent/.logs",
-            "/home/ma-user/.jiuwenswarm/agent/sessions",
+            "/home/ma-user/.jiuwenswarm",
         ],
-        "workspace_base": "/home/ma-user/.jiuwenswarm/agent/workspace",
+        "workspace_base": "/home/ma-user/.jiuwenswarm/agent/jiuwenclaw_workspace",
         "skill_subdir": "skills",
     },
 
@@ -496,31 +495,41 @@ def prepare_local_agent_config(
         logging.info(f"Updated settings.yaml with provider from {local_user_proxy_model_path}")
 
     elif framework == "jiuwenswarm":
-        # jw_config.yaml: 把 user_proxy_model.json 的每个模型注入到 models.defaults。
-        # 注意 jw_config.yaml 大量使用 ${VAR:-default} 占位符，OmegaConf 会把它当
-        # interpolation 解析而失败，故用 pyyaml 原文往返，保留占位符字符串。
+        # jw_config.yaml: 把 user_proxy_model.json 的
+        # 每个模型追加成 models.defaults 的一条, 用 alias 区分; 默认模型靠
+        # is_default: true 标记, 其余段(permissions 等)原样保留。
         data = yaml.safe_load(Path(local_path).read_text(encoding="utf-8")) or {}
         models = data.setdefault("models", {})
         defaults = models.setdefault("defaults", [])
-        if not isinstance(defaults, list):
-            defaults = [defaults]
-            models["defaults"] = defaults
+        entries = [e for e in defaults if isinstance(e, dict)]
 
-        existing_aliases = {
-            e.get("alias") for e in defaults if isinstance(e, dict)
+        default_entry = next((e for e in entries if e.get("is_default")), None)
+
+        # 新条目沿用默认模型条目的可选字段, 不硬编码。
+        # 注意别往 model_config_obj 塞 context_window: 它会被并进 extra_params,
+        # 再传给 openai SDK 的 chat.completions.create(), 后者不认这个键, 直接 TypeError。
+        proto_mcc = (default_entry or {}).get("model_client_config") or {}
+        proto_mcc_obj = (default_entry or {}).get("model_config_obj") or {}
+
+        # jiuwenswarm 拒绝 alias 与任何条目的 model_name 撞名, 一并纳入校验。
+        taken_names = {
+            n for e in entries
+            for n in (str(e.get("alias") or "").strip(),
+                      str((e.get("model_client_config") or {}).get("model_name") or "").strip())
+            if n
         }
 
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
-            if agent_name in existing_aliases:
-                logging.info(
-                    f"jiuwenswarm model alias={agent_name} already exists, skip"
-                )
-                continue
             if not (cfg.get("model") and cfg.get("base_url") and cfg.get("api_key")):
                 logging.warning(
                     f"agent {agent_name} missing model/base_url/api_key, skip"
+                )
+                continue
+            if agent_name in taken_names:
+                logging.info(
+                    f"jiuwenswarm model alias={agent_name} already exists, skip"
                 )
                 continue
 
@@ -528,23 +537,26 @@ def prepare_local_agent_config(
             client_provider = (
                 "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
             )
-            base_url = normalize_base_url(cfg["base_url"], api_kind)
 
-            entry = {
+            defaults.append({
                 "model_client_config": {
-                    "api_base": base_url,
+                    "api_base": normalize_base_url(cfg["base_url"], api_kind),
                     "api_key": cfg["api_key"],
                     "model_name": cfg["model"],
                     "client_provider": client_provider,
-                    "timeout": 1800,
-                    "verify_ssl": True,
+                    "timeout": proto_mcc.get("timeout", 1800),
+                    "verify_ssl": proto_mcc.get("verify_ssl", True),
+                    "stream_first_chunk_timeout":
+                        proto_mcc.get("stream_first_chunk_timeout", 300),
+                    "stream_idle_timeout":
+                        proto_mcc.get("stream_idle_timeout", 120),
+                    "custom_headers": copy.deepcopy(proto_mcc.get("custom_headers", {})),
                 },
-                "model_config_obj": {"context_window": 262144},
+                "model_config_obj": copy.deepcopy(proto_mcc_obj),
                 "is_default": False,
                 "alias": agent_name,
-            }
-            defaults.append(entry)
-            existing_aliases.add(agent_name)
+            })
+            taken_names.add(agent_name)
             logging.info(
                 f"Added jiuwenswarm model: alias={agent_name} "
                 f"model={cfg['model']} provider={client_provider}"
@@ -563,7 +575,16 @@ def prepare_local_agent_config(
         data.setdefault("models", {}).setdefault("mode", "merge")
         providers = data["models"].setdefault("providers", {})
         agents_section = data.setdefault("agents", {})
-        agents_list = agents_section.setdefault("list", [])
+
+        # 两代 agent schema, 按模板里有没有 entries 键判定(不依赖版本号文本):
+        #   - 10.6: agents.entries 按 agent 名键控的对象;
+        #   - 6.6:  agents.list 数组, 条目带 id 字段。
+        entries_mode = isinstance(agents_section.get("entries"), dict)
+        agents_entries = agents_section.setdefault("entries", {}) if entries_mode else None
+        agents_list = (
+            agents_section.setdefault("list", [])
+            if not entries_mode else None
+        )
 
         # 按 sandbox_type 归一化 home 路径: windows 用 PureWindowsPath(反斜杠), 其余用 PurePosixPath
         path_cls = PureWindowsPath if sandbox_type == "windows" else PurePosixPath
@@ -602,44 +623,62 @@ def prepare_local_agent_config(
                 ],
             }
 
-            entry = {
-                "id": agent_name,
-                "name": agent_name,
-                "workspace": str(path_cls(home, ".openclaw", f"workspace-{agent_name}")),
-                "agentDir": str(path_cls(home, ".openclaw", "agents", agent_name)),
-                "model": {"primary": model_ref},
-                "models": {model_ref: {}},
-            }
-            idx = next(
-                (i for i, e in enumerate(agents_list)
-                 if isinstance(e, dict) and e.get("id") == agent_name),
-                None,
-            )
-            if idx is None:
-                agents_list.append(entry)
+            workspace = str(path_cls(home, ".openclaw", f"workspace-{agent_name}"))
+
+            if entries_mode:
+                # entries 的键就是 agent 名, 条目里不再写 id/name。
+                # agentDir 由下方统一按 10.6 的 agents/<id>/agent 补齐。
+                agents_entries[agent_name] = {
+                    **agents_entries.get(agent_name, {}),
+                    "workspace": workspace,
+                    "model": {"primary": model_ref},
+                    "models": {model_ref: {}},
+                }
             else:
-                agents_list[idx] = {**agents_list[idx], **entry}
+                agent_dir = str(path_cls(home, ".openclaw", "agents", agent_name))
+                entry = {
+                    "id": agent_name,
+                    "name": agent_name,
+                    "workspace": workspace,
+                    "agentDir": agent_dir,
+                    "model": {"primary": model_ref},
+                    "models": {model_ref: {}},
+                }
+                idx = next(
+                    (i for i, e in enumerate(agents_list)
+                     if isinstance(e, dict) and e.get("id") == agent_name),
+                    None,
+                )
+                if idx is None:
+                    agents_list.append(entry)
+                else:
+                    agents_list[idx] = {**agents_list[idx], **entry}
 
             logging.info(
                 f"Injected provider={provider_key} model={model_ref} for agent {agent_name}"
             )
 
-        # 补注册 oc_agent_names 里传入但 agents_list 中还没有的 agent。
-        # 只为缺号条目补 id + workspace(agentDir 统一在下方归一化补齐)。
+        # 补注册 oc_agent_names 里传入但配置中还没有的 agent。
         # workspace 仍按 <base>-<name> 派生, 与 harness 的命名规则一致。
-        existing_ids = {
-            str(e.get("id", "")) for e in agents_list if isinstance(e, dict)
-        }
         added: List[str] = []
         for name in (oc_agent_names or []):
             name = str(name).strip()
-            if not name or name in existing_ids:
+            if not name:
                 continue
-            agents_list.append({
-                "id": name,
-                "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
-            })
-            existing_ids.add(name)
+            if entries_mode:
+                if name in agents_entries:
+                    continue
+                agents_entries[name] = {
+                    "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
+                }
+            else:
+                if any(isinstance(e, dict) and e.get("id") == name
+                       for e in agents_list):
+                    continue
+                agents_list.append({
+                    "id": name,
+                    "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
+                })
             added.append(name)
         if added:
             logging.info(f"Registered agents from oc_agent_names: {added}")
@@ -649,12 +688,27 @@ def prepare_local_agent_config(
         # session 状态, 而不是 home 派生的路径 → upload_paths 指向的
         # ~/.openclaw/agents 一直是空的, 且跨 query 续聊(session 复用)会报
         # "Session history or replay state is invalid"。统一按 home 派生补齐。
-        for e in agents_list:
-            if not isinstance(e, dict):
-                continue
-            name = (e.get("id") or e.get("name") or "").strip()
-            if name and not e.get("agentDir"):
-                e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
+        # entries 模式的键即名字; list 模式条目自带 id/name。
+        if entries_mode:
+            # 10.6 多 agent 名册必须显式声明归属, 否则整份配置被判非法:
+            # "multi-agent rosters require agents.ownership='explicit' or one legacy
+            #  default=true marker"。单条目时加也无害, 故 entries 模式恒写。
+            agents_section["ownership"] = "explicit"
+            for name, e in agents_entries.items():
+                if isinstance(e, dict) and not e.get("agentDir"):
+                    # 10.6 的 agentDir 默认是 <home>/.openclaw/agents/<id>/agent
+                    # (模板里 test/test1/test2 也是这个形态), 与本分支保持一致;
+                    # 显式写成 agents/<id> 会让 agent 状态库落到父目录, 与
+                    # openclaw 自己的解析结果不一致。
+                    e["agentDir"] = str(
+                        path_cls(home, ".openclaw", "agents", name, "agent"))
+        else:
+            for e in agents_list:
+                if not isinstance(e, dict):
+                    continue
+                name = (e.get("id") or e.get("name") or "").strip()
+                if name and not e.get("agentDir"):
+                    e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
 
         Path(local_path).write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",

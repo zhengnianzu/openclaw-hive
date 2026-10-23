@@ -228,6 +228,7 @@ class TaskConfig:
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
+    enable_pip_install: bool = False  # true: 起主脚本前先 pip install -r requirements.txt
     model_api_key: str = ""  # 主 agent 原始 key(平台传入), suffix_api_keys 时在 hive 里打后缀
     harness_md: list = field(default_factory=list)  # 平台选定 harness 配置 md 的本地绝对路径列表
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
@@ -752,10 +753,12 @@ class OpenClawDistillationTask:
         code_stem = Path(self.config.main_code_tar).stem
         log_path = self.config.sandbox_config.result_workdir
 
+        # enable_pip_install=false 时跳过依赖安装(镜像里已预装, 可省 ~几十秒/任务)。
+        pip_step = "pip install -r requirements.txt && " if self.config.enable_pip_install else ""
         command = (
             f"cd {self.config.sandbox_config.workspace} && "
             f"mkdir -p {log_path} && cd {code_stem} && "
-            f"pip install -r requirements.txt && "
+            f"{pip_step}"
             f"python {python_file} --config {config_path} --harness {self.config.sandbox_config.harness_type} 2>&1 | "
             f"tee {log_path}/{self.config.sandbox_config.result_log}"
         )
@@ -1247,9 +1250,6 @@ class OpenClawDistillationTask:
         elif self.config.sandbox_config.harness_type.strip().lower() == "jiuwenswarm":
             # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
             await self._start_jiuwenswarm_gateway(config_file)
-        elif self.config.sandbox_config.harness_type.strip().lower() == "openclaw-tui":
-            # TUI 后端直接执行 ``openclaw agent --local --json``，无需常驻 Gateway。
-            await self._copy_agent_config(config_file)
         else:
             # 就地改写 → 上传 agent config + user_proxy_model → 还原
             await self._copy_agent_config(config_file)

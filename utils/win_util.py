@@ -421,8 +421,10 @@ async def _run_main_script_windows(self, config_file: str, task_idx: int) -> Non
         # 默认 USERPROFILE 指向 systemprofile, 会把 workspace 落到那里, 与
         # 配置/home 派生的路径对不上; 显式指到 sandbox home 让两边一致。
         f"+'set USERPROFILE={sandbox_cfg.home}'+[Environment]::NewLine"
-        f"+'pip install -r requirements.txt > nul 2>&1'+[Environment]::NewLine"
-        f"+'python {python_file} --config \"{config_path}\" --harness {self.config.sandbox_config.harness_type} > \"{log_path}\" 2>&1'+[Environment]::NewLine"
+        # enable_pip_install=false 时跳过依赖安装(与 Linux 分支 _run_main_script 一致)。
+        + ("+'pip install -r requirements.txt > nul 2>&1'+[Environment]::NewLine"
+           if self.config.enable_pip_install else "")
+        + f"+'python {python_file} --config \"{config_path}\" --harness {self.config.sandbox_config.harness_type} > \"{log_path}\" 2>&1'+[Environment]::NewLine"
         f"+'echo %errorlevel% > \"{exit_code_remote}\"'; "
         f"Set-Content -Path '{run_cmd_remote}' -Value $bat -Encoding ASCII; "
         f"Start-Process cmd.exe -ArgumentList '/d /c {run_cmd_remote}' -WorkingDirectory '{task_dir}' -WindowStyle Hidden; "
