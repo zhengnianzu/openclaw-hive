@@ -45,6 +45,7 @@ from prepare_config import (
     _FRAMEWORK_LAYOUTS,
     load_yaml_config,
     prepare_local_agent_config,
+    prepare_task_config_models,
     adapt_layout_for_windows,
     HiveError,
     _log_sandbox_detail,
@@ -495,6 +496,8 @@ class OpenClawDistillationTask:
         所有运行时字段都在这里注入：
         - platform: sandbox_type == windows 时为 windows，否则为 linux；
         - harness_type: 当前 run_config.harness_type；
+        - agents[].model: user_proxy_model.json 按 agent.name 覆盖，随后 Harness
+          主模型覆盖 queries[0].agent_name；
         - agents[].config: 仅给 queries[].agent_name 对应的 agent 插入
           harness_md 的 __default__ 路径；
         - gateway_ws_url: port 不为空时写入本次 OpenClaw gateway 端口。
@@ -515,6 +518,13 @@ class OpenClawDistillationTask:
         data = json.loads(Path(config_file).read_text(encoding="utf-8"))
         data["platform"] = "windows" if sandbox_type == "windows" else "linux"
         data["harness_type"] = self.config.sandbox_config.harness_type
+
+        model_merge = prepare_task_config_models(
+            data,
+            self.config.sandbox_config.harness_type,
+            self.local_config_file,
+            self.local_model_config_file,
+        )
 
         harness_configs = [
             f"__default__/{os.path.basename(md_path)}"
@@ -562,7 +572,10 @@ class OpenClawDistillationTask:
             f"Patched data config: platform={data['platform']}, "
             f"harness_type={data['harness_type']}, "
             f"harness_md={len(harness_configs)}, "
-            f"query_agents={sorted(query_agent_names)}, port={port or '-'}"
+            f"query_agents={sorted(query_agent_names)}, "
+            f"proxy_model_agents={model_merge['proxy_agents']}, "
+            f"main_model={model_merge['main_agent']}:{model_merge['main_model'] or '-'}, "
+            f"port={port or '-'}"
         )
         self.logger.info(
             f"Data config paths: source={Path(config_file).resolve()}, "

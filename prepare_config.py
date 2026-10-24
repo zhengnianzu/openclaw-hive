@@ -11,7 +11,7 @@ import copy
 import json
 import logging
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import yaml
 from omegaconf import OmegaConf
@@ -202,6 +202,173 @@ def _read_agent_system_prompts(data_config_file: Optional[str]) -> dict:
     return {
         agent.get("name", ""): agent.get("system_prompt", "")
         for agent in (data.get("agents") or [])
+    }
+
+
+def _model_id_from_ref(model_ref: Any) -> Optional[str]:
+    """把 ``provider/model-id`` 引用还原成表单里的模型 ID。"""
+    if not isinstance(model_ref, str):
+        return None
+    model_ref = model_ref.strip()
+    if not model_ref:
+        return None
+    return model_ref.split("/", 1)[1] if "/" in model_ref else model_ref
+
+
+def read_harness_model_id(
+    framework: str,
+    local_path: Optional[str],
+) -> Optional[str]:
+    """从平台生成的 Harness 配置中读取主模型 ID。
+
+    不同 Harness 把表单的 ``model_id`` 写在不同位置；此函数只读取主模型，
+    供上传 task_config 前同步 ``queries[0].agent_name`` 对应的 agent。
+    """
+    if not local_path:
+        return None
+    path = Path(local_path)
+    if not path.is_file():
+        return None
+
+    framework = (framework or "").strip().lower()
+
+    if framework in {"openclaw", "openclaw-tui"}:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        primary = (
+            ((data.get("agents") or {}).get("defaults") or {})
+            .get("model", {})
+            .get("primary")
+        )
+        return _model_id_from_ref(primary)
+
+    if framework == "opencode":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        model_ref = ((data.get("agent") or {}).get("main") or {}).get("model")
+        return _model_id_from_ref(model_ref)
+
+    if framework == "claude-code":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        model_id = (data.get("env") or {}).get("ANTHROPIC_MODEL")
+    elif framework == "openjiuwen":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        model_id = (data.get("default") or {}).get("model")
+    elif framework == "pi":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        providers = data.get("providers") or {}
+        provider = providers.get("custom") or next(
+            (value for value in providers.values() if isinstance(value, dict)),
+            {},
+        )
+        models = provider.get("models") or []
+        model_id = models[0].get("id") if models and isinstance(models[0], dict) else None
+    elif framework == "hermes":
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        model = data.get("model") or {}
+        model_id = model.get("default") or model.get("model")
+    elif framework == "dsh":
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        model_id = (data.get("agent-default-model") or {}).get("model")
+    elif framework == "jiuwenswarm":
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        defaults = (data.get("models") or {}).get("defaults") or []
+        if not isinstance(defaults, list):
+            defaults = [defaults]
+        default_entry = next(
+            (entry for entry in defaults
+             if isinstance(entry, dict) and entry.get("is_default")),
+            None,
+        )
+        if default_entry is None:
+            default_entry = next(
+                (entry for entry in defaults if isinstance(entry, dict)),
+                {},
+            )
+        model_id = (default_entry.get("model_client_config") or {}).get("model_name")
+    elif framework in {"codex", "grok"}:
+        import tomllib
+
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        if framework == "codex":
+            model_id = data.get("model")
+        else:
+            model_id = ((data.get("model") or {}).get("default-model") or {}).get("model")
+    else:
+        return None
+
+    if not isinstance(model_id, str):
+        return None
+    return model_id.strip() or None
+
+
+def prepare_task_config_models(
+    data: dict,
+    framework: str,
+    local_path: Optional[str],
+    local_user_proxy_model_path: Optional[str],
+) -> dict:
+    """把表单模型配置合并进待上传的 task_config。
+
+    优先级（后者覆盖前者）：task_config 原值、user_proxy_model.json 同名项、
+    Harness 主模型。主 agent 由 ``queries[0].agent_name`` 唯一确定。
+
+    这里只更新 ``agents`` 中已经存在的同名 agent，不新增 agent，避免把
+    ``user_simulator`` 等模型配置误注册为 Harness agent。
+    """
+    proxy_models: dict[str, str] = {}
+    if local_user_proxy_model_path:
+        proxy_path = Path(local_user_proxy_model_path)
+        if proxy_path.is_file():
+            proxy_data = json.loads(proxy_path.read_text(encoding="utf-8"))
+            if isinstance(proxy_data, dict):
+                proxy_models = {
+                    str(name): str(config["model"]).strip()
+                    for name, config in proxy_data.items()
+                    if isinstance(config, dict)
+                    and isinstance(config.get("model"), str)
+                    and config["model"].strip()
+                }
+
+    agents = data.get("agents") or []
+    if not isinstance(agents, list):
+        logging.warning("task_config agents is not a list, skip model injection")
+        agents = []
+
+    proxy_updated: List[str] = []
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        agent_name = str(agent.get("name") or "").strip()
+        if agent_name and agent_name in proxy_models:
+            agent["model"] = proxy_models[agent_name]
+            proxy_updated.append(agent_name)
+
+    queries = data.get("queries") or []
+    first_query = queries[0] if isinstance(queries, list) and queries else {}
+    main_agent = (
+        str(first_query.get("agent_name") or "").strip()
+        if isinstance(first_query, dict) else ""
+    )
+    main_model = read_harness_model_id(framework, local_path)
+    main_updated = False
+    if main_agent and main_model:
+        for agent in agents:
+            if (isinstance(agent, dict)
+                    and str(agent.get("name") or "").strip() == main_agent):
+                agent["model"] = main_model
+                main_updated = True
+
+    if main_agent and main_model and not main_updated:
+        logging.warning(
+            f"main agent {main_agent!r} not found in task_config agents; "
+            "harness model not injected"
+        )
+
+    return {
+        "proxy_agents": sorted(set(proxy_updated)),
+        "main_agent": main_agent,
+        "main_model": main_model,
+        "main_updated": main_updated,
     }
 
 
