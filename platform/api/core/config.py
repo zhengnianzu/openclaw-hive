@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     WIKI_DIR: str = ""
     WIKI_DB_PATH: str = ""
 
+    # 沙箱产物浏览（实例详情「工作区」tab）：
+    # 目录清单存 platform.db（4 worker 共享），文件字节复用 OUTPUT_CACHE 下的 _artifacts/ 子目录
+    # （不单独引一个缓存根，避免同一份 OBS 账在机器上有两个缓存目录要清理）。
+    # 目录清单 TTL 到期才重新 ls；文件字节按 size/etag 变化才重下。
+    ARTIFACT_DIR_TTL: int = 300
+    # LibreOffice headless，用于 pptx/docx/xlsx → PDF 预览。缺省命令不存在时接口返回 503。
+    SOFFICE_PATH: str = "soffice"
+
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 

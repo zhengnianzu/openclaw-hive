@@ -76,6 +76,79 @@ async def async_execute_returning(sql, params=None):
     return await async_execute(_execute_returning, sql, params)
 
 
+def self_heal_traj_level_nullable(conn):
+    """把 task_traj_records.level 的 NOT NULL 放开（老库升级）。
+
+    为什么需要：产物下载的发现阶段按「实例的 config 列表」建行，此时还没有分级
+    （浅层可能从未跑过——比如从别的机器拷来的实例）。level 若仍 NOT NULL，
+    这些行插不进去。
+
+    SQLite 不支持 ALTER COLUMN，只能重建表搬数据。只在检测到旧约束时做一次。
+    """
+    try:
+        info = conn.execute("PRAGMA table_info(task_traj_records)").fetchall()
+    except Exception:
+        return
+    level_col = next((r for r in info if r[1] == "level"), None)
+    if level_col is None:
+        return
+    # notnull 是第 4 列（cid, name, type, notnull, dflt_value, pk）
+    if not level_col[3]:
+        return                      # 已经是可 NULL，无需迁移
+
+    cols = [r[1] for r in info]
+    col_list = ", ".join(cols)
+    conn.executescript(f"""
+        ALTER TABLE task_traj_records RENAME TO _ttr_old;
+        CREATE TABLE task_traj_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            task_idx INTEGER,
+            config_name TEXT NOT NULL,
+            traj_name TEXT NOT NULL,
+            level TEXT,
+            harness TEXT DEFAULT 'openclaw',
+            passed_gate INTEGER, has_eval INTEGER, task_done INTEGER,
+            completion REAL,
+            tool_calls INTEGER, plain_rounds INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            reasoning_tokens INTEGER, total_tokens INTEGER,
+            char_len INTEGER,
+            trajectory_rel TEXT,
+            traj_status TEXT DEFAULT 'done',
+            artifacts_status TEXT DEFAULT 'queued',
+            artifact_complete INTEGER DEFAULT 0,
+            artifact_bytes INTEGER,
+            artifact_files INTEGER,
+            artifact_downloaded_at REAL,
+            artifact_worker TEXT,
+            artifact_started_at REAL,
+            artifact_attempts INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'done',
+            error TEXT,
+            shallow_status TEXT,
+            shallow_error TEXT,
+            assistant_traj_path TEXT,
+            evaluator_traj_path TEXT,
+            task_log_path TEXT,
+            gateway_log_path TEXT,
+            eval_log_path TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(instance_id, config_name, traj_name)
+        );
+        INSERT INTO task_traj_records ({col_list})
+            SELECT {col_list} FROM _ttr_old;
+        DROP TABLE _ttr_old;
+        CREATE INDEX IF NOT EXISTS idx_traj_records_inst
+            ON task_traj_records(instance_id);
+        CREATE INDEX IF NOT EXISTS idx_traj_records_task
+            ON task_traj_records(instance_id, config_name);
+        CREATE INDEX IF NOT EXISTS idx_traj_artifacts_status
+            ON task_traj_records(artifacts_status);
+    """)
+    print("[db] task_traj_records.level 已放开 NOT NULL（重建表迁移）")
+
+
 def init_db():
     os.makedirs(os.path.dirname(get_db_path()), exist_ok=True)
     with get_connection() as conn:
@@ -442,7 +515,10 @@ def init_db():
                 task_idx INTEGER,                    -- task-<idx>.log 的 idx（若 task_records 该行有），可空
                 config_name TEXT NOT NULL,           -- task_records.config_name（config 文件名 / task 目录名）
                 traj_name TEXT NOT NULL,             -- OBS task 目录名（leaf），如 acad_000012
-                level TEXT NOT NULL,                 -- L0/L1/L1.5/L2/L3（compute_level 输出，dropped 归 L0）
+                -- level 允许 NULL：产物下载的发现阶段按「实例的 config 列表」建行，
+                -- 那时还没有分级结果（浅层可能从未跑过，比如从别的机器拷来的实例）。
+                -- 漏斗/分级统计一律按 level IN (L0..L3) 过滤，NULL 自然被排除。
+                level TEXT,                          -- L0/L1/L1.5/L2/L3（compute_level 输出，dropped 归 L0）
                 harness TEXT DEFAULT 'openclaw',
                 passed_gate INTEGER, has_eval INTEGER, task_done INTEGER,
                 completion REAL,
@@ -451,7 +527,18 @@ def init_db():
                 reasoning_tokens INTEGER, total_tokens INTEGER,
                 char_len INTEGER,
                 trajectory_rel TEXT,                 -- 相对 origin 的 assistant 轨迹路径（缓存内）
-                status TEXT DEFAULT 'done',          -- pending/downloading/done/failed（仅深层触发时置 pending）
+                -- 轨迹下载状态（deep 详情按需下载固定几个文件）
+                traj_status TEXT DEFAULT 'done',     -- NULL/pending/downloading/done/failed
+                -- 产物下载状态（工作区 tab 全量下载整个 OBS 前缀）
+                artifacts_status TEXT DEFAULT 'queued',  -- queued/downloading/done/failed/skipped
+                artifact_complete INTEGER DEFAULT 0, -- 该 config 是否出现在本地 complete.jsonl
+                artifact_bytes INTEGER,              -- 产物落盘字节数
+                artifact_files INTEGER,              -- 产物文件数
+                artifact_downloaded_at REAL,
+                artifact_worker TEXT,                -- 领取者 hostname:pid，便于排查
+                artifact_started_at REAL,            -- 领取时间，超时回收用它
+                artifact_attempts INTEGER DEFAULT 0, -- 重试次数
+                status TEXT DEFAULT 'done',          -- 兼容列：等同于 traj_status
                 error TEXT,                          -- 深层下载/解析失败信息
                 shallow_status TEXT,                 -- 浅层处理状态: NULL未处理/processed/empty(OBS无轨迹)/error
                 shallow_error TEXT,                  -- 浅层错误信息
@@ -468,15 +555,58 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_traj_records_task ON task_traj_records(instance_id, config_name);
         """)
 
+        # 沙箱产物下载记账 —— 已并入 task_traj_records（artifacts_status 等列）。
+        # 原 task_artifacts 表废弃：它与 task_traj_records 是同一套「待下载→领取→完成」
+        # 状态机，且两者下载到同一个 task 目录，拆两张表等于把同一模式写两遍。
+        # 保留一行 DROP 让老库自愈；新库从未建过该表，DROP IF EXISTS 无副作用。
+        conn.execute("DROP TABLE IF EXISTS task_artifacts")
+
+        # Worker 心跳（资源看板「调度监控」）。
+        # 之前 worker 跑起来在界面上完全不可见：只有 pid 文件、且日志只在有产出时才打印
+        # （空闲时一行都不追加，实测空跑 21 小时后日志 mtime 仍停在启动那一刻）。
+        # 进程重启、空闲、卡死三种状态在数据上完全无法区分，因此每轮落一行心跳。
+        # 只保留最近 2000 行（写入时顺带裁剪），够画 1 小时趋势即可。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                worker      TEXT NOT NULL,        -- shallow | deep | artifacts
+                pid         INTEGER,
+                round_start REAL NOT NULL,        -- epoch；启动标记行写 0
+                round_end   REAL,
+                duration    REAL,
+                processed   INTEGER DEFAULT 0,
+                failed      INTEGER DEFAULT 0,
+                note        TEXT,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_heartbeat_worker
+                ON worker_heartbeats(worker, round_start);
+        """)
+
         # migrate: 为已存在的 task_traj_records 补列（IF NOT EXISTS 不会加列），风格同 task_records
         for col in [
             "shallow_status TEXT",
             "shallow_error TEXT",
+            # 产物下载（工作区 tab）：与轨迹下载独立的状态机
+            "artifacts_status TEXT DEFAULT 'queued'",
+            "artifact_complete INTEGER DEFAULT 0",
+            "artifact_bytes INTEGER",
+            "artifact_files INTEGER",
+            "artifact_downloaded_at REAL",
+            "artifact_worker TEXT",
+            "artifact_started_at REAL",
+            "artifact_attempts INTEGER DEFAULT 0",
         ]:
             try:
                 conn.execute(f"ALTER TABLE task_traj_records ADD COLUMN {col}")
             except Exception:
                 pass
+        # migrate: 产物下载相关列（老库升级路径）。
+        # level 的 NOT NULL 放开需要重建表；SQLite 不能 ALTER COLUMN，只能建新表搬数据。
+        # 只在检测到旧约束时做一次，正常库不受影响。
+        self_heal_traj_level_nullable(conn)
+
         # 迁移回填：已有行都是浅层处理过的——有分级 → processed；failed 占位 → 无轨迹 empty。
         # 无 level 的 NULL 行保持待处理，交给浅层首次分析。
         try:

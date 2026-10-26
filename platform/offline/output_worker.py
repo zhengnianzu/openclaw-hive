@@ -12,8 +12,12 @@
     浅层只做一次（无 stale 回收）：task_traj_records.shallow_status 记录处理状态——
     processed(已分级)/empty(OBS 无轨迹目录,非 running 一次到位)/error(出错)。
     running 实例 OBS 未命中的行保持 NULL，下轮重新 ls_obs_dir 重试；已处理行不再重复。
-  深层（按需，仅用户点开会话详情/轨迹/日志时经 API 置 status='pending' 触发）：
-    status='pending' → download_task_detail + load_task_detail → 回填 5 个路径列 → done | failed。
+  产物下载（沙箱交付物）：
+    按实例 config 列表建 task_traj_records 行（level 允许 NULL），用本地 complete.jsonl
+    标记 artifact_complete；对已完成的 task 全量 `obsutil cp -r` 整个 OBS 前缀到
+    output_cache/<batch>/<leaf>/，artifacts_status: queued → downloading → done/failed/skipped。
+    **会话详情直接读这个目录**，不再有独立的「深层轨迹/日志按需下载」——
+    两者的落盘目录本来就相同（_cache_subdir_for），全量下载已覆盖 deep 要的全部文件。
 
 ⚠ 关键设计约束：worker 写 task_records 的 UPDATE 不得触碰 updated_at。
 task_records.updated_at 语义 =「在线 _sync_task_records 最后写入时间」（instances.py:1331 每次 UPSERT
@@ -25,9 +29,10 @@ task_records.updated_at 语义 =「在线 _sync_task_records 最后写入时间�
     分支不更新已有行的 updated_at。
 
 用法:
-  python offline/output_worker.py --once                     # 扫一遍浅层 + 深层后退出（调试/CI）
+  python offline/output_worker.py --once                     # 扫一遍浅层 + 产物后退出（调试/CI）
   python offline/output_worker.py --interval 60              # 常驻，每 60s 一轮（默认）
-  python offline/output_worker.py --once --deep-only         # 只消费深层 pending 队列
+  python offline/output_worker.py --once --deep-only         # 只跑产物下载队列
+  python offline/output_worker.py --once --artifacts-only    # 同上（显式）
   python offline/output_worker.py --once --instance <id>     # 只处理指定实例（调试）
 """
 from __future__ import annotations
@@ -36,6 +41,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -66,8 +73,62 @@ BACKFILL_CONCURRENCY = int(os.environ.get("BACKFILL_CONCURRENCY", "16"))
 # 浅层分级并发度：同一实例内并行处理多个 task 行（OBS 下载是 I/O 密集，串行太慢）。
 # obsutil 走独立 subprocess、DB 写用独立连接（WAL），线程安全。过高会打爆 OBS 带宽。
 SHALLOW_CONCURRENCY = int(os.environ.get("SHALLOW_CONCURRENCY", "16"))
-# 深层下载并发度（_consume_deep 用）：同理，I/O 密集。设低些避免与浅层抢 OBS。
-DEEP_CONCURRENCY = int(os.environ.get("DEEP_CONCURRENCY", "2"))
+
+# ── 沙箱产物全量下载（_consume_artifacts）──
+# 参数来自 settings/worker/config.yaml；环境变量可临时覆盖（优先级最高）。
+# 这样调并发不用改代码，`./run.sh worker-restart` 即可生效。
+
+def _load_worker_cfg() -> dict:
+    """读 settings/worker/config.yaml；缺失/损坏时返回空 dict（全部走内置默认）。"""
+    path = os.path.join(PLATFORM_DIR, "settings", "worker", "config.yaml")
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+_WCFG = _load_worker_cfg()
+
+
+def _cfg(section: str, key: str, default, env: str | None = None):
+    """取配置：环境变量 > yaml > 默认。"""
+    if env:
+        v = os.environ.get(env)
+        if v not in (None, ""):
+            try:
+                return type(default)(v)
+            except (TypeError, ValueError):
+                pass
+    sec = _WCFG.get(section) or {}
+    v = sec.get(key)
+    if v is None:
+        return default
+    try:
+        return type(default)(v)
+    except (TypeError, ValueError):
+        return default
+
+
+ARTIFACT_CONCURRENCY = _cfg("download", "concurrency", 3, "ARTIFACT_CONCURRENCY")
+ARTIFACT_MAX_TASKS_PER_ROUND = _cfg("download", "max_tasks_per_round", 20,
+                                    "ARTIFACT_MAX_TASKS_PER_ROUND")
+ARTIFACT_MAX_INSTANCES_PER_ROUND = _cfg("download", "max_instances_per_round", 4,
+                                        "ARTIFACT_MAX_INSTANCES_PER_ROUND")
+ARTIFACT_MAX_TASK_BYTES = _cfg("download", "max_task_bytes", 2 * 1024 ** 3,
+                               "ARTIFACT_MAX_TASK_BYTES")
+ARTIFACT_DOWNLOADING_TIMEOUT_MIN = _cfg("download", "downloading_timeout_minutes", 30,
+                                        "ARTIFACT_DOWNLOADING_TIMEOUT_MIN")
+ARTIFACT_FAIL_RETRY_SECONDS = _cfg("download", "fail_retry_seconds", 600,
+                                   "ARTIFACT_FAIL_RETRY_SECONDS")
+# 最多尝试次数（含首次）。超过就判死 skipped，不再排队、不再回收。
+# 之前没有上限，超时回收→排回 queued→立刻再领→再超时，死循环（实测 168 次）。
+ARTIFACT_MAX_ATTEMPTS = _cfg("download", "max_attempts", 3, "ARTIFACT_MAX_ATTEMPTS")
+HEARTBEAT_KEEP_ROWS = _cfg("worker", "heartbeat_keep_rows", 2000,
+                           "HEARTBEAT_KEEP_ROWS")
+WORKER_INTERVAL = _cfg("worker", "interval_seconds", DEFAULT_INTERVAL,
+                       "WORKER_INTERVAL")
 
 
 # ============ OBS 根 / 实例 → 队列 ============
@@ -134,7 +195,8 @@ def _pick_pending_rows(conn, instance_id: str | None = None) -> list[dict]:
 
 def _instance_by_id(conn, instance_id: str) -> dict | None:
     row = conn.execute(
-        "SELECT id, name, config_path, config_snapshot FROM task_instances WHERE id=?", (instance_id,)
+        "SELECT id, name, config_path, config_snapshot, status FROM task_instances WHERE id=?",
+        (instance_id,)
     ).fetchone()
     return dict(row) if row else None
 
@@ -343,6 +405,54 @@ def _read_task_log_map(inst: dict) -> dict:
     return out
 
 
+def _seed_task_records_from_logs(inst: dict) -> int:
+    """用实例本地 outputs/config/logs/task-*.log 补齐 task_records 缺失行。
+
+    为什么需要：task_records 正常由在线 _sync_task_records 在实例 running 时增量写入。
+    从别的机器拷来的实例、或建库早于在线同步的实例，这张表可能是空的 —— 而
+    会话列表（/shallow/tasks）、漏斗（/shallow）全部读它，于是页面一片空白，
+    即使 task_traj_records / OBS 里数据齐全。补全逻辑本身又只看「task_records 中
+    traj_level IS NULL 的缺口行」，表空就永远没有缺口，形成死结。
+
+    任务日志是这些行的权威来源（hive.py 每个 task 收尾都写 BEGIN config= 与
+    任务执行状态= status error_code=），且完全在本地，零 OBS 成本。
+
+    traj_level 写 NULL（不是 'failed'）：这些行还没做过浅层分级，写 NULL 正好让它们
+    进入下面 _backfill_finished_tasks 的缺口队列，由 tsr / 日志兜底分级。
+    已有行不动（ON CONFLICT DO NOTHING）——在线同步写入的 task_idx/status 更新更及时。
+
+    返回新插入的行数。
+    """
+    log_map = _read_task_log_map(inst)
+    if not log_map:
+        return 0
+    rows = []
+    for config_name, meta in log_map.items():
+        code = meta.get("code")
+        if code in ("-", "", None):
+            code = None
+        category = code[0] if code else None
+        rows.append((inst["id"], meta.get("task_idx"), config_name,
+                     meta.get("status"), code, category))
+    with get_connection() as conn:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM task_records WHERE instance_id=?", (inst["id"],)
+        ).fetchone()[0]
+        conn.executemany(
+            "INSERT INTO task_records "
+            "(instance_id, task_idx, config_name, status, error_code, "
+            " error_category, traj_level, updated_at) "
+            "VALUES (?,?,?,?,?,?,NULL,CURRENT_TIMESTAMP) "
+            "ON CONFLICT(instance_id, config_name) DO NOTHING",
+            rows,
+        )
+        conn.commit()
+        after = conn.execute(
+            "SELECT COUNT(*) FROM task_records WHERE instance_id=?", (inst["id"],)
+        ).fetchone()[0]
+    return after - before
+
+
 # ============ 单任务日志（按需，仅补齐缺失 config 的 status/code） ============
 
 def _read_task_log_for(inst: dict, task_idx: int) -> dict:
@@ -453,6 +563,16 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
     # 实例级 harness 类型：占位行与 compute_level 的 harness 兜底都用它，避免一律写死 openclaw
     # （存量实例 tsr 无 harness_type 字段时，靠这个值定级；也用于无 tsr 占位行的 harness 列）。
     inst_ht = _instance_harness_type(inst)
+    # 先把「本地任务日志里有、DB 里没有」的 config 补成 task_records 行。
+    # 必须做在查缺口之前：从别的机器拷来的实例（或在线 _sync_task_records 从未跑过的
+    # finished 实例）task_records 整张表是空的，缺口查询恒返回 0 行 → 补全永远不启动
+    # → 会话列表空白、漏斗全 0，而 task_traj_records 里其实有货。任务日志是这些行
+    # 的权威来源（hive.py 每个 task 收尾都会写 BEGIN config= / 任务执行状态=）。
+    n_seeded = _seed_task_records_from_logs(inst)
+    if n_seeded:
+        print(f"    [backfill] {inst['id']}: 从本地任务日志补 {n_seeded} 行 task_records",
+              flush=True)
+
     with get_connection() as conn:
         gaps = [dict(r) for r in conn.execute(
             "SELECT config_name, task_idx, status, error_code "
@@ -461,7 +581,7 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
             (inst["id"], BACKFILL_MAX_TASKS_PER_INSTANCE),
         ).fetchall()]
     if not gaps:
-        return 0
+        return n_seeded
     print(f"    [backfill] {inst['id']}: 缺口 {len(gaps)} 行，枚举 OBS 叶子目录", flush=True)
 
     # 首目录探测：区分"轨迹整批在 OBS"（在线竞态漏写，逐行拉 tsr 分级）和"轨迹已失效"
@@ -803,150 +923,523 @@ def _short_traj(traj_name: str) -> str:
     return traj_name.rstrip("/").rsplit("/", 1)[-1]
 
 
-def _consume_deep(origin: str, obsutil: str, instance_id: str | None = None) -> dict:
-    """消费全部 pending 行。返回 {n_done, n_failed}。
+# ============ 沙箱产物全量下载 ============
 
-    行级并发：OBS 下载/解析是 I/O 密集（subprocess cp / ls），串行逐行等下载极慢，
-    用线程池并行。DB 操作全部在主线程（连接非线程安全）——pending 读取、downloading
-    标记、结果批量回填都在主线程；线程池只做下载 + 解析返回结果。
+def _local_complete_records(inst: dict) -> list[str]:
+    """读实例本地的 outputs/<...>/complete.jsonl，返回已完成的 config 文件名列表。
 
-    downloading 标记在主线程一次性批量执行（防多 worker 重复消费），线程池拿到的是
-    已标记的行，下载完回填。若某行标记失败（已被别的 worker 抢先标记），该行跳过，
-    不做本线程消费。
+    这是「哪些任务真的跑完了」的权威来源（hive.py:368-377 每个任务结束时 append 一行，
+    整批跑完才上传 OBS —— 但本地文件一直都在）。每行是一个 config 文件名，
+    如 `task_000124.json`；对应 OBS 叶子目录名 = 去掉 `.json`。
+
+    task_output_path 在 config.yaml 里是建实例时写死的绝对路径，机器搬迁后可能失效
+    （实测拷来的实例指向原机器的 /root/...），所以取不到时回退到实例目录下的 outputs/。
     """
+    names: list[str] = []
+    out_dir = None
+    try:
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load(inst["config_path"])
+        out_dir = str(cfg.run_config.task.task_output_path or "")
+    except Exception:
+        out_dir = None
+    if not out_dir or not os.path.isdir(out_dir):
+        inst_dir = os.path.dirname(inst.get("config_path") or "")
+        if inst_dir:
+            out_dir = os.path.join(inst_dir, "outputs")
+    if not out_dir or not os.path.isdir(out_dir):
+        return []
+
+    # complete.jsonl 可能在 outputs/ 或 outputs/<batch>/ 下（hive 的 task_output_path
+    # 会随批次追加一层），两者都找
+    candidates = [os.path.join(out_dir, "complete.jsonl")]
+    for dirpath, dirnames, filenames in os.walk(out_dir):
+        if "complete.jsonl" in filenames:
+            p = os.path.join(dirpath, "complete.jsonl")
+            if p not in candidates:
+                candidates.append(p)
+        # 只下钻两层，避免遍历巨大的 outputs 树
+        if dirpath[len(out_dir):].count(os.sep) >= 2:
+            dirnames[:] = []
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    name = line.strip()
+                    if not name:
+                        continue
+                    stem = name[:-5] if name.endswith(".json") else name
+                    if stem not in names:
+                        names.append(stem)
+        except OSError:
+            continue
+    return names
+
+
+def _ls_objects_retry(obsutil: str, task_obs: str, attempts: int = 3) -> list:
+    """递归列 task 对象，带重试。
+
+    并发下 obsutil 会偶发 exit 8（请求数超限类的瞬时错误）；实测手动单跑同前缀
+    立刻成功（114 个文件）。不重试的话这些 task 会被记账成 failed 而永久跳过。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return oa.ls_objects(obsutil, task_obs, recursive=True, timeout=300)
+        except Exception as e:
+            last = e
+            if i + 1 < attempts:
+                time.sleep(2 * (i + 1))       # 2s, 4s 递增
+    raise last
+
+
+def _cp_retry(obsutil: str, task_obs: str, dest_parent: str, attempts: int = 4) -> None:
+    """递归 cp 整个 task 前缀，带重试。
+
+    实测失败案例：
+      - exit 8 → OBS 请求数超限（并发太高）
+      - exit 4 + 网关空错误（Code=/RequestId= 全空）→ 瞬时故障
+    两者单独重跑都能成功（实测 task_000224 手动 cp 4.09MB 成功），
+    所以必须重试，否则这些 task 会被记账成 failed 而跳过。
+
+    重试间隔递增（3s/6s/12s），给 OBS 侧限流留恢复时间。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            oa.run_obsutil_cp(obsutil, task_obs, dest_parent, recursive=True)
+            return
+        except Exception as e:
+            last = e
+            if i + 1 < attempts:
+                time.sleep(3 * (2 ** i))
+    raise last
+
+
+def _instance_config_names(inst: dict) -> list[str]:
+    """实例的**全部** task config 名（= OBS 叶子目录名）。
+
+    这是子任务行的权威来源：configs/ 下有几个 json 就有几个子任务，与是否跑完无关。
+    task_traj_records 的行就是按这个列表建的（而不是按 complete.jsonl ——
+    它只标出「哪些已完成」，不决定有哪些任务）。
+    """
+    out_dir = None
+    try:
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load(inst["config_path"])
+        out_dir = str(cfg.run_config.task.task_input_path or "")
+    except Exception:
+        out_dir = None
+    if not out_dir or not os.path.isdir(out_dir):
+        inst_dir = os.path.dirname(inst.get("config_path") or "")
+        out_dir = os.path.join(inst_dir, "configs") if inst_dir else ""
+    if not out_dir or not os.path.isdir(out_dir):
+        return []
+    # 穿透单层嵌套（configs/configs/*.json）
+    for _ in range(4):
+        try:
+            entries = os.listdir(out_dir)
+        except OSError:
+            return []
+        subdirs = [e for e in entries if os.path.isdir(os.path.join(out_dir, e))]
+        files = [e for e in entries if e.endswith(".json")]
+        if files or not subdirs or len(subdirs) > 1:
+            break
+        out_dir = os.path.join(out_dir, subdirs[0])
+    try:
+        return sorted(f[:-5] for f in os.listdir(out_dir) if f.endswith(".json"))
+    except OSError:
+        return []
+
+
+def _discover_artifacts(obsutil: str, inst: dict, budget: dict) -> int:
+    """按实例的 config 列表建子任务行，并用 complete.jsonl 标记完成状态。
+
+    模型（用户定稿）：
+      - 行 = 实例的**全部** config（99 个），不是只建 complete 里的（82 个）；
+        config 列表是固定的，落在 DB 里，complete 只决定 artifact_complete 标志。
+      - artifacts_status 只在 artifact_complete=1 时才排进下载队列；
+        failed/未跑的 config 保持 queued，永不下载。
+      - 行已存在就不重复插（UNIQUE(instance_id, config_name, traj_name)）。
+
+    返回本轮新入队数。
+    """
+    if budget["tasks"] <= 0:
+        return 0
+
+    configs = _instance_config_names(inst)
+    if not configs:
+        return 0
+    completed = set(_local_complete_records(inst))
+    obs_base = _make_obs_base_for(inst)
+    base = obs_base.rstrip("/") + "/"
+    now = time.time()
+    new_queued = 0
+
     with get_connection() as conn:
-        rows = _pick_pending_rows(conn, instance_id)
+        for leaf in configs:
+            is_done = 1 if leaf in completed else 0
+            # config_name 必须与 task_records 同款（**带 .json 的完整文件名**）：
+            # 全站的 task_records ⟕ task_traj_records JOIN 都按 instance_id+config_name 匹配
+            # （batch_output.py 的分页/漏斗、worker 的 _level_rows_for_instance）。
+            # 早先这里写的是去掉扩展名的 OBS 叶子名，于是浅层写 task_000001.json、
+            # 产物发现写 task_000001，UNIQUE 撞不上 → 同一 task 两行，JOIN 也接不到。
+            # traj_name 仍用叶子名，因为它是 OBS 目录名、也是产物下载的定位键。
+            config_name = leaf if leaf.endswith(".json") else leaf + ".json"
+            conn.execute(
+                "INSERT INTO task_traj_records "
+                "(instance_id, config_name, traj_name, level, harness, "
+                " traj_status, artifacts_status, artifact_complete, updated_at) "
+                "VALUES (?,?,?,NULL,?,'done',?,?,CURRENT_TIMESTAMP) "
+                # artifact_complete 用 MAX：1 可能来自用户显式「下载交付物」
+                # （POST /deep/{traj} 会置 1），不能被 complete.jsonl 的 0 覆盖回去，
+                # 否则下一轮发现就把这行踢出队列、用户点了也永远下不下来。
+                "ON CONFLICT(instance_id, config_name, traj_name) DO UPDATE SET "
+                "artifact_complete=MAX(COALESCE(task_traj_records.artifact_complete,0), "
+                "excluded.artifact_complete)",
+                (inst["id"], config_name, leaf, _instance_harness_type(inst),
+                 "queued", is_done))
+
+            if not is_done:
+                continue
+            if budget["tasks"] <= 0:
+                continue
+            # 已下完 / 正在下 / 已跳过的不再排
+            cur = conn.execute(
+                "SELECT artifacts_status FROM task_traj_records "
+                "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                (inst["id"], config_name, leaf)).fetchone()
+            st = cur["artifacts_status"] if cur else None
+            if st in ("downloading", "done", "skipped"):
+                continue
+            if st == "failed":
+                # 达到重试上限：判死，永远不再排（用户要求：失败就失败，不无限重试）
+                row = conn.execute(
+                    "SELECT artifact_started_at, artifact_attempts "
+                    "FROM task_traj_records "
+                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                    (inst["id"], config_name, leaf)).fetchone()
+                attempts = (row["artifact_attempts"] if row else 0) or 0
+                if attempts >= ARTIFACT_MAX_ATTEMPTS:
+                    conn.execute(
+                        "UPDATE task_traj_records SET artifacts_status='skipped', "
+                        "updated_at=CURRENT_TIMESTAMP "
+                        "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                        (inst["id"], config_name, leaf))
+                    continue
+                # 未达上限：退避窗口内不重试
+                started = (row["artifact_started_at"] if row else None) or 0
+                if now - float(started) < ARTIFACT_FAIL_RETRY_SECONDS:
+                    continue
+            # 注意：不清 error —— 清了就看不出上次为什么失败（曾导致 168 次重试无痕）
+            conn.execute(
+                "UPDATE task_traj_records SET artifacts_status='queued', "
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE instance_id=? AND config_name=? AND traj_name=? "
+                "AND artifacts_status NOT IN ('downloading','done','skipped')",
+                (inst["id"], config_name, leaf))
+            new_queued += 1
+            budget["tasks"] -= 1
+        conn.commit()
+    return new_queued
+
+
+def _download_artifact_task(inst: dict, tr: dict, origin: str, obsutil: str) -> tuple:
+    """下载单个 task 的全量产物到 output_cache/<batch>/<leaf>/。
+
+    `obsutil cp <task_obs> <dest_parent> -r -f` 保留 leaf basename（已实测），
+    落点与 deep 详情用同一个 task 目录，一次下载同时满足工作区与会话详情。
+    """
+    leaf = tr["traj_name"]
+    obs_base = _make_obs_base_for(inst)
+    task_obs = obs_base.rstrip("/") + "/" + leaf + "/"
+    cache_subdir = oa._cache_subdir_for(task_obs)
+    dest_parent = os.path.join(origin, os.path.dirname(cache_subdir))
+    dest = os.path.join(origin, *cache_subdir.split("/"))
+    os.makedirs(dest_parent, exist_ok=True)
+
+    t0 = time.time()
+    try:
+        _cp_retry(obsutil, task_obs, dest_parent)
+    except Exception as e:
+        return ("fail", None, (str(e)[:500], inst["id"], tr["config_name"], leaf))
+
+    # 统计落盘结果（原来靠下载前递归 ls 预估体积，现在改为落盘后实测 ——
+    # 少一次可能长达数分钟的递归列举）
+    n = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(dest):
+        for fn in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+                n += 1
+            except OSError:
+                pass
+
+    elapsed = time.time() - t0
+    if total > ARTIFACT_MAX_TASK_BYTES:
+        # 超限：磁盘已经被占了，删掉避免长期占空间，并标 oversize 不再重试
+        shutil.rmtree(dest, ignore_errors=True)
+        msg = f"超过单任务上限 {ARTIFACT_MAX_TASK_BYTES} 字节（实际 {total}）"
+        print(f"    [artifacts] {leaf}: 已删除（{total/1048576:.1f}MB 超上限）", flush=True)
+        return ("oversize", None, (msg, inst["id"], tr["config_name"], leaf))
+
+    print(f"    [artifacts] {leaf}: 完成 {n} 文件 / {total/1048576:.2f}MB "
+          f"{elapsed:.1f}s", flush=True)
+    return ("ok", (n, total, time.time(), inst["id"], tr["config_name"], leaf), None)
+
+
+def _reclaim_stuck_hours(timeout_minutes: int | None = None) -> int:
+    """回收卡死的 downloading 行。
+
+    worker 中途被 kill 时不会回滚，行会永久停在 downloading（CAS 只认 queued，
+    再也捡不起来）。用 artifact_started_at（epoch）判断，比 updated_at 更准 ——
+    后者是 SQLite UTC 字符串，和其他 epoch 列混用容易出错。
+    """
+    timeout = ARTIFACT_DOWNLOADING_TIMEOUT_MIN if timeout_minutes is None else timeout_minutes
+    cutoff = time.time() - timeout * 60
+    try:
+        with get_connection() as conn:
+            # 超过重试上限的直接判死，不再排队 —— 否则会陷入
+            # 「超时回收→排回 queued→立刻再领取→再超时」的死循环（实测出现过 168 次）。
+            dead = conn.execute(
+                "UPDATE task_traj_records SET artifacts_status='skipped', "
+                "error=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE artifacts_status='downloading' "
+                "AND (artifact_started_at IS NULL OR artifact_started_at < ?) "
+                "AND COALESCE(artifact_attempts,0) >= ?",
+                (f"放弃：下载超时且已重试 {ARTIFACT_MAX_ATTEMPTS} 次", cutoff,
+                 ARTIFACT_MAX_ATTEMPTS)).rowcount
+
+            cur = conn.execute(
+                "UPDATE task_traj_records SET artifacts_status='queued', "
+                "error=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE artifacts_status='downloading' "
+                "AND (artifact_started_at IS NULL OR artifact_started_at < ?) "
+                "AND COALESCE(artifact_attempts,0) < ?",
+                (f"自动回收：downloading 超过 {timeout} 分钟未回写", cutoff,
+                 ARTIFACT_MAX_ATTEMPTS))
+            n = cur.rowcount
+            conn.commit()
+        if dead:
+            print(f"    [artifacts] 放弃 {dead} 条（重试达上限 "
+                  f"{ARTIFACT_MAX_ATTEMPTS} 次）", flush=True)
+        if n:
+            print(f"    [artifacts] 回收卡死行 {n} 条", flush=True)
+        return n + dead
+    except Exception as e:
+        print(f"    [artifacts] 回收失败: {str(e)[:150]}", flush=True)
+        return 0
+
+
+def _consume_artifacts(origin: str, obsutil: str, instance_id: str | None = None) -> dict:
+    """发现并下载沙箱产物。返回 {n_discovered, n_done, n_failed}。
+
+    分两段：
+      1. 发现：complete.jsonl 里列出的 task（任务结束即写入，running 的不在里面）；
+      2. 下载：pending → downloading（CAS 防重复）→ 线程池 cp → done/failed。
+    """
+    _reclaim_stuck_hours()
+    budget = {"tasks": ARTIFACT_MAX_TASKS_PER_ROUND}
+    n_discovered = 0
+
+    # ── 阶段 1：发现（只对已结束的实例自动发现）──
+    with get_connection() as conn:
+        if instance_id:
+            insts = [d for d in (_instance_by_id(conn, instance_id),) if d]
+        else:
+            insts = [dict(r) for r in conn.execute(
+                "SELECT id, name, config_path, config_snapshot, status FROM task_instances "
+                "WHERE status IN ('finished', 'stopped', 'completed') "
+                "ORDER BY created_at DESC LIMIT ?",
+                (ARTIFACT_MAX_INSTANCES_PER_ROUND,)).fetchall()]
+
+    for inst in insts:
+        if budget["tasks"] <= 0:
+            break
+        try:
+            n = _discover_artifacts(obsutil, inst, budget)
+            if n:
+                n_discovered += n
+                print(f"    [artifacts] {inst['id']}: 新入队 {n} 个 task", flush=True)
+        except Exception as e:
+            print(f"    [artifacts] {inst['id']}: 发现失败 {str(e)[:200]}", flush=True)
+
+    # ── 阶段 2：领取并下载 ──
+    # 队列 = task_traj_records 里 artifacts_status='queued' 且 artifact_complete=1 的行。
+    # **只领 ARTIFACT_CONCURRENCY 条**：把整批都标成 downloading 再丢给线程池，
+    # 排队等线程的那些也成了 downloading —— 页面上看着 20 个在下、实际只 3 个在跑，
+    # 且它们永远等不到回写（实测累积 60 条假 downloading）。
+    worker_id = f"{socket.gethostname()}:{os.getpid()}"
+    with get_connection() as conn:
+        sql = ("SELECT * FROM task_traj_records "
+               "WHERE artifacts_status='queued' AND artifact_complete=1 "
+               "ORDER BY updated_at LIMIT ?")
+        params: tuple = (ARTIFACT_CONCURRENCY,)
+        if instance_id:
+            sql = ("SELECT * FROM task_traj_records "
+                   "WHERE instance_id=? AND artifacts_status='queued' "
+                   "AND artifact_complete=1 ORDER BY updated_at LIMIT ?")
+            params = (instance_id, ARTIFACT_CONCURRENCY)
+        rows = conn.execute(sql, params).fetchall()
+
+        work: list[tuple[dict, dict]] = []
         inst_cache: dict[str, dict] = {}
-
-        n_done = n_fail = 0
-        n_submitted = len(rows)
-        target = f"instance {instance_id}" if instance_id else "全局"
-        # 结果批量回填：成功/失败攒到线程池收尾统一 executemany + 一次 commit。
-        batch_done: list[tuple] = []   # (assistant, eval, log, gw, ev, id)
-        batch_failed: list[tuple] = []  # (error, id)
-        if n_submitted:
-            print(f"    [deep] {target}: 提交 {n_submitted} 条待下载", flush=True)
-
-        # 主线程阶段 1：跳过实例已删的行；其余批量标记 downloading（原子防重复消费）。
-        # 标记只对 status='pending' 生效——已被别的 worker 抢先标记的行标记失败即跳过。
-        work: list[tuple[dict, dict]] = []  # (tr, inst)
-        deleted_ids: list[int] = []
         for tr in rows:
-            traj_name = _short_traj(tr.get("traj_name") or tr.get("config_name") or "")
+            tr = dict(tr)
             inst = inst_cache.get(tr["instance_id"])
             if inst is None:
                 inst = _instance_by_id(conn, tr["instance_id"])
                 if inst:
                     inst_cache[tr["instance_id"]] = inst
             if not inst:
-                # 实例已删：直接收尾，避免永久残留 pending
-                deleted_ids.append(tr["id"])
-                print(f"    [deep] {traj_name}: 跳过(实例已删)", flush=True)
-                n_fail += 1
+                conn.execute(
+                    "UPDATE task_traj_records SET artifacts_status='skipped', "
+                    "error='实例不存在', updated_at=CURRENT_TIMESTAMP "
+                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                    (tr["instance_id"], tr["config_name"], tr["traj_name"]))
                 continue
-            # 标记 downloading（防多 worker 重复消费；原子：仅 pending→downloading）
             cur = conn.execute(
-                "UPDATE task_traj_records SET status='downloading', updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=? AND status='pending'",
-                (tr["id"],),
-            )
+                "UPDATE task_traj_records SET artifacts_status='downloading', "
+                "artifact_worker=?, artifact_started_at=?, "
+                "artifact_attempts=COALESCE(artifact_attempts,0)+1, "
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE instance_id=? AND config_name=? AND traj_name=? "
+                "AND artifacts_status='queued'",
+                (worker_id, time.time(), tr["instance_id"],
+                 tr["config_name"], tr["traj_name"]))
             if cur.rowcount == 0:
-                # 已被别的 worker/上一轮抢占：跳过本行，避免重复下载
-                print(f"    [deep] {traj_name}: 跳过(已被抢占)", flush=True)
                 continue
             work.append((tr, inst))
-        if deleted_ids:
-            conn.executemany(
-                "UPDATE task_traj_records SET status='failed', error='实例不存在', "
-                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                [(i,) for i in deleted_ids],
-            )
         if work:
-            conn.commit()  # 标记落盘后线程池才开跑（防重复消费窗口）
+            conn.commit()
 
-        if work:
-            # 线程池阶段 2：只做 OBS 下载/解析（I/O 密集），返回 (ok行成功元组|None, err, tr)。
-            def _download_one(tr: dict, inst: dict) -> tuple:
-                traj_name = _short_traj(tr.get("traj_name") or tr.get("config_name") or "")
-                t_dl = time.time()
-                print(f"    [deep] {traj_name}: 开始下载", flush=True)
-                try:
-                    obs_base = _make_obs_base_for(inst)
-                    task_obs = obs_base.rstrip("/") + "/" + traj_name + "/"
-                    # 预检 OBS 目录存在性：不存在（轨迹已清理/路径不符）直接判 failed，
-                    # 避免永久 pending/重试
-                    listing = oa.run_obsutil_ls(obsutil, task_obs, one_level=False)
-                    if not listing:
-                        raise FileNotFoundError(
-                            f"OBS 目录不存在或无对象: {task_obs}")
-                    task_dir = oa.download_task_detail(obsutil, task_obs, origin)
-                    detail = oa.load_task_detail(task_dir, traj_name)
+    if not work:
+        return {"n_discovered": n_discovered, "n_done": 0, "n_failed": 0}
 
-                    traj_paths = {}
-                    for t in detail.get("trajectories") or []:
-                        role = t.get("role")
-                        if role == "assistant" and not traj_paths.get("assistant"):
-                            traj_paths["assistant"] = t["path"]
-                        elif role == "evaluator" and not traj_paths.get("evaluator"):
-                            traj_paths["evaluator"] = t["path"]
-                    log_path = (detail.get("log") or {}).get("path")
-                    gw_path = (detail.get("gateway") or {}).get("path")
-                    ev_path = (detail.get("eval_use_log") or {}).get("path")
+    def _persist(outcome: str, ok, err) -> None:
+        """每个 task 下完立刻落库。
 
-                    ap = os.path.basename(traj_paths.get("assistant") or "") or "无assistant轨迹"
-                    print(f"    [deep] {traj_name}: 完成 {time.time()-t_dl:.1f}s "
-                          f"assistant={ap}", flush=True)
-                    # 成功元组
-                    return ("ok", (traj_paths.get("assistant"), traj_paths.get("evaluator"),
-                                   log_path, gw_path, ev_path, tr["id"]), None)
-                except Exception as e:
-                    print(f"    [deep] {traj_name}: 失败 - {str(e)[:200]}", flush=True)
-                    return ("fail", None, (str(e)[:500], tr["id"]))
+        原来是「整轮结束后 executemany 批量回写」：一轮要下 20 个（并发 3，单个
+        10s~158s），整轮几分钟都不回写，页面上 done 一直是 0、downloading 一路涨，
+        看起来像「一个都没下载成功」——其实文件早已在磁盘上。
+        单行 UPDATE 的成本可以忽略，换来状态实时可见。
+        """
+        with get_connection() as c:
+            if outcome == "ok":
+                n, total, ts, iid, cfg, leaf = ok
+                c.execute(
+                    "UPDATE task_traj_records SET artifacts_status='done', error=NULL, "
+                    "artifact_files=?, artifact_bytes=?, artifact_downloaded_at=?, "
+                    "updated_at=CURRENT_TIMESTAMP "
+                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                    (n, total, ts, iid, cfg, leaf))
+            elif outcome == "oversize":
+                msg, iid, cfg, leaf = err
+                c.execute(
+                    "UPDATE task_traj_records SET artifacts_status='skipped', error=?, "
+                    "updated_at=CURRENT_TIMESTAMP "
+                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                    (msg, iid, cfg, leaf))
+            else:
+                msg, iid, cfg, leaf = err
+                c.execute(
+                    "UPDATE task_traj_records SET artifacts_status='failed', error=?, "
+                    "updated_at=CURRENT_TIMESTAMP "
+                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
+                    (msg, iid, cfg, leaf))
+            c.commit()
 
-            with ThreadPoolExecutor(max_workers=DEEP_CONCURRENCY,
-                                    thread_name_prefix="deep") as pool:
-                futures = {pool.submit(_download_one, tr, inst): tr
-                           for tr, inst in work}
-                for fut in as_completed(futures):
-                    outcome, ok, err = fut.result()
-                    if outcome == "ok":
-                        batch_done.append(ok)
-                        n_done += 1
-                    else:
-                        batch_failed.append(err)
-                        n_fail += 1
+    n_done = n_failed = 0
+    with ThreadPoolExecutor(max_workers=ARTIFACT_CONCURRENCY,
+                            thread_name_prefix="art") as pool:
+        futures = {pool.submit(_download_artifact_task, inst, tr, origin, obsutil): tr
+                   for tr, inst in work}
+        for fut in as_completed(futures):
+            outcome, ok, err = fut.result()
+            try:
+                _persist(outcome, ok, err)
+            except Exception as e:
+                print(f"    [artifacts] 回写失败: {str(e)[:120]}", flush=True)
+            if outcome == "ok":
+                n_done += 1
+            else:
+                n_failed += 1
 
-        # 主线程阶段 3：批量回填 + commit。
-        with get_connection() as conn:
-            if batch_done:
-                conn.executemany(
-                    "UPDATE task_traj_records SET "
-                    "status='done', error=NULL, updated_at=CURRENT_TIMESTAMP, "
-                    "assistant_traj_path=?, evaluator_traj_path=?, "
-                    "task_log_path=?, gateway_log_path=?, eval_log_path=? "
-                    "WHERE id=?",
-                    batch_done,
-                )
-            if batch_failed:
-                conn.executemany(
-                    "UPDATE task_traj_records SET status='failed', error=?, "
-                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    batch_failed,
-                )
-            if batch_done or batch_failed:
-                conn.commit()
-        if n_submitted:
-            print(f"    [deep] {target}: 本轮完成 提交={n_submitted} "
-                  f"done={n_done} failed={n_fail}", flush=True)
-        return {"n_done": n_done, "n_failed": n_fail}
+    return {"n_discovered": n_discovered,
+            "n_done": n_done, "n_failed": n_failed}
 
 
 # ============ 主循环 ============
 
+def _worker_mode(deep_only: bool, shallow_only: bool, artifacts_only: bool) -> str:
+    """本轮进程扮演的角色，写进心跳的 worker 列。"""
+    if artifacts_only:
+        return "artifacts"
+    if shallow_only:
+        return "shallow"
+    if deep_only:
+        return "deep"
+    return "mixed"
+
+
+def _write_heartbeat(worker: str, pid: int, round_start: float, round_end: float,
+                     processed: int, failed: int, note: str = "") -> None:
+    """落一行心跳。**失败静默**——监控不能拖垮 worker 本身。
+
+    只保留最近 HEARTBEAT_KEEP_ROWS 行，顺带裁剪。
+    """
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO worker_heartbeats "
+                "(worker, pid, round_start, round_end, duration, processed, failed, note) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (worker, pid, round_start, round_end, round(round_end - round_start, 2),
+                 processed, failed, (note or "")[:300]))
+            conn.execute(
+                "DELETE FROM worker_heartbeats WHERE id <= "
+                "(SELECT MAX(id) - ? FROM worker_heartbeats)", (HEARTBEAT_KEEP_ROWS,))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _write_worker_started(worker: str, pid: int, note: str) -> None:
+    """启动标记行（round_start=0）：区分「从未运行过」与「运行过但已退出」。
+
+    duration 留空 —— round_start=0 是哨兵值，拿它算时长会得到一个无意义的巨大数。
+    """
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO worker_heartbeats "
+                "(worker, pid, round_start, round_end, duration, processed, failed, note) "
+                "VALUES (?,?,0,?,NULL,0,0,?)",
+                (worker, pid, time.time(), note[:300]))
+            conn.execute(
+                "DELETE FROM worker_heartbeats WHERE id <= "
+                "(SELECT MAX(id) - ? FROM worker_heartbeats)", (HEARTBEAT_KEEP_ROWS,))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _run_once(obsutil: str, origin: str,
-              instance_id: str | None, deep_only: bool, shallow_only: bool = False) -> dict:
+              instance_id: str | None, deep_only: bool, shallow_only: bool = False,
+              artifacts_only: bool = False) -> dict:
     report: dict = {"shallow": {"n_processed": 0, "n_failed": 0},
-                    "deep": {"n_done": 0, "n_failed": 0}}
+                    # deep 恒为 0：轨迹下载已并入产物下载
+                    "deep": {"n_done": 0, "n_failed": 0},
+                    "artifacts": {"n_discovered": 0, "n_done": 0, "n_failed": 0}}
+
+    # 产物下载独立进程：--artifacts-only 时只跑产物，其余全跳过
+    if artifacts_only:
+        report["artifacts"] = _consume_artifacts(origin, obsutil, instance_id)
+        return report
 
     # 浅层/深层互斥（解耦成两个进程）：--shallow-only 只浅层，--deep-only 只深层，
     # 两者都不加 = 混合（向后兼容，两者都跑）。深层只读 task_traj_records.status='pending'，
@@ -986,21 +1479,26 @@ def _run_once(obsutil: str, origin: str,
                 print(f"  [shallow] {inst['id']} 新分级={r['n_processed']} "
                       f"失败={r['n_failed']}", flush=True)
 
-    # 深层：--shallow-only 时不跑（避免与独立深层 worker 重复消费）；混合与 --deep-only 都跑。
+    # 产物下载（含轨迹）：--shallow-only 时不跑；--deep-only 与混合都跑。
+    # 注：原「深层轨迹/日志按需下载」已取消 —— 产物全量下载覆盖同一目录，
+    # 会话详情直接读本地，不再需要单独下一份。
     if not shallow_only:
-        d = _consume_deep(origin, obsutil, instance_id)
-        report["deep"] = d
+        report["artifacts"] = _consume_artifacts(origin, obsutil, instance_id)
     return report
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="输出分析 worker（独立进程，分级 + 明细回填 platform.db）")
     ap.add_argument("--once", action="store_true", help="扫一遍即退出（调试/CI）")
-    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+    ap.add_argument("--interval", type=int, default=WORKER_INTERVAL,
                     help=f"常驻轮询间隔秒（默认 {DEFAULT_INTERVAL}）")
     ap.add_argument("--instance", default=None, help="只处理指定 instance_id（调试）")
-    ap.add_argument("--deep-only", action="store_true", help="只消费深层 pending 队列")
-    ap.add_argument("--shallow-only", action="store_true", help="只跑浅层分级/补全（不做深层下载）")
+    ap.add_argument("--deep-only", action="store_true",
+                    help="（历史名，等同 --artifacts-only）只跑产物下载队列")
+    ap.add_argument("--shallow-only", action="store_true",
+                    help="只跑浅层分级/补全（不下载产物）")
+    ap.add_argument("--artifacts-only", action="store_true",
+                    help="只跑沙箱产物全量下载（不碰分级；会话详情也靠它）")
     ap.add_argument("--cache-dir", dest="origin", default=oa.DEFAULT_OUTPUT_CACHE,
                     help=f"本地缓存根（默认 {oa.DEFAULT_OUTPUT_CACHE}）")
     ap.add_argument("--obsutil", default=oa.DEFAULT_OBSUTIL)
@@ -1011,28 +1509,45 @@ def main() -> None:
     origin = os.path.abspath(a.origin)
     os.makedirs(origin, exist_ok=True)
 
-    if a.deep_only:
-        print(f"[worker] 只消费深层队列: origin={origin}", flush=True)
+    if a.deep_only or a.artifacts_only:
+        print(f"[worker] 只跑沙箱产物下载队列: origin={origin}", flush=True)
     elif a.shallow_only:
         print(f"[worker] 只跑浅层分级/补全: origin={origin}", flush=True)
     else:
         print(f"[worker] 输出分析 worker 启动: interval={a.interval}s origin={origin}", flush=True)
 
+    _write_worker_started(_worker_mode(a.deep_only, a.shallow_only, a.artifacts_only),
+                          os.getpid(), f"started interval={a.interval}s")
+
     while True:
         t0 = time.time()
+        mode = _worker_mode(a.deep_only, a.shallow_only, a.artifacts_only)
         try:
-            rep = _run_once(a.obsutil, origin, a.instance, a.deep_only, a.shallow_only)
-            if rep["shallow"]["n_processed"] or rep["shallow"]["n_failed"] \
-                    or rep["deep"]["n_done"] or rep["deep"]["n_failed"]:
+            rep = _run_once(a.obsutil, origin, a.instance, a.deep_only,
+                            a.shallow_only, a.artifacts_only)
+            processed = (rep["shallow"]["n_processed"] + rep["deep"]["n_done"]
+                         + rep["artifacts"]["n_done"] + rep["artifacts"]["n_discovered"])
+            failed = (rep["shallow"]["n_failed"] + rep["deep"]["n_failed"]
+                      + rep["artifacts"]["n_failed"])
+            note = (f"浅层新={rep['shallow']['n_processed']} "
+                    f"深层done={rep['deep']['n_done']} "
+                    f"产物发现={rep['artifacts']['n_discovered']} "
+                    f"done={rep['artifacts']['n_done']}")
+            _write_heartbeat(mode, os.getpid(), t0, time.time(), processed, failed, note)
+            if processed or failed:
                 print(f"[worker] 本轮: 浅层(新={rep['shallow']['n_processed']} "
                       f"fail={rep['shallow']['n_failed']}) | "
                       f"深层(done={rep['deep']['n_done']} fail={rep['deep']['n_failed']}) | "
+                      f"产物(发现={rep['artifacts']['n_discovered']} "
+                      f"done={rep['artifacts']['n_done']} fail={rep['artifacts']['n_failed']}) | "
                       f"{time.time()-t0:.1f}s", flush=True)
         except KeyboardInterrupt:
             print("[worker] 收到中断，退出", flush=True)
             return
         except Exception as e:
             print(f"[worker] 本轮异常: {e}", flush=True)
+            _write_heartbeat(mode, os.getpid(), t0, time.time(), 0, 1,
+                             f"本轮异常: {str(e)[:200]}")
         if a.once:
             break
         time.sleep(max(1, a.interval))

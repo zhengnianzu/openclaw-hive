@@ -2,6 +2,10 @@ fastapi>=0.135.0
 uvicorn[standard]>=0.30.0
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
+# api/core/security.py 直接 import bcrypt（不经 passlib），必须显式声明。
+# 只靠 passlib[bcrypt] 的 extra 时，用 --no-deps 或旧 pip 解析可能装不上，
+# 启动会停在 main.py → security.py 的 import bcrypt。
+bcrypt>=4.0.0
 python-multipart>=0.0.9
 aiofiles>=24.1.0
 omegaconf>=2.3.0

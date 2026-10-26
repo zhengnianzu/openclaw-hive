@@ -18,7 +18,8 @@ from api.routers import auth, instances, obs, logs, registrations, images, code_
 from api.routers import batch_output, resource_pools, stats
 from api.routers import wiki, notifications, settings_overview
 from api.routers import public_api
-
+from api.routers import artifacts
+from api.routers import worker_monitor
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
 for name in SETTINGS_FILES:
@@ -72,6 +73,10 @@ app.include_router(notifications.router)
 app.include_router(settings_overview.router)
 # 对外 API：固定 AK 鉴权（X-API-Key），不涉用户身份，见 routers/public_api.py
 app.include_router(public_api.router)
+# 沙箱产物浏览（实例详情「工作区」tab）：按层懒加载 OBS 目录 + 文件字节缓存
+app.include_router(artifacts.router)
+# Worker 调度监控（资源看板）：心跳 / 进程指标 / 队列积压 / ETA
+app.include_router(worker_monitor.router)
 
 init_db()
 harness_configs.ensure_defaults()
