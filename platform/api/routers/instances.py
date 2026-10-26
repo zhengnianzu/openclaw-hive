@@ -9,19 +9,23 @@ import subprocess
 import time
 import uuid
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from omegaconf import OmegaConf
 
 from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..models.instance import (
-    InstanceCreate, InstanceInfo, InstanceOverview, OverviewBatchRequest,
+    InstanceCreate, InstanceExportRequest, InstanceInfo, InstanceOverview,
+    OverviewBatchRequest,
 )
 from ..services.queue_scheduler import (
     schedule_queue, OCCUPYING_STATUSES,
@@ -644,6 +648,399 @@ def list_instances(user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM task_instances ORDER BY created_at DESC").fetchall()
     return [InstanceInfo(**_with_resources(_with_harness_type(_sync_instance_status(dict(r))))) for r in rows]
+
+
+_EXPORT_HEADERS = [
+    "实例 ID", "实例名称", "状态", "状态代码", "失败原因", "PID", "配置文件", "创建者",
+    "创建时间", "启动时间", "结束时间", "并发数", "总任务", "已完成", "失败", "运行中",
+    "队列中", "成功率", "已用时间", "平均耗时", "预计剩余", "所属队列", "队列位置",
+    "任务标识", "Harness 类型", "Harness 配置", "Invite Code", "技能目录", "默认技能",
+    "Agent 目录", "用户 Config 目录", "用户 Profile 目录", "轨迹保存路径", "主模型 Base URL",
+    "主模型 API Key", "主模型 API 类型", "主模型 ID", "用户模拟配置", "起始索引", "任务总数",
+    "沙箱配置", "沙箱标识", "沙箱块", "沙箱文件", "Key 沙箱后缀", "资源池", "CPU 请求",
+    "CPU 限制", "内存请求 GiB", "内存限制 GiB", "镜像名称", "代码仓 ID", "任务执行情况", "错误明细",
+]
+
+_EXPORT_STATUS_TEXT = {
+    "running": "运行中", "preparing": "准备中", "queued": "排队中",
+    "completed": "已完成", "finished": "已结束", "stopped": "已停止",
+    "failed": "失败", "created": "待启动",
+}
+
+
+def _export_json_dict(value) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _mask_export_key(value) -> str:
+    key = str(value or "")
+    if not key:
+        return "-"
+    if len(key) <= 8:
+        return key
+    return f"{key[:4]}***{key[-4:]}"
+
+
+def _export_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _export_obs_path(params: dict, field: str, *, traj: bool = False) -> str:
+    value = str(params.get(field) or "")
+    if not value or value.startswith("obs://"):
+        return value or "-"
+    bucket = params.get("traj_save_bucket") if traj else params.get("obs_bucket")
+    bucket = bucket or params.get("obs_bucket")
+    if not bucket:
+        return value
+    return f"{str(bucket).rstrip('/')}/{value.lstrip('/')}"
+
+
+def _enrich_export_params(row: dict, harness_versions: dict, sandboxes: dict) -> dict:
+    params = _export_json_dict(row.get("create_params"))
+    params.pop("copy_complete_from", None)
+    params["suffix_api_keys"] = _resolve_suffix_api_keys(row)
+
+    snap = None
+    if row.get("config_snapshot"):
+        try:
+            snap = OmegaConf.create(row["config_snapshot"])
+            params["obs_bucket"] = OmegaConf.select(snap, "s3.bucket_name")
+            traj_bucket = OmegaConf.select(snap, "run_config.obs.traj_save_bucket")
+            if traj_bucket:
+                params["traj_save_bucket"] = traj_bucket
+            if not params.get("traj_save_path"):
+                params["traj_save_path"] = OmegaConf.select(
+                    snap, "run_config.obs.traj_save_path"
+                ) or ""
+        except Exception:
+            snap = None
+
+    hv = harness_versions.get(params.get("harness_config_version_id"))
+    if hv:
+        params["harness_config_version"] = hv.get("version")
+        if hv.get("config_name"):
+            params["harness_config_name"] = hv["config_name"]
+
+    sb = sandboxes.get(params.get("sandbox_config_id"))
+    if sb:
+        params["sandbox_config_name"] = sb.get("name")
+        params["sandbox_type"] = sb.get("sandbox_type")
+        params["sandbox_key"] = sb.get("sandbox_key")
+        params["sandbox_file"] = sb.get("file")
+
+    if snap is not None:
+        try:
+            key = OmegaConf.select(snap, "sandbox_active_key")
+            params["sandbox_active_key"] = key
+            image = OmegaConf.select(snap, f"sandbox.{key}.sandbox.image") if key else None
+            if image:
+                params["sandbox_image"] = image
+            params["sandbox_namespace"] = OmegaConf.select(snap, "sandbox_namespace") or ""
+        except Exception:
+            pass
+    return params
+
+
+def _export_overview(inst: dict) -> dict:
+    completed = inst.get("completed_tasks") or 0
+    failed = inst.get("failed_tasks") or 0
+    total = inst.get("total_tasks") or 0
+    finished = completed + failed
+    running = 0
+    if inst.get("status") == "running" and total > finished:
+        running = min(inst.get("concurrent_num") or 0, total - finished)
+    pending = max(0, total - finished - running)
+    breakdown = _analyze_task_status(inst.get("config_path") or "", total, inst.get("status") or "")
+    tree = _analyze_tree_cache.get(inst.get("config_path") or "", [])
+    estimate = _estimate_remaining_time(total, finished, inst.get("started_at"), inst.get("status"))
+    elapsed = None
+    if inst.get("started_at"):
+        end = inst.get("stopped_at") or datetime.now().isoformat()
+        try:
+            elapsed = round(
+                (datetime.fromisoformat(str(end)) - datetime.fromisoformat(str(inst["started_at"]))).total_seconds(),
+                0,
+            )
+        except (TypeError, ValueError):
+            pass
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "pending": pending,
+        "success_rate": completed / finished if finished else 0,
+        "elapsed_seconds": elapsed,
+        "error_breakdown": breakdown,
+        "error_tree": tree,
+        **estimate,
+    }
+
+
+def _export_agents(params: dict) -> str:
+    agents = params.get("agents") or []
+    lines = []
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        lines.append(
+            f"{agent.get('name') or '-'} | model={agent.get('model') or '-'} | "
+            f"provider={agent.get('provider') or '-'} | base_url={agent.get('base_url') or '-'} | "
+            f"api={agent.get('api') or '-'} | api_key={_mask_export_key(agent.get('api_key'))}"
+        )
+    if not lines and (params.get("user_proxy_model_name") or params.get("user_proxy_base_url")):
+        lines.append(
+            f"user_simulator | model={params.get('user_proxy_model_name') or '-'} | "
+            f"base_url={params.get('user_proxy_base_url') or '-'} | "
+            f"api_key={_mask_export_key(params.get('user_proxy_api_key'))}"
+        )
+    return "\n".join(lines) or "-"
+
+
+def _export_breakdown(overview: dict) -> str:
+    items = overview.get("error_breakdown") or {}
+    return "；".join(f"{name} {count}" for name, count in items.items()) or "暂无数据"
+
+
+def _export_error_tree(overview: dict) -> str:
+    lines = []
+    for group in overview.get("error_tree") or []:
+        lines.append(f"{group.get('prefix', '')} {group.get('label', '')} × {group.get('count', 0)}".strip())
+        for item in group.get("codes") or []:
+            desc = f" {item.get('desc')}" if item.get("desc") else ""
+            lines.append(f"  {item.get('code', '')}{desc} × {item.get('count', 0)}")
+    return "\n".join(lines) or "-"
+
+
+def _safe_export_username(value: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", str(value or "user")).strip(" ._")
+    return cleaned or "user"
+
+
+@router.post("/export-xlsx")
+def export_instance_details(
+    payload: InstanceExportRequest,
+    user: dict = Depends(get_current_user),
+):
+    """导出 Dashboard 跨页勾选的实例详情；单工作表，一实例一行。"""
+    ids = list(dict.fromkeys(str(value).strip() for value in payload.instance_ids if str(value).strip()))
+    if not ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个实例")
+    if len(ids) > 200:
+        raise HTTPException(status_code=400, detail="单次最多导出 200 个实例")
+
+    placeholders = ",".join("?" * len(ids))
+    with get_connection() as conn:
+        rows = [dict(row) for row in conn.execute(
+            f"SELECT * FROM task_instances WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()]
+        by_id = {row["id"]: row for row in rows}
+        ordered_rows = [by_id[instance_id] for instance_id in ids if instance_id in by_id]
+        if not ordered_rows:
+            raise HTTPException(status_code=404, detail="所选实例不存在或已被删除")
+
+        raw_params = [_export_json_dict(row.get("create_params")) for row in ordered_rows]
+        hv_ids = list({p.get("harness_config_version_id") for p in raw_params if p.get("harness_config_version_id")})
+        sb_ids = list({p.get("sandbox_config_id") for p in raw_params if p.get("sandbox_config_id")})
+
+        harness_versions = {}
+        if hv_ids:
+            marks = ",".join("?" * len(hv_ids))
+            found = conn.execute(
+                "SELECT v.id, v.version, c.name AS config_name FROM harness_config_versions v "
+                f"LEFT JOIN harness_configs c ON c.id=v.config_id WHERE v.id IN ({marks})",
+                tuple(hv_ids),
+            ).fetchall()
+            harness_versions = {item["id"]: dict(item) for item in found}
+
+        sandboxes = {}
+        if sb_ids:
+            marks = ",".join("?" * len(sb_ids))
+            found = conn.execute(
+                f"SELECT id, name, sandbox_type, sandbox_key, file FROM sandbox_configs WHERE id IN ({marks})",
+                tuple(sb_ids),
+            ).fetchall()
+            sandboxes = {item["id"]: dict(item) for item in found}
+
+        queue_ranks = {}
+        queue_ids = list({row.get("queue_id") for row in ordered_rows if row.get("queue_id")})
+        if queue_ids:
+            marks = ",".join("?" * len(queue_ids))
+            waiting = conn.execute(
+                "SELECT id, queue_id FROM task_instances WHERE status='queued' "
+                f"AND queue_id IN ({marks}) ORDER BY queue_id, queue_position",
+                tuple(queue_ids),
+            ).fetchall()
+            rank_by_queue = {}
+            for item in waiting:
+                queue_id = item["queue_id"]
+                rank_by_queue[queue_id] = rank_by_queue.get(queue_id, 0) + 1
+                queue_ranks[item["id"]] = rank_by_queue[queue_id]
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="服务端未安装 Excel 导出依赖 openpyxl") from exc
+
+    data_rows = []
+    for raw_row in ordered_rows:
+        inst = _with_resources(_with_harness_type(_sync_instance_status(raw_row.copy())))
+        params = _enrich_export_params(inst, harness_versions, sandboxes)
+        overview = _export_overview(inst)
+        harness_config = params.get("harness_config_name") or params.get("harness_config_label") or params.get("harness_config_id") or "-"
+        if params.get("harness_config_name") and params.get("harness_config_version"):
+            harness_config = f"{params['harness_config_name']} / v{params['harness_config_version']}"
+        sandbox_name = params.get("sandbox_config_name")
+        if not sandbox_name and params.get("sandbox_config_id"):
+            sandbox_name = f"已删除（id={params['sandbox_config_id']}）"
+        if not sandbox_name:
+            sandbox_name = "未选择（用模板默认）"
+        data_rows.append([
+            inst.get("id"), inst.get("name"), _EXPORT_STATUS_TEXT.get(inst.get("status"), inst.get("status")), inst.get("status"),
+            inst.get("error_summary") or "", inst.get("pid"), inst.get("config_path"), inst.get("created_by"),
+            _export_datetime(inst.get("created_at")), _export_datetime(inst.get("started_at")), _export_datetime(inst.get("stopped_at")),
+            inst.get("concurrent_num") or 0, overview["total"], overview["completed"], overview["failed"], overview["running"],
+            overview["pending"], overview["success_rate"],
+            overview["elapsed_seconds"] / 86400 if overview["elapsed_seconds"] is not None else None,
+            overview.get("avg_task_seconds") / 86400 if overview.get("avg_task_seconds") is not None else None,
+            overview.get("estimated_remaining_seconds") / 86400 if overview.get("estimated_remaining_seconds") is not None else None,
+            inst.get("queue_id") or "-", queue_ranks.get(inst.get("id"), "-"), params.get("task_name") or "-",
+            params.get("harness_type") or inst.get("harness_type") or "openclaw", harness_config,
+            params.get("invite_code") or "-", _export_obs_path(params, "skill_dir"), params.get("default_skills") or "-",
+            _export_obs_path(params, "agent_dir"), _export_obs_path(params, "user_config_dir"),
+            _export_obs_path(params, "user_profile_dir"), _export_obs_path(params, "traj_save_path", traj=True),
+            params.get("model_base_url") or "-", _mask_export_key(params.get("model_api_key")),
+            params.get("model_api_type") or "-", params.get("model_id") or "-", _export_agents(params),
+            params.get("start_index") or 0, params.get("total_num") or 0, sandbox_name,
+            params.get("task_name") or "-", params.get("sandbox_active_key") or "-", params.get("sandbox_file") or "-",
+            "已开启" if params.get("suffix_api_keys") else "未开启", inst.get("sandbox_namespace") or params.get("sandbox_namespace") or "-",
+            inst.get("cpu_request") or 0, inst.get("cpu_limit") or 0, inst.get("memory_request") or 0,
+            inst.get("memory_limit") or 0, params.get("sandbox_image") or params.get("image_name") or "-",
+            params.get("code_repo_id") or "-", _export_breakdown(overview), _export_error_tree(overview),
+        ])
+
+    export_time = datetime.now(timezone(timedelta(hours=8)))
+    username = _safe_export_username(user.get("username"))
+    filename = f"{username}_{export_time.strftime('%Y%m%d_%H%M%S')}_{len(data_rows)}.xlsx"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "实例详情"
+    ws.sheet_view.showGridLines = False
+    last_col = get_column_letter(len(_EXPORT_HEADERS))
+    ws.merge_cells(f"A1:{last_col}1")
+    ws["A1"] = "平台实例详细信息导出"
+    ws["A1"].font = Font(name="Arial", size=16, bold=True, color="1E293B")
+    ws["A1"].alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 28
+    ws["A2"] = f"导出用户：{user.get('username') or 'user'}"
+    ws["D2"] = f"导出时间：{export_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    ws["H2"] = f"导出数量：{len(data_rows)}"
+    ws["L2"] = "数据粒度：一个实例一行"
+    for cell in ws[2]:
+        cell.font = Font(name="Arial", size=10, color="64748B")
+
+    groups = [
+        (1, 12, "实例信息", "E0E7FF"), (13, 21, "任务执行情况", "D1FAE5"),
+        (22, 23, "队列信息", "FEF3C7"), (24, 27, "基本配置", "EDE9FE"),
+        (28, 33, "OBS 配置", "DBEAFE"), (34, 37, "主模型配置", "CCFBF1"),
+        (38, 38, "用户模拟", "FCE7F3"), (39, 52, "高级配置", "F1F5F9"),
+        (53, 54, "诊断", "FEE2E2"),
+    ]
+    thin = Side(style="thin", color="CBD5E1")
+    for start, end, label, color in groups:
+        if start != end:
+            ws.merge_cells(start_row=4, start_column=start, end_row=4, end_column=end)
+        cell = ws.cell(4, start, label)
+        cell.fill = PatternFill("solid", fgColor=color)
+        cell.font = Font(name="Arial", size=10, bold=True, color="334155")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for column, header in enumerate(_EXPORT_HEADERS, 1):
+        cell = ws.cell(5, column, header)
+        cell.fill = PatternFill("solid", fgColor="334155")
+        cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[5].height = 36
+
+    date_format = "yyyy-mm-dd hh:mm:ss"
+    duration_format = '[h]"小时 "mm"分"'
+    status_fills = {
+        "运行中": ("DCFCE7", "047857"), "已完成": ("E0E7FF", "4338CA"),
+        "已停止": ("FEE2E2", "B91C1C"), "失败": ("FEE2E2", "B91C1C"),
+        "准备中": ("FEF3C7", "B45309"), "排队中": ("FEF3C7", "B45309"),
+    }
+    for row_number, values in enumerate(data_rows, 6):
+        for column, value in enumerate(values, 1):
+            cell = ws.cell(row_number, column, value)
+            cell.font = Font(name="Arial", size=10, color="1E293B")
+            cell.alignment = Alignment(vertical="top", wrap_text=column in {1, 5, 7, 33, 38, 53, 54})
+            cell.border = Border(bottom=Side(style="thin", color="E2E8F0"))
+        for column in (9, 10, 11):
+            ws.cell(row_number, column).number_format = date_format
+        ws.cell(row_number, 18).number_format = "0.0%"
+        for column in (19, 20, 21):
+            ws.cell(row_number, column).number_format = duration_format
+        for column in range(12, 18):
+            ws.cell(row_number, column).number_format = "#,##0"
+        for column in (39, 40):
+            ws.cell(row_number, column).number_format = "#,##0"
+        for column in range(47, 51):
+            ws.cell(row_number, column).number_format = "0.0"
+        status_style = status_fills.get(str(values[2]))
+        if status_style:
+            ws.cell(row_number, 3).fill = PatternFill("solid", fgColor=status_style[0])
+            ws.cell(row_number, 3).font = Font(name="Arial", size=10, bold=True, color=status_style[1])
+        ws.row_dimensions[row_number].height = 66
+
+    widths = [24, 25, 10, 11, 28, 10, 30, 12, 20, 20, 20, 10, 10, 10, 9, 10, 10, 10, 13, 13, 13, 12, 10,
+              23, 14, 24, 13, 28, 20, 28, 30, 30, 38, 32, 16, 20, 30, 58, 10, 10, 22, 24, 14, 24, 16, 16,
+              11, 11, 14, 14, 28, 12, 30, 40]
+    for index, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(index)].width = width
+    ws.freeze_panes = "C6"
+    table = Table(displayName="InstanceDetailsTable", ref=f"A5:{last_col}{5 + len(data_rows)}")
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
+        showRowStripes=True, showColumnStripes=False,
+    )
+    ws.add_table(table)
+
+    output = BytesIO()
+    wb.save(output)
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": disposition,
+            "X-Export-Requested-Count": str(len(ids)),
+            "X-Export-Succeeded-Count": str(len(data_rows)),
+            "X-Export-Skipped-Count": str(len(ids) - len(data_rows)),
+        },
+    )
 
 
 @router.get("/{instance_id}", response_model=InstanceInfo)
@@ -1742,9 +2139,12 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
         else:
             create_params = json.loads(inst["create_params"]) if inst.get("create_params") else {}
             model_api_key = (create_params.get("model_api_key") or "").strip()
+            model_id = (create_params.get("model_id") or "").strip()
             hive_cmd = ["python", os.path.join(settings.HIVE_ROOT, "hive.py"), "--config", config_path]
             if model_api_key:
                 hive_cmd += ["--model-api-key", model_api_key]
+            if model_id:
+                hive_cmd += ["--model-id", model_id]
             with open(log_file, "a") as lf:
                 proc = subprocess.Popen(
                     hive_cmd,

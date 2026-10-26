@@ -184,6 +184,42 @@ def load_yaml_config(config_file: str):
     return OmegaConf.load(config_file)
 
 
+def apply_agent_model_overrides(
+    task_config: dict,
+    main_model_id: str,
+    proxy_config: dict,
+) -> tuple[int, int]:
+    """Apply runtime agent models to a task config in place.
+
+    The platform main model applies only to the agent referenced by
+    ``queries[0].agent_name``. A non-empty model in user_proxy_model.json then
+    overrides every task agent with the same name.
+    """
+    main_overrides = 0
+    proxy_overrides = 0
+    queries = task_config.get("queries") or []
+    first_query = queries[0] if queries and isinstance(queries[0], dict) else {}
+    main_agent_name = str(first_query.get("agent_name") or "").strip()
+
+    for agent in task_config.get("agents") or []:
+        if not isinstance(agent, dict):
+            continue
+        agent_name = str(agent.get("name") or "").strip()
+        if main_model_id and main_agent_name and agent_name == main_agent_name:
+            agent["model"] = main_model_id
+            main_overrides += 1
+
+        proxy_agent = proxy_config.get(agent_name)
+        if not isinstance(proxy_agent, dict):
+            continue
+        proxy_model = proxy_agent.get("model")
+        if isinstance(proxy_model, str) and proxy_model.strip():
+            agent["model"] = proxy_model
+            proxy_overrides += 1
+
+    return main_overrides, proxy_overrides
+
+
 def _read_agent_system_prompts(data_config_file: Optional[str]) -> dict:
     """从 data_config JSON 里抽 {agent.name: agent.system_prompt}。
 

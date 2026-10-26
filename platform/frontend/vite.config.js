@@ -11,9 +11,11 @@ export default defineConfig({
     Components({ resolvers: [ElementPlusResolver()] }),
   ],
   server: {
+    // 默认只绑 127.0.0.1，别的机器访问不了；开发环境需要从局域网直连。
+    host: '0.0.0.0',
     port: 3000,
     proxy: {
-      '/api': { target: 'http://localhost:8087', changeOrigin: true, ws: true },
+      '/api': { target: 'http://localhost:8089', changeOrigin: true, ws: true },
     },
   },
 })

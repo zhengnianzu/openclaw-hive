@@ -2,9 +2,14 @@
   <div>
     <div class="header-row">
       <h2>任务实例管理</h2>
-      <el-button v-if="authStore.isOperator" type="primary" @click="router.push('/create')">
-        <el-icon><Plus /></el-icon> 新建任务
-      </el-button>
+      <div class="header-actions">
+        <el-button :disabled="selectedInstanceIds.length === 0" :loading="exporting" @click="openExportDialog">
+          <el-icon><Download /></el-icon> 导出（{{ selectedInstanceIds.length }}）
+        </el-button>
+        <el-button v-if="authStore.isOperator" type="primary" @click="router.push('/create')">
+          <el-icon><Plus /></el-icon> 新建实例
+        </el-button>
+      </div>
     </div>
 
     <div class="resource-panel">
@@ -136,7 +141,9 @@
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
-      <el-table :data="pagedInstances" v-loading="loading" stripe style="width:100%" border>
+      <el-table :data="pagedInstances" row-key="id" v-loading="loading"
+        stripe style="width:100%" border @select="handleRowSelect" @select-all="handleSelectAll">
+        <el-table-column type="selection" width="48" align="center" reserve-selection />
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable>
           <template #default="{row}">
             <span>{{ row.name }}</span>
@@ -240,6 +247,40 @@
         layout="total, sizes, prev, pager, next, jumper"
         background />
     </div>
+
+    <el-dialog v-model="exportDialogVisible" title="导出实例详情" width="640px" append-to-body>
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
+        已选择 {{ selectedInstanceIds.length }} 个实例。跨页选择已保留，导出后每个实例占 Excel 一行。
+      </el-alert>
+
+      <div class="export-section-label">已选实例</div>
+      <el-table :data="selectedInstances" size="small" border max-height="240" style="width:100%">
+        <el-table-column prop="name" label="实例名称" min-width="220" show-overflow-tooltip />
+        <el-table-column label="状态" width="90">
+          <template #default="{row}">
+            <el-tag :type="statusColor(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="created_by" label="创建者" width="110" show-overflow-tooltip />
+      </el-table>
+
+      <div class="export-detail-row">
+        <span class="export-detail-label">导出内容</span>
+        <span>实例详情页展示信息，单工作表，一行一个实例</span>
+      </div>
+      <div class="export-detail-row">
+        <span class="export-detail-label">文件名称</span>
+        <code>{{ estimatedExportFilename }}</code>
+      </div>
+      <div class="export-security-hint">API Key 按详情页相同规则脱敏，实际文件名以服务端响应为准。</div>
+
+      <template #footer>
+        <el-button @click="exportDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="exporting" @click="exportSelectedInstances">
+          导出 {{ selectedInstanceIds.length }} 个实例
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -247,7 +288,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, Search, Cpu, Coin, Histogram } from '@element-plus/icons-vue'
+import { ArrowDown, Search, Cpu, Coin, Histogram, Download, Plus } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -267,6 +308,9 @@ const dateRange = ref(null)
 const nameSearch = ref('')
 const currentPage = ref(1)
 const pageSize = ref(20)
+const selectedInstanceIds = ref([])
+const exportDialogVisible = ref(false)
+const exporting = ref(false)
 const router = useRouter()
 const route = useRoute()
 let timer = null
@@ -379,6 +423,85 @@ const pagedInstances = computed(() => {
   return filteredInstances.value.slice(start, start + pageSize.value)
 })
 
+const selectedInstances = computed(() => {
+  const byId = new Map(instances.value.map(instance => [instance.id, instance]))
+  return selectedInstanceIds.value.map(id => byId.get(id)).filter(Boolean)
+})
+
+function handleRowSelect(selection, row) {
+  const selected = selection.some(item => item.id === row.id)
+  const current = selectedInstanceIds.value.filter(id => id !== row.id)
+  if (selected) current.push(row.id)
+  selectedInstanceIds.value = current
+}
+
+function handleSelectAll(selection) {
+  const currentPageIds = new Set(pagedInstances.value.map(instance => instance.id))
+  const selectedOnPage = new Set(selection.map(instance => instance.id))
+  const retained = selectedInstanceIds.value.filter(id => !currentPageIds.has(id))
+  const appended = pagedInstances.value
+    .filter(instance => selectedOnPage.has(instance.id))
+    .map(instance => instance.id)
+  selectedInstanceIds.value = [...retained, ...appended]
+}
+
+function exportTimestamp() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Hong_Kong', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(new Date())
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]))
+  return `${values.year}${values.month}${values.day}_${values.hour}${values.minute}${values.second}`
+}
+
+function safeFilenamePart(value) {
+  return String(value || 'user').replace(/[\\/:*?"<>|]+/g, '_').replace(/^[ ._]+|[ ._]+$/g, '') || 'user'
+}
+
+const estimatedExportFilename = computed(() => (
+  `${safeFilenamePart(authStore.username)}_${exportTimestamp()}_${selectedInstanceIds.value.length}.xlsx`
+))
+
+function openExportDialog() {
+  if (!selectedInstanceIds.value.length) return
+  exportDialogVisible.value = true
+}
+
+function responseFilename(disposition) {
+  if (!disposition) return ''
+  const utf8 = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8) {
+    try { return decodeURIComponent(utf8[1]) } catch { return utf8[1] }
+  }
+  const fallback = disposition.match(/filename="?([^";]+)"?/i)
+  return fallback?.[1] || ''
+}
+
+async function exportSelectedInstances() {
+  if (!selectedInstanceIds.value.length || exporting.value) return
+  exporting.value = true
+  try {
+    const response = await api.post('/instances/export-xlsx', {
+      instance_ids: selectedInstanceIds.value,
+    }, { responseType: 'blob', rawResponse: true, timeout: 120000 })
+    const filename = responseFilename(response.headers['content-disposition']) || estimatedExportFilename.value
+    const url = URL.createObjectURL(response.data)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    const skipped = Number(response.headers['x-export-skipped-count'] || 0)
+    exportDialogVisible.value = false
+    if (skipped > 0) ElMessage.warning(`导出完成，${skipped} 个实例已不存在并被跳过`)
+    else ElMessage.success(`已导出 ${selectedInstanceIds.value.length} 个实例`)
+  } finally {
+    exporting.value = false
+  }
+}
+
 // 筛选/每页条数变化时回到第一页；当前页因数据减少而越界时也回退，避免停在空白页
 watch([statusFilter, queueFilter, harnessFilter, userFilter, dateRange, nameSearch, pageSize], () => {
   if (restoring) return
@@ -425,6 +548,8 @@ async function loadInstances() {
   if (isFirstLoad) loading.value = true
   try {
     instances.value = await api.get('/instances')
+    const availableIds = new Set(instances.value.map(instance => instance.id))
+    selectedInstanceIds.value = selectedInstanceIds.value.filter(id => availableIds.has(id))
     await loadOverviews()
   } finally { if (isFirstLoad) loading.value = false }
 }
@@ -554,6 +679,7 @@ onUnmounted(() => {
 
 <style scoped>
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+.header-actions { display: flex; align-items: center; gap: 8px; }
 h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 
 /* ===== 当前资源使用情况 ===== */
@@ -633,4 +759,9 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 .filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .mono-num { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-secondary); white-space: nowrap; }
 .pagination-bar { display: flex; justify-content: flex-end; margin-top: 16px; }
+.export-section-label { margin-bottom: 8px; color: var(--text-secondary); font-size: 13px; font-weight: 600; }
+.export-detail-row { display: flex; gap: 16px; margin-top: 16px; line-height: 1.6; }
+.export-detail-label { flex: 0 0 68px; color: var(--text-muted); }
+.export-detail-row code { word-break: break-all; color: var(--text-primary); }
+.export-security-hint { margin-top: 12px; color: var(--text-muted); font-size: 12px; }
 </style>

@@ -152,6 +152,11 @@ class OverviewBatchRequest(BaseModel):
     ids: List[str] = []
 
 
+class InstanceExportRequest(BaseModel):
+    """Dashboard 跨页勾选后的实例详情导出请求。"""
+    instance_ids: List[str] = []
+
+
 class InstanceOverview(BaseModel):
     total: int
     completed: int

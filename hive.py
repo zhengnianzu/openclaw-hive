@@ -50,6 +50,7 @@ from prepare_config import (
     _log_sandbox_detail,
     _classify_task_stdout,
     ERROR_CATALOG,
+    apply_agent_model_overrides,
 )
 from utils.win_util import (
     ps_command,
@@ -230,6 +231,7 @@ class TaskConfig:
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
     enable_pip_install: bool = False  # true: 起主脚本前先 pip install -r requirements.txt
     model_api_key: str = ""  # 主 agent 原始 key(平台传入), suffix_api_keys 时在 hive 里打后缀
+    model_id: str = ""  # 主 agent 模型 ID(平台传入), 作为 task config 的默认模型
     harness_md: list = field(default_factory=list)  # 平台选定 harness 配置 md 的本地绝对路径列表
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
@@ -496,6 +498,9 @@ class OpenClawDistillationTask:
         所有运行时字段都在这里注入：
         - platform: sandbox_type == windows 时为 windows，否则为 linux；
         - harness_type: 当前 run_config.harness_type；
+        - agents[].model: 先将平台传入的主 agent 模型写入
+          queries[0].agent_name 对应的 agent，再按 agent name 用
+          user_proxy_model.json 中的同名模型覆盖；
         - agents[].config: 仅给 queries[].agent_name 对应的 agent 插入
           harness_md 的 __default__ 路径；
         - gateway_ws_url: port 不为空时写入本次 OpenClaw gateway 端口。
@@ -516,6 +521,17 @@ class OpenClawDistillationTask:
         data = json.loads(Path(config_file).read_text(encoding="utf-8"))
         data["platform"] = "windows" if sandbox_type == "windows" else "linux"
         data["harness_type"] = self.config.sandbox_config.harness_type
+
+        # 模型优先级：user_proxy_model.json 同名 agent > 前端主 agent 模型
+        # > task config 原值。主模型只注入 queries[0].agent_name 对应的 agent；
+        # proxy 文件只覆盖显式配置了非空 model 的同名 agent。
+        proxy_model_path = Path(
+            self.config.sandbox_config.user_proxy_model_local_file
+        )
+        proxy_config = json.loads(proxy_model_path.read_text(encoding="utf-8"))
+        main_model_overrides, proxy_model_overrides = apply_agent_model_overrides(
+            data, self.config.model_id, proxy_config
+        )
 
         harness_configs = [
             f"__default__/{os.path.basename(md_path)}"
@@ -562,6 +578,8 @@ class OpenClawDistillationTask:
         self.logger.info(
             f"Patched data config: platform={data['platform']}, "
             f"harness_type={data['harness_type']}, "
+            f"main_model_overrides={main_model_overrides}, "
+            f"proxy_model_overrides={proxy_model_overrides}, "
             f"harness_md={len(harness_configs)}, "
             f"query_agents={sorted(query_agent_names)}, port={port or '-'}"
         )
@@ -616,29 +634,46 @@ class OpenClawDistillationTask:
             # data config 的 gateway_ws_url 写入正确端口再上传
             await self._upload_data_config(config_file, port=port)
 
-            # Start gateway
+            # Start gateway. SDK 命令只负责拉起后台进程，启动等待放在
+            # SDK 命令之外，避免远程 shell 因 sleep 长时间占用执行连接。
             gateway_log_path = os.path.join(
                 self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
             )
-            gateway_cmd = [
+            gateway_start_cmd = [
                 "/bin/bash", "-c",
                 f"mkdir -p {self.config.sandbox_config.result_workdir} && "
                 f"nohup {self.config.sandbox_config.openclaw_bash} gateway --port {port} "
-                f"> {gateway_log_path} 2>&1 & sleep {self.config.sandbox_config.openclaw_start_timeout} && cat {gateway_log_path}"
+                f"> {gateway_log_path} 2>&1 &"
             ]
-            exec_request = ExtendExecCommand(
-                command=gateway_cmd,
-                timeout=self.config.sandbox_config.openclaw_start_timeout + 5
+            start_request = ExtendExecCommand(
+                command=gateway_start_cmd,
+                timeout=self.config.simple_bash_timeout,
             )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
+            start_result = await self.execution_client.extend(args=start_request.to_dict())
 
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+            start_data = start_result.data or {}
+            if start_result.code != ErrorCode.SUCCESS[0] or start_data.get("exit_code") != 0:
                 self.logger.error(f"[S001] gateway start failed on port {port}")
                 _log_sandbox_detail(self.logger, f"gateway start failed — port {port}",
+                                    start_result, level=logging.ERROR)
+                raise HiveError("S001", detail=f"port={port}", sandbox_result=start_result)
+
+            await asyncio.sleep(self.config.sandbox_config.openclaw_start_timeout)
+
+            gateway_log_cmd = ["/bin/bash", "-c", f"cat {gateway_log_path}"]
+            log_request = ExtendExecCommand(
+                command=gateway_log_cmd,
+                timeout=self.config.simple_bash_timeout,
+            )
+            result = await self.execution_client.extend(args=log_request.to_dict())
+            result_data = result.data or {}
+            if result.code != ErrorCode.SUCCESS[0] or result_data.get("exit_code") != 0:
+                self.logger.error(f"[S001] gateway log check failed on port {port}")
+                _log_sandbox_detail(self.logger, f"gateway log check failed — port {port}",
                                     result, level=logging.ERROR)
                 raise HiveError("S001", detail=f"port={port}", sandbox_result=result)
 
-            stdout = result.data.get("stdout", "")
+            stdout = result_data.get("stdout", "")
             if f"Port {port} is already in use" in stdout:
                 self.logger.warning(f"Port {port} in use, retrying...")
                 await asyncio.sleep(2)
@@ -1612,6 +1647,7 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Configuration file path (YAML)")
     parser.add_argument("--failed", action="store_true", help="Run only previously failed tasks")
     parser.add_argument("--model-api-key", default="", help="Model API key passed from the platform")
+    parser.add_argument("--model-id", default="", help="Main agent model ID passed from the platform")
     args = parser.parse_args()
 
     config_obj = load_yaml_config(args.config)
@@ -1651,6 +1687,7 @@ def main() -> None:
             harness_type=harness_type,
         ),
         model_api_key=args.model_api_key,
+        model_id=args.model_id,
         harness_md=list(run_cfg.get("harness_md") or []),
     )
 
