@@ -243,6 +243,13 @@ async function loadDoc() {
     tagList.value = doc.tags ? doc.tags.split(',').map((s) => s.trim()).filter(Boolean) : []
     if (doc.linked_entity_type) await onEntityTypeChange(doc.linked_entity_type)
     form.value.linked_entity_key = doc.linked_entity_key
+  } catch (e) {
+    // 越权（改别人的文档）由保存时的 PUT 返回 403；这里先拦住的是「路由直接跳进来」的情况。
+    // 提示后退回列表，避免用户对着一个保存必失败的编辑页填半天。
+    if (e?.response?.status === 403 || e?.response?.status === 404) {
+      ElMessage.error('文档不存在，或你没有修改权限（只能编辑自己创建的文档）')
+      router.push('/wiki')
+    }
   } finally {
     loading.value = false
   }

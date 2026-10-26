@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from ..core.database import get_connection
 from ..services.wiki_store import get_wiki_connection, _init_wiki_db, assets_dir
-from ..core.security import get_current_user, require_admin
+from ..core.security import get_current_user, require_admin, require_operator
 from ..models.wiki import (
     LINKED_ENTITY_TYPES,
     WikiCategoryCreate,
@@ -40,7 +40,13 @@ from ..services import wiki_store
 
 router = APIRouter(prefix="/api/wiki", tags=["wiki"])
 
-# 写权限的唯一开关。将来要放开给 operator，只改这一行 + 前端按钮的 v-if。
+# 写权限拆成两档：
+#   WIKI_CREATE —— 新建文档、上传配图。operator 也能做，内容归他们自己。
+#   WIKI_WRITE  —— 分类管理、文档排序、发布通知。这三类都会「跨用户批量写」
+#                  或「全站广播」（前者重写所有人文档的 frontmatter，后者推给全部用户），
+#                  必须留在 admin。
+# 修改/删除单篇文档走 require_operator + _load_owned 的归属校验，见下面两个端点。
+WIKI_CREATE = require_operator
 WIKI_WRITE = require_admin
 
 MAX_CONTENT_LEN = 200_000
@@ -64,6 +70,23 @@ def _check_slug(slug: str) -> str:
     except ValueError:
         raise HTTPException(status_code=400, detail="非法文件名")
     return slug
+
+
+def _load_owned(slug: str, user: dict) -> dict:
+    """取文档并校验归属：admin 通吃，其他人只能动自己 author 的文档。
+
+    author 是可信字段 —— WikiDocumentCreate / WikiDocumentUpdate 都没有这个键，
+    pydantic 会忽略请求体里多传的字段，所以它只能由服务端在创建时写入。
+
+    查不到一律 404（与 config_templates 的 id+owner 双条件查询同款）：
+    分不清「不存在」和「不是你的」，避免泄露资源是否存在。
+    """
+    rec = wiki_store.parse_file(_check_slug(slug))
+    if not rec:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if user.get("role") != "admin" and (rec.get("author") or "") != user["username"]:
+        raise HTTPException(status_code=403, detail="只能修改自己创建的文档")
+    return rec
 
 
 def _category_names(conn) -> dict[int, str]:
@@ -322,7 +345,7 @@ def _resolve_category(conn, name: str) -> Optional[int]:
 
 
 @router.post("/documents", response_model=WikiDocumentDetail)
-def create_document(req: WikiDocumentCreate, user: dict = Depends(WIKI_WRITE)):
+def create_document(req: WikiDocumentCreate, user: dict = Depends(WIKI_CREATE)):
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="标题不能为空")
@@ -351,6 +374,9 @@ def create_document(req: WikiDocumentCreate, user: dict = Depends(WIKI_WRITE)):
         "title": title, "category": cat_name, "tags": req.tags, "summary": req.summary,
         "linked_entity_type": req.linked_entity_type, "linked_entity_key": req.linked_entity_key,
         "is_pinned": req.is_pinned, "author": user["username"],
+        # 补 sort_order：req 里有这个字段但原来没传，新建文档一律回落 100，
+        # 排序完全失效。放开给 operator 后会有更多人建文档，这个 bug 会更显眼。
+        "sort_order": getattr(req, "sort_order", None) or 100,
         "created_at": now, "updated_at": now,
     }
     wiki_store.write_file(slug, meta, req.content_md)
@@ -359,11 +385,9 @@ def create_document(req: WikiDocumentCreate, user: dict = Depends(WIKI_WRITE)):
 
 
 @router.put("/documents/{slug}", response_model=WikiDocumentDetail)
-def update_document(slug: str, req: WikiDocumentUpdate, user: dict = Depends(WIKI_WRITE)):
-    _check_slug(slug)
-    parsed = wiki_store.parse_file(slug)
-    if not parsed:
-        raise HTTPException(status_code=404, detail="文档不存在")
+def update_document(slug: str, req: WikiDocumentUpdate, user: dict = Depends(require_operator)):
+    # 归属校验在 _load_owned 里：admin 通吃，其他人只能改自己 author 的文档。
+    parsed = _load_owned(slug, user)
 
     updates = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
     if "title" in updates:
@@ -406,6 +430,9 @@ def update_document(slug: str, req: WikiDocumentUpdate, user: dict = Depends(WIK
         "is_pinned": updates.get("is_pinned", rec.get("is_pinned")),
         "sort_order": updates.get("sort_order", rec.get("sort_order", 100)),
         "author": rec.get("author") or user["username"],
+        # updated_by 原来从来没写过：meta 里没这个键，parse_file 就回退成 author，
+        # 于是详情页「最后由 X 更新」永远显示作者本人。这里补上真正的编辑人。
+        "updated_by": user["username"],
         "created_at": rec.get("created_at") or datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
     }
@@ -457,7 +484,9 @@ def reorder_documents(req: WikiReorderRequest, user: dict = Depends(WIKI_WRITE))
 
 
 @router.delete("/documents/{slug}")
-def delete_document(slug: str, user: dict = Depends(WIKI_WRITE)):
+def delete_document(slug: str, user: dict = Depends(require_operator)):
+    # 归属校验：admin 通吃，其他人只能删自己创建的。
+    _load_owned(slug, user)
     path = wiki_store.doc_path(_check_slug(slug))
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="文档不存在")
@@ -540,7 +569,7 @@ def _check_asset_name(name: str) -> str:
 
 
 @router.post("/assets", response_model=WikiAssetInfo)
-async def upload_asset(file: UploadFile = File(...), user: dict = Depends(WIKI_WRITE)):
+async def upload_asset(file: UploadFile = File(...), user: dict = Depends(WIKI_CREATE)):
     """上传文档配图。转 WebP 压缩到最长边 1600px；动画 GIF 原样保留。"""
     from PIL import Image
 

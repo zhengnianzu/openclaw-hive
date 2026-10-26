@@ -28,9 +28,9 @@ const routes = [
       // 文档中心。参数名是 slug（= 文件名），不是自增 id。
       // wiki/new 必须排在 wiki/:slug 之前，否则 "new" 会被当成 slug
       { path: 'wiki', name: 'WikiList', component: () => import('../views/WikiList.vue') },
-      { path: 'wiki/new', name: 'WikiNew', component: () => import('../views/WikiEdit.vue'), meta: { adminOnly: true } },
+      { path: 'wiki/new', name: 'WikiNew', component: () => import('../views/WikiEdit.vue'), meta: { operatorOnly: true } },
       { path: 'wiki/:slug', name: 'WikiDetail', component: () => import('../views/WikiDetail.vue') },
-      { path: 'wiki/:slug/edit', name: 'WikiEdit', component: () => import('../views/WikiEdit.vue'), meta: { adminOnly: true } },
+      { path: 'wiki/:slug/edit', name: 'WikiEdit', component: () => import('../views/WikiEdit.vue'), meta: { operatorOnly: true } },
       { path: 'notifications', name: 'NotificationCenter', component: () => import('../views/NotificationCenter.vue') },
       { path: 'settings', name: 'SettingsOverview', component: () => import('../views/SettingsOverview.vue') },
     ],
@@ -45,11 +45,21 @@ router.beforeEach((to, from, next) => {
     next({ name: 'Login' })
     return
   }
-  // 角色守卫只是防误触（role 取自 localStorage），真正的边界在后端 require_admin。
+  // 角色守卫只是防误触（role 取自 localStorage），真正的边界在后端。
   // 未登录时放过，交给上面的登录跳转。
   if (to.meta?.adminOnly && token && localStorage.getItem('role') !== 'admin') {
     next({ name: 'WikiList' })
     return
+  }
+  // 文档中心新建/编辑：admin + operator 都放行（viewer 不行）。
+  // 编辑页的「只能改自己的」由后端 _load_owned 判定，这里拿不到文档归属，
+  // 不做前端预判 —— 越权时后端 403，编辑页会提示并退回。
+  if (to.meta?.operatorOnly && token) {
+    const role = localStorage.getItem('role')
+    if (role !== 'admin' && role !== 'operator') {
+      next({ name: 'WikiList' })
+      return
+    }
   }
   next()
 })

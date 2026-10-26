@@ -6,7 +6,9 @@
       </template>
       <template #extra>
         <div style="display:flex;gap:8px">
-          <el-button v-if="authStore.isAdmin" @click="$router.push(`/wiki/${doc.slug}/edit`)">
+          <!-- 编辑只给作者本人或 admin（后端 _load_owned 同样口径）；
+               发布为全站通知会推送给所有用户，仍然只有 admin 能点。 -->
+          <el-button v-if="canEdit" @click="$router.push(`/wiki/${doc.slug}/edit`)">
             <el-icon><EditPen /></el-icon> 编辑
           </el-button>
           <el-button v-if="authStore.isAdmin" type="primary" @click="openPublish">
@@ -88,6 +90,10 @@ const notificationStore = useNotificationStore()
 const doc = ref({})
 const categories = ref([])
 const loading = ref(false)
+
+// 作者本人或 admin 才能编辑，与后端 _load_owned 口径一致。
+const canEdit = computed(
+  () => authStore.isAdmin || (!!doc.value.author && doc.value.author === authStore.username))
 
 const publishDialog = ref(false)
 const publishing = ref(false)
