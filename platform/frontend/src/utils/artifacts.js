@@ -7,7 +7,9 @@
 // doc = 需要 LibreOffice 转 PDF 才能预览；web/image/pdf = 浏览器原生可渲染；
 // data = 结构化文本（CSV 用表格渲染）；text = 纯文本直读。
 const GROUP_RULES = [
-  { id: 'web', label: '网页', exts: ['.html', '.htm', '.xhtml'] },
+  // label 用文件格式名而不是抽象类别：「HTML」比「网页」更直接 ——
+  // 沙箱产出里 .html 往往是报告/看板，用户找的是「那个 html 文件」而不是「网页」。
+  { id: 'web', label: 'HTML', exts: ['.html', '.htm', '.xhtml'] },
   { id: 'doc', label: '文档/表格', exts: [
     '.pptx', '.ppt', '.ppsx', '.pps',
     '.docx', '.doc', '.rtf', '.odt',
@@ -59,6 +61,10 @@ export function previewKindOf(name) {
   if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico',
        '.tiff', '.avif'].includes(ext)) return 'image'
   if (ext === '.pdf') return 'pdf'
+  // .json 单独一类：字节仍是纯文本（后端按 text/plain 返回），但前端要格式化 + 高亮。
+  if (ext === '.json') return 'json'
+  // .jsonl/.ndjson 是逐行 JSON：整份解析必然失败，走逐行解析 + 分页渲染。
+  if (['.jsonl', '.ndjson'].includes(ext)) return 'jsonl'
   if (['.csv', '.tsv'].includes(ext)) return 'table'
   if (['.pptx', '.ppt', '.ppsx', '.pps', '.docx', '.doc', '.rtf', '.odt',
        '.xlsx', '.xls', '.xlsm', '.ods'].includes(ext)) return 'office'
@@ -67,6 +73,97 @@ export function previewKindOf(name) {
        '.ts', '.tsx', '.jsx', '.sh', '.bash', '.sql', '.java', '.go', '.rs',
        '.c', '.h', '.cpp', '.css', '.scss', '.ini', '.conf', '.cfg', '.env'].includes(ext)) return 'text'
   return 'binary'
+}
+
+// ── JSON 预览 ──────────────────────────────────────────────────────────────
+// 沙箱产出里 .json 很常见（traj_stats_result.json、*.config.json 等），
+// 原样平铺一行没法读。这里做两件事：缩进格式化 + 语法高亮。
+// 解析失败（截断的大文件、jsonl 误判）时返回原文，让用户至少能看到内容。
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/**
+ * 把 JSON 文本格式化成缩进版本。
+ * @returns {{ok: boolean, text: string, error?: string}}
+ */
+export function formatJson(raw) {
+  const src = String(raw || '')
+  if (!src.trim()) return { ok: false, text: src, error: '空文件' }
+  try {
+    return { ok: true, text: JSON.stringify(JSON.parse(src), null, 2) }
+  } catch (e) {
+    // 大文件被后端截断（_read_text_slice 有 200 万字符上限）时必然解析失败,
+    // 这是预期情况，不该当成错误刷红。
+    return { ok: false, text: src, error: 'JSON 解析失败（可能被截断或不是合法 JSON）' }
+  }
+}
+
+/**
+ * 语法高亮：返回可直接 v-html 的安全字符串（全部转义后再加 span）。
+ * 用单次正则扫描而不是逐 token 拼接，避免长文件上的性能问题。
+ */
+export function highlightJson(text) {
+  const escaped = escapeHtml(text)
+  // 顺序重要：字符串优先，否则字符串里的 true/false 会被当成关键字着色。
+  return escaped.replace(
+    /(&quot;(?:[^&\\]|\\.|&(?!quot;))*?&quot;)(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
+    (m, str, colon, kw, num) => {
+      if (str) {
+        // 后跟冒号的字符串是键名，用另一种颜色区分
+        return colon
+          ? `<span class="j-key">${str}</span>${colon}`
+          : `<span class="j-str">${str}</span>`
+      }
+      if (kw) return `<span class="j-kw">${kw}</span>`
+      if (num) return `<span class="j-num">${num}</span>`
+      return m
+    },
+  )
+}
+
+// ── JSONL 预览 ─────────────────────────────────────────────────────────────
+// JSONL 是「每行一个独立 JSON」，整份文件不是合法 JSON，不能走 formatJson。
+// 逐行解析后按 block 渲染：每行的对象字段单独展开，一屏放不下就分页加载。
+//
+// 为什么分页而不是一次全渲染：trajectory.jsonl 这类文件单行可达十几万字符，
+// 几百行全展开会让浏览器卡死。默认只渲染前几条，滚动到底再追加。
+
+const JSONL_MAX_LINES = 5000      // 超过就不再解析（后端本来也只给前 200 万字符）
+
+/**
+ * 逐行解析 JSONL。
+ * @returns {{ok:boolean, blocks:Array, total:number, bad:number, truncated:boolean, error?:string}}
+ */
+export function parseJsonl(raw, maxLines = JSONL_MAX_LINES) {
+  const src = String(raw || '')
+  if (!src.trim()) {
+    return { ok: false, blocks: [], total: 0, bad: 0, truncated: false, error: '空文件' }
+  }
+  const lines = src.split(/\r?\n/).filter(l => l.trim())
+  const limit = Math.min(lines.length, maxLines)
+  const blocks = []
+  let bad = 0
+  for (let i = 0; i < limit; i += 1) {
+    const line = lines[i]
+    try {
+      // 每行单独 pretty-print：原样一行几千字符没法读
+      blocks.push({ idx: i, ok: true, text: JSON.stringify(JSON.parse(line), null, 2) })
+    } catch {
+      bad += 1
+      blocks.push({ idx: i, ok: false, text: line })
+    }
+  }
+  return {
+    ok: blocks.length > 0,
+    blocks,
+    total: lines.length,
+    bad,
+    truncated: lines.length > maxLines,
+  }
 }
 
 // 目录在前、按名升序（沿用 OutputViewer.vue 的排序规则）

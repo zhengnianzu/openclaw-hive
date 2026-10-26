@@ -180,10 +180,52 @@
               <el-button size="small" @click="download">下载文件</el-button>
             </div>
 
+            <div v-else-if="kind === 'json' && isEmptyText" class="aw-notice">
+              <p>该文件是空的（0 字节）。</p>
+              <el-button size="small" @click="download">下载文件</el-button>
+            </div>
+
             <MarkdownView v-else-if="kind === 'markdown' && !isEmptyText" class="aw-markdown"
               :content="text" />
 
+            <!-- JSON：格式化 + 语法高亮。内容来自本实例的沙箱产出、已全部转义，
+                 v-html 在这里是安全的（highlightJson 先 escapeHtml 再加 span）。 -->
+            <div v-else-if="kind === 'json'" class="aw-json">
+              <div v-if="jsonState && !jsonState.ok" class="aw-json-warn">{{ jsonState.error }}</div>
+              <pre class="aw-json-body" v-html="jsonHtml" />
+            </div>
+
             <pre v-else-if="kind === 'text'" class="aw-text">{{ text }}</pre>
+
+            <!-- JSONL：每行一个 JSON 对象，逐条渲染成 block。
+                 默认只出前 5 条，滚动到底/点按钮再追加 —— 单行可达十几万字符，
+                 一次全展开会让浏览器卡死。 -->
+            <div v-else-if="kind === 'jsonl'" class="aw-jsonl">
+              <div v-if="jsonlState && !jsonlState.ok" class="aw-json-warn">
+                {{ jsonlState.error }}
+              </div>
+              <template v-else>
+                <div class="aw-jsonl-head">
+                  <span>共 {{ jsonlState.total }} 条</span>
+                  <span v-if="jsonlState.bad" class="aw-jsonl-bad">
+                    {{ jsonlState.bad }} 条解析失败（按原文显示）
+                  </span>
+                  <span v-if="jsonlState.truncated">内容被截断，仅解析前 5000 条</span>
+                </div>
+                <div v-for="b in jsonlBlocks" :key="b.idx" class="aw-jsonl-block">
+                  <div class="aw-jsonl-idx">
+                    #{{ b.idx + 1 }}
+                    <span v-if="!b.ok" class="aw-jsonl-bad">非 JSON，原文</span>
+                  </div>
+                  <pre class="aw-json-body" v-html="b.html" />
+                </div>
+                <div v-if="jsonlHasMore" class="aw-jsonl-more">
+                  <el-button size="small" @click="jsonlMore">
+                    加载更多（已显示 {{ jsonlBlocks.length }} / {{ jsonlState.blocks.length }}）
+                  </el-button>
+                </div>
+              </template>
+            </div>
 
             <div v-else-if="kind === 'table'" class="aw-table-wrap">
               <el-table v-if="tableRows.length" :data="tableRows" size="small"
@@ -233,6 +275,7 @@ import MarkdownView from './MarkdownView.vue'
 import {
   fmtSize, fmtTime, groupOf, groupLabel, previewKindOf,
   GROUPS, collectLocalRefs, rewriteLocalRefs,
+  formatJson, highlightJson, parseJsonl,
 } from '../utils/artifacts'
 
 const props = defineProps({
@@ -283,8 +326,44 @@ let assetBlobUrls = []
 
 const kind = computed(() => (selected.value ? previewKindOf(selected.value.name) : ''))
 const isEmptyText = computed(() =>
-  ['text', 'table', 'markdown'].includes(kind.value)
+  ['text', 'table', 'markdown', 'json', 'jsonl'].includes(kind.value)
   && !text.value && selected.value?.size === 0)
+
+// JSON 预览：格式化 + 高亮。解析失败时退回原文（大文件被后端截断是常态，
+// 不该当成错误刷红让用户以为文件坏了）。
+const jsonState = computed(() => (kind.value === 'json' ? formatJson(text.value) : null))
+const jsonHtml = computed(() =>
+  (jsonState.value ? highlightJson(jsonState.value.text) : ''))
+
+// ── JSONL 预览：逐行解析 + 分块懒加载 ──────────────────────────────────────
+// 默认只渲染前 JSONL_PAGE 条。trajectory.jsonl 单行可达十几万字符，
+// 一次全展开会让浏览器卡死 —— 用户通常只需要看开头几条确认结构。
+const JSONL_PAGE = 5
+const jsonlLimit = ref(JSONL_PAGE)
+const jsonlState = computed(() =>
+  (kind.value === 'jsonl' ? parseJsonl(text.value) : null))
+// 已展开的块（含高亮后的 HTML）。每条 block 单独 highlight，
+// 避免把几百条拼成一个巨大字符串再正则扫一遍。
+const jsonlBlocks = computed(() => {
+  const st = jsonlState.value
+  if (!st) return []
+  return st.blocks.slice(0, jsonlLimit.value).map(b => ({
+    idx: b.idx,
+    ok: b.ok,
+    html: highlightJson(b.text),
+  }))
+})
+const jsonlHasMore = computed(() => {
+  const st = jsonlState.value
+  return !!st && st.blocks.length > jsonlLimit.value
+})
+function jsonlMore() {
+  const st = jsonlState.value
+  if (!st) return
+  jsonlLimit.value = Math.min(st.blocks.length, jsonlLimit.value + JSONL_PAGE * 4)
+}
+// 切换文件时重置展开进度，否则上一个文件的展开量会带过来
+watch(() => selected.value?.rel, () => { jsonlLimit.value = JSONL_PAGE })
 
 // CSV/TSV 表格预览：只做朴素切分（带引号的复杂 CSV 交给下载后处理，
 // 这里是为了「扫一眼」而不是替代 Excel）
@@ -593,7 +672,7 @@ function toggleGroup(id) {
 }
 
 function iconOf(name) {
-  return { html: 'H', markdown: 'M', image: '▧', office: 'W', pdf: 'PDF',
+  return { html: 'H', markdown: 'M', json: '{}', image: '▧', office: 'W', pdf: 'PDF',
            text: '≡', binary: '?' }[
     previewKindOf(name)] || '?'
 }
@@ -628,7 +707,11 @@ async function loadPreview() {
   const rel = selected.value.rel
   previewLoading.value = true
   try {
-    if (kind.value === 'text' || kind.value === 'table' || kind.value === 'markdown') {
+    // json / jsonl 也走文本读取：后端 media_type() 返回 text/plain，
+    // 字节层与 text 完全相同，只是前端多做一步解析 + 高亮。
+    if (kind.value === 'text' || kind.value === 'table'
+        || kind.value === 'markdown' || kind.value === 'json'
+        || kind.value === 'jsonl') {
       const res = await api.get(`/artifacts/${props.instanceId}/content`, {
         params: { task: task.value, key: rel }, silent: true,
       })
@@ -865,6 +948,44 @@ onBeforeUnmount(() => { stopPoll(); revokeBlob() })
   font: 12px/1.7 Consolas, Monaco, monospace; color: #c9d5e4;
   background: #142136; border-radius: 8px; padding: 16px; min-height: 320px;
 }
+
+/* JSON 预览：与 aw-text 同一套深色终端风格，只多语法高亮配色。
+   配色按语义分组（键/字符串/数字/关键字），不要超过四种颜色，否则反而难读。 */
+.aw-json { display: flex; flex-direction: column; gap: 8px; }
+.aw-json-body {
+  margin: 0; white-space: pre; overflow: auto; max-height: 620px;
+  font: 12px/1.7 Consolas, Monaco, monospace; color: #c9d5e4;
+  background: #142136; border-radius: 8px; padding: 16px; min-height: 320px;
+}
+.aw-json-body :deep(.j-key) { color: #7fd1ff; }
+.aw-json-body :deep(.j-str) { color: #a5e075; }
+.aw-json-body :deep(.j-num) { color: #ffb454; }
+.aw-json-body :deep(.j-kw)  { color: #ff7b9c; }
+.aw-json-warn {
+  padding: 8px 12px; border-radius: 6px; font-size: 12px;
+  color: #8a6d1f; background: #fdf6e3; border: 1px solid #f2e3b3;
+}
+
+/* JSONL：每条一个 block，块间留白 + 左侧序号，便于对照「第几条」。 */
+.aw-jsonl { display: flex; flex-direction: column; gap: 12px; }
+.aw-jsonl-head {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-size: 12px; color: #6e83a1;
+}
+.aw-jsonl-bad { color: #d68e1b; }
+.aw-jsonl-block {
+  border: 1px solid #e6ecf5; border-radius: 8px; overflow: hidden;
+}
+.aw-jsonl-idx {
+  display: flex; gap: 8px; align-items: center;
+  padding: 4px 10px; font-size: 11px; color: #7b899b;
+  background: #f7f9fd; border-bottom: 1px solid #e6ecf5;
+}
+/* block 内的 pre 去掉圆角与最小高度，由外层圆角统一裁切 */
+.aw-jsonl-block .aw-json-body {
+  border-radius: 0; min-height: 0; max-height: 480px;
+}
+.aw-jsonl-more { display: flex; justify-content: center; padding: 4px 0 8px; }
 .aw-markdown {
   /* MarkdownView 渲染的是文档正文：深色 <pre> 显然不合适，用白底卡片 + 全局
      .markdown-body 排版（样式在 App.vue 全局段，scoped 命不中 v-html 内容）。 */
