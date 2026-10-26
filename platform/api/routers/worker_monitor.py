@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Query
 
 from ..core.config import settings
-from ..core.database import get_connection
+from ..core.database import async_execute, get_connection
 from ..core.security import require_operator
 
 router = APIRouter(prefix="/api/worker-monitor", tags=["worker-monitor"])
@@ -29,18 +29,38 @@ router = APIRouter(prefix="/api/worker-monitor", tags=["worker-monitor"])
 WORKER_PID_FILES = {
     "shallow": "worker.pid",          # --shallow-only
     "deep": "deep_worker.pid",        # --deep-only（含产物下载）
+    "realtime": "realtime_worker.pid",  # --realtime-only（只下用户点击的）
 }
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 WORKER_LABEL = {
     "shallow": "浅层分级",
     "deep": "深层下载 / 产物",
+    "realtime": "实时下载（点击优先）",
     "artifacts": "产物下载",
     "mixed": "混合",
 }
 
-# 心跳超过这个秒数没更新，判为「可能卡住」（worker 默认 60s 一轮）
+# 心跳超过这个秒数没更新，判为「可能卡住」。
+# 这只是**下限**：心跳是每轮结束时才写一次，所以判定阈值必须跟「上一轮实际跑了多久」
+# 挂钩，否则单轮耗时长的 worker 会在正常工作期间被反复误报。
+# 实测浅层单轮 746s / 925s / 1625s / 1240s（12~27 分钟），而旧阈值固定 300s，
+# 于是每轮跑到第 5 分钟就显示「疑似卡住」，一直红到该轮结束 —— 纯误报。
 HEARTBEAT_STALE_SECONDS = 300
+# 阈值 = max(下限, 上轮实测耗时 × 该倍数)。1.5 倍留出正常的轮间抖动余量。
+HEARTBEAT_STALE_FACTOR = 1.5
+
+
+def _stale_limit(hb: dict | None) -> float:
+    """该 worker 的「卡住」判定阈值（秒），随上一轮实测耗时自适应。
+
+    只用最后一条心跳的 duration：worker 卡死时 duration 为空或很小，
+    阈值自然回落到下限 300s，仍然能报出来。
+    """
+    dur = (hb or {}).get("duration")
+    if not dur or dur <= 0:
+        return HEARTBEAT_STALE_SECONDS
+    return max(HEARTBEAT_STALE_SECONDS, float(dur) * HEARTBEAT_STALE_FACTOR)
 
 
 # ── 进程指标 ────────────────────────────────────────────────────────────────
@@ -112,27 +132,6 @@ def _proc_metrics(pid: int) -> dict:
     return out
 
 
-def _dir_size(path: str, limit: int = 200000) -> int | None:
-    """目录占用字节数。超量时返回 None（不做昂贵统计）。"""
-    if not path or not os.path.isdir(path):
-        return None
-    total = 0
-    seen = 0
-    try:
-        for dirpath, _dirnames, filenames in os.walk(path):
-            for fn in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, fn))
-                except OSError:
-                    pass
-                seen += 1
-                if seen > limit:
-                    return None
-    except OSError:
-        return None
-    return total
-
-
 # ── 心跳 ────────────────────────────────────────────────────────────────────
 
 def _latest_heartbeat(worker: str) -> dict | None:
@@ -171,14 +170,17 @@ async def overview(user: dict = Depends(require_operator)):
         alive = bool(pid) and _pid_alive(pid)
         hb = _latest_heartbeat(name)
         age = _heartbeat_age(hb)
+        # 阈值跟着上一轮实测耗时走，避免单轮 20 分钟的 worker 在正常跑的时候被误报
+        limit = _stale_limit(hb)
         item = {
             "worker": name,
             "label": WORKER_LABEL.get(name, name),
             "pid": pid,
             "alive": alive,
             "state": ("offline" if not alive
-                      else ("stalled" if (age is not None and age > HEARTBEAT_STALE_SECONDS)
+                      else ("stalled" if (age is not None and age > limit)
                             else "running")),
+            "stale_after_seconds": round(limit),
             "cpu_percent": None,
             "memory_mb": None,
             "started_at": None,
@@ -204,10 +206,12 @@ async def overview(user: dict = Depends(require_operator)):
     art_hb = _latest_heartbeat("artifacts")
     if art_hb:
         age = _heartbeat_age(art_hb)
+        art_limit = _stale_limit(art_hb)
         workers.append({
             "worker": "artifacts", "label": WORKER_LABEL["artifacts"], "pid": art_hb.get("pid"),
             "alive": bool(art_hb.get("pid")) and _pid_alive(int(art_hb["pid"])),
-            "state": "running" if (age is not None and age <= HEARTBEAT_STALE_SECONDS) else "offline",
+            "state": "running" if (age is not None and age <= art_limit) else "offline",
+            "stale_after_seconds": round(art_limit),
             "cpu_percent": None, "memory_mb": None, "started_at": None, "uptime_seconds": None,
             "last_round_at": (datetime.fromtimestamp(art_hb["round_end"]).isoformat(timespec="seconds")
                               if art_hb.get("round_end") else None),
@@ -226,18 +230,43 @@ async def overview(user: dict = Depends(require_operator)):
             "total_bytes": usage.total, "used_bytes": usage.used,
             "free_bytes": usage.free,
             "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else None,
-            "output_cache_bytes": _dir_size(settings.OUTPUT_CACHE),
+            # 产物占用取 DB 记账值（SUM(artifact_bytes)），不再 walk OUTPUT_CACHE。
+            #
+            # 原来这里调 _dir_size_cached 做 NFS 全量遍历：实测稳定吃满 5 秒墙钟
+            # 上限后返回 None —— 每轮白烧 5 秒、一个字节都算不出来（539 个批次目录、
+            # 5 秒只走到 1,334 文件 / 4,431 目录）。而且 uvicorn 是 --workers 4，
+            # 每个进程各有独立的模块级缓存，请求随机落点 → 约 4/5 的请求打冷缓存，
+            # 整个 /overview 就被这 5 秒拖到 6.2 秒，看板一进去先卡 6 秒。
+            #
+            # DB 里本来就有交付物下载的记账（artifact_bytes），0.07 秒聚合出
+            # 46 GiB，与目录口径一致，且是**准确的交付物**体积（不含深层详情等
+            # 其它缓存）。磁盘总量上面已经由 disk_usage 给了。
+            "output_cache_bytes": await async_execute(_artifact_bytes_total),
         }
     except OSError:
         disk = None
 
-    counts = _queue_counts()
+    counts = await async_execute(_queue_counts)
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "workers": workers,
         "disk": disk,
         "queue": counts,
     }
+
+
+def _artifact_bytes_total() -> int:
+    """已下载交付物的总体积（字节），取自 DB 记账。
+
+    替代原来对 OUTPUT_CACHE 的 NFS 全量遍历：那次遍历实测耗满 5 秒上限、
+    最终返回 None，等于每轮白烧 5 秒。DB 里 artifact_bytes 是下载时实测写入的
+    落盘字节数，聚合 0.07 秒即可，口径与「产物」这一项完全对得上。
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(artifact_bytes), 0) s FROM task_traj_records "
+            "WHERE artifacts_status='done'").fetchone()
+    return (row["s"] if row else 0) or 0
 
 
 def _queue_counts() -> dict:
@@ -250,8 +279,20 @@ def _queue_counts() -> dict:
         art_bytes = conn.execute(
             "SELECT COALESCE(SUM(artifact_bytes),0) s FROM task_traj_records "
             "WHERE artifacts_status='done'").fetchone()["s"]
-        shallow_pending = conn.execute(
-            "SELECT COUNT(*) n FROM task_records WHERE traj_level IS NULL").fetchone()["n"]
+        # 浅层分级的进度：原来只返回 shallow_pending 一个数字，看板拿不到
+        # 「总共多少 / 已分多少 / 失败多少」，也就画不出进度。这里一次聚合算全，
+        # 走 idx_task_records_level 覆盖索引，实测 0.54s（拆成 5 条独立查询反而 1.5s+）。
+        shallow_row = conn.execute(
+            "SELECT COUNT(*) total, "
+            "       SUM(CASE WHEN traj_level IS NULL THEN 1 ELSE 0 END) pending, "
+            "       SUM(CASE WHEN traj_level='failed' THEN 1 ELSE 0 END) failed, "
+            "       SUM(CASE WHEN traj_level IN ('L0','L1','L1.5','L2','L3') "
+            "                THEN 1 ELSE 0 END) graded "
+            "FROM task_records").fetchone()
+        shallow_total = shallow_row["total"] or 0
+        shallow_pending = shallow_row["pending"] or 0
+        shallow_failed = shallow_row["failed"] or 0
+        shallow_graded = shallow_row["graded"] or 0
         inst_active = conn.execute(
             "SELECT COUNT(*) n FROM task_instances "
             "WHERE status IN ('running','preparing')").fetchone()["n"]
@@ -266,9 +307,18 @@ def _queue_counts() -> dict:
         "artifact_done": art.get("done", 0),
         "artifact_failed": art.get("failed", 0),
         "artifact_oversize": art.get("skipped", 0),
+        # OBS 前缀确认存在但没有任何文件（沙箱没产出）。这是终态、不是故障，
+        # 单独统计，别混进 failed 让人白排查。
+        "artifact_empty": art.get("empty", 0),
         "artifact_done_bytes": art_bytes,
         "artifact_not_complete": not_complete,
         "shallow_pending": shallow_pending,
+        "shallow_total": shallow_total,
+        "shallow_graded": shallow_graded,
+        "shallow_failed": shallow_failed,
+        # 进度百分比：已分级 / 总数。分母为 0 时给 None，前端显示「—」而不是 0%。
+        "shallow_progress": (round(shallow_graded / shallow_total * 100, 1)
+                             if shallow_total else None),
         "instances_active": inst_active,
         "instances_queued": inst_queued,
     }
@@ -289,9 +339,21 @@ async def queue(
     实例进度取自 task_instances 的 total/completed/failed（沙箱侧的任务完成情况），
     与产物下载进度（artifact_complete / artifacts_status）是两回事，这里都给出。
     """
+    # 这条查询带 3 个相关子查询，实测 27s+（首次 97s），前端每 30 秒轮询。
+    # 同步跑在 async handler 里 = 事件循环被钉住几十秒，必须整个丢线程池。
+    items = await async_execute(_queue_page, limit, status)
+    counts = await async_execute(_queue_counts)
+    return {"items": items, "counts": counts}
+
+
+def _queue_page(limit: int, status: str) -> list[dict]:
+    """同步实现：查队列明细并算速度/进度。调用方放线程池。"""
     where = {
+        # empty 是终态（OBS 前缀确实为空、沙箱没产出），不该出现在「活跃队列」里 ——
+        # 它不是待处理的积压，混进去会让运维以为还有活没干完。
         "active": "a.artifacts_status IN ('queued','downloading','failed','skipped')",
         "done": "a.artifacts_status='done'",
+        "empty": "a.artifacts_status='empty'",
         "all": "1=1",
     }.get(status, "1=1")
 
@@ -301,20 +363,67 @@ async def queue(
             "SELECT a.instance_id, a.traj_name, a.artifacts_status AS status, a.error, "
             "a.artifact_files AS file_count, a.artifact_bytes AS total_bytes, "
             "a.artifact_started_at, a.artifact_downloaded_at, a.updated_at, "
-            "a.artifact_attempts, a.artifact_worker, "
+            "a.artifact_attempts, a.artifact_worker, a.artifact_priority, "
             "ti.name AS instance_name, ti.status AS instance_status, "
-            "ti.total_tasks, ti.completed_tasks, ti.failed_tasks, "
-            "(SELECT COUNT(*) FROM task_traj_records q "
-            "   WHERE q.instance_id=a.instance_id AND q.artifacts_status='queued' "
-            "     AND q.updated_at <= a.updated_at) AS queue_pos, "
-            "(SELECT COUNT(*) FROM task_traj_records c "
-            "   WHERE c.instance_id=a.instance_id AND c.artifact_complete=1) AS inst_total, "
-            "(SELECT COUNT(*) FROM task_traj_records c "
-            "   WHERE c.instance_id=a.instance_id AND c.artifacts_status='done') AS inst_done "
+            "ti.total_tasks, ti.completed_tasks, ti.failed_tasks "
             f"FROM task_traj_records a "
             "LEFT JOIN task_instances ti ON ti.id = a.instance_id "
             f"WHERE {where} AND a.artifact_complete=1 "
-            "ORDER BY a.updated_at DESC LIMIT ?", (limit,)).fetchall()
+            # 必须与 worker 的领取顺序完全一致（offline/output_worker.py 的
+            # `ORDER BY artifact_priority DESC, updated_at`），否则看板第一行是队尾：
+            # 用户看到的「排在前面」实际最后才下。原先是 a.updated_at DESC，方向反了。
+            "ORDER BY a.artifact_priority DESC, a.updated_at LIMIT ?", (limit,)).fetchall()
+
+        # 实例级计数 + 排队位置都在 Python 侧算，不用相关子查询。
+        # 相关子查询被 SQLite 选错索引时（实测选了 idx_traj_artifacts_status，
+        # 先扫全库 362 万条 queued 再按实例过滤）单次 6~17s，乘上每页行数就是分钟级。
+        #
+        # 两条子查询都必须 INDEXED BY idx_traj_records_inst：
+        # 优化器只看 WHERE 里有没有 artifacts_status，就选了那个索引，
+        # 于是「按实例取几千行」变成「扫全库几百万行再按实例过滤」。
+        # 强制走 instance_id 索引后实测 16.99s -> 0.03s。
+        iids = {r["instance_id"] for r in rows}
+        stats: dict[str, tuple[int, int]] = {}
+        queued_ts: dict[str, list[str]] = {}
+        for iid in iids:
+            row = conn.execute(
+                "SELECT SUM(CASE WHEN artifact_complete=1 THEN 1 ELSE 0 END) AS total, "
+                "       SUM(CASE WHEN artifacts_status='done' THEN 1 ELSE 0 END) AS done "
+                "FROM task_traj_records INDEXED BY idx_traj_records_inst "
+                "WHERE instance_id=?", (iid,)).fetchone()
+            stats[iid] = ((row["total"] or 0) if row else 0,
+                          (row["done"] or 0) if row else 0)
+            queued_ts[iid] = [
+                (r["artifact_priority"] or 0, r["updated_at"])
+                for r in conn.execute(
+                    "SELECT artifact_priority, updated_at FROM task_traj_records "
+                    "INDEXED BY idx_traj_records_inst "
+                    # 必须带 artifact_complete=1：worker 只领 complete=1 的行，
+                    # 不加这条会把 359 万条永不下载的行算进名次 —— 实测同一实例
+                    # UI 显示第 19515 名、真实第 6599 名，虚高 2.96 倍。
+                    "WHERE instance_id=? AND artifacts_status='queued' "
+                    "AND artifact_complete=1", (iid,))
+                if r["updated_at"] is not None]
+
+    def _queue_pos(d: dict) -> int | None:
+        """同实例内排在该行之前的可领取行数（与 worker 领取顺序同口径）。
+
+        排序键 = (artifact_priority DESC, updated_at ASC)，与
+        offline/output_worker.py 的领取 SQL 完全一致 —— 用户点了「下载此任务」
+        会置 priority=100，名次必须立刻跳到最前，否则看板与真实队列不符。
+        updated_at 是 SQLite 的 UTC 字符串，字典序即时间序。
+        """
+        if d["status"] != "queued":
+            return None
+        ts = d.get("updated_at")
+        if ts is None:
+            return None
+        my_pri = d.get("artifact_priority") or 0
+        before = sum(
+            1 for pri, t in queued_ts.get(d["instance_id"], ())
+            if pri > my_pri or (pri == my_pri and t < ts)
+        )
+        return before + 1
 
     items = []
     for r in rows:
@@ -328,8 +437,7 @@ async def queue(
             if end and end > started:
                 speed = round(d["total_bytes"] / (end - started) / 1048576, 2)
 
-        inst_total = d.get("inst_total") or 0
-        inst_done = d.get("inst_done") or 0
+        inst_total, inst_done = stats.get(d["instance_id"], (0, 0))
         items.append({
             "instance_id": d["instance_id"],
             "instance_name": d.get("instance_name") or d["instance_id"],
@@ -340,7 +448,7 @@ async def queue(
             "file_count": d.get("file_count"),
             "total_bytes": d.get("total_bytes"),
             "speed_mbps": speed,
-            "queue_pos": (d.get("queue_pos") if d["status"] == "queued" else None),
+            "queue_pos": _queue_pos(d),
             "started_at": started,
             "downloaded_at": d.get("artifact_downloaded_at"),
             "attempts": d.get("artifact_attempts"),
@@ -355,77 +463,7 @@ async def queue(
             "sandbox_completed": d.get("completed_tasks"),
             "sandbox_failed": d.get("failed_tasks"),
         })
-    return {"items": items, "counts": _queue_counts()}
-
-
-@router.get("/gantt")
-async def gantt(
-    limit: int = Query(default=40, ge=1, le=200),
-    instance_id: str | None = Query(default=None, description="只看某实例"),
-    user: dict = Depends(require_operator),
-):
-    """每任务的实际耗时（甘特图数据）。
-
-    数据来自 artifact_started_at / artifact_downloaded_at 两个真实时间戳，
-    不是估算。只返回有起止时间的行（即真正跑过的下载）。
-    """
-    now = time.time()
-    with get_connection() as conn:
-        sql = ("SELECT a.instance_id, a.traj_name, a.artifacts_status AS status, "
-               "a.artifact_started_at AS t0, a.artifact_downloaded_at AS t1, "
-               "a.artifact_bytes, a.artifact_files, ti.name AS instance_name "
-               "FROM task_traj_records a "
-               "LEFT JOIN task_instances ti ON ti.id = a.instance_id "
-               "WHERE a.artifact_started_at IS NOT NULL "
-               "  AND a.artifacts_status IN ('done','failed','skipped') ")
-        params: list = []
-        if instance_id:
-            sql += " AND a.instance_id=?"
-            params.append(instance_id)
-        sql += " ORDER BY a.artifact_started_at DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, tuple(params)).fetchall()
-
-        pend = conn.execute(
-            "SELECT COUNT(*) n FROM task_traj_records "
-            "WHERE artifacts_status='queued' AND artifact_complete=1").fetchone()["n"]
-
-    items = []
-    for r in rows:
-        d = dict(r)
-        t0, t1 = d["t0"], d["t1"]
-        dur = round(t1 - t0, 1) if (t0 and t1) else None
-        spd = (round(d["artifact_bytes"] / dur / 1048576, 2)
-               if (dur and dur > 0 and d["artifact_bytes"]) else None)
-        items.append({
-            "instance_id": d["instance_id"],
-            "instance_name": d.get("instance_name") or d["instance_id"],
-            "traj_name": d["traj_name"],
-            "status": d["status"],
-            "started_at": t0,
-            "finished_at": t1,
-            "duration_seconds": dur,
-            "bytes": d["artifact_bytes"],
-            "files": d["artifact_files"],
-            "speed_mbps": spd,
-        })
-
-    durations = [i["duration_seconds"] for i in items if i["duration_seconds"]]
-    avg = round(sum(durations) / len(durations), 1) if durations else None
-    # 用已完成任务的平均耗时估剩余时间（比按轮次吞吐更贴近真实工作量）
-    remaining = round(pend * avg, 0) if (avg and pend) else None
-    return {
-        "items": items,
-        "pending": pend,
-        "avg_seconds": avg,
-        "median_seconds": (round(sorted(durations)[len(durations) // 2], 1)
-                           if durations else None),
-        "remaining_seconds": remaining,
-        "estimated_finish_at": ((datetime.now() + timedelta(seconds=remaining)
-                                 ).isoformat(timespec="seconds")
-                                if remaining else None),
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    return items
 
 
 @router.get("/trend")
@@ -434,6 +472,18 @@ async def trend(
     user: dict = Depends(require_operator),
 ):
     """心跳按时间分桶，供负载趋势图。桶宽自适应（最多 ~60 个点）。"""
+    points, bucket = await async_execute(_trend_points, hours)
+    counts = await async_execute(_queue_counts)
+    return {
+        "hours": hours,
+        "bucket_seconds": bucket,
+        "points": points,
+        "counts": counts,
+    }
+
+
+def _trend_points(hours: float) -> tuple[list[dict], float]:
+    """同步实现：读心跳并按时间分桶。调用方放线程池。"""
     since = time.time() - hours * 3600
     bucket = max(60.0, (hours * 3600) / 60)
     with get_connection() as conn:
@@ -453,13 +503,7 @@ async def trend(
         cur["failed"] += r["failed"] or 0
         cur["rounds"] += 1
 
-    points = [buckets[k] for k in sorted(buckets)]
-    return {
-        "hours": hours,
-        "bucket_seconds": bucket,
-        "points": points,
-        "counts": _queue_counts(),
-    }
+    return [buckets[k] for k in sorted(buckets)], bucket
 
 
 @router.get("/eta")
@@ -472,16 +516,8 @@ async def eta(
     吞吐为 0 时明确返回 null（estimated_finish_at / remaining_seconds 都为 null），
     不显示假数字。
     """
-    since = time.time() - window_minutes * 60
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(processed),0) p FROM worker_heartbeats "
-            "WHERE round_start >= ? AND round_start > 0", (since,)).fetchone()
-        pending = conn.execute(
-            "SELECT COUNT(*) n FROM task_traj_records "
-            "WHERE artifacts_status='queued' AND artifact_complete=1").fetchone()["n"]
+    processed, pending = await async_execute(_eta_inputs, window_minutes)
 
-    processed = row["p"]
     per_min = processed / window_minutes if window_minutes else 0
     remaining = None
     finish_at = None
@@ -500,6 +536,19 @@ async def eta(
     }
 
 
+def _eta_inputs(window_minutes: int) -> tuple[int, int]:
+    """同步实现：取窗口内吞吐与积压量。调用方放线程池。"""
+    since = time.time() - window_minutes * 60
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(processed),0) p FROM worker_heartbeats "
+            "WHERE round_start >= ? AND round_start > 0", (since,)).fetchone()
+        pending = conn.execute(
+            "SELECT COUNT(*) n FROM task_traj_records "
+            "WHERE artifacts_status='queued' AND artifact_complete=1").fetchone()["n"]
+    return row["p"], pending
+
+
 @router.post("/reclaim")
 async def reclaim(user: dict = Depends(require_operator)):
     """手动把卡住的 downloading 改回 pending。
@@ -508,5 +557,7 @@ async def reclaim(user: dict = Depends(require_operator)):
     这个端点用于人工立即处理。
     """
     from offline.output_worker import _reclaim_stuck_hours
-    n = _reclaim_stuck_hours()
-    return {"reclaimed": n, "counts": _queue_counts()}
+    # 回收会 UPDATE 多行 + 连库，同步跑在 async handler 里同样会钉住事件循环
+    n = await async_execute(_reclaim_stuck_hours)
+    counts = await async_execute(_queue_counts)
+    return {"reclaimed": n, "counts": counts}

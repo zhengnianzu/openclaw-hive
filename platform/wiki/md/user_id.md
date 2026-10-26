@@ -8,6 +8,7 @@ summary: 自部署模型（网关按照user_id计费）需要，上传前给模�
 linked_entity_type: harness_config
 linked_entity_key: ppt_256k
 is_pinned: true
+sort_order: 30
 author: admin
 created_at: '2026-10-20T14:48:52.535204'
 updated_at: '2026-10-20T14:48:52.535204'

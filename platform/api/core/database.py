@@ -1,6 +1,7 @@
 import sqlite3
 import asyncio
 import os
+import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -76,81 +77,343 @@ async def async_execute_returning(sql, params=None):
     return await async_execute(_execute_returning, sql, params)
 
 
+def _table_exists(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone() is not None
+
+
+def _index_names(conn, table: str) -> set[str]:
+    return {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+        (table,))}
+
+
+# task_traj_records 上必须存在的业务索引。
+# 注意：这三个索引原来只写在「放开 level NOT NULL」的重建脚本里，而那段脚本是
+# RENAME → CREATE → INSERT → DROP → CREATE INDEX 的一串 executescript，
+# 中间任何一步被打断（4 个 uvicorn worker 并发跑 init_db + database is locked），
+# 就会出现「表建好了、索引没建」的半迁移状态。第 96 行的早退条件只看 level 约束，
+# 于是永久不再修复。现在把「补索引」独立出来，每次启动都校验。
+TRAJ_INDEXES = (
+    ("idx_traj_records_inst",
+     "CREATE INDEX IF NOT EXISTS idx_traj_records_inst ON task_traj_records(instance_id)"),
+    ("idx_traj_records_task",
+     "CREATE INDEX IF NOT EXISTS idx_traj_records_task "
+     "ON task_traj_records(instance_id, config_name)"),
+    ("idx_traj_artifacts_status",
+     "CREATE INDEX IF NOT EXISTS idx_traj_artifacts_status "
+     "ON task_traj_records(artifacts_status)"),
+    # 队列领取：ORDER BY 要能走索引，否则每轮都是全表扫 + 临时 B 树排序。
+    # 有 artifact_priority（用户点开会置 100）后排序键变成两列，索引也要跟上。
+    ("idx_traj_artifact_queue",
+     "CREATE INDEX IF NOT EXISTS idx_traj_artifact_queue "
+     "ON task_traj_records(artifact_priority DESC, updated_at) "
+     "WHERE artifacts_status='queued' AND artifact_complete=1"),
+    # 看板 _queue_counts 里的 artifact_complete=0 计数（350 万行全表扫 ≈2.5s）
+    ("idx_traj_artifact_complete",
+     "CREATE INDEX IF NOT EXISTS idx_traj_artifact_complete "
+     "ON task_traj_records(artifact_complete)"),
+)
+
+# 其它表上被看板高频查询打到、但一直没建索引的列。
+OTHER_INDEXES = (
+    # shallow_pending = WHERE traj_level IS NULL，330 万行全表扫 ≈2.3s
+    ("idx_task_records_level",
+     "CREATE INDEX IF NOT EXISTS idx_task_records_level ON task_records(traj_level)"),
+)
+
+
+def _ensure_traj_indexes(conn) -> list[str]:
+    """补齐 task_traj_records 的业务索引，返回本次新建的索引名。
+
+    产物下载队列每轮都要跑
+      WHERE artifacts_status='queued' AND artifact_complete=1 ORDER BY updated_at
+    索引缺失时会退化成全表扫 + 临时 B 树排序（3.5M 行实测 0.33~0.38s/次），
+    在 4 uvicorn + 2 worker 共享写锁的情况下会持续放大 database is locked。
+
+    **索引名在 SQLite 里是全局唯一的**：重建表时 RENAME 会把原索引一并搬到
+    _ttr_old 名下，此时 `CREATE INDEX IF NOT EXISTS idx_traj_records_inst ON
+    task_traj_records(...)` 会静默 no-op（名字被占，IF NOT EXISTS 不报错也不建）。
+    所以必须先清掉挂在别的表上的同名索引，否则「补索引」永远补不上。
+    """
+    if not _table_exists(conn, "task_traj_records"):
+        return []
+    have = _index_names(conn, "task_traj_records")
+    created = []
+    for name, ddl in TRAJ_INDEXES:
+        if name in have:
+            continue
+        shadow = conn.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
+            (name,)).fetchone()
+        if shadow and shadow[0] != "task_traj_records":
+            conn.execute(f"DROP INDEX IF EXISTS {name}")
+        conn.execute(ddl)
+        created.append(name)
+
+    # 其它表的看板索引：同样要防「索引名被 _ttr_old 之类占用」的静默 no-op
+    for name, ddl in OTHER_INDEXES:
+        shadow = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            (name,)).fetchone()
+        if shadow:
+            continue
+        conn.execute(ddl)
+        created.append(name)
+    return created
+
+
+def _finish_interrupted_traj_rebuild(conn) -> bool:
+    """收尾被打断的重建表迁移。返回是否做了收尾动作。
+
+    现场可能处在任意一步：
+      a) RENAME 成功、CREATE/INSERT 未完成  → task_traj_records 不存在或刚建好没数据
+      b) INSERT 完成、DROP 未执行          → 新表数据齐全，_ttr_old 残留（占半个库）
+    判断依据用行数：新表行数 >= 旧表行数即认为拷贝完成（迁移后新写入的行只会更多）。
+    无法判断或数据不全时**保留 _ttr_old 不动**，宁可占空间也不能丢数据。
+    """
+    if not _table_exists(conn, "_ttr_old"):
+        return False
+
+    if not _table_exists(conn, "task_traj_records"):
+        # a) 旧表已被 RENAME 走、新表没建成 —— 直接改回名字，数据原封不动
+        conn.execute("ALTER TABLE _ttr_old RENAME TO task_traj_records")
+        print("[db] 检测到中断的重建迁移：task_traj_records 缺失，已从 _ttr_old 还原")
+        return True
+
+    old_n = conn.execute("SELECT COUNT(*) FROM _ttr_old").fetchone()[0]
+    new_n = conn.execute("SELECT COUNT(*) FROM task_traj_records").fetchone()[0]
+    if new_n < old_n:
+        print(f"[db] 警告: _ttr_old 残留但新表行数不足（old={old_n} new={new_n}），"
+              f"保留 _ttr_old 未删除，请人工核对")
+        return False
+
+    conn.execute("DROP TABLE _ttr_old")
+    print(f"[db] 已收尾中断的重建迁移：删除残留表 _ttr_old（{old_n} 行）")
+    return True
+
+
 def self_heal_traj_level_nullable(conn):
-    """把 task_traj_records.level 的 NOT NULL 放开（老库升级）。
+    """把 task_traj_records.level 的 NOT NULL 放开（老库升级）+ 收尾半迁移现场。
 
     为什么需要：产物下载的发现阶段按「实例的 config 列表」建行，此时还没有分级
     （浅层可能从未跑过——比如从别的机器拷来的实例）。level 若仍 NOT NULL，
     这些行插不进去。
 
-    SQLite 不支持 ALTER COLUMN，只能重建表搬数据。只在检测到旧约束时做一次。
+    SQLite 不支持 ALTER COLUMN，只能重建表搬数据。
+
+    **这个函数必须是幂等且可重入的**：init_db() 在 --workers 4 下被 4 个进程并发
+    调用，重建脚本一旦被打断就会留下 _ttr_old + 缺索引的半成品，而旧版的早退条件
+    （只看 level 是否可空）让这种现场永久无法自愈。
     """
     try:
         info = conn.execute("PRAGMA table_info(task_traj_records)").fetchall()
     except Exception:
         return
+
+    # 无论走哪条分支，先把半迁移现场收尾、索引补齐 —— 这两件事与 level 约束无关
+    _finish_interrupted_traj_rebuild(conn)
+    _ensure_traj_indexes(conn)
+
     level_col = next((r for r in info if r[1] == "level"), None)
     if level_col is None:
         return
     # notnull 是第 4 列（cid, name, type, notnull, dflt_value, pk）
     if not level_col[3]:
-        return                      # 已经是可 NULL，无需迁移
+        return                      # 已经是可 NULL，无需重建
 
     cols = [r[1] for r in info]
     col_list = ", ".join(cols)
-    conn.executescript(f"""
-        ALTER TABLE task_traj_records RENAME TO _ttr_old;
-        CREATE TABLE task_traj_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            instance_id TEXT NOT NULL,
-            task_idx INTEGER,
-            config_name TEXT NOT NULL,
-            traj_name TEXT NOT NULL,
-            level TEXT,
-            harness TEXT DEFAULT 'openclaw',
-            passed_gate INTEGER, has_eval INTEGER, task_done INTEGER,
-            completion REAL,
-            tool_calls INTEGER, plain_rounds INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            reasoning_tokens INTEGER, total_tokens INTEGER,
-            char_len INTEGER,
-            trajectory_rel TEXT,
-            traj_status TEXT DEFAULT 'done',
-            artifacts_status TEXT DEFAULT 'queued',
-            artifact_complete INTEGER DEFAULT 0,
-            artifact_bytes INTEGER,
-            artifact_files INTEGER,
-            artifact_downloaded_at REAL,
-            artifact_worker TEXT,
-            artifact_started_at REAL,
-            artifact_attempts INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'done',
-            error TEXT,
-            shallow_status TEXT,
-            shallow_error TEXT,
-            assistant_traj_path TEXT,
-            evaluator_traj_path TEXT,
-            task_log_path TEXT,
-            gateway_log_path TEXT,
-            eval_log_path TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(instance_id, config_name, traj_name)
-        );
-        INSERT INTO task_traj_records ({col_list})
-            SELECT {col_list} FROM _ttr_old;
-        DROP TABLE _ttr_old;
-        CREATE INDEX IF NOT EXISTS idx_traj_records_inst
-            ON task_traj_records(instance_id);
-        CREATE INDEX IF NOT EXISTS idx_traj_records_task
-            ON task_traj_records(instance_id, config_name);
-        CREATE INDEX IF NOT EXISTS idx_traj_artifacts_status
-            ON task_traj_records(artifacts_status);
-    """)
-    print("[db] task_traj_records.level 已放开 NOT NULL（重建表迁移）")
+    # 整个重建必须是一个原子单元。
+    # **BEGIN IMMEDIATE 必须写在 executescript 脚本内部**：executescript 在执行前
+    # 会隐式 COMMIT 掉当前事务（已实测：BEGIN 之后 conn.in_transaction 为 True，
+    # executescript 之后变成 False），所以外面那句 BEGIN IMMEDIATE 形同虚设，
+    # 后面的 rollback() 也回滚不了任何已执行的 DDL/DML —— 这正是线上留下
+    # `_ttr_old` 350 万行残留的机械原因，不是「偶发中断」。
+    # executescript 内部会自动 COMMIT，把 BEGIN 放进脚本即可获得真正的原子性。
+    try:
+        conn.executescript(f"""
+            BEGIN IMMEDIATE;
+            ALTER TABLE task_traj_records RENAME TO _ttr_old;
+            CREATE TABLE task_traj_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                task_idx INTEGER,
+                config_name TEXT NOT NULL,
+                traj_name TEXT NOT NULL,
+                level TEXT,
+                harness TEXT DEFAULT 'openclaw',
+                passed_gate INTEGER, has_eval INTEGER, task_done INTEGER,
+                completion REAL,
+                tool_calls INTEGER, plain_rounds INTEGER,
+                input_tokens INTEGER, output_tokens INTEGER,
+                reasoning_tokens INTEGER, total_tokens INTEGER,
+                char_len INTEGER,
+                trajectory_rel TEXT,
+                traj_status TEXT DEFAULT 'done',
+                artifacts_status TEXT DEFAULT 'queued',
+                artifact_complete INTEGER DEFAULT 0,
+                artifact_priority INTEGER DEFAULT 0,
+                artifact_bytes INTEGER,
+                artifact_files INTEGER,
+                artifact_downloaded_at REAL,
+                artifact_worker TEXT,
+                artifact_started_at REAL,
+                artifact_attempts INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'done',
+                error TEXT,
+                shallow_status TEXT,
+                shallow_error TEXT,
+                assistant_traj_path TEXT,
+                evaluator_traj_path TEXT,
+                task_log_path TEXT,
+                gateway_log_path TEXT,
+                eval_log_path TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(instance_id, config_name, traj_name)
+            );
+            INSERT INTO task_traj_records ({col_list})
+                SELECT {col_list} FROM _ttr_old;
+            DROP TABLE _ttr_old;
+            COMMIT;
+        """)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    conn.commit()
+
+    _ensure_traj_indexes(conn)
+    conn.commit()
+    print("[db] task_traj_records.level 已放开 NOT NULL（重建表迁移完成）")
+
+
+@contextmanager
+def init_db_lock(timeout: float = 120.0):
+    """init_db 的跨进程互斥锁（带超时）。
+
+    uvicorn 以 --workers 4 启动时，4 个进程会各自 import main 并执行迁移。
+    库里有重建表迁移（RENAME/CREATE/INSERT/DROP），并发执行会互相抢写锁，
+    表现为 database is locked + 进程起不来，且可能留下「表搬了一半」的现场
+    （实测线上就留下过 _ttr_old 350 万行 + 业务索引全丢）。
+    这里用 flock 排他锁串行化，后到的进程等前一个跑完即可。
+
+    **必须带超时**：flock 的阻塞等待没有上限，一旦有进程拿到锁后卡死不释放
+    （或同进程重复加锁导致自死锁），后续所有 worker 会永久挂在
+    locks_lock_inode_wait —— 服务再也起不来，而且 ps 上看不出任何异常。
+    超时后放弃拿锁、直接往下走：迁移语句本身是幂等的，并发最坏结果是
+    database is locked 重试，比整个服务起不来好得多。
+    """
+    path = os.path.join(os.path.dirname(get_db_path()) or ".", ".init_db.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    acquired = False
+    try:
+        try:
+            import fcntl
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        print(f"[db] 警告: 等待 init_db 锁超过 {timeout:.0f}s 未拿到，"
+                              f"跳过等待继续启动（迁移语句幂等，并发最多报 locked）",
+                              flush=True)
+                        break
+                    time.sleep(0.2)
+        except ImportError:      # 非 POSIX 平台：退化为无锁（单 worker 场景够用）
+            pass
+        yield
+    finally:
+        if acquired:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        os.close(fd)
 
 
 def init_db():
     os.makedirs(os.path.dirname(get_db_path()), exist_ok=True)
+    with init_db_lock():
+        init_db_unlocked()
+
+
+# task_traj_records 的「新增可选列」。建表语句、重建表语句、ADD COLUMN 迁移三处
+# 必须同步，否则重建表迁移一旦发生就会把列丢掉。这里集中一份，供轻量自愈复用。
+TRAJ_EXTRA_COLUMNS = (
+    "shallow_status TEXT",
+    "shallow_error TEXT",
+    "artifacts_status TEXT DEFAULT 'queued'",
+    "artifact_complete INTEGER DEFAULT 0",
+    "artifact_priority INTEGER DEFAULT 0",
+    "artifact_bytes INTEGER",
+    "artifact_files INTEGER",
+    "artifact_downloaded_at REAL",
+    "artifact_worker TEXT",
+    "artifact_started_at REAL",
+    "artifact_attempts INTEGER DEFAULT 0",
+)
+
+# task_instances 的「新增可选列」。
+# 注意：产物发现的轮转时间戳属于**实例**维度（一个实例记一次即可），
+# 不属于 task 行。曾经误放进 TRAJ_EXTRA_COLUMNS，结果是列加到了 task_traj_records
+# 上、而 SQL 查的是 task_instances，worker 一启动就 no such column 直接崩。
+INSTANCE_EXTRA_COLUMNS = (
+    "last_artifact_discover_at REAL",
+)
+
+
+def ensure_traj_extra_columns() -> None:
+    """幂等补列，不建表、不重建、不做重迁移。
+
+    offline/output_worker.py 是**独立进程**，从不调用 init_db()，它只靠 uvicorn
+    启动时把库迁移好。于是「新增一列 + 只重启 worker」的组合会让 worker 的 SQL
+    直接报 no such column（列还没被加过），而症状是全轮发现失败、日志只有一句
+    笼统的错误。worker 启动时调一次本函数即可自愈。
+
+    与 self_heal_traj_level_nullable 的区别：那个会重建整张表（3.5M 行，分钟级），
+    这里只做 ALTER TABLE ADD COLUMN（纯元数据操作，秒级），可以每次启动都跑。
+    """
+    for table, columns in (("task_traj_records", TRAJ_EXTRA_COLUMNS),
+                           ("task_instances", INSTANCE_EXTRA_COLUMNS)):
+        try:
+            with get_connection() as conn:
+                if not _table_exists(conn, table):
+                    continue
+                have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+                added = []
+                for col in columns:
+                    name = col.split()[0]
+                    if name in have:
+                        continue
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+                        added.append(name)
+                    except Exception:
+                        pass
+                if added:
+                    conn.commit()
+                    print(f"[db] {table} 补列: {', '.join(added)}")
+                if table == "task_traj_records":
+                    _ensure_traj_indexes(conn)
+                    conn.commit()
+        except Exception as e:
+            print(f"[db] {table} 补列失败（worker 可能仍能用已有列）: {str(e)[:150]}")
+
+
+def init_db_unlocked():
+    """建表+迁移主体。**调用方必须已经持有 init_db_lock()**。
+
+    不要在这里再加锁：flock 不按进程重入，同一进程两个 fd 打开同一把锁会自死锁
+    （实测卡在 locks_lock_inode_wait 永不返回，该 uvicorn worker 直接起不来）。
+    """
     with get_connection() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -178,6 +441,9 @@ def init_db():
                 concurrent_num INTEGER DEFAULT 100,
                 config_snapshot TEXT,
                 error_summary TEXT,
+                -- 产物发现轮转：上次被发现阶段扫到的时间（epoch）。
+                -- 按「最久没被发现」排序，避免固定取最新的 N 个实例导致其余永远饿死。
+                last_artifact_discover_at REAL,
                 create_params TEXT,
                 output_status TEXT          -- 点击输出/浅层完成状态: NULL未输出, done浅层完成可直接用
                 , task_done_sync INTEGER NOT NULL DEFAULT 0   -- 终态(completed/finished)后最后扫描是否完成: 0待扫, 1已终扫
@@ -532,6 +798,7 @@ def init_db():
                 -- 产物下载状态（工作区 tab 全量下载整个 OBS 前缀）
                 artifacts_status TEXT DEFAULT 'queued',  -- queued/downloading/done/failed/skipped
                 artifact_complete INTEGER DEFAULT 0, -- 该 config 是否出现在本地 complete.jsonl
+                artifact_priority INTEGER DEFAULT 0, -- 越大越优先；用户点「沙箱交付物」=100
                 artifact_bytes INTEGER,              -- 产物落盘字节数
                 artifact_files INTEGER,              -- 产物文件数
                 artifact_downloaded_at REAL,
@@ -584,20 +851,10 @@ def init_db():
                 ON worker_heartbeats(worker, round_start);
         """)
 
-        # migrate: 为已存在的 task_traj_records 补列（IF NOT EXISTS 不会加列），风格同 task_records
-        for col in [
-            "shallow_status TEXT",
-            "shallow_error TEXT",
-            # 产物下载（工作区 tab）：与轨迹下载独立的状态机
-            "artifacts_status TEXT DEFAULT 'queued'",
-            "artifact_complete INTEGER DEFAULT 0",
-            "artifact_bytes INTEGER",
-            "artifact_files INTEGER",
-            "artifact_downloaded_at REAL",
-            "artifact_worker TEXT",
-            "artifact_started_at REAL",
-            "artifact_attempts INTEGER DEFAULT 0",
-        ]:
+        # migrate: 为已存在的 task_traj_records 补列（IF NOT EXISTS 不会加列）。
+        # 列清单集中在 TRAJ_EXTRA_COLUMNS，worker 启动时的 ensure_traj_extra_columns()
+        # 复用同一份 —— 三处（建表 / 重建表 / ADD COLUMN）不同步时，重建一次就会丢列。
+        for col in TRAJ_EXTRA_COLUMNS:
             try:
                 conn.execute(f"ALTER TABLE task_traj_records ADD COLUMN {col}")
             except Exception:
@@ -606,6 +863,14 @@ def init_db():
         # level 的 NOT NULL 放开需要重建表；SQLite 不能 ALTER COLUMN，只能建新表搬数据。
         # 只在检测到旧约束时做一次，正常库不受影响。
         self_heal_traj_level_nullable(conn)
+
+        # self_heal 可能触发重建（新表按字面量建，可能缺列）或从 _ttr_old 还原，
+        # 两种情况都要再过一遍补列 —— 必须放在 self_heal 之后。
+        for col in TRAJ_EXTRA_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE task_traj_records ADD COLUMN {col}")
+            except Exception:
+                pass
 
         # 迁移回填：已有行都是浅层处理过的——有分级 → processed；failed 占位 → 无轨迹 empty。
         # 无 level 的 NULL 行保持待处理，交给浅层首次分析。
@@ -750,3 +1015,26 @@ def init_db():
             conn.execute("ALTER TABLE notifications ADD COLUMN doc_slug TEXT")
         except Exception:
             pass
+
+        # 补统计信息 + 回收 WAL。
+        #
+        # ANALYZE：全库从未跑过，sqlite_stat1 不存在 → 优化器无法评估部分索引的
+        # 收益，产物队列的专用索引 idx_traj_artifact_queue 建了却从未被选中
+        # （实测走了 idx_traj_artifact_complete + USE TEMP B-TREE FOR ORDER BY，
+        # 领取查询 67ms；强制走队列索引后 0ms）。
+        #
+        # wal_checkpoint：全仓没有任何 checkpoint 调用，WAL 曾涨到 2.37GB。
+        # WAL 越大 checkpoint 越贵，而 checkpoint 又要等所有 reader 让出读锁 ——
+        # 一个慢查询就能让 WAL 在那段时间里无法推进，形成正反馈。
+        # 这里只在启动时做一次 TRUNCATE（4 个 uvicorn worker 由 init_db_lock 串行化），
+        # 不影响运行期。
+        for stmt, label in (
+            ("ANALYZE task_traj_records", "ANALYZE"),
+            ("PRAGMA wal_checkpoint(TRUNCATE)", "wal_checkpoint"),
+        ):
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except Exception as e:
+                # 失败不能影响启动：ANALYZE 只是优化收益，checkpoint 拿不到锁是常态。
+                print(f"[db] {label} 跳过: {str(e)[:120]}")

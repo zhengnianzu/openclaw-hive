@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Optional
 
 from ..core.config import settings
@@ -53,16 +54,29 @@ _TEXT_EXTS = {".txt", ".log", ".md", ".markdown", ".json", ".jsonl", ".ndjson",
 # PDF 单独一类（浏览器内置阅读器，无需转换）
 _PDF_EXTS = {".pdf"}
 
-# 平台自己生成的中间目录，不属于沙箱交付件，遍历时必须跳过：
-#   _pdf/ = LibreOffice 转换结果缓存
-_INTERNAL_DIRS = {"_pdf"}
+# 不是沙箱交付件的目录，遍历时必须跳过：
+#   _pdf/ = LibreOffice 转换结果缓存（平台生成的中间产物）
+#   .git/ = 沙箱 agent 的版本库元数据（objects/refs 下大量空目录，纯粹拖慢遍历）
+_INTERNAL_DIRS = {"_pdf", ".git"}
 
 
 # ── 路径与安全 ──────────────────────────────────────────────────────────────
 
 def cache_root() -> str:
-    """产物缓存根 = OUTPUT_CACHE（与 worker 的 origin 一致）。"""
-    root = os.path.abspath(settings.OUTPUT_CACHE)
+    """产物缓存根 = OUTPUT_CACHE（与 worker 的 origin 必须解析成同一个绝对路径）。
+
+    解析基准必须与 worker 一致：offline_analysis._load_env_cache_dir 对相对路径是
+    **基于 platform/ 解析**的。这里若用 abspath（跟进程 CWD），uvicorn 不从 platform/
+    启动时两边就指向不同目录 —— 症状是文件明明在盘上，/tree 却恒返回
+    「该 task 尚未下载到本地」，且没有任何报错可查。
+    """
+    root = settings.OUTPUT_CACHE
+    if not os.path.isabs(root):
+        # platform/ 目录 = api/services -> api -> platform
+        platform_dir = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        root = os.path.join(platform_dir, root)
+    root = os.path.normpath(root)
     os.makedirs(root, exist_ok=True)
     return root
 
@@ -120,12 +134,24 @@ def walk_tree(root: str, rel_prefix: str = "", max_entries: int = 20000) -> list
     """递归遍历本地目录，返回扁平文件列表（不含目录）。
 
     每项 {rel, name, size, mtime}，rel 是相对 root 的路径。目录结构由前端从 rel 推导。
-    本地 IO，毫秒级。
 
-    `_pdf/` 是 LibreOffice 转换的中间产物目录，不是沙箱产出的交付件，必须跳过。
+    `_pdf/` 是 LibreOffice 转换的中间产物目录，`.git/` 是沙箱 agent 的版本库元数据，
+    都不是沙箱产出的交付件，必须跳过。
+    """
+    out, _truncated = walk_tree_limited(root, max_entries)
+    return out
+
+
+def walk_tree_limited(root: str, max_entries: int = 20000,
+                      time_budget: float = 20.0) -> tuple[list[dict], bool]:
+    """同 walk_tree，额外返回「是否被截断」，并带墙钟上限。
+
+    目录在 NFS 上，单个 task 实测可达 3.3 万文件；遍历期间必须能主动放弃，
+    否则调用方（接口）会长时间占住。截断必须显式告诉前端，不能静默少列文件。
     """
     out: list[dict] = []
     root = os.path.realpath(root)
+    started = time.monotonic()
     for dirpath, dirnames, filenames in os.walk(root):
         # 原地过滤：os.walk 会尊重这个修改
         dirnames[:] = sorted(d for d in dirnames if d not in _INTERNAL_DIRS)
@@ -143,8 +169,10 @@ def walk_tree(root: str, rel_prefix: str = "", max_entries: int = 20000) -> list
                 "mtime": st.st_mtime,
             })
             if len(out) >= max_entries:
-                return out
-    return out
+                return out, True
+        if time.monotonic() - started > time_budget:
+            return out, True
+    return out, False
 
 
 def list_subdirs(root: str) -> list[str]:
@@ -234,8 +262,15 @@ def pdf_cache_path(task_dir: str, rel: str) -> str:
 
 
 def _pdf_is_fresh(pdf: str, src: str) -> bool:
-    """PDF 比源文件新即视为有效。"""
+    """PDF 比源文件新、且非空即视为有效。
+
+    校验大小是必须的：NFSv3 上不能 rename，缓存只能原地覆盖写，
+    覆盖过程中崩溃会留下一个 mtime 很新的**半截文件**，只看 mtime 会把它
+    当成有效缓存一直返回。
+    """
     try:
+        if os.path.getsize(pdf) < 1024:      # 正常 PDF 不会小于 1KB
+            return False
         return os.path.getmtime(pdf) >= os.path.getmtime(src)
     except OSError:
         return False
@@ -279,9 +314,18 @@ def ensure_pdf(task_dir: str, rel: str) -> str:
             raise RuntimeError(
                 f"LibreOffice 未产出 PDF（exit={proc.returncode}）: "
                 f"{(proc.stderr or proc.stdout or '')[-300:]}")
+        # 注意：这里**不能**用 os.replace/os.rename —— OUTPUT_CACHE 在 sfs_turbo 上，
+        # 是 NFSv3（无 rename 语义），实测 os.replace 直接 EPERM（Operation not permitted）。
+        # 原地覆盖写：先写 .part，再 copyfile 到目标名（copyfile 是 open+write，不含 rename），
+        # 最后删 .part。代价是目标文件在被覆盖的瞬间不是原子的，所以 _pdf_is_fresh
+        # 还要校验大小，避免把半截文件当成有效缓存返回。
         tmp = pdf + ".part"
         shutil.copyfile(produced, tmp)
-        os.replace(tmp, pdf)
+        shutil.copyfile(tmp, pdf)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return pdf
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -19,9 +19,9 @@
         <div class="wm-kpi-sub">下载中 {{ counts.artifact_downloading }} · 失败 {{ counts.artifact_failed }}</div>
       </div>
       <div class="wm-kpi">
-        <div class="wm-kpi-label">平均下载速度</div>
-        <div class="wm-kpi-value">{{ avgSpeed != null ? avgSpeed : '—' }}<span class="wm-unit">MB/s</span></div>
-        <div class="wm-kpi-sub">峰值 {{ peakSpeed != null ? peakSpeed : '—' }} MB/s</div>
+        <div class="wm-kpi-label">已下载</div>
+        <div class="wm-kpi-value">{{ counts.artifact_done ?? '—' }}</div>
+        <div class="wm-kpi-sub">累计 {{ counts.artifact_done_bytes ? fmtSize(counts.artifact_done_bytes) : '—' }}</div>
       </div>
       <div class="wm-kpi">
         <div class="wm-kpi-label">磁盘使用</div>
@@ -77,9 +77,40 @@
 
       <el-col :xs="24" :lg="8">
         <div class="glass-card panel">
-          <div class="panel-head"><span class="panel-title">任务状态分布</span></div>
-          <EChart v-if="statusDist.length" :option="statusPieOption" height="230px" />
-          <el-empty v-else description="无数据" :image-size="50" />
+          <div class="panel-head">
+            <span class="panel-title">浅层分级进度</span>
+            <span class="panel-hint">
+              {{ counts.shallow_progress != null ? counts.shallow_progress + '%' : '—' }}
+            </span>
+          </div>
+          <div class="wm-eta-grid" style="margin-top:4px">
+            <div class="wm-eta-item">
+              <span class="wm-eta-num">{{ fmtNum(counts.shallow_graded) }}</span>
+              <span class="wm-eta-label">已分级</span>
+            </div>
+            <div class="wm-eta-item">
+              <span class="wm-eta-num">{{ fmtNum(counts.shallow_pending) }}</span>
+              <span class="wm-eta-label">待分级</span>
+            </div>
+            <div class="wm-eta-item">
+              <span class="wm-eta-num">{{ fmtNum(counts.shallow_failed) }}</span>
+              <span class="wm-eta-label">失败</span>
+            </div>
+            <div class="wm-eta-item">
+              <span class="wm-eta-num">{{ fmtNum(counts.shallow_total) }}</span>
+              <span class="wm-eta-label">总数</span>
+            </div>
+          </div>
+          <el-progress
+            :percentage="counts.shallow_progress || 0"
+            :stroke-width="10"
+            :show-text="false"
+            color="#2a78d6"
+            style="margin-top:12px"
+          />
+          <div class="wm-dim" style="margin-top:8px">
+            进度 = 已分级 / 总数（数据源 task_records.traj_level）
+          </div>
         </div>
       </el-col>
     </el-row>
@@ -110,12 +141,8 @@
               <span class="wm-eta-label">预计总耗时</span>
             </div>
             <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ gantt?.avg_seconds ? gantt.avg_seconds + 's' : '—' }}</span>
-              <span class="wm-eta-label">单任务均值</span>
-            </div>
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ gantt?.median_seconds ? gantt.median_seconds + 's' : '—' }}</span>
-              <span class="wm-eta-label">中位数</span>
+              <span class="wm-eta-num">{{ eta?.throughput_per_minute ?? '—' }}</span>
+              <span class="wm-eta-label">任务/分钟</span>
             </div>
             <div class="wm-eta-item">
               <span class="wm-eta-num">{{ eta?.pending ?? '—' }}</span>
@@ -130,16 +157,6 @@
         </div>
       </el-col>
     </el-row>
-
-    <!-- ===== 甘特图：每任务实际耗时 ===== -->
-    <div class="glass-card panel">
-      <div class="panel-head">
-        <span class="panel-title">任务执行时间（甘特）</span>
-        <span class="panel-hint">真实起止时间，来自 artifact_started_at / downloaded_at</span>
-      </div>
-      <EChart v-if="ganttBars.length" :option="ganttOption" :height="ganttHeight" />
-      <el-empty v-else description="暂无已完成的下载" :image-size="50" />
-    </div>
 
     <!-- ===== 队列明细 ===== -->
     <div class="glass-card panel">
@@ -222,7 +239,6 @@ const workers = ref([])
 const counts = ref({})
 const disk = ref(null)
 const eta = ref(null)
-const gantt = ref(null)
 const queueItems = ref([])
 const queueTab = ref('active')
 const trendPoints = ref([])
@@ -244,6 +260,12 @@ const statusTagType = s => ({
   queued: 'warning', downloading: 'primary', done: 'success',
   failed: 'danger', skipped: 'info',
 }[s] || 'info')
+
+// 千分位格式化；null/undefined 显示「—」而不是 0，避免把「还没数据」误显示成 0
+function fmtNum(n) {
+  if (n == null) return '—'
+  return Number(n).toLocaleString('en-US')
+}
 
 function fmtSize(bytes) {
   const v = Number(bytes || 0)
@@ -278,17 +300,6 @@ const totalSubtasks = computed(() => {
     + (c.artifact_downloading || 0) + (c.artifact_failed || 0)
     + (c.artifact_oversize || 0)
   return done + (c.artifact_not_complete || 0)
-})
-
-// 平均/峰值下载速度：从甘特数据（真实耗时）算
-const avgSpeed = computed(() => {
-  const sp = (gantt.value?.items || []).map(i => i.speed_mbps).filter(v => v)
-  if (!sp.length) return null
-  return (sp.reduce((a, b) => a + b, 0) / sp.length).toFixed(2)
-})
-const peakSpeed = computed(() => {
-  const sp = (gantt.value?.items || []).map(i => i.speed_mbps).filter(v => v)
-  return sp.length ? Math.max(...sp).toFixed(2) : null
 })
 
 const statusDist = computed(() => {
@@ -339,68 +350,16 @@ const trendOption = computed(() => ({
   ],
 }))
 
-// 甘特：每任务一条横杠，从最早开始时间算相对偏移
-const ganttBars = computed(() => {
-  const items = (gantt.value?.items || [])
-    .filter(i => i.started_at && i.finished_at && i.duration_seconds)
-    .slice(0, 30)
-    .reverse()
-  return items
-})
-
-const ganttHeight = computed(() => `${Math.max(180, Math.min(560, ganttBars.value.length * 22 + 60))}px`)
-
-const ganttOption = computed(() => {
-  const bars = ganttBars.value
-  if (!bars.length) return {}
-  const t0 = Math.min(...bars.map(b => b.started_at))
-  const names = bars.map(b => b.traj_name)
-  const offsets = bars.map(b => +(b.started_at - t0).toFixed(0))
-  return {
-    grid: { left: 150, right: 60, top: 12, bottom: 30 },
-    tooltip: {
-      trigger: 'axis', axisPointer: { type: 'shadow' },
-      formatter: (ps) => {
-        const i = ps[0].dataIndex
-        const b = bars[i]
-        return `${b.traj_name}<br/>耗时 ${b.duration_seconds}s<br/>`
-          + `${fmtSize(b.bytes)} · ${b.files} 文件<br/>`
-          + `${b.speed_mbps ? b.speed_mbps + ' MB/s' : ''}`
-      },
-    },
-    xAxis: {
-      type: 'value', name: '秒', axisLabel: { fontSize: 10 },
-      max: Math.max(...offsets.map((o, i) => o + bars[i].duration_seconds)),
-    },
-    yAxis: {
-      type: 'category', data: names,
-      axisLabel: { fontSize: 10 }, axisTick: { show: false },
-    },
-    series: [{
-      type: 'bar', stack: 'g', silent: true,
-      itemStyle: { color: 'transparent' },
-      data: offsets,
-    }, {
-      type: 'bar', stack: 'g',
-      itemStyle: {
-        color: (p) => (bars[p.dataIndex].status === 'done' ? '#2a78d6' : '#d03b3b'),
-        borderRadius: [3, 3, 3, 3],
-      },
-      label: { show: true, position: 'right', fontSize: 10, formatter: p => `${bars[p.dataIndex].duration_seconds}s` },
-      data: bars.map(b => b.duration_seconds),
-    }],
-  }
-})
-
 // ── 数据加载 ──────────────────────────────────────────────────────────────
 
 async function loadAll() {
   loading.value = true
   try {
-    const [ov, et, ga, q] = await Promise.all([
+    // 注意：这里用 Promise.all，任何一支超时都会让整块面板空白。
+    // 所以每个请求都必须足够快（/queue 曾经 50s 超时，就是因为这个整片空白）。
+    const [ov, et, q] = await Promise.all([
       api.get('/worker-monitor/overview', { silent: true }),
       api.get('/worker-monitor/eta', { silent: true }),
-      api.get('/worker-monitor/gantt?limit=40', { silent: true }),
       api.get(`/worker-monitor/queue?status=${queueTab.value}&limit=50`, { silent: true }),
     ])
     workers.value = ov.workers || []
@@ -408,7 +367,6 @@ async function loadAll() {
     disk.value = ov.disk || null
     generatedAt.value = (ov.generated_at || '').replace('T', ' ')
     eta.value = et
-    gantt.value = ga
     queueItems.value = q.items || []
   } catch { /* 单块失败不影响其他块 */ }
   finally { loading.value = false }

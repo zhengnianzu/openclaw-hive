@@ -1,0 +1,50 @@
+# 输出分析 worker 的运行参数（offline/output_worker.py）。
+#
+# 优先级：环境变量 > 本文件 > 代码内置默认。
+# 调参后执行 `./run.sh deep-restart`（产物下载）或 `./run.sh worker-restart`（浅层）生效。
+#
+# 注意：本文件缺失或格式错误时，worker 会**静默**退回内置默认值，不报任何错
+# （见 output_worker.py 的 _cfg）。怀疑参数没生效时先确认这里能正常解析。
+
+worker:
+  # 常驻轮询间隔（秒）。每轮内部还要跑发现 + 下载，实测单轮常超过 120s，
+  # 所以这个值相当于「轮与轮之间的空档」而不是「每轮总时长」。
+  interval_seconds: 60
+
+  # worker_heartbeats 表保留行数（看板趋势用，超出即裁剪）
+  heartbeat_keep_rows: 2000
+
+download:
+  # 并发下载线程数。obsutil 走独立 subprocess，过高会打爆 OBS 带宽。
+  # 实测单 task 只要 1.2~1.6 秒（100 文件 / 2~4 MB），3 太保守；
+  # 但也不要无脑调大，OBS 侧会返回 exit 8（请求数超限）。
+  concurrency: 8
+
+  # 每轮最多新发现多少个 task（防止一次把整个实例的 config 全灌进队列）
+  max_tasks_per_round: 20
+
+  # 每轮最多扫描多少个已结束实例。
+  # 按「最久没被发现」轮转（task_instances.last_artifact_discover_at），
+  # 不是固定取最新的 N 个 —— 否则最新几个实例会长期占满预算，其余永远轮不到。
+  max_instances_per_round: 4
+
+  # 后台自动发现只覆盖最近 N 天**有活动**（COALESCE(stopped_at, created_at)）的实例。
+  # 取结束时间而非创建时间：创建早、刚跑完的实例才是用户此刻关心的。
+  # 历史实例不自动入队 —— 等用户在实例详情点开「沙箱交付物」时按需下载，
+  # 且按需下载会置 artifact_priority=100 直接插队到最前。
+  # 设为 0 = 不限制（回到全量自动发现的老行为，不推荐）。
+  auto_discover_days: 1
+
+  # 单个 task 产物落盘上限（字节）。超过会删除并标记 skipped，不再重试。
+  # 默认 2 GiB。注意：交付物是整目录 cp -r，含 workspace/.git 等，实测有单任务
+  # 3.3 万文件 / 388 MB 的离群值，容量规划要按最坏情况留余量。
+  max_task_bytes: 2147483648
+
+  # 行停在 downloading 超过这个分钟数就回收重排（worker 被 kill 的情况）
+  downloading_timeout_minutes: 30
+
+  # failed 行的重试间隔（秒）
+  fail_retry_seconds: 600
+
+  # 最多尝试次数（含首次），超过判死 skipped，不再排队
+  max_attempts: 3

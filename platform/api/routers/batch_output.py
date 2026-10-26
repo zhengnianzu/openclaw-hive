@@ -21,7 +21,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
-from ..core.config import settings
+from ..core.config import settings, ARTIFACT_PRIORITY_USER
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..services import proxy as proxy_service
@@ -342,12 +342,16 @@ async def trigger_deep(instance_id: str, traj_name: str,
                     "status": "downloading"}
         if st == "done":
             return {"instance_id": instance_id, "traj_name": traj_name, "status": "done"}
-        # 重试次数清零：这是用户显式重试，不该受此前自动重试上限（skipped）限制
+        # 重试次数清零：这是用户显式重试，不该受此前自动重试上限（skipped）限制。
+        # artifact_priority=100 必须和 artifacts.py 的 POST /request 口径一致 ——
+        # 两条入口都自称「等价」，但这里原来不置优先级，于是从会话详情点
+        # 「下载交付物」实际排在数万条积压之后，而工作区里点同名按钮是即时的。
         conn.execute(
             "UPDATE task_traj_records SET artifacts_status='queued', "
-            "artifact_complete=1, artifact_attempts=0, updated_at=CURRENT_TIMESTAMP "
+            "artifact_complete=1, artifact_attempts=0, artifact_priority=?, "
+            "error=NULL, updated_at=CURRENT_TIMESTAMP "
             "WHERE id=? AND artifacts_status<>'downloading'",
-            (row["id"],),
+            (ARTIFACT_PRIORITY_USER, row["id"]),
         )
         conn.commit()
     return {"instance_id": instance_id, "traj_name": traj_name, "status": "queued"}

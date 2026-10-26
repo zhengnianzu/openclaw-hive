@@ -26,11 +26,9 @@ class Settings(BaseSettings):
     WIKI_DIR: str = ""
     WIKI_DB_PATH: str = ""
 
-    # 沙箱产物浏览（实例详情「工作区」tab）：
-    # 目录清单存 platform.db（4 worker 共享），文件字节复用 OUTPUT_CACHE 下的 _artifacts/ 子目录
-    # （不单独引一个缓存根，避免同一份 OBS 账在机器上有两个缓存目录要清理）。
-    # 目录清单 TTL 到期才重新 ls；文件字节按 size/etag 变化才重下。
-    ARTIFACT_DIR_TTL: int = 300
+    # 沙箱产物浏览（实例详情「工作区」tab）。
+    # 文件由 offline/output_worker.py 全量预下载到 OUTPUT_CACHE/<batch>/<leaf>/，
+    # 接口只读本地磁盘（零 obsutil 调用），所以这里没有单独的缓存根。
     # LibreOffice headless，用于 pptx/docx/xlsx → PDF 预览。缺省命令不存在时接口返回 503。
     SOFFICE_PATH: str = "soffice"
 
@@ -104,3 +102,10 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# 产物下载优先级：数值越大越先被 worker 领取。
+# 0 = 后台自动发现入队（按 updated_at FIFO）。
+# 100 = 用户显式请求（点「下载此任务」/「下载交付物」/打开工作区）。
+# 放在这里而不是某个 router 里：artifacts.py 与 batch_output.py 两条入口
+# 必须用同一个值，否则同一件事在两个界面上排到不同的队列位置。
+ARTIFACT_PRIORITY_USER = 100

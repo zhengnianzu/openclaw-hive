@@ -12,7 +12,7 @@ from fastapi import Depends, HTTPException, Query
 from typing import Optional
 
 from api.core.config import settings
-from api.core.database import init_db, get_connection
+from api.core.database import init_db, init_db_lock, init_db_unlocked, get_connection
 from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues, sandbox_configs
 from api.routers import batch_output, resource_pools, stats
@@ -21,12 +21,16 @@ from api.routers import public_api
 from api.routers import artifacts
 from api.routers import worker_monitor
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
-SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml", "cc_settings.json"]
+# 子目录项（worker/config.yaml）也在这里，os.path.join 能正常处理；
+# 复制前需要先确保父目录存在，否则 copy2 会 FileNotFoundError。
+SETTINGS_FILES = ["config.yaml", "openclaw.json", "user_proxy_model.json", "hermes_config.yaml",
+                  "cc_settings.json", os.path.join("worker", "config.yaml")]
 for name in SETTINGS_FILES:
     actual = os.path.join(settings.SETTINGS_DIR, name)
     example = f"{actual}.example"
     if not os.path.exists(actual):
         if os.path.exists(example):
+            os.makedirs(os.path.dirname(actual) or ".", exist_ok=True)
             shutil.copy2(example, actual)
             print(f"已从 {os.path.basename(example)} 创建 {os.path.basename(actual)}，请编辑填入实际密钥")
         else:
@@ -73,24 +77,34 @@ app.include_router(notifications.router)
 app.include_router(settings_overview.router)
 # 对外 API：固定 AK 鉴权（X-API-Key），不涉用户身份，见 routers/public_api.py
 app.include_router(public_api.router)
-# 沙箱产物浏览（实例详情「工作区」tab）：按层懒加载 OBS 目录 + 文件字节缓存
+# 沙箱产物浏览（实例详情「工作区」tab）：只读本地磁盘，产物由 offline worker 全量预下载
 app.include_router(artifacts.router)
 # Worker 调度监控（资源看板）：心跳 / 进程指标 / 队列积压 / ETA
 app.include_router(worker_monitor.router)
 
-init_db()
-harness_configs.ensure_defaults()
-sandbox_configs.ensure_defaults()
+# 启动期的**所有**写库动作必须共享同一把跨进程锁。
+# uvicorn --workers 4 会起 4 个进程，每个进程 import main 时都会把这段跑一遍；
+# 之前只把 init_db() 包进锁，后面三步仍在锁外，4 个进程并发抢同一个 SQLite 写锁，
+# 实测启动时 harness_configs.ensure_defaults() 抛 database is locked，
+# 该 worker 直接起不来（日志里 INFO: Child process [xxx] died）。
+#
+# 注意调用的是 init_db_unlocked()，不是 init_db()：后者内部自己会拿同一把锁，
+# 这里已经持有，再进一次就是 flock 自死锁（同一进程两个 fd 也互斥），
+# 实测卡在 locks_lock_inode_wait 永不返回。
+with init_db_lock():
+    init_db_unlocked()
+    harness_configs.ensure_defaults()
+    sandbox_configs.ensure_defaults()
 
-with get_connection() as conn:
-    existing = conn.execute("SELECT id FROM users WHERE username = ?", (settings.ADMIN_USERNAME,)).fetchone()
-    if not existing:
-        hashed = get_password_hash(settings.ADMIN_PASSWORD)
-        try:
-            conn.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, 'admin')", (settings.ADMIN_USERNAME, hashed))
-            print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
-        except Exception:
-            pass
+    with get_connection() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (settings.ADMIN_USERNAME,)).fetchone()
+        if not existing:
+            hashed = get_password_hash(settings.ADMIN_PASSWORD)
+            try:
+                conn.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, 'admin')", (settings.ADMIN_USERNAME, hashed))
+                print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
+            except Exception:
+                pass
 
 
 @app.get("/api/health")

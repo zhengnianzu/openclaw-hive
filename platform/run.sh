@@ -17,17 +17,19 @@ NGINX_PORT="${4:-80}"
 # 可用 PYTHON=... 覆盖，默认取当前 shell 的 python3。
 PYTHON="${PYTHON:-$(command -v python3)}"
 
-# 提醒：激活了别人的 venv 时，python3 会指向那个项目的环境，
-# 依赖会装错地方、服务也用错解释器跑（典型症状：装完仍报 No module named 'bcrypt'）。
+# 提醒：激活的 venv 与即将使用的解释器不一致时才会出问题——
+# 依赖装进 A、服务用 B 跑（典型症状：装完仍报 No module named 'bcrypt'）。
+# 注意不能按「venv 是否在本仓库内」判断：本机常态就是 VIRTUAL_ENV=/root/.venv
+# （仓库外的独立 venv），那样判断会每次启动都误报。
 _active_venv="${VIRTUAL_ENV:-}"
 if [ -n "$_active_venv" ]; then
-    _venv_root="$(cd "$_active_venv/.." 2>/dev/null && pwd)"
-    _self_root="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)"
-    if [ "$_venv_root" != "$_self_root" ]; then
-        echo "警告: 当前激活的虚拟环境不属于本仓库:"
+    _py_dir="$(cd "$(dirname "$PYTHON")" 2>/dev/null && pwd)"
+    _venv_bin="$(cd "$_active_venv/bin" 2>/dev/null && pwd)"
+    if [ -n "$_py_dir" ] && [ -n "$_venv_bin" ] && [ "$_py_dir" != "$_venv_bin" ]; then
+        echo "警告: 激活的虚拟环境与将使用的解释器不一致:"
         echo "      VIRTUAL_ENV=$_active_venv"
         echo "      将使用 python3 = $PYTHON"
-        echo "      如非本意，请先 deactivate，或用 PYTHON=/path/to/python3 指定解释器。"
+        echo "      依赖会装错地方。如非本意，请先 deactivate，或用 PYTHON=/path/to/python3 指定解释器。"
     fi
 fi
 
@@ -46,27 +48,95 @@ UVICORN="$PYTHON -m uvicorn"
 # 或 stop 时只杀了父进程而 worker 仍持有监听），再次 start 会直接
 # "ERROR: [Errno 98] Address already in use"。启动前统一清掉占用者。
 # 先 TERM 给进程自己收尾的机会，1 秒后仍在则 KILL。
+# 取监听某端口的 PID。
+# **不能用 lsof**：lsof 会把全系统所有进程的 fd 都读一遍，本机有 30 个进程持有
+# sfs_turbo 的 fd（单个最多 1.3 万个），而该挂载上还有卡住的 RPC，实测
+# `lsof -ti tcp:8087` 30 秒都不返回 —— 于是 free_port 第一步就挂死，
+# 表现为「run.sh 卡住不动」，跟端口占用毫无关系。
+# `ss -lntp` 只读 netlink 的 socket 表，实测 0.5 秒内返回，且直接带 pid。
+_port_pids() {
+    local port="$1"
+    ss -lntp 2>/dev/null | awk -v p=":$port" '$4 ~ p"$"' \
+        | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+
 free_port() {
     local port="$1" pids
-    pids=$( { lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || fuser -n tcp "$port" 2>/dev/null; } | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u )
+    pids=$(_port_pids "$port")
     if [ -z "$pids" ]; then
         return 0
     fi
     echo "端口 $port 被占用 (PID: $(echo $pids | tr '\n' ' '))，正在释放..."
     kill $pids 2>/dev/null
-    for _ in 1 2 3 4 5; do
+    for _ in $(seq 1 25); do
         sleep 0.2
-        pids=$( { lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || fuser -n tcp "$port" 2>/dev/null; } | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u )
+        pids=$(_port_pids "$port")
         [ -z "$pids" ] && { echo "端口 $port 已释放"; return 0; }
     done
+
+    # 走了 5 秒还没退，先看是不是 D 状态（卡在不可中断的内核 I/O，NFS/SFS 抖动时常见）。
+    # 注意：D 状态**不代表 kill -9 无效** —— 实测卡在 rpc_wait_bit_killable 的进程
+    # 收到 SIGKILL 后 4 秒内就退出了（那个等待点本身是可 kill 的）。
+    # 所以这里照样发 KILL 并给足等待时间，只有确实杀不掉才报错。
+    local stuck d
+    for pid in $pids; do
+        stuck=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+        case "$stuck" in
+            D*) echo "提示: 端口 $port 的 PID $pid 处于 D 状态（疑似卡在 NFS I/O），尝试强杀..." ;;
+        esac
+    done
     kill -9 $pids 2>/dev/null
-    sleep 0.3
-    pidof_check=$( { lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || fuser -n tcp "$port" 2>/dev/null; } | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u )
-    if [ -n "$pidof_check" ]; then
-        echo "警告: 端口 $port 仍被占用 (PID: $(echo $pidof_check | tr '\n' ' '))"
-        return 1
+    for _ in $(seq 1 50); do
+        sleep 0.2
+        pids=$(_port_pids "$port")
+        [ -z "$pids" ] && { echo "端口 $port 已释放"; return 0; }
+    done
+
+    echo "错误: 端口 $port 仍被占用 (PID: $(echo $pids | tr '\n' ' '))，SIGKILL 后 10 秒仍未退出"
+    for pid in $pids; do
+        echo "      PID $pid stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ') wchan=$(cat /proc/$pid/wchan 2>/dev/null)"
+    done
+    echo "      这类进程通常是父进程 uvicorn(master) 仍在向子进程转发信号。"
+    echo "      请先杀 master：kill -9 \$(pgrep -f 'uvicorn main:app.*--port $port')"
+    return 1
+}
+
+# 启动后健康检查：nohup 起来不代表服务可用。
+# 历史上出现过「uvicorn 进程在、端口在 Listen，但 4 个 worker 全卡在 NFS D 状态，
+# 监听队列 Recv-Q 打满，任何请求都超时」却没有任何报错的情况。
+# 这里用 /api/health 确认真的能响应，失败时把日志尾部打出来并让脚本非 0 退出。
+wait_healthy() {
+    local port="$1" max_wait="${2:-40}" pidfile="platform.pid"
+    local i code
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "未找到 curl，跳过健康检查"
+        return 0
     fi
-    echo "端口 $port 已释放"
+    echo "健康检查: http://127.0.0.1:${port}/api/health"
+    for ((i = 0; i < max_wait; i += 2)); do
+        sleep 2
+        code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:${port}/api/health" 2>/dev/null)
+        if [ "$code" = "200" ]; then
+            echo "服务健康检查通过"
+            return 0
+        fi
+    done
+    echo ""
+    echo "错误: 服务在 ${max_wait}s 内没有通过健康检查（最后状态码: ${code:-无}）"
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "      进程 $pid 仍在，但无法响应请求。当前状态:"
+        ps -o pid,stat,wchan:28,cmd -p "$pid" 2>/dev/null | tail -2
+        echo "      全部 8087 相关进程:"
+        ps -eo pid,stat,wchan:28,args 2>/dev/null | grep -F -- "--port ${port}" | grep -v grep
+        echo "      若 stat 是 D，说明卡在不可中断 I/O（NFS/SFS 抖动），kill 无效，需重启机器。"
+    else
+        echo "      进程已退出（pid 文件: ${pid:-无}）"
+    fi
+    echo "      --- platform.log 尾部 40 行 ---"
+    [ -f platform.log ] && tail -n 40 platform.log
+    return 1
 }
 
 # 输出分析 worker：浅层（分级/补全）+ 产物下载（沙箱交付物全量）两个独立进程
@@ -135,6 +205,23 @@ stop_deep_worker() {
     _stop_pidfile deep_worker.pid "产物下载 worker"
 }
 
+# 实时下载 worker：只处理用户点击过（artifact_priority=100）的任务。
+# 与 deep worker 分开进程、分开线程池，点击不必等几万条积压。
+start_realtime_worker() {
+    if [ -f realtime_worker.pid ] && kill -0 "$(cat realtime_worker.pid)" 2>/dev/null; then
+        echo "实时下载 worker 已在运行 (PID: $(cat realtime_worker.pid))"
+        return
+    fi
+    rm -f realtime_worker.pid
+    nohup $PYTHON offline/output_worker.py --realtime-only > realtime_worker.log 2>&1 &
+    echo $! > realtime_worker.pid
+    echo "实时下载 worker 已启动 (PID: $(cat realtime_worker.pid))"
+}
+
+stop_realtime_worker() {
+    _stop_pidfile realtime_worker.pid "实时下载 worker"
+}
+
 case "$ACTION" in
     install)
         echo "=== 安装后端依赖 ==="
@@ -199,7 +286,7 @@ case "$ACTION" in
         echo ""
         echo "请在另一个终端执行: cd frontend && npm run dev"
         echo ""
-        free_port "$PORT"
+        free_port "$PORT" || exit 1
         $UVICORN main:app --host "$HOST" --port "$PORT" --reload
         ;;
 
@@ -213,12 +300,15 @@ case "$ACTION" in
 
         echo "启动 uvicorn (workers=4)..."
         echo "服务地址: http://${HOST}:${PORT} (API直连)"
-        free_port "$PORT"
+        # 端口清不掉就不要往下启动：否则新进程 bind 失败，而 start 仍然打印
+        # "Uvicorn 已启动"，日志里只留一行 Errno 98，很难看出来。
+        free_port "$PORT" || exit 1
         nohup $UVICORN main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
         start_worker
         start_deep_worker
+        start_realtime_worker
 
         # 启动 Nginx（如果已安装）
         if command -v nginx &> /dev/null; then
@@ -253,6 +343,12 @@ case "$ACTION" in
         fi
         stop_worker
         stop_deep_worker
+        stop_realtime_worker
+        # uvicorn --workers N 是「父进程 + N 个 spawn 出来的子进程」。
+        # 只 kill pid 文件里那个 master，子进程会被 reparent 到 PID 1 变成孤儿，
+        # **继续占着端口**——表现就是「进程列表里看不到 uvicorn，但 8087 仍在监听」，
+        # 下次 start 直接 Errno 98。这里按端口兜底清一遍。
+        free_port "$PORT"
         # 停止 Nginx（如果由我们启动）
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null && echo "Nginx 已停止"
@@ -268,6 +364,7 @@ case "$ACTION" in
         fi
         stop_worker
         stop_deep_worker
+        stop_realtime_worker
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null
         fi
@@ -278,12 +375,13 @@ case "$ACTION" in
         fi
 
         echo "启动 uvicorn (workers=4)..."
-        free_port "$PORT"
+        free_port "$PORT" || exit 1
         nohup $UVICORN main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
         start_worker
         start_deep_worker
+        start_realtime_worker
 
         if command -v nginx &> /dev/null; then
             NGINX_CONF="$SCRIPT_DIR/nginx.conf"
@@ -335,6 +433,11 @@ case "$ACTION" in
         else
             echo "产物下载 worker 未运行"
         fi
+        if [ -f realtime_worker.pid ] && kill -0 "$(cat realtime_worker.pid)" 2>/dev/null; then
+            echo "实时下载 worker 运行中 (PID: $(cat realtime_worker.pid))"
+        else
+            echo "实时下载 worker 未运行"
+        fi
         echo "--- 浅层 worker.log 尾部 20 行 ---"
         if [ -f worker.log ]; then
             tail -n 20 worker.log
@@ -352,19 +455,23 @@ case "$ACTION" in
     worker-start)
         start_worker
         start_deep_worker
+        start_realtime_worker
         ;;
 
     worker-stop)
         stop_worker
         stop_deep_worker
+        stop_realtime_worker
         ;;
 
     worker-restart)
         stop_worker
         stop_deep_worker
+        stop_realtime_worker
         sleep 1
         start_worker
         start_deep_worker
+        start_realtime_worker
         ;;
 
     shallow-start|shallow-stop|shallow-restart)
@@ -380,6 +487,14 @@ case "$ACTION" in
             deep-start|artifacts-start) start_deep_worker ;;
             deep-stop|artifacts-stop)   stop_deep_worker ;;
             deep-restart|artifacts-restart) stop_deep_worker; sleep 1; start_deep_worker ;;
+        esac
+        ;;
+
+    realtime-start|realtime-stop|realtime-restart)
+        case "$ACTION" in
+            realtime-start) start_realtime_worker ;;
+            realtime-stop)  stop_realtime_worker ;;
+            realtime-restart) stop_realtime_worker; sleep 1; start_realtime_worker ;;
         esac
         ;;
 
@@ -405,6 +520,7 @@ case "$ACTION" in
         echo "  shallow-start|stop|restart   只动浅层（分级/补全）"
         echo "  deep-start|stop|restart      只动产物下载（deep/artifacts 两个名字等价）"
         echo "  artifacts-start|stop|restart 同 deep（产物下载跑在 deep_worker 进程里）"
+        echo "  realtime-start|stop|restart  只动实时下载（仅处理用户点击的任务，2s 轮询）"
         echo ""
         echo "默认端口: uvicorn=${PORT}, nginx=${NGINX_PORT}"
         ;;

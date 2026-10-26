@@ -10,6 +10,7 @@
 """
 import os
 import sys
+import tempfile
 import time
 import unittest
 
@@ -17,8 +18,15 @@ PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PLATFORM_DIR not in sys.path:
     sys.path.insert(0, PLATFORM_DIR)
 
+from api.core.config import settings  # noqa: E402
 from api.core.database import get_connection, init_db  # noqa: E402
 from offline import output_worker as w  # noqa: E402
+
+# 这些用例会真的建表、插行、跑迁移。必须在 import 之后、任何 get_connection 之前
+# 把 DB_PATH 指向临时库 —— 否则 init_db() 会作用在线上 platform.db 上
+# （实际发生过：测试把生产库的残留表清理 + 索引重建跑了一遍）。
+_TMP_DB_DIR = tempfile.mkdtemp(prefix="wm_test_db_")
+settings.DB_PATH = os.path.join(_TMP_DB_DIR, "test_platform.db")
 
 IID = "__wm_test_instance__"
 

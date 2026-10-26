@@ -20,7 +20,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
-from ..core.config import settings
+from ..core.config import settings, ARTIFACT_PRIORITY_USER
 from ..core.database import async_execute, async_query
 from ..core.security import get_current_user, require_operator
 from ..models.artifact import ArtifactTaskItem, ArtifactTasksResponse, ArtifactTreeResponse
@@ -32,6 +32,16 @@ router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
 _INLINE_CSP = ("sandbox; default-src 'none'; img-src data: blob:; "
                "style-src 'unsafe-inline'; script-src 'unsafe-inline'")
 _PDF_CSP = "sandbox; default-src 'none'; object-src 'none'"
+
+# /inline 与 /pdf 是整文件读进内存再返回的（要 preview 必须一次性给出完整字节），
+# 单任务上限是 2 GiB，不设阈值的话一个大文件就能把 API 进程打爆。
+# 超过阈值的预览请求改走 /raw（FileResponse 流式，不吃内存）。
+INLINE_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 
 def _cache_subdir(obs_base: str, task: str) -> str:
@@ -115,28 +125,50 @@ async def list_artifact_tasks(instance_id: str, user: dict = Depends(get_current
         "artifact_downloaded_at AS downloaded_at, artifact_complete "
         "FROM task_traj_records WHERE instance_id=? ORDER BY traj_name", (instance_id,))
 
-    items: list[ArtifactTaskItem] = []
+    # 懒发现条件必须是「没有任何已完成的 task」，不能是「一行都没有」。
+    #
+    # 原来的 `if not rows` 漏掉了一整类实例：浅层分析会先建行（_shallow_upsert），
+    # 那条 INSERT 不含 artifact_complete（默认 0），而 running 实例又不参与后台
+    # 自动发现（_consume_artifacts 只扫 finished/stopped/completed）。于是
+    # 「有 888 行、全是 complete=0」的实例兜底不触发，列表永远空 ——
+    # 实测单个实例 7161 个 task 里 1419 个早已跑完，界面上一个都看不到。
+    # 全库曾有 1479 个实例处于这个状态。
+    if not any(r["artifact_complete"] for r in rows):
+        # 注意：不管 _discover_one_instance 返回几，都要重新查一次。
+        # 它的返回值是「本轮新排进下载队列的条数」（受 20 条预算限制），
+        # 而 artifact_complete 是对**每个** config 都写一遍的（UPSERT 不受预算约束）。
+        # 用 found 判断会漏掉最常见的情况：预算已耗尽 / 行全在队列里 → found=0，
+        # 但 complete 已经标好了，界面却仍然空。
+        await async_execute(_discover_one_instance, instance_id, inst)
+        rows = await async_query(
+            "SELECT traj_name, artifacts_status AS status, error, "
+            "artifact_files AS file_count, artifact_bytes AS total_bytes, "
+            "artifact_downloaded_at AS downloaded_at, artifact_complete "
+            "FROM task_traj_records WHERE instance_id=? ORDER BY traj_name",
+            (instance_id,))
+
+    result: list[ArtifactTaskItem] = []
     for r in rows:
-        # 未标记 complete 的（任务失败/未跑）不参与产物浏览，但列表里仍可见
-        if not r["artifact_complete"]:
-            continue
-        task_dir = ""
-        if obs_base:
-            try:
-                task_dir = store.task_local_dir(_cache_subdir(obs_base, r["traj_name"]))
-            except ValueError:
-                task_dir = ""
-        local = bool(task_dir) and os.path.isdir(task_dir)
-        items.append(ArtifactTaskItem(
+        # 「已下载」必须看 DB 状态，不能只看目录是否存在：
+        # 深层详情下载会先把 <batch>/<leaf>/ 目录建出来（里面只有 logs/ workdir/），
+        # 交付物实际在 <leaf>/<leaf>/ 这一层。用 isdir 判断的话，凡是跑过深层详情的
+        # 任务都会被误标成「已下载」——实测单个实例 11678 行全被标成已下载，
+        # 其中 11459 行其实一条交付物都没下。
+        downloaded = r["status"] == "done"
+        result.append(ArtifactTaskItem(
             traj_name=r["traj_name"],
             status=r["status"] or "queued",
             error=r["error"],
             file_count=r["file_count"],
             total_bytes=r["total_bytes"],
             downloaded_at=r["downloaded_at"],
-            downloaded=local,
+            downloaded=downloaded,
+            complete=bool(r["artifact_complete"]),
         ))
-    return ArtifactTasksResponse(instance_id=instance_id, obs_base=obs_base, tasks=items)
+    # 已完成的排前面：用户点开 tab 想先看到能用的那些，未完成的长尾沉到后面。
+    # 前端列表长（单实例可上万条），这个顺序直接影响第一屏。
+    result.sort(key=lambda t: (not t.complete, t.traj_name))
+    return ArtifactTasksResponse(instance_id=instance_id, obs_base=obs_base, tasks=result)
 
 
 # ============ 目录树（一次返回全部，本地 IO） ============
@@ -147,13 +179,16 @@ async def get_artifact_tree(
     task: str = Query(description="task 目录名"),
     user: dict = Depends(get_current_user),
 ):
-    """整个 task 的文件列表。本地遍历，毫秒级，无需懒加载。"""
+    """整个 task 的文件列表。"""
     inst, obs_base, task_dir = await _resolve(instance_id, task)
     if not os.path.isdir(task_dir):
         raise HTTPException(status_code=409,
                             detail="该 task 尚未下载到本地，请先点「下载此任务」")
-    entries = store.walk_tree(task_dir)
-    return ArtifactTreeResponse(task=task, root=task_dir, entries=entries)
+    # 遍历跑在 NFS 上，单个 task 实测可达 3.3 万文件（light_variant_21098 = 33207）。
+    # 同步 walk 放在 async handler 里会把事件循环钉住，必须丢线程池。
+    entries, truncated = await async_execute(store.walk_tree_limited, task_dir)
+    return ArtifactTreeResponse(task=task, root=task_dir, entries=entries,
+                                truncated=truncated)
 
 
 # ============ 内容 / 下载 / 预览 ============
@@ -186,14 +221,14 @@ async def download_artifact(
     inst, obs_base, task_dir = await _resolve(instance_id, task)
     path = _file_path(task_dir, key)
     name = os.path.basename(store.clean_rel(key))
+    # 不能手工拼 Content-Disposition：Starlette 用 latin-1 编码 header 值，
+    # 中文文件名会直接 UnicodeEncodeError → 500（沙箱交付物里 pptx/docx 中文名极常见）。
+    # 只交 filename=，Starlette 自己生成 RFC 5987 的 filename*=utf-8''... 形式。
     return FileResponse(
         path,
         filename=name,
         media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f'attachment; filename="{name}"',
-            "X-Content-Type-Options": "nosniff",
-        },
+        headers={"X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -207,9 +242,16 @@ async def inline_artifact(
     """内联返回文件字节，供前端 blob/iframe 预览。"""
     inst, obs_base, task_dir = await _resolve(instance_id, task)
     path = _file_path(task_dir, key)
+    size = os.path.getsize(path)
+    if size > INLINE_MAX_BYTES:
+        # 整文件读进内存再返回：2 GiB 的单任务上限内，任何一个大文件都足以把
+        # API 进程打爆。超过阈值让前端改用 /raw（FileResponse 是流式的）。
+        raise HTTPException(
+            status_code=413,
+            detail=(f"文件过大（{size / 1048576:.1f} MB > "
+                    f"{INLINE_MAX_BYTES / 1048576:.0f} MB），不支持在线预览，请下载查看"))
     media, inline_ok = store.media_type(store.clean_rel(key))
-    with open(path, "rb") as f:
-        body = f.read()
+    body = await async_execute(_read_bytes, path)
     headers = {"X-Content-Type-Options": "nosniff"}
     if inline_ok:
         headers["Content-Security-Policy"] = _INLINE_CSP
@@ -242,8 +284,11 @@ async def artifact_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"转换失败: {str(e)[:300]}")
 
-    with open(pdf, "rb") as f:
-        body = f.read()
+    if os.path.getsize(pdf) > INLINE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="转换后的 PDF 过大，不支持在线预览，请下载原始文件查看")
+    body = await async_execute(_read_bytes, pdf)
     return Response(content=body, media_type="application/pdf",
                     headers={"Content-Security-Policy": _PDF_CSP,
                              "X-Content-Type-Options": "nosniff"})
@@ -261,36 +306,84 @@ async def request_artifact_download(
 
     running 实例不自动下载，用户点开工作区时才走这里。
     """
-    insts = await async_query("SELECT id FROM task_instances WHERE id=?", (instance_id,))
+    insts = await async_query("SELECT * FROM task_instances WHERE id=?", (instance_id,))
     if not insts:
         raise HTTPException(status_code=404, detail="实例不存在")
 
+    task_name = task.strip("/")
     rows = await async_query(
         "SELECT traj_name, artifacts_status FROM task_traj_records "
         "WHERE instance_id=? AND traj_name=?",
-        (instance_id, task.strip("/")))
+        (instance_id, task_name))
     if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail="该 task 尚未被 worker 发现；等 worker 扫过该批次后重试")
+        # 该 task 还没被 worker 发现过（running 实例从不自动发现，
+        # 或实例刚建还没来得及扫）。就地补一次发现，只针对这一个实例。
+        # 否则用户点开「沙箱交付物」只会看到「等 worker 扫过该批次后重试」，
+        # 而 worker 对 running 实例永远不会扫 —— 永远等不到。
+        found = await async_execute(
+            _discover_one_instance, instance_id, dict(insts[0]))
+        if found:
+            # 补发现后必须重新读一次，否则拿到的还是空行
+            rows = await async_query(
+                "SELECT traj_name, artifacts_status FROM task_traj_records "
+                "WHERE instance_id=? AND traj_name=?",
+                (instance_id, task_name))
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail="该实例暂无已完成的可下载 task"
+                       "（complete.jsonl 为空/取不到，或该 task 尚未跑完）")
 
     cur = rows[0]
-    if cur["status"] == "downloading":
+    status = cur["artifacts_status"]
+    if status == "downloading":
         return {"task": task, "status": "downloading"}
-    if cur["status"] == "done":
+    if status == "done":
         return {"task": task, "status": "done"}
 
-    await async_execute(
-        lambda: _requeue_artifact(instance_id, task.strip("/")))
-    return {"task": task, "status": "pending"}
+    await async_execute(lambda: _requeue_artifact(instance_id, task_name))
+    return {"task": task, "status": "queued"}
+
+
+def _discover_one_instance(instance_id: str, inst: dict) -> int:
+    """按需发现单个实例的交付物（仅供 POST /request 用）。
+
+    与 _consume_artifacts 的自动发现不同：不受「最近 N 天」限制，也不看实例状态，
+    因为这是用户显式点击触发的。发现出来的行仍是 queued，由 _requeue_artifact
+    单独把被点击的那条提到最高优先级。
+    """
+    from offline import output_worker as w
+    from src import offline_analysis as oa
+    from ..core.database import get_connection
+    budget = {"tasks": w.ARTIFACT_MAX_TASKS_PER_ROUND}
+    try:
+        # get_connection 是 contextmanager，必须 with 进去拿连接
+        with get_connection() as conn:
+            full = w._instance_by_id(conn, instance_id) or inst
+        # obsutil 可执行文件在 oa 上（worker 内部也是用 oa.DEFAULT_OBSUTIL），
+        # 不在 output_worker 模块里。
+        return w._discover_artifacts(oa.DEFAULT_OBSUTIL, full, budget)
+    except Exception as e:
+        # 不能静默返回 0：用户点「沙箱交付物」没反应时，日志里必须留下原因。
+        print(f"[artifacts] 按需发现失败 {instance_id}: {str(e)[:200]}", flush=True)
+        return 0
 
 
 def _requeue_artifact(instance_id: str, task: str) -> None:
     from ..core.database import get_connection
     with get_connection() as conn:
+        # 必须同时把 artifact_complete 置 1：worker 只领
+        # `artifacts_status='queued' AND artifact_complete=1` 的行
+        # （offline/output_worker.py 的 _consume_artifacts）。只改 status 的话
+        # 用户点了「下载此任务」也永远排不进队列。
+        # artifact_attempts 清零：与 batch_output.trigger_deep 口径一致 ——
+        # 这是用户显式重试，不该被此前的自动重试上限（skipped）永久卡住。
+        # artifact_priority=100：用户点开「沙箱交付物」是最高优先级，
+        # 队列按 artifact_priority DESC, updated_at 领取，能直接插到 1.9 万条积压前面。
         conn.execute(
-            "UPDATE task_traj_records SET artifacts_status='queued', error=NULL, "
-            "updated_at=CURRENT_TIMESTAMP "
+            "UPDATE task_traj_records SET artifacts_status='queued', "
+            "artifact_complete=1, artifact_attempts=0, artifact_priority=?, "
+            "error=NULL, updated_at=CURRENT_TIMESTAMP "
             "WHERE instance_id=? AND traj_name=? AND artifacts_status<>'downloading'",
-            (instance_id, task))
+            (ARTIFACT_PRIORITY_USER, instance_id, task))
         conn.commit()

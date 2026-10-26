@@ -13,27 +13,29 @@
       </div>
       <div class="aw-pane-body">
         <div v-if="!tasks.length && !loadingTasks" class="aw-notice-sm">
-          暂无已完成任务。worker 会把 complete.jsonl 里的任务全量下载到本地。
+          暂无可浏览的任务。实例还没产出交付物，或 complete.jsonl 尚未生成。
         </div>
         <div v-for="t in filteredTasks" :key="t.traj_name" class="aw-task"
-          :class="{ active: t.traj_name === task }" @click="selectTask(t.traj_name)">
-          <!-- 已下载：整条就一行「任务名 ✓」，文件数/体积降级成 hover 提示；
-               未下载：名字后面跟状态文字，需要时再加下载按钮（都是少数几项） -->
-          <div class="aw-task-name" :title="t.downloaded ? taskDetailHint(t) : null">
+          :class="{ active: t.traj_name === task, 'is-incomplete': !t.complete }"
+          @click="openTask(t)">
+          <!-- 整条任务行就是入口：已下载 → 直接打开文件树；未下载 → 立刻排进实时下载队列。
+               未完成的行只列出、不接受点击：沙箱里还没产出，OBS 上也就没有可下的东西。
+               保留它们是为了让用户看到整体进度，而不是对着空列表猜发生了什么。 -->
+          <div class="aw-task-name" :title="t.downloaded ? taskDetailHint(t) : downloadHint(t)">
             <el-icon class="aw-task-icon"><Box /></el-icon>
             <span class="aw-ellipsis">{{ t.traj_name }}</span>
-            <span v-if="t.downloaded" class="aw-task-ok">✓</span>
+            <span v-if="!t.complete" class="aw-task-state incomplete">未完成</span>
+            <span v-else-if="t.downloaded" class="aw-task-ok">✓</span>
             <span v-else class="aw-task-state" :class="t.status">{{ statusLabel(t) }}</span>
-          </div>
-          <div v-if="!t.downloaded" class="aw-task-actions">
-            <el-button size="small" type="primary" link :loading="requesting === t.traj_name"
-              @click.stop="requestDownload(t)">下载此任务</el-button>
           </div>
         </div>
       </div>
       <div class="aw-pane-foot">
-        <span v-if="lastSync">已下载 {{ downloadedCount }} / {{ tasks.length }}</span>
-        <span v-else>未加载</span>
+        <span v-if="tasks.length">
+          已下载 {{ downloadedCount }} / 已完成 {{ completeCount }} / 共 {{ tasks.length }}
+        </span>
+        <span v-else-if="!loadingTasks">无任务</span>
+        <span v-else>加载中…</span>
       </div>
     </aside>
 
@@ -64,6 +66,9 @@
 
       <div class="aw-pane-body" v-loading="loadingTree">
         <div v-if="treeError" class="aw-notice-sm">{{ treeError }}</div>
+        <div v-else-if="treeTruncated" class="aw-notice-sm">
+          文件过多，列表已截断，仅显示部分交付物。请用「下载」获取完整内容。
+        </div>
 
         <!-- 目录视图：本地树，默认展开前两层 -->
         <el-tree
@@ -256,6 +261,7 @@ const collapsed = ref(new Set())
 const treeData = ref([])          // el-tree 的嵌套数据
 const flatEntries = ref([])       // 扁平文件列表（分组视图与预览用）
 const treeError = ref('')
+const treeTruncated = ref(false)  // 后端遍历被截断（文件过多/超时）
 const treeKey = ref(0)
 const defaultExpanded = ref([])
 
@@ -325,13 +331,20 @@ const filteredTasks = computed(() => {
   return kw ? tasks.value.filter(t => t.traj_name.toLowerCase().includes(kw)) : tasks.value
 })
 const downloadedCount = computed(() => tasks.value.filter(t => t.downloaded).length)
-const lastSync = computed(() => downloadedCount.value > 0)
+// 已完成 = 沙箱里跑完了（complete=true）。后端已按「已完成优先」排好序，
+// 底部三个数字让用户一眼看出 1419 / 7161 这种进度，而不是面对空列表。
+const completeCount = computed(() => tasks.value.filter(t => t.complete).length)
 const treeProps = { label: 'label', children: 'children', isLeaf: 'leaf' }
 
-// 已下载不再走这里（模板里直接渲染一个 ✓），故只覆盖未完成的状态
+// 已下载不再走这里（模板里直接渲染一个 ✓），故只覆盖未完成的状态。
+// 状态词表与后端 worker 状态机保持一致（queued/downloading/done/failed/skipped），
+// oversize 在后端归为 skipped，这里保留 oversize 映射以兼容旧响应。
 function statusLabel(t) {
-  return { pending: '排队中', downloading: '下载中', failed: '下载失败',
-           oversize: '体积超限', done: '已下载' }[t.status] || t.status
+  return { queued: '排队中', pending: '排队中', downloading: '下载中',
+           failed: '下载失败', skipped: '已跳过', oversize: '体积超限',
+           // empty = 沙箱没产出，OBS 前缀本身是空的。用中性文案，别让用户以为平台出错。
+           empty: '无产出',
+           done: '已下载' }[t.status] || t.status
 }
 
 // 单行展示后，文件数与体积改到 hover 提示里（不丢信息，也不占行）
@@ -342,10 +355,26 @@ function taskDetailHint(t) {
   return bits.join(' · ')
 }
 
+// 下载图标按钮的悬停提示：图标没文字，必须把「失败原因」和「当前状态」说清楚，
+// 否则用户只知道点不动，不知道为什么。
+function downloadHint(t) {
+  if (!t.complete) return '该任务尚未跑完，完成后才能下载交付物'
+  if (requesting.value === t.traj_name) return '正在提交…'
+  // empty = OBS 前缀确认存在但一个文件都没有（沙箱没产出），不是下载失败。
+  // 提示语必须说清楚，否则用户会以为平台坏了，反复重试一个注定为空的目录。
+  if (t.status === 'empty') return '该任务没有产出交付物（OBS 上没有任何文件）'
+  if (t.status === 'failed') return `下载失败，点击重试${t.error ? '：' + t.error : ''}`
+  if (t.status === 'skipped') return `已跳过，点击重试${t.error ? '：' + t.error : ''}`
+  if (t.status === 'downloading') return '正在下载…'
+  if (t.status === 'queued' || t.status === 'pending') return '已排队，点击重新排队'
+  return '下载此任务'
+}
+
 // ── 数据加载（全部走本地磁盘，无 obsutil） ─────────────────────────────────
 
-async function loadTasks() {
-  loadingTasks.value = true
+async function loadTasks(opts = {}) {
+  const quiet = !!opts.quiet
+  if (!quiet) loadingTasks.value = true
   try {
     const res = await api.get(`/artifacts/${props.instanceId}/tasks`, { silent: true })
     tasks.value = res.tasks || []
@@ -354,19 +383,40 @@ async function loadTasks() {
     if (prefer && prefer !== task.value) selectTask(prefer)
     else if (!task.value && tasks.value.length) selectTask(tasks.value[0].traj_name)
   } catch (e) {
-    treeError.value = e?.response?.data?.detail || '任务列表加载失败'
+    // 轮询期间的偶发失败不该把文件栏刷成报错
+    if (!quiet) treeError.value = e?.response?.data?.detail || '任务列表加载失败'
   } finally {
-    loadingTasks.value = false
+    if (!quiet) loadingTasks.value = false
   }
 }
 
-function selectTask(name) {
-  if (name === task.value) return
+function selectTask(name, force = false) {
+  // force=true 用于「下载完成后重新加载」：同名也要重新拉树，
+  // 否则用户点完下载、再点同一个任务名没有任何反应（原来直接 return）。
+  if (name === task.value && !force) return
   task.value = name
   selected.value = null
   revokeBlob()
   resetPreview()
   loadTree()
+}
+
+// 点击任务行：已下载就正常打开；未下载就直接触发下载并开始轮询，
+// 让用户「点一下就能拿到」，而不是先点任务、再去找右边的小按钮。
+async function openTask(t) {
+  // 未完成的任务没有可下的东西：沙箱里还没产出，OBS 前缀上也没有。
+  // 点下去只会排进队列、下一轮拿到空目录再判 failed，纯属浪费。
+  if (!t.complete) {
+    ElMessage.info('该任务尚未跑完，完成后才能下载交付物')
+    return
+  }
+  if (t.downloaded) {
+    selectTask(t.traj_name)
+    return
+  }
+  // 失败/跳过状态允许再点（显式重试会清零 attempts 和优先级）
+  selectTask(t.traj_name)
+  await requestDownload(t)
 }
 
 async function loadTree() {
@@ -378,6 +428,9 @@ async function loadTree() {
       params: { task: task.value }, silent: true,
     })
     flatEntries.value = res.entries || []
+    // 后端在文件数超上限或遍历超时时会截断（单个 task 实测可达 3.3 万文件）。
+    // 必须显式提示，否则用户以为自己看到的是全部交付物。
+    treeTruncated.value = !!res.truncated
     const { nodes, expanded } = buildTree(flatEntries.value)
     treeData.value = nodes
     defaultExpanded.value = expanded
@@ -387,6 +440,7 @@ async function loadTree() {
     treeError.value = detail
     flatEntries.value = []
     treeData.value = []
+    treeTruncated.value = false
   } finally {
     loadingTree.value = false
   }
@@ -451,15 +505,62 @@ function buildTree(entries) {
 async function requestDownload(t) {
   requesting.value = t.traj_name
   try {
-    await api.post(`/artifacts/${props.instanceId}/request`, null,
+    // 后端会返回当前真实状态（可能已经是 queued/downloading/done），
+    // 不能一律当 queued —— 实测已下载完成的任务再点会被误显示成「排队中」。
+    const res = await api.post(`/artifacts/${props.instanceId}/request`, null,
       { params: { task: t.traj_name } })
-    ElMessage.success('已排进下载队列，worker 下一轮处理')
-    t.status = 'pending'
+    t.status = res.data?.status || 'queued'
+    if (t.status === 'done') {
+      // 服务端已下完：直接刷新，不需要等 worker
+      await loadTasks()
+      await selectTask(t.traj_name, true)
+      return
+    }
+    ElMessage.success('已排进下载队列，完成后自动打开')
+    startPoll()
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '提交失败')
   } finally {
     requesting.value = ''
   }
+}
+
+// ── 下载状态轮询 ────────────────────────────────────────────────────────────
+// 单 task 下载实测中位 1.6s（P90 2.2s），但前端原来完全没有轮询 ——
+// 点完「下载此任务」状态永远停在「排队中」，用户以为没反应，只能手动刷新。
+// 这里每 2 秒刷一次任务列表，发现当前 task 变 done 就自动加载文件树。
+const POLL_MS = 2000
+const POLL_MAX = 150          // 最多轮询 5 分钟（下载 P99 6.6s，留足余量）
+let pollTimer = null
+let pollCount = 0
+
+function stopPoll() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+  pollCount = 0
+}
+
+function startPoll() {
+  if (pollTimer) return           // 已在轮询，避免叠加
+  pollCount = 0
+  pollTimer = setInterval(async () => {
+    pollCount += 1
+    if (pollCount > POLL_MAX) { stopPoll(); return }
+    const before = task.value
+    await loadTasks({ quiet: true })
+    const cur = tasks.value.find(x => x.traj_name === before)
+    if (!cur) return
+    // 当前选中的 task 下完了 → 立刻拉文件树并停止轮询
+    if (cur.downloaded) {
+      stopPoll()
+      if (before === task.value) await loadTree()
+      return
+    }
+    // 全部到达终态（完成 / 空产出 / 失败 / 跳过）就停止轮询，避免空转。
+    // empty 也是终态：OBS 前缀确实没有文件，再等也不会变。
+    const pending = tasks.value.some(
+      x => !x.downloaded && !['done', 'empty', 'failed', 'skipped'].includes(x.status))
+    if (!pending) stopPoll()
+  }, POLL_MS)
 }
 
 // ── 分组视图（纯前端，同一份树数据） ──────────────────────────────────────
@@ -640,7 +741,8 @@ watch(() => props.initialTask, (name) => {
 })
 
 onMounted(loadTasks)
-onBeforeUnmount(revokeBlob)
+// 离开页面必须清掉轮询，否则组件销毁后定时器仍在打接口
+onBeforeUnmount(() => { stopPoll(); revokeBlob() })
 </script>
 
 <style scoped>
@@ -676,6 +778,11 @@ onBeforeUnmount(revokeBlob)
 .aw-task { padding: 9px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
 .aw-task:hover { background: #f7f9fd; }
 .aw-task.active { background: #f0f5ff; border-color: #dce7ff; }
+/* 未完成的行只列不点：沙箱里还没产出，点下去也没有可下载的内容。
+   用降透明 + 默认光标表达「看得见但不可操作」，不要整行隐藏 ——
+   用户需要看到 1419 / 7161 的整体进度。 */
+.aw-task.is-incomplete { cursor: default; opacity: 0.55; }
+.aw-task.is-incomplete:hover { background: transparent; }
 .aw-task-name { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; }
 .aw-task-icon { color: #6e83a1; flex-shrink: 0; }
 .aw-task.active .aw-task-icon { color: #396ef0; }
@@ -687,7 +794,7 @@ onBeforeUnmount(revokeBlob)
 .aw-task-ok { margin-left: auto; flex-shrink: 0; color: #159a74; font-weight: 700; }
 .aw-task-state.pending { color: #d68e1b; }
 .aw-task-state.failed, .aw-task-state.oversize { color: #e26163; }
-.aw-task-actions { margin: 4px 0 0 20px; }
+.aw-task-state.incomplete { color: #9aa7b8; }
 
 .aw-crumb {
   font-family: monospace; font-size: 11px; color: #7b899b;

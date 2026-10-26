@@ -1366,10 +1366,12 @@ async function loadArtifactProgress() {
   try {
     const res = await api.get(`/artifacts/${id}/tasks`, { silent: true })
     const tasks = res.tasks || []
-    const acc = { total: tasks.length, done: 0, queued: 0, downloading: 0, failed: 0 }
+    const acc = { total: tasks.length, done: 0, queued: 0, downloading: 0, failed: 0, empty: 0 }
     for (const t of tasks) {
       if (t.downloaded) acc.done += 1
       else if (t.status === 'downloading') acc.downloading += 1
+      // empty = OBS 前缀存在但没文件（沙箱没产出），不是故障，单独计数
+      else if (t.status === 'empty') acc.empty += 1
       else if (t.status === 'failed' || t.status === 'skipped') acc.failed += 1
       else acc.queued += 1
     }
@@ -1583,6 +1585,14 @@ async function pollDeep() {
   let st = null
   try { st = await api.get(`/instances/${id}/deep/${detailTrajName.value}/status`, { silent: true }) } catch { return }
   if (st.status === 'downloading') { detailStatusHint.value = '正在下载交付物…'; return }
+  // empty = OBS 前缀确实存在但一个文件都没有（沙箱没产出）。这是终态，
+  // 不能当 failed 提示「下载失败」，否则用户会反复重试一个注定为空的目录。
+  if (st.status === 'empty') {
+    clearInterval(deepPollTimer)
+    deepPollTimer = null
+    detailStatusHint.value = '该任务没有产出交付物（OBS 上没有任何文件）'
+    return
+  }
   if (st.status === 'failed' || st.status === 'skipped') {
     clearInterval(deepPollTimer)
     deepPollTimer = null
