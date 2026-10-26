@@ -103,7 +103,7 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="['openclaw','opencode','pi','dsh','jiuwenswarm'].includes(form.harness_type)" label="API 类型">
+          <el-form-item v-if="['openclaw','openclaw-tui','opencode','pi','dsh','jiuwenswarm'].includes(form.harness_type)" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
@@ -123,9 +123,9 @@
 
           <el-form-item label="模型 ID">
             <el-input v-model="form.model_id" :placeholder="form.harness_type === 'claude-code' ? '例如：claude-opus-4-7-thinking' : '例如：claude-opus-4-7-thinking'">
-              <template v-if="form.harness_type === 'openclaw'" #prepend>local/</template>
+              <template v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" #prepend>local/</template>
             </el-input>
-            <div v-if="form.harness_type === 'openclaw'" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
+            <div v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
           </el-form-item>
         </el-tab-pane>
 

@@ -54,6 +54,7 @@ platform.db.bak.20260809101613
 settings/proxy_name.json
 worker.pid
 *.json
+!platform/settings/openclaw_tui.json
 
 # 实际配置文件，含密钥
 configs/hive_*.yaml

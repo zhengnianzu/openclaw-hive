@@ -1,0 +1,69 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "local": {
+        "baseUrl": "https://model.example.com/v1",
+        "apiKey": "replace-with-api-key",
+        "api": "openai-completions",
+        "timeoutSeconds": 3600,
+        "models": [
+          {
+            "id": "replace-with-model-id",
+            "name": "replace-with-model-id",
+            "api": "openai-completions",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 200000,
+            "maxTokens": 65536,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/home/ma-user/.openclaw/workspace",
+      "model": {
+        "primary": "local/replace-with-model-id"
+      },
+      "models": {
+        "local/replace-with-model-id": {}
+      },
+      "skipBootstrap": true,
+      "memorySearch": {
+        "enabled": false
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "workspace": "/home/ma-user/.openclaw/workspace-main",
+        "agentDir": "/home/ma-user/.openclaw/agents/main",
+        "model": {
+          "primary": "local/replace-with-model-id"
+        },
+        "models": {
+          "local/replace-with-model-id": {}
+        }
+      }
+    ]
+  },
+  "tools": {
+    "profile": "coding",
+    "deny": [
+      "sessions_spawn",
+      "subagents",
+      "conversations_send",
+      "conversations_turn"
+    ]
+  }
+}

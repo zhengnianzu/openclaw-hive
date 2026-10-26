@@ -4,6 +4,7 @@ Agent Distillation Task Runner
 A configuration-driven task orchestration system for running AI Agent tasks
 in remote sandboxed environments (k8s/docker). 
 - openclaw
+- openclaw-tui
 - hermes
 - claude-code
 """
@@ -227,6 +228,7 @@ class TaskConfig:
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
+    enable_pip_install: bool = False  # true: 起主脚本前先 pip install -r requirements.txt
     model_api_key: str = ""  # 主 agent 原始 key(平台传入), suffix_api_keys 时在 hive 里打后缀
     harness_md: list = field(default_factory=list)  # 平台选定 harness 配置 md 的本地绝对路径列表
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
@@ -411,11 +413,12 @@ class OpenClawDistillationTask:
 
         # 2) provider 注入 + agent 预注册 + 路径本地化, 全部走 prepare_config
         #    (openclaw 分支内按 sandbox_type/home 派生, 无后处理)
-        # oc_agent_names: openclaw 专用, task config 里的 agent 名(host 已注册的
+        # oc_agent_names: OpenClaw 系 harness 专用, task config 里的 agent 名(host 已注册的
         # 交给 prepare_config 补进 agents.list), 其余 framework 传空。
         oc_agent_names = (
             self._derive_agent_names(data_config_file)
-            if self.config.sandbox_config.harness_type == "openclaw" and data_config_file else []
+            if self.config.sandbox_config.harness_type in {"openclaw", "openclaw-tui"}
+            and data_config_file else []
         )
         sandbox_cfg = self.config.sandbox_config
         prepare_local_agent_config(
@@ -750,10 +753,12 @@ class OpenClawDistillationTask:
         code_stem = Path(self.config.main_code_tar).stem
         log_path = self.config.sandbox_config.result_workdir
 
+        # enable_pip_install=false 时跳过依赖安装(镜像里已预装, 可省 ~几十秒/任务)。
+        pip_step = "pip install -r requirements.txt && " if self.config.enable_pip_install else ""
         command = (
             f"cd {self.config.sandbox_config.workspace} && "
             f"mkdir -p {log_path} && cd {code_stem} && "
-            f"pip install -r requirements.txt && "
+            f"{pip_step}"
             f"python {python_file} --config {config_path} --harness {self.config.sandbox_config.harness_type} 2>&1 | "
             f"tee {log_path}/{self.config.sandbox_config.result_log}"
         )
@@ -1219,9 +1224,11 @@ class OpenClawDistillationTask:
     async def _execute_task(self, config_file: str, task_idx: int) -> None:
         """Execute the full task pipeline.
 
-        两种模式只差一步:
+        各模式主要差异:
           openclaw: 通过 _start_openclaw_gateway 启动 node gateway 进程
                     (内部会先 _copy_agent_config 把 openclaw.json 上传)
+          openclaw-tui: 只上传 openclaw.json，由 openclaw-task 在进程内通过
+                        ``agent --local --json`` 启动每轮 CLI，不启动 Gateway
           hermes:   只 _copy_agent_config 把 ~/.hermes/config.yaml 上传
                     (没有 gateway 进程, AIAgent 进程内调用)
         其他步骤变量复用, 路径靠 config.yaml 覆写。

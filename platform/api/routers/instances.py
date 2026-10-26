@@ -766,7 +766,6 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
     # harness 配置文件路径: 由 harness_config.json 的 agent_config 派生。
     # 下方各 harness 配置生成分支仍按原变量名引用这些局部变量, 故在此集中定义。
-    openclaw_path = os.path.join(instance_dir, "openclaw.json")
     hermes_config_path = os.path.join(instance_dir, "hermes_config.yaml")
     cc_settings_path = os.path.join(instance_dir, "cc_settings.json")
     openjiuwen_path = os.path.join(instance_dir, "openjiuwen.json")
@@ -780,6 +779,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
     # harness_local_config_file: 直接用 agent_config 文件名拼路径, 兜底 openclaw.json
     _agent_cfg = harness_meta.agent_config(req.harness_type) or "openclaw.json"
+    openclaw_path = os.path.join(instance_dir, _agent_cfg)
     base.run_config.sandbox.harness_local_config_file = os.path.join(instance_dir, _agent_cfg)
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
 
@@ -1105,9 +1105,10 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         with open(jw_config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(jw_cfg, f, allow_unicode=True, sort_keys=False)
     else:
-        openclaw_template = os.path.join(harness_settings_dir, "openclaw.json")
+        # openclaw 与 openclaw-tui 使用相同原生 schema，但模板文件彼此独立。
+        openclaw_template = os.path.join(harness_settings_dir, _agent_cfg)
         if not os.path.exists(openclaw_template):
-            openclaw_template = os.path.join(settings.SETTINGS_DIR, "openclaw.json")
+            openclaw_template = os.path.join(settings.SETTINGS_DIR, _agent_cfg)
         with open(openclaw_template, "r", encoding="utf-8") as f:
             openclaw_cfg = json.load(f)
 
