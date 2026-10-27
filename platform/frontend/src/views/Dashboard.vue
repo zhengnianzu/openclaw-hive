@@ -10,7 +10,7 @@
     <div class="resource-panel">
       <div class="resource-panel-head">
         <span class="resource-panel-title">当前资源使用情况</span>
-        <span class="resource-panel-hint">按当前并发数 × 沙箱配置计算</span>
+        <span class="resource-panel-hint">按当前存活沙箱数 × 沙箱配置计算</span>
       </div>
 
       <div class="resource-panel-body">
@@ -280,19 +280,33 @@ const progressColor = [
 const runningInstances = computed(() => instances.value.filter(i => i.status === 'running'))
 
 // ===== 资源使用情况 =====
-// 口径与后端 check_global_sandbox_capacity 一致：preparing 期间已经占住额度，
-// 所以「已用」= running + preparing；「排队中」单列，不计入已用。
+// 口径与后端 stats.effective_pods 一致：「已用」= running + preparing（preparing
+// 期间已占住队列槽位，仍全额计入）；「排队中」单列，不计入已用。
+// 每个实例的沙箱数不是配置并发，而是此刻实际活着的数量（见 effectivePods）。
 const resourcePools = ref({ total_cpu: 0, total_memory_gb: 0, pools: [] })
 const activeInstances = computed(() => instances.value.filter(i => ['running', 'preparing'].includes(i.status)))
 const queuedInstances = computed(() => instances.value.filter(i => i.status === 'queued'))
 const doneCount = computed(() => instances.value.filter(i => ['completed', 'finished'].includes(i.status)).length)
-// 「运行中沙箱」= 运行中任务的并发数之和（原看板口径，保留）
-const totalRunningPods = computed(() => runningInstances.value.reduce((sum, inst) => sum + (inst.concurrent_num || 0), 0))
+
+// 实例此刻真实占用的沙箱数，与后端 stats.effective_pods 同口径。
+// hive.py 是 concurrent_num 个 worker 各领一个任务、每个任务一个沙箱，所以尾部
+// 只剩 total - finished 个沙箱活着；total 未知（0）时回退到配置并发。
+function effectivePods(i) {
+  const n = i.concurrent_num || 0
+  if (i.status !== 'running') return n
+  const total = i.total_tasks || 0
+  if (total <= 0) return n
+  const remaining = total - ((i.completed_tasks || 0) + (i.failed_tasks || 0))
+  return Math.max(0, Math.min(n, remaining))
+}
+
+// 「运行中沙箱」= 活跃实例（运行中 + 准备中）此刻存活沙箱之和
+const totalRunningPods = computed(() => activeInstances.value.reduce((sum, inst) => sum + effectivePods(inst), 0))
 const failedCount = computed(() => instances.value.filter(i => i.status === 'failed').length)
 
-// 每个实例占用 = 并发数 × 单沙箱资源
+// 每个实例占用 = 当前存活沙箱数 × 单沙箱资源
 function sumResources(list, field) {
-  return list.reduce((sum, i) => sum + (i.concurrent_num || 0) * (i[field] || 0), 0)
+  return list.reduce((sum, i) => sum + effectivePods(i) * (i[field] || 0), 0)
 }
 const runningCpu = computed(() => sumResources(activeInstances.value, 'cpu_request'))
 const runningCpuLimit = computed(() => sumResources(activeInstances.value, 'cpu_limit'))

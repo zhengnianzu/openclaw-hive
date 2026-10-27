@@ -39,12 +39,42 @@ def _num(v, default=0.0):
         return default
 
 
+def effective_pods(row: dict) -> float:
+    """实例此刻真实占用的沙箱数（= 活着的 worker 数）。
+
+    hive.py 是 concurrent_num 个 worker 各领一个任务、每个任务一个沙箱，
+    所以 running 实例的活沙箱数 = min(并发, 剩余任务数)。尾部时这个值远小于
+    并发上限——tail_skip 放行的新任务正是利用这部分空出来的额度，按并发上限
+    统计会把两个实例的占用都算满，明显高估。
+    口径与 instances.py 单实例概览的 running_pods 一致。
+
+    total_tasks 未知（0）时无法判断尾部，回退到配置并发，保持历史行为。
+    preparing 还未建沙箱，但队列槽位已占用，维持全额计入（见 OCCUPYING 注释）。
+    """
+    n = _num(row.get("concurrent_num"))
+    if row.get("status") != "running":
+        return n
+    total = _num(row.get("total_tasks"))
+    if total <= 0:
+        return n
+    remaining = total - (_num(row.get("completed_tasks")) + _num(row.get("failed_tasks")))
+    return max(0.0, min(n, remaining))
+
+
 def instance_cpu(row: dict) -> float:
-    return _num(row.get("concurrent_num")) * _num(row.get("cpu_request"))
+    return effective_pods(row) * _num(row.get("cpu_request"))
 
 
 def instance_mem(row: dict) -> float:
-    return _num(row.get("concurrent_num")) * _num(row.get("memory_request"))
+    return effective_pods(row) * _num(row.get("memory_request"))
+
+
+def instance_cpu_limit(row: dict) -> float:
+    return effective_pods(row) * _num(row.get("cpu_limit"))
+
+
+def instance_mem_limit(row: dict) -> float:
+    return effective_pods(row) * _num(row.get("memory_limit"))
 
 
 def aggregate_summary(rows: list) -> dict:
@@ -55,13 +85,13 @@ def aggregate_summary(rows: list) -> dict:
     running = preparing = queued = 0
     for r in rows:
         status = r.get("status")
-        n = int(_num(r.get("concurrent_num")))
         if status in OCCUPYING:
+            # 已用 / 上限 / 沙箱数三者同口径，都按此刻存活沙箱数折算
             used_cpu += instance_cpu(r)
-            used_cpu_limit += _num(r.get("concurrent_num")) * _num(r.get("cpu_limit"))
+            used_cpu_limit += instance_cpu_limit(r)
             used_mem += instance_mem(r)
-            used_mem_limit += _num(r.get("concurrent_num")) * _num(r.get("memory_limit"))
-            pods += n
+            used_mem_limit += instance_mem_limit(r)
+            pods += int(effective_pods(r))
             if status == "running":
                 running += 1
             else:
@@ -108,7 +138,7 @@ def _group(rows: list, key: str) -> dict:
         item["count"] += 1
         item["cpu"] += instance_cpu(r)
         item["memory_gb"] += instance_mem(r)
-        item["pods"] += int(_num(r.get("concurrent_num")))
+        item["pods"] += int(effective_pods(r))
         if r.get("sandbox_type_inferred"):
             item["inferred_count"] += 1
     return g
@@ -170,7 +200,7 @@ def user_leaderboard(rows: list) -> list:
             item["running"] += 1
         else:
             item["preparing"] += 1
-        item["pods"] += int(_num(r.get("concurrent_num")))
+        item["pods"] += int(effective_pods(r))
         item["cpu"] += instance_cpu(r)
         item["memory_gb"] += instance_mem(r)
         os_key = "windows" if r.get("sandbox_type") == "windows" else "linux"
@@ -285,8 +315,8 @@ def _row_agent_urls(params: dict) -> list:
 def proxy_load(rows: list, proxy_map: dict) -> list:
     """按 (角色, 代理) 聚合运行中实例的并发负载。
 
-    口径：只统计 running；负载 = concurrent_num 累加（一个实例开 500 并发，
-    就是 500 个沙箱在打这台代理）。排队/准备中的实例还没发请求，不计入。
+    口径：只统计 running；负载 = 当前存活沙箱数累加（尾部实例只剩少量沙箱在打
+    这台代理，按配置并发累加会高估）。排队/准备中的实例还没发请求，不计入。
     """
     from . import proxy as proxy_service
 
@@ -294,7 +324,7 @@ def proxy_load(rows: list, proxy_map: dict) -> list:
     for r in rows:
         if r.get("status") != "running":
             continue
-        pods = int(_num(r.get("concurrent_num")))
+        pods = int(effective_pods(r))
         cpu, mem = instance_cpu(r), instance_mem(r)
         for role, url in _row_agent_urls(_create_params(r)):
             ident = proxy_service.proxy_identity(url, proxy_map)
@@ -407,8 +437,12 @@ def reconstruct_trend(rows: list, start_ts: float, end_ts: float, step: int) -> 
         s = max(s, start_ts)
         if e is not None:
             e = min(e, end_ts)
-        cpu, mem = instance_cpu(r), instance_mem(r)
+        # 趋势是历史区间重建：不知道「当时」还剩多少任务，只能按配置并发估算。
+        # 与实时口径（effective_pods，只看此刻）刻意不同，勿合并——否则整条
+        # 历史曲线会被压成尾部值，反而失真。
         pods = int(_num(r.get("concurrent_num")))
+        cpu = pods * _num(r.get("cpu_request"))
+        mem = pods * _num(r.get("memory_request"))
         os_key = "windows" if r.get("sandbox_type") == "windows" else "linux"
         events.append((s, cpu, mem, pods, 1, os_key))
         # 运行中的实例不产生结束事件：否则末桶会把它算成「已经结束」，曲线尾部掉 0。

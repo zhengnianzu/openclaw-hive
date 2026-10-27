@@ -157,6 +157,65 @@ class PoolUsageTest(unittest.TestCase):
         self.assertEqual(out[0]["instances"], 0)
 
 
+class EffectivePodsTest(unittest.TestCase):
+    """尾部折算：running 实例的活沙箱数 = min(并发, 剩余任务数)。
+
+    背景：hive.py 是 concurrent_num 个 worker 各领一个任务，尾部只剩少量沙箱。
+    队列的 tail_skip 会在这个窗口里放行下一个任务，若按配置并发统计，两个实例
+    的占用都被算满，看板明显高估。
+    """
+
+    def test_tail_is_folded(self):
+        # 并发 100，剩 49 个任务 → 49 个沙箱，不是 100
+        row = _inst(concurrent_num=100, total_tasks=1000, completed_tasks=951, failed_tasks=0)
+        self.assertEqual(stats.effective_pods(row), 49)
+        self.assertEqual(stats.instance_cpu(row), 98.0)   # 49 × 2.0
+
+    def test_head_is_clamped_to_concurrency(self):
+        # 剩 900 个任务，但只有 100 个 worker → 钳到 100
+        row = _inst(concurrent_num=100, total_tasks=1000, completed_tasks=100, failed_tasks=0)
+        self.assertEqual(stats.effective_pods(row), 100)
+
+    def test_unknown_total_falls_back_to_concurrency(self):
+        row = _inst(concurrent_num=100, total_tasks=0, completed_tasks=0, failed_tasks=0)
+        self.assertEqual(stats.effective_pods(row), 100)
+
+    def test_all_done_is_zero_not_negative(self):
+        row = _inst(concurrent_num=100, total_tasks=50, completed_tasks=40, failed_tasks=20)
+        self.assertEqual(stats.effective_pods(row), 0)
+
+    def test_failed_counts_too(self):
+        row = _inst(concurrent_num=100, total_tasks=1000, completed_tasks=940, failed_tasks=11)
+        self.assertEqual(stats.effective_pods(row), 49)
+
+    def test_preparing_stays_full(self):
+        # preparing 还没建沙箱，但队列槽位已占用，维持全额计入
+        row = _inst(status="preparing", concurrent_num=100, total_tasks=1000, completed_tasks=999)
+        self.assertEqual(stats.effective_pods(row), 100)
+
+    def test_summary_and_pods_share_caliber(self):
+        # 已用核数 / 上限 / 沙箱数三者必须同口径，不能一个折算一个不折
+        s = stats.aggregate_summary([
+            _inst(concurrent_num=100, total_tasks=1000, completed_tasks=951),
+        ])
+        self.assertEqual(s["used_cpu"], 98.0)          # 49 × 2.0
+        self.assertEqual(s["used_cpu_limit"], 147.0)   # 49 × 3.0
+        self.assertEqual(s["pods"], 49)
+
+    def test_trend_keeps_configured_concurrency(self):
+        # 趋势是历史重建，不知道当时剩多少任务，仍按配置并发估算，不能跟着折算
+        end = datetime(2026, 10, 19, 12, 0, 0).timestamp()
+        start = end - 3600
+        row = _inst(
+            total_tasks=1000, completed_tasks=951,
+            started_at=datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S"),
+            stopped_at=datetime.fromtimestamp(end).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        points = stats.reconstruct_trend([row], start, end, 60)
+        self.assertGreater(len(points), 0)
+        self.assertEqual(points[0]["used_cpu"], 20.0)   # 10 并发 × 2.0，未被折成 5 个沙箱
+
+
 class TrendTest(unittest.TestCase):
     def setUp(self):
         self.end = datetime(2026, 10, 19, 12, 0, 0).timestamp()
