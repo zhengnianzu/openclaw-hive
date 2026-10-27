@@ -39,7 +39,10 @@
           <div class="kpi-card">
             <div class="kpi-label"><i class="dot" style="background:#6250d6"></i>运行中沙箱</div>
             <div class="kpi-value">{{ summary.pods }}</div>
-            <div class="kpi-sub">累计并发数</div>
+            <div class="kpi-sub">
+              上限 {{ summary.max_sandboxes ? fmtNum(summary.max_sandboxes) : '未配置' }}
+              <span v-if="summary.max_sandboxes"> · {{ pct(summary.pods, summary.max_sandboxes) }}%</span>
+            </div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label"><i class="dot" style="background:#2a78d6"></i>CPU 占用</div>
@@ -224,6 +227,20 @@
                     <span v-if="p.queued_memory_gb" class="pool-queued">+{{ fmtGi(p.queued_memory_gb) }} 排队</span>
                   </span>
                 </div>
+                <!-- 沙箱并发上限：按机器组派生（Σ 节点数 × 单机可用沙箱数），老格式池无此数 -->
+                <div class="pool-row">
+                  <span class="pool-axis">沙箱</span>
+                  <el-progress
+                    :percentage="poolPercent(p.pods, p.max_sandboxes)"
+                    :show-text="false" :stroke-width="8"
+                    :color="percentColor(poolPercent(p.pods, p.max_sandboxes))"
+                    class="pool-bar" />
+                  <span class="pool-val">
+                    {{ fmtNum(p.pods) }} / {{ p.max_sandboxes ? fmtNum(p.max_sandboxes) : '—' }}
+                    <span v-if="p.max_sandboxes" class="pool-pct">{{ poolPercent(p.pods, p.max_sandboxes) }}%</span>
+                    <span v-if="!p.max_sandboxes" class="pool-pct">需按机器组配置</span>
+                  </span>
+                </div>
               </div>
             </div>
           </el-col>
@@ -337,7 +354,7 @@ const rankMetric = ref('pods')
 const summary = ref({
   active: 0, running: 0, preparing: 0, queued: 0, pods: 0,
   used_cpu: 0, used_memory_gb: 0, instances_total: 0, active_users: 0,
-  total_cpu: 0, total_memory_gb: 0,
+  total_cpu: 0, total_memory_gb: 0, max_sandboxes: 0,
 })
 const statusDist = ref([])
 const harnessDist = ref([])

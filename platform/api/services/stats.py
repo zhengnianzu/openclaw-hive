@@ -234,16 +234,22 @@ def user_leaderboard(rows: list) -> list:
 
 
 def pool_usage(rows: list, pools: dict) -> list:
-    """每个资源池的已用/排队占用。pools = {ns: {total_cpu, total_memory_gb}}。"""
+    """每个资源池的已用/排队占用。
+
+    pools = {ns: 池容量 dict}（见 resource_pools.load_pools），除 total_cpu /
+    total_memory_gb 外还带 max_sandboxes（沙箱并发上限，老格式池为 0）。
+    `pods` 是池内此刻存活的沙箱数，与 aggregate_summary 同口径。
+    """
     out = {}
     for ns, spec in (pools or {}).items():
         out[ns] = {
             "namespace": ns,
             "total_cpu": _num(spec.get("total_cpu")),
             "total_memory_gb": _num(spec.get("total_memory_gb")),
+            "max_sandboxes": _num(spec.get("max_sandboxes")),
             "used_cpu": 0.0, "used_memory_gb": 0.0,
             "queued_cpu": 0.0, "queued_memory_gb": 0.0,
-            "instances": 0, "configured": True,
+            "pods": 0, "instances": 0, "configured": True,
         }
     for r in rows:
         status = r.get("status")
@@ -254,10 +260,10 @@ def pool_usage(rows: list, pools: dict) -> list:
             # 未在 resource_pools.yaml 登记的池：分母为 0，前端显示「未配置总量」
             out[ns] = {
                 "namespace": ns or "未归属",
-                "total_cpu": 0.0, "total_memory_gb": 0.0,
+                "total_cpu": 0.0, "total_memory_gb": 0.0, "max_sandboxes": 0.0,
                 "used_cpu": 0.0, "used_memory_gb": 0.0,
                 "queued_cpu": 0.0, "queued_memory_gb": 0.0,
-                "instances": 0, "configured": False,
+                "pods": 0, "instances": 0, "configured": False,
             }
         item = out[ns]
         if status == "queued":
@@ -266,6 +272,7 @@ def pool_usage(rows: list, pools: dict) -> list:
         else:
             item["used_cpu"] += instance_cpu(r)
             item["used_memory_gb"] += instance_mem(r)
+            item["pods"] += int(effective_pods(r))
             item["instances"] += 1
     for item in out.values():
         for k in ("used_cpu", "used_memory_gb", "queued_cpu", "queued_memory_gb"):

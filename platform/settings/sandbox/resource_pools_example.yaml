@@ -1,10 +1,37 @@
-# 资源池总量（首页看板「当前资源使用情况」的分母）
+# 资源池容量（首页看板「当前资源使用情况」与资源看板的分母）
 #
 # 资源池的唯一标识 = 沙箱配置里的 sandbox_namespace。
 # 同一 namespace 的沙箱跑在同一集群，共享同一份配额；controlplane_base_url
 # 只决定提交到哪个控制面，不参与归属判断。
 #
-# total_cpu 单位：核；total_memory_gb 单位：GiB。
+# 两种写法，任选其一：
+#
+# 1) 按机器组（推荐）——每个池列出若干 group，总量与最大并发由平台派生：
+#
+#       pools:
+#         <namespace>:
+#           groups:
+#             - name: group1
+#               nodes: 38                  # 该组机器台数
+#               cpu_per_node: 384          # 单机核数
+#               memory_gb_per_node: 1536   # 单机内存，GiB
+#               max_sandboxes_per_node: 256  # 单机最多能塞多少沙箱（声明上限）
+#
+#    单机实际可用沙箱数 = min(max_sandboxes_per_node, cpu_per_node)。
+#    max_sandboxes_per_node 只是**上限声明**：核数不够时会被核数压住。
+#    派生结果（均由平台计算，不要手写）：
+#      total_cpu        = Σ nodes × cpu_per_node
+#      total_memory_gb  = Σ nodes × memory_gb_per_node
+#      max_sandboxes    = Σ nodes × 单机实际可用沙箱数
+#      frames           = Σ nodes（机器总台数）
+#
+# 2) 直接写总数（老格式，仍兼容）——此时无法得知沙箱并发，看板显示「未配置」：
+#
+#       pools:
+#         <namespace>:
+#           total_cpu: 256
+#           total_memory_gb: 1024
+#
 # 不在本文件里的 namespace，看板会显示「未配置」，已用量照常统计。
 
 # 默认池：历史实例（旧版 config，快照里没有 sandbox_namespace）统一归到
@@ -13,5 +40,9 @@ default: omni-env-default-worker
 
 pools:
   omni-env-default-worker:
-    total_cpu: 256
-    total_memory_gb: 1024
+    groups:
+      - name: group1
+        nodes: 38
+        cpu_per_node: 384
+        memory_gb_per_node: 1536
+        max_sandboxes_per_node: 256

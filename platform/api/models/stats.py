@@ -16,6 +16,8 @@ class StatsSummary(BaseModel):
     # 资源池总量（各池之和）；未配置时为 0，前端显示「未配置」
     total_cpu: float = 0.0
     total_memory_gb: float = 0.0
+    # 沙箱并发上限（各池节点数 × 单机可用沙箱数之和）；老格式池不贡献，为 0
+    max_sandboxes: float = 0.0
     used_cpu: float = 0.0
     used_cpu_limit: float = 0.0
     used_memory_gb: float = 0.0
@@ -79,10 +81,13 @@ class PoolUsageItem(BaseModel):
     namespace: str
     total_cpu: float = 0.0
     total_memory_gb: float = 0.0
+    # 沙箱并发上限；0 表示该池没按机器组配置（老格式），前端显示「—」
+    max_sandboxes: float = 0.0
     used_cpu: float = 0.0
     used_memory_gb: float = 0.0
     queued_cpu: float = 0.0
     queued_memory_gb: float = 0.0
+    pods: int = 0
     instances: int = 0
     configured: bool = True
 

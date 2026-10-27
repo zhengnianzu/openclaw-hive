@@ -193,6 +193,9 @@
                 </el-select>
                 <div class="hint" v-if="selectedPool">
                   资源池容量：{{ selectedPool.total_cpu }} 核 / {{ selectedPool.total_memory_gb }} GiB
+                  <template v-if="selectedPool.max_sandboxes">
+                    · 最大并发 {{ selectedPool.max_sandboxes }} 沙箱
+                  </template>
                 </div>
                 <div class="hint warn" v-else-if="!poolOptions.length">
                   尚未配置资源池，请先在 settings/sandbox/resource_pools.yaml 登记

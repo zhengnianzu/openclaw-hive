@@ -97,6 +97,9 @@ async def get_stats(
     summary["total_memory_gb"] = sum(
         p["total_memory_gb"] for p in pools if p["configured"]
     )
+    summary["max_sandboxes"] = sum(
+        p["max_sandboxes"] for p in pools if p["configured"]
+    )
 
     return StatsResponse(
         generated_at=now.isoformat(timespec="seconds"),

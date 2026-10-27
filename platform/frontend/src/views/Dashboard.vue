@@ -69,6 +69,31 @@
           </div>
         </div>
 
+        <!-- 沙箱并发：池最多能同时跑多少个沙箱（按机器组派生），分母来自资源池配置 -->
+        <div class="resource-card">
+          <div class="resource-card-head">
+            <el-icon :size="18" style="color:#0ea5e9"><Grid /></el-icon>
+            <span>沙箱并发</span>
+          </div>
+          <div class="resource-main">
+            <div class="resource-main-left">
+              <div class="resource-value">
+                <span class="resource-used">{{ fmtNum(totalRunningPods) }}</span>
+                <span class="resource-sep">/</span>
+                <span class="resource-total">{{ maxSandboxes ? fmtNum(maxSandboxes) : '—' }}</span>
+                <span class="resource-unit">个</span>
+              </div>
+              <div class="resource-sub">
+                可用 {{ maxSandboxes ? fmtNum(availSandboxes) + ' 个' : '—' }}
+              </div>
+              <el-progress
+                :percentage="sandboxPercent" :show-text="false" :stroke-width="10"
+                :color="percentColor(sandboxPercent)" />
+              <div class="resource-percent">{{ maxSandboxes ? sandboxPercent.toFixed(0) + '%' : '未配置总量' }}</div>
+            </div>
+          </div>
+        </div>
+
         <!-- 任务统计 -->
         <div class="resource-card task-card">
           <div class="resource-card-head">
@@ -247,7 +272,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, Search, Cpu, Coin, Histogram } from '@element-plus/icons-vue'
+import { ArrowDown, Search, Cpu, Coin, Histogram, Grid } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -283,7 +308,7 @@ const runningInstances = computed(() => instances.value.filter(i => i.status ===
 // 口径与后端 stats.effective_pods 一致：「已用」= running + preparing（preparing
 // 期间已占住队列槽位，仍全额计入）；「排队中」单列，不计入已用。
 // 每个实例的沙箱数不是配置并发，而是此刻实际活着的数量（见 effectivePods）。
-const resourcePools = ref({ total_cpu: 0, total_memory_gb: 0, pools: [] })
+const resourcePools = ref({ total_cpu: 0, total_memory_gb: 0, max_sandboxes: 0, pools: [] })
 const activeInstances = computed(() => instances.value.filter(i => ['running', 'preparing'].includes(i.status)))
 const queuedInstances = computed(() => instances.value.filter(i => i.status === 'queued'))
 const doneCount = computed(() => instances.value.filter(i => ['completed', 'finished'].includes(i.status)).length)
@@ -321,14 +346,19 @@ const usedMem = runningMem
 const usedMemLimit = runningMemLimit
 const totalCpu = computed(() => resourcePools.value.total_cpu || 0)
 const totalMem = computed(() => resourcePools.value.total_memory_gb || 0)
+// 沙箱并发上限：资源池按机器组派生（Σ 节点数 × 单机可用沙箱数）。老格式池为 0。
+const maxSandboxes = computed(() => resourcePools.value.max_sandboxes || 0)
 
 // 可用 = 总量 - 已用 - 排队；夹到 0，避免三段图例出现负数
 const availCpu = computed(() => Math.max(0, totalCpu.value - runningCpu.value - queuedCpu.value))
 const availMem = computed(() => Math.max(0, totalMem.value - runningMem.value - queuedMem.value))
+const availSandboxes = computed(() =>
+  Math.max(0, maxSandboxes.value - totalRunningPods.value))
 
 // 进度条与主数值同口径（只算已用），排队中的量单独列在右侧图例里
 const cpuPercent = computed(() => calcPercent(runningCpu.value, totalCpu.value))
 const memPercent = computed(() => calcPercent(runningMem.value, totalMem.value))
+const sandboxPercent = computed(() => calcPercent(totalRunningPods.value, maxSandboxes.value))
 function calcPercent(used, total) {
   if (!total) return 0
   return Math.min(100, Math.max(0, (used / total) * 100))
@@ -588,7 +618,7 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 
 .resource-panel-body {
   display: grid;
-  grid-template-columns: 1.45fr 1.45fr 1fr;
+  grid-template-columns: 1.45fr 1.45fr 1.15fr 1fr;
   gap: 16px;
 }
 .resource-card {
@@ -640,6 +670,10 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
   font-variant-numeric: tabular-nums; padding-left: 13px;
 }
 
+@media (max-width: 1400px) {
+  /* 四张卡挤一行会压扁数值，先退成两行两列 */
+  .resource-panel-body { grid-template-columns: 1fr 1fr; }
+}
 @media (max-width: 1200px) {
   .resource-panel-body { grid-template-columns: 1fr; }
 }
