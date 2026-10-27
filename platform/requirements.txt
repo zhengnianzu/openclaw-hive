@@ -18,3 +18,6 @@ websockets>=12.0
 tomli-w>=1.0.0
 # 文档中心图片上传：转 WebP 压缩
 Pillow>=10.0.0
+# Excel 导出（输出页会话漏斗、proxy-config、任务详情导出）。代码里是函数内延迟
+# import，不声明时部署环境漏装会在导出端点直接 500。
+openpyxl>=3.1.0

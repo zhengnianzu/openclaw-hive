@@ -28,6 +28,7 @@ from ..services.queue_scheduler import (
     slot_condition_sql as _slot_condition_sql,
     slot_condition_params as _slot_condition_params,
 )
+from ..services.create_params import build_create_params
 from . import harness_meta
 from . import harness_configs
 from . import sandbox_configs
@@ -1373,6 +1374,11 @@ def get_instance_config(instance_id: str, filename: str, user: dict = Depends(ge
 
 @router.get("/{instance_id}/create-params")
 def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
+    """详情页「配置信息 → 创建参数」卡片。
+
+    组装逻辑与任务导出共用 api.services.create_params.build_create_params，
+    保证「详情页看到什么，导出就是什么」。
+    """
     with get_connection() as conn:
         row = conn.execute(
             "SELECT create_params, config_snapshot, suffix_api_keys "
@@ -1383,68 +1389,7 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="实例不存在")
     if not row["create_params"]:
         raise HTTPException(status_code=404, detail="该实例无创建参数记录")
-    params = json.loads(row["create_params"])
-    params.pop("copy_complete_from", None) # 不继承
-    # 以 DB 列为准（创建/迁移时已写入），历史实例同样有值
-    params["suffix_api_keys"] = _resolve_suffix_api_keys(dict(row))
-    # OBS 路径的最终生效值从 config_snapshot 回填：既兼容历史实例（自动生成的
-    # traj_save_path 未写入 create_params），也区分普通 OBS bucket 与轨迹 bucket。
-    snap = None
-    if row["config_snapshot"]:
-        try:
-            snap = OmegaConf.create(row["config_snapshot"])
-            params["obs_bucket"] = OmegaConf.select(snap, "s3.bucket_name")
-            traj_bucket = OmegaConf.select(snap, "run_config.obs.traj_save_bucket")
-            if traj_bucket:
-                params["traj_save_bucket"] = traj_bucket
-            if not params.get("traj_save_path"):
-                params["traj_save_path"] = (
-                    OmegaConf.select(snap, "run_config.obs.traj_save_path") or ""
-                )
-        except Exception:
-            snap = None
-    # 沙箱配置：create_params 只存了 id，这里补上名称/类型/文件，供详情页展示。
-    # 实例可能引用了已删除的沙箱配置，此时查不到，保持 sandbox_config_name 为空。
-    sb_id = params.get("sandbox_config_id")
-    # Harness 配置：历史实例只有 harness_config_id，这里补上方案名/版本号；
-    # 版本行可能已被删除，能查到时才补。
-    hv_id = params.get("harness_config_version_id")
-    if hv_id:
-        with get_connection() as conn:
-            hv = conn.execute(
-                "SELECT v.version, c.name AS config_name FROM harness_config_versions v "
-                "LEFT JOIN harness_configs c ON c.id = v.config_id WHERE v.id = ?",
-                (hv_id,),
-            ).fetchone()
-        if hv:
-            params["harness_config_version"] = hv["version"]
-            if hv["config_name"]:
-                params["harness_config_name"] = hv["config_name"]
-    if sb_id:
-        with get_connection() as conn:
-            sb = conn.execute(
-                "SELECT name, sandbox_type, sandbox_key, file FROM sandbox_configs WHERE id = ?",
-                (sb_id,),
-            ).fetchone()
-        if sb:
-            params["sandbox_config_name"] = sb["name"]
-            params["sandbox_type"] = sb["sandbox_type"]
-            params["sandbox_key"] = sb["sandbox_key"]
-            params["sandbox_file"] = sb["file"]
-    # 实际生效的 sandbox key / 镜像：从 config_snapshot 读（可能与当前沙箱配置不同，
-    # 因为实例创建时的值已固化进快照）
-    if snap is not None:
-        try:
-            key = OmegaConf.select(snap, "sandbox_active_key")
-            params["sandbox_active_key"] = key
-            img = OmegaConf.select(snap, f"sandbox.{key}.sandbox.image") if key else None
-            if img:
-                params["sandbox_image"] = img
-            # 资源池与单沙箱资源：与首页看板同源（config_snapshot），
-            # 沙箱配置事后被改/删也不影响这里显示的历史值。
-            params["sandbox_namespace"] = OmegaConf.select(snap, "sandbox_namespace") or ""
-        except Exception:
-            pass
+    params, _ = build_create_params(dict(row))
     return params
 
 
