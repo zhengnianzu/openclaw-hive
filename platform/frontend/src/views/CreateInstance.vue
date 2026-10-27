@@ -103,14 +103,14 @@
             </div>
           </el-form-item>
 
-          <el-form-item v-if="['openclaw','openclaw-tui','opencode','pi','dsh','jiuwenswarm'].includes(form.harness_type)" label="API 类型">
+          <el-form-item v-if="['openclaw','openclaw-tui','opencode','pi','dsh','jiuwenswarm-dev','jiuwenswarm-xiaoyi'].includes(form.harness_type)" label="API 类型">
             <el-select v-model="form.model_api_type" placeholder="留空使用模板默认值" clearable style="width:100%">
               <el-option label="Anthropic Messages" value="anthropic-messages" />
               <el-option label="OpenAI Completions" value="openai-completions" />
             </el-select>
             <div v-if="form.harness_type === 'opencode'" style="font-size:12px;color:#999;margin-top:4px">决定 provider 的 npm 包：anthropic 用 @ai-sdk/anthropic，openai 用 @ai-sdk/openai-compatible</div>
             <div v-if="form.harness_type === 'pi'" style="font-size:12px;color:#999;margin-top:4px">写入 models.json 的 providers.custom.api 字段</div>
-            <div v-if="form.harness_type === 'jiuwenswarm'" style="font-size:12px;color:#999;margin-top:4px">写入 jw_config.yaml 的 client_provider（Anthropic/OpenAI）；base_url 的 /v1 由后端按此自动补齐或去除</div>
+            <div v-if="['jiuwenswarm-dev','jiuwenswarm-xiaoyi'].includes(form.harness_type)" style="font-size:12px;color:#999;margin-top:4px">写入 harness 配置文件（dev= jw_dev_config.yaml / xiaoyi= jw_xiaoyi_config.yaml）的 client_provider（Anthropic/OpenAI）；base_url 的 /v1 由后端按此自动补齐或去除</div>
           </el-form-item>
 
           <el-form-item v-if="form.harness_type === 'openjiuwen'" label="Provider">

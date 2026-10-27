@@ -48,7 +48,7 @@
 - dsh
 └── AGENTS.md
 
-- jiuwenswarm
+- jiuwenswarm（旧标识，模板与 jiuwenswarm-dev 独立维护）
 ~/.jiuwenswarm/agent/workspace
 ├── AGENT.md
 ├── HEARTBEAT.md
@@ -57,5 +57,21 @@
 │   └── MEMORY.md
 ├── SOUL.md
 └── USER.md
+
+- jiuwenswarm-dev
+~/.jiuwenswarm/agent/jiuwenclaw_workspace
+├── AGENT.md
+├── HEARTBEAT.md
+├── IDENTITY.md
+├── SOUL.md
+└── USER.md
+
+- jiuwenswarm-xiaoyi
+~/.jiuwenswarm/agent/workspace
+├── AGENT.md
+├── HEARTBEAT.md
+├── IDENTITY.md
+└── SOUL.md
+
 
 

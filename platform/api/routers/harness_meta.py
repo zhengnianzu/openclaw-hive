@@ -27,6 +27,9 @@ _CONFIG_PATH = os.path.join(settings.SETTINGS_DIR, "harness_config.json")
 
 # traj_prefix 代码派生: claude-code 用 cc_trajs, 其余 {id}_trajs
 _TRAJ_SPECIAL = {"claude-code": "cc_trajs"}
+# md 模板目录默认与 harness id 同名（settings/harness_mds/<id>/）。
+# 这里只登记「目录名 != id」的例外；旧 jiuwenswarm 标识复用 jiuwenswarm 目录。
+_MD_TEMPLATE_ALIASES: dict[str, str] = {}
 
 
 @lru_cache(maxsize=1)
@@ -94,7 +97,7 @@ def md_templates(harness_type: str) -> list[str]:
     只取顶层 *.md，不递归：jiuwenswarm/memory/MEMORY.md 这类子目录模板
     本期不支持（历史上递归扫描曾把 settings/ 整个卷进去，产生过 404 层嵌套目录）。
     """
-    d = os.path.join(HARNESS_MDS_DIR, harness_type)
+    d = os.path.join(HARNESS_MDS_DIR, _MD_TEMPLATE_ALIASES.get(harness_type, harness_type))
     if not os.path.isdir(d):
         return []
     return sorted(f for f in os.listdir(d)
@@ -105,7 +108,8 @@ def md_template_path(harness_type: str, filename: str) -> str | None:
     """模板绝对路径；文件名不在白名单内返回 None（防穿越）。"""
     if filename not in md_templates(harness_type):
         return None
-    return os.path.join(HARNESS_MDS_DIR, harness_type, filename)
+    template_type = _MD_TEMPLATE_ALIASES.get(harness_type, harness_type)
+    return os.path.join(HARNESS_MDS_DIR, template_type, filename)
 
 
 def traj_prefix(harness_type: str) -> str:

@@ -36,6 +36,8 @@ from . import resource_pools
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
+JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
+
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
 _OCCUPYING_STATUSES = OCCUPYING_STATUSES
 _OCCUPYING_PLACEHOLDERS = ",".join("?" * len(_OCCUPYING_STATUSES))
@@ -775,11 +777,13 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     pi_path = os.path.join(instance_dir, "models.json")
     grok_path = os.path.join(instance_dir, "grok_config.toml")
     dsh_path = os.path.join(instance_dir, "dsh_settings.yaml")
-    jw_config_path = os.path.join(instance_dir, "jw_config.yaml")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     # harness_local_config_file: 直接用 agent_config 文件名拼路径, 兜底 openclaw.json
     _agent_cfg = harness_meta.agent_config(req.harness_type) or "openclaw.json"
+    # jiuwenswarm 系: 实例内文件名跟随 agent_config(jw_dev_config.yaml / jw_xiaoyi_config.yaml),
+    # 不要硬编码成 jw_config.yaml —— 旧标识 jiuwenswarm 的 agent_config 恰好就是它, 兼容。
+    jw_config_path = os.path.join(instance_dir, _agent_cfg)
     openclaw_path = os.path.join(instance_dir, _agent_cfg)
     base.run_config.sandbox.harness_local_config_file = os.path.join(instance_dir, _agent_cfg)
     base.run_config.sandbox.user_proxy_model_local_file = user_proxy_path
@@ -1055,14 +1059,24 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             credentials[api_key_env] = req.model_api_key
 
         OmegaConf.save(dsh_omega, dsh_path)
-    elif req.harness_type == "jiuwenswarm":
-        # jw_config.yaml: 模型真源是 models.defaults 列表, 默认模型由 is_default: true 标记。
+    elif req.harness_type in JIUWENSWARM_TYPES:
+        # jw 系配置: 模型真源是 models.defaults 列表, 默认模型由 is_default: true 标记。
         # 注意该文件大量使用 ${VAR:-default} 占位符(jiuwenswarm 自己的 env 模板语法),
         # OmegaConf 会当 interpolation 解析而抛 UnsupportedInterpolationType,
         # 故用 pyyaml 原文往返(与 prepare_config.py 的 jiuwenswarm 分支一致)。
-        jw_template = os.path.join(harness_settings_dir, "jw_config.yaml")
+        # 模板名 = agent_config(jw_dev_config.yaml / jw_xiaoyi_config.yaml / jw_config.yaml),
+        # 版本目录 → 扁平 settings → .example 逐级兜底。
+        _jw_name = _agent_cfg
+        jw_template = os.path.join(harness_settings_dir, _jw_name)
         if not os.path.exists(jw_template):
-            jw_template = os.path.join(settings.SETTINGS_DIR, "jw_config.yaml")
+            jw_template = os.path.join(settings.SETTINGS_DIR, _jw_name)
+        if not os.path.exists(jw_template):
+            jw_template = os.path.join(settings.SETTINGS_DIR, _jw_name + ".example")
+        if not os.path.exists(jw_template):
+            raise HTTPException(
+                status_code=500,
+                detail=f"jiuwenswarm 配置模板不存在: {_jw_name}(也未找到 .example)",
+            )
         import yaml
         with open(jw_template, "r", encoding="utf-8") as f:
             jw_cfg = yaml.safe_load(f) or {}
@@ -1203,7 +1217,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 credentials = dsh_omega.setdefault("credentials", OmegaConf.create({}))
                 credentials[api_key_env] = req.model_api_key
                 OmegaConf.save(dsh_omega, dsh_path)
-            elif req.harness_type == "jiuwenswarm" and os.path.exists(jw_config_path):
+            elif req.harness_type in JIUWENSWARM_TYPES and os.path.exists(jw_config_path):
                 import yaml
                 with open(jw_config_path, "r", encoding="utf-8") as f:
                     jw_cfg = yaml.safe_load(f) or {}

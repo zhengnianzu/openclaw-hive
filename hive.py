@@ -81,6 +81,7 @@ OBS_UPLOAD_TIMEOUT = 900
 # 由 main() 注入 SandboxConfig.harness_type (同 sandbox_type), 方法读
 # self.config.sandbox_config.harness_type。
 _FW: dict = _FRAMEWORK_LAYOUTS["openclaw"]
+_JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
 
 
 def set_agent_framework(name: str, sandbox_type: str = "x86_cpu", home: str = "/home/ma-user") -> str:
@@ -687,10 +688,15 @@ class OpenClawDistillationTask:
             gateway_log_path = os.path.join(
                 self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
             )
+            gateway_pid_path = os.path.join(
+                self.config.sandbox_config.result_workdir, "jiuwenswarm-gateway.pid"
+            )
             gateway_cmd = [
                 "/bin/bash", "-c",
                 f"mkdir -p {self.config.sandbox_config.result_workdir} && "
-                f"nohup {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
+                # 独立进程组 + PID 文件，任务结束后可先停止整个 JiuwenSwarm 服务树。
+                f"nohup setsid {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
+                f"echo $! > {gateway_pid_path}; "
                 # 轮询就绪(每 5s grep 一次), 就绪即退出, 而非固定 sleep 180s
                 f"ready=0; "
                 f"for i in $(seq 1 {max_polls}); do sleep {poll_interval}; "
@@ -742,6 +748,58 @@ class OpenClawDistillationTask:
             raise HiveError("S003", detail=os.path.basename(config_file), sandbox_result=result)
 
         self.logger.info("JiuwenSwarm gateway started (TUI on 19001)")
+
+
+    async def _stop_jiuwenswarm_gateway(self) -> None:
+        """停止本任务启动的 JiuwenSwarm 进程组，使会话文件稳定后再上传。"""
+        result_workdir = self.config.sandbox_config.result_workdir
+        pid_path = os.path.join(result_workdir, "jiuwenswarm-gateway.pid")
+
+        # 第一阶段只发 TERM；等待放在 SDK 命令外，避免长时间占用一次 extend 调用。
+        term_script = (
+            f"pid_file='{pid_path}'; "
+            "if [ -s \"$pid_file\" ]; then "
+            "pid=$(cat \"$pid_file\"); "
+            "if kill -0 -- \"-$pid\" 2>/dev/null; then "
+            "kill -TERM -- \"-$pid\" 2>/dev/null || true; "
+            "elif kill -0 \"$pid\" 2>/dev/null; then "
+            "kill -TERM \"$pid\" 2>/dev/null || true; fi; "
+            "echo HIVE_JIUWENSWARM_TERM_PID=$pid; "
+            "else "
+            # 兼容旧启动方式或 PID 文件意外丢失；沙箱内仅运行当前任务。
+            "pkill -TERM -f '[j]iuwenswarm-start|[j]iuwenswarm.start_services' 2>/dev/null || true; "
+            "echo HIVE_JIUWENSWARM_TERM_FALLBACK; fi"
+        )
+        term_result = await self._exec_sandbox(
+            ["/bin/bash", "-c", term_script], self.config.simple_bash_timeout
+        )
+        _log_sandbox_detail(self.logger, "jiuwenswarm gateway stop TERM", term_result)
+
+        await asyncio.sleep(5)
+
+        # 第二阶段清理仍存活的进程组；正常退出时这里只删除 PID 文件。
+        kill_script = (
+            f"pid_file='{pid_path}'; forced=0; "
+            "if [ -s \"$pid_file\" ]; then "
+            "pid=$(cat \"$pid_file\"); "
+            "if kill -0 -- \"-$pid\" 2>/dev/null; then "
+            "kill -KILL -- \"-$pid\" 2>/dev/null || true; forced=1; "
+            "elif kill -0 \"$pid\" 2>/dev/null; then "
+            "kill -KILL \"$pid\" 2>/dev/null || true; forced=1; fi; fi; "
+            "rm -f \"$pid_file\"; echo HIVE_JIUWENSWARM_STOPPED forced=$forced"
+        )
+        kill_result = await self._exec_sandbox(
+            ["/bin/bash", "-c", kill_script], self.config.simple_bash_timeout
+        )
+        _log_sandbox_detail(self.logger, "jiuwenswarm gateway stopped", kill_result)
+        kill_data = kill_result.data or {}
+        if (kill_result.code != ErrorCode.SUCCESS[0]
+                or kill_data.get("exit_code") not in (None, 0)):
+            raise RuntimeError(
+                f"stop jiuwenswarm gateway failed: "
+                f"exit_code={kill_data.get('exit_code')} stderr={kill_data.get('stderr', '')}"
+            )
+        self.logger.info("JiuwenSwarm gateway stopped before OBS upload")
 
 
     async def _run_main_script(self, config_file: str, task_idx: int) -> None:
@@ -1087,14 +1145,28 @@ class OpenClawDistillationTask:
         result = await self._exec_sandbox(
             exec_command, self.config.obs_config.upload_timeout
         )
-        stdout = (result.data or {}).get("stdout", "") or ""
+        result_data = result.data or {}
+        stdout = result_data.get("stdout", "") or ""
+        stderr = result_data.get("stderr", "") or ""
         if "HIVE_MISSING" in stdout:
             return "missing"
         m = re.search(r"HIVE_RC=(-?\d+)", stdout)
         rc = int(m.group(1)) if m else None
         if rc == 0 and result.code == ErrorCode.SUCCESS[0]:
+            if stderr.strip():
+                self.logger.warning(
+                    f"[upload_traj] obsutil stderr {src} -> {remote}:\n{stderr}"
+                )
             return "ok"
-        return f"fail:{rc if rc is not None else (result.data or {}).get('exit_code')}"
+        effective_rc = rc if rc is not None else result_data.get("exit_code")
+        self.logger.error(
+            f"[upload_traj] obsutil command failed {src} -> {remote} "
+            f"rc={effective_rc} sdk_code={result.code} "
+            f"exit_code={result_data.get('exit_code')}\n"
+            f"stdout(last 8000 chars):\n{stdout[-8000:]}\n"
+            f"stderr:\n{stderr}"
+        )
+        return f"fail:{effective_rc}"
 
     async def _upload_traj_to_obs(self, config_file: str) -> bool:
         """Upload execution traj (logs) to OBS.
@@ -1242,21 +1314,34 @@ class OpenClawDistillationTask:
         await self._upload_harness_md(config_file, sandbox_type)
         await self._download_s3_agents(sandbox_type)
         await self._upload_data_config(config_file)
-        if self.config.sandbox_config.harness_type.strip().lower() == "openclaw":
-            if sandbox_type == "windows":
-                await self._start_openclaw_gateway_windows(config_file)
+        harness_type = self.config.sandbox_config.harness_type.strip().lower()
+        stop_jiuwenswarm = harness_type in _JIUWENSWARM_TYPES
+        try:
+            if harness_type == "openclaw":
+                if sandbox_type == "windows":
+                    await self._start_openclaw_gateway_windows(config_file)
+                else:
+                    await self._start_openclaw_gateway(config_file)
+            elif stop_jiuwenswarm:
+                # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
+                await self._start_jiuwenswarm_gateway(config_file)
             else:
-                await self._start_openclaw_gateway(config_file)
-        elif self.config.sandbox_config.harness_type.strip().lower() == "jiuwenswarm":
-            # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
-            await self._start_jiuwenswarm_gateway(config_file)
-        else:
-            # 就地改写 → 上传 agent config + user_proxy_model → 还原
-            await self._copy_agent_config(config_file)
-        if sandbox_type == "windows":
-             await self._run_main_script_windows(config_file, task_idx)
-        else:
-            await self._run_main_script(config_file, task_idx)
+                # 就地改写 → 上传 agent config + user_proxy_model → 还原
+                await self._copy_agent_config(config_file)
+            if sandbox_type == "windows":
+                await self._run_main_script_windows(config_file, task_idx)
+            else:
+                await self._run_main_script(config_file, task_idx)
+        finally:
+            if stop_jiuwenswarm:
+                try:
+                    await self._stop_jiuwenswarm_gateway()
+                except Exception as e:
+                    # 停止失败不覆盖主任务的原始异常；OBS 上传仍会执行并记录结果。
+                    self.logger.error(
+                        f"Failed to stop JiuwenSwarm gateway before OBS upload: "
+                        f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                    )
 
     async def run(self, config_file: str, task_idx: int = 0) -> None:
         """Run a single distillation task.

@@ -133,6 +133,7 @@ _FRAMEWORK_LAYOUTS: dict = {
         "workspace_base": "/home/ma-user/.dsh/workspace",
         "skill_subdir": ".agents/skills",
     },
+    # 保留旧标识，仅用于兼容历史 config / 仍在用的旧实例；新任务用下面两个明确版本。
     "jiuwenswarm": {
         "harness_dir":            "/home/ma-user/.jiuwenswarm",
         "harness_local_config":   "uploads/jw_config.yaml",
@@ -141,6 +142,29 @@ _FRAMEWORK_LAYOUTS: dict = {
             "/home/ma-user/.jiuwenswarm",
         ],
         "workspace_base": "/home/ma-user/.jiuwenswarm/agent/jiuwenclaw_workspace",
+        "skill_subdir": "skills",
+    },
+    "jiuwenswarm-dev": {
+        "harness_dir":            "/home/ma-user/.jiuwenswarm",
+        "harness_local_config":   "uploads/jw_dev_config.yaml",
+        "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
+        "upload_paths": [
+            "/home/ma-user/.jiuwenswarm/service_default/.logs",
+            "/home/ma-user/.jiuwenswarm/service_default/agent_default/agent"
+        ],
+        "workspace_base": "/home/ma-user/.jiuwenswarm/agent/jiuwenclaw_workspace",
+        "skill_subdir": "skills",
+    },
+    "jiuwenswarm-xiaoyi": {
+        "harness_dir":            "/home/ma-user/.jiuwenswarm",
+        "harness_local_config":   "uploads/jw_xiaoyi_config.yaml",
+        "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
+        "upload_paths": [
+            "/home/ma-user/.jiuwenswarm/logs",
+            "/home/ma-user/.jiuwenswarm/agent/.logs",
+            "/home/ma-user/.jiuwenswarm/agent/sessions",
+        ],
+        "workspace_base": "/home/ma-user/.jiuwenswarm/agent/workspace",
         "skill_subdir": "skills",
     },
 
@@ -494,7 +518,7 @@ def prepare_local_agent_config(
         OmegaConf.save(data, local_path)
         logging.info(f"Updated settings.yaml with provider from {local_user_proxy_model_path}")
 
-    elif framework == "jiuwenswarm":
+    elif framework in {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}:
         # jw_config.yaml: 把 user_proxy_model.json 的
         # 每个模型追加成 models.defaults 的一条, 用 alias 区分; 默认模型靠
         # is_default: true 标记, 其余段(permissions 等)原样保留。

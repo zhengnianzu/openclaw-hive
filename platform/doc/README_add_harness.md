@@ -160,8 +160,88 @@ elif req.harness_type == "myharness":
 
 ---
 
+## 七、harness md 管理(模板 → 方案 → 版本 → 实例)
+
+md 是给 agent 用的系统提示文件(`AGENTS.md` / `AGENT.md` / `SOUL.md` / `IDENTITY.md` /
+`HEARTBEAT.md` / `USER.md` 等),它们和 agent 配置文件一样**进版本快照**,
+但来源、白名单和注入路径都是独立的一套。
+
+### 7.1 目录约定:`settings/harness_mds/<harness_type>/`
+
+- 目录名默认**与 harness id 完全一致**;只有「目录名 ≠ id」时才需要在
+  `platform/api/routers/harness_meta.py` 的 `_MD_TEMPLATE_ALIASES` 里登记例外
+  (目前为空——`jiuwenswarm-dev` / `jiuwenswarm-xiaoyi` 各有独立目录,不要指向旧目录,
+  否则两个 harness 会共享同一批模板,前端改一个等于改两个)。
+- 只扫**顶层 `*.md`**,不递归。`jiuwenswarm/memory/MEMORY.md` 这类子目录模板
+  不会被识别(历史上递归扫描曾把整个 settings/ 卷进去)。
+- 模板文件名即白名单:`_assert_md_name` 用它做路径穿越防护,
+  任何不在该目录顶层列表里的文件名一律 404。
+
+新增 harness 时这一目录**必须建**,否则该 harness 的可选 md 列表为空:
+`md_templates()` 找不到目录直接返回 `[]`,工作台里就一个 md 都看不到。
+
+### 7.2 校验清单
+
+| 检查项 | 命令 / 位置 | 期望 |
+|--------|-------------|------|
+| 目录存在 | `ls platform/settings/harness_mds/<id>/` | 至少一个 `.md` |
+| 别名未错配 | `harness_meta._MD_TEMPLATE_ALIASES` | 不含该 id(除非目录名确实不同) |
+| 枚举正确 | 见下方脚本 | 输出与目录内容一致 |
+
+```bash
+cd platform && python3 -c "
+from api.routers import harness_meta as hm
+for t in ['jiuwenswarm-dev','jiuwenswarm-xiaoyi']:
+    print(t, hm.md_templates(t))
+"
+```
+
+### 7.3 md 的四层流转
+
+```
+settings/harness_mds/<type>/*.md        模板(提交进 git)
+        │  工作台「从模板初始化」
+        ▼
+settings/harness/<type>/harness-N/draft/md/*.md     方案草稿
+        │  发布版本
+        ▼
+settings/harness/<type>/harness-N/<version>/md/*.md 版本快照(只读)
+        │  创建实例
+        ▼
+instances/<id>/workspace/*.md           → config.yaml 的 run_config.harness_md
+        │  hive 上传到沙箱
+        ▼
+workspace/<code_stem>/<agent_dir>/__default__/*.md
+```
+
+关键点:
+
+1. **草稿可写、版本只读**:`PUT /{config_id}/md/{name}` 作用于草稿;
+   版本里的 md 只能查看(`GET .../versions/{vid}/md/{name}`)。
+2. **未初始化 ≠ 不存在**:`_md_file_list()` 会把模板里有的文件全部列出,
+   并带 `exists` 标志——前端据此显示「未初始化」而不是隐藏。
+3. **保存 md 会同步 config.yaml**:`_sync_harness_md()` 用**文本行插入**
+   重写 `run_config.harness_md`(绝对路径列表),不用 YAML round-trip,
+   避免用户手写的缩进/注释/引号被整形。md 为空时写 `harness_md: []`。
+4. **实例侧拷到 `workspace/`**:`create_instance` 把版本目录 `md/` 下所有 `.md`
+   拷进 `instances/<id>/workspace/`,并把实例内绝对路径写进 `harness_md`。
+   没有 md 的旧版本写空列表,不报错。
+5. **hive 侧兜底上传**:`_upload_harness_md()` 在 `_download_s3_agents` **之前**
+   把 md 传到 `workspace/<code_stem>/<agent_dir>/__default__/`;
+   OBS 上同名文件会覆盖它。task config 没有 `input_dir.agent_dir` 时整步跳过并告警。
+
+### 7.4 常见坑
+
+| 现象 | 原因 |
+|------|------|
+| 工作台看不到任何 md | `harness_mds/<id>/` 目录不存在,或 `_MD_TEMPLATE_ALIASES` 指到了别的目录 |
+| 两个 harness 的 md 互相影响 | 两者在 `_MD_TEMPLATE_ALIASES` 里被指向同一目录 |
+| 保存 md 后 config.yaml 格式被打乱 | 有人把 `_sync_harness_md` 改成了 YAML 库 round-trip |
+| 沙箱里没有 md | task config 缺 `input_dir.agent_dir`,或 OBS agents 下载覆盖 |
 
 ---
+
+
 
 ## 附:现有 harness 配置对照表
 
@@ -177,5 +257,7 @@ elif req.harness_type == "myharness":
 | pi | Pi | models.json | #17a2b8 | pi_trajs |
 | grok | Grok | grok_config.toml | #00d084 | grok_trajs |
 | dsh | DeepSeek Harness | dsh_settings.yaml | #ff8c00 | dsh_trajs |
-| jiuwenswarm | JiuwenSwarm | jw_config.yaml | #e91e63 | jiuwenswarm_trajs |
+| jiuwenswarm-dev | JiuwenSwarm-dev | jw_dev_config.yaml | #e91e63 | jiuwenswarm-dev_trajs |
+| jiuwenswarm-xiaoyi | JiuwenSwarm-xiaoyi | jw_xiaoyi_config.yaml | #9c27b0 | jiuwenswarm-xiaoyi_trajs |
+| jiuwenswarm | JiuwenSwarm（旧标识） | jw_config.yaml | #e91e63 | jiuwenswarm_trajs |
 | common | 通用 | (无) | #c0c4cc | (兜底 openclaw_trajs) |

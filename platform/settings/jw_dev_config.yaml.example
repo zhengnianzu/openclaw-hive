@@ -1,0 +1,453 @@
+version: 1.0
+models:
+  defaults:
+    - model_client_config:
+        api_base: http://115.120.113.66:8082/
+        api_key: sk-xxxxxxxx
+        model_name: deepseek-v4.1-flash-1017
+        client_provider: Anthropic
+        timeout: 1800
+        stream_first_chunk_timeout: 300
+        stream_idle_timeout: 120
+        verify_ssl: true
+        custom_headers: {}
+      model_config_obj: {}
+      is_default: true
+
+# JiuwenSwarm converts enabled entries below into McpServerConfig internally.
+# Enable only servers whose command/path/URL is reachable from the JiuwenSwarm
+# server process. For containers, stdio paths must be paths inside the container.
+mcp:
+  servers:
+    # Playwright MCP (stdio)
+    - name: playwright
+      enabled: false
+      transport: stdio
+      command: npx
+      args:
+        - "@playwright/mcp@0.0.79"
+        - --browser
+        - chromium
+      timeout_s: 300
+
+    # Image-reading MCP (stdio)
+    - name: image-reading
+      enabled: false
+      transport: stdio
+      command: node
+      args:
+        - /opt/mcp/image-reading/index.js
+      env:
+        VL_API_BASE: https://your-vl-gateway.example.com/v1
+        VL_API_KEY: "${VL_API_KEY}"
+        VL_MODEL: your-vl-model
+      timeout_s: 300
+
+    # GitHub MCP (stdio)
+    - name: github
+      enabled: false
+      transport: stdio
+      command: npx
+      args:
+        - -y
+        - "@modelcontextprotocol/server-github"
+      env:
+        GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      timeout_s: 300
+
+    # Remote Streamable HTTP MCP
+    - name: remote-streamable
+      enabled: false
+      transport: streamable-http
+      url: https://mcp.example.com/mcp
+      headers:
+        Authorization: "Bearer ${REMOTE_MCP_TOKEN}"
+      timeout_s: 60
+
+    # Legacy SSE MCP
+    - name: remote-sse
+      enabled: false
+      transport: sse
+      url: https://mcp.example.com/sse
+      headers:
+        Authorization: "Bearer ${REMOTE_MCP_TOKEN}"
+      timeout_s: 60
+
+permissions:
+  enabled: false
+  schema: tiered_policy
+  permission_mode: normal
+  defaults:
+    '*': allow
+  tools:
+    bash: allow
+    mcp_exec_command: allow
+    create_terminal: allow
+    write: allow
+    write_file: allow
+    edit_file: allow
+    search_replace: allow
+    ask_user: allow
+    write_memory: allow
+    edit_memory: allow
+    read_memory: allow
+    memory_search: allow
+    memory_get: allow
+    todo_create: allow
+    todo_insert: allow
+    todo_complete: allow
+    todo_remove: allow
+    todo_list: allow
+    coding_memory_write: allow
+    coding_memory_edit: allow
+    coding_memory_read: allow
+    ltm_search: allow
+    ltm_search_summary: allow
+    mem0_profile: allow
+    mem0_search: allow
+    mem0_conclude: allow
+    viking_search: allow
+    viking_read: allow
+    viking_browse: allow
+    viking_remember: allow
+    viking_add_resource: allow
+    mcp_fetch_webpage: allow
+    cron_list_jobs: allow
+    cron_get_job: allow
+    cron_create_job: allow
+    cron_update_job: allow
+    cron_delete_job: allow
+    cron_toggle_job: allow
+    cron_preview_job: allow
+    acp_chat: ask
+  rules:
+    - id: shell_allow_dir
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: dir *
+      severity: LOW
+    - id: shell_allow_ls
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: ls *
+      severity: LOW
+    - id: shell_allow_pwd
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: pwd *
+      severity: LOW
+    - id: shell_allow_cd
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: cd *
+      severity: LOW
+    - id: shell_allow_echo
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: echo *
+      severity: LOW
+    - id: shell_allow_cat
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: cat *
+      severity: LOW
+    - id: shell_allow_type
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: type *
+      severity: LOW
+    - id: shell_allow_head
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: head *
+      severity: LOW
+    - id: shell_allow_tail
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: tail *
+      severity: LOW
+    - id: shell_allow_git_status
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: git status *
+      severity: LOW
+    - id: shell_allow_git_log
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: git log *
+      severity: LOW
+    - id: shell_allow_git_diff
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: git diff *
+      severity: LOW
+    - id: shell_allow_git_branch
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: git branch *
+      severity: LOW
+    - id: shell_allow_set_location
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Set-Location *
+      severity: LOW
+    - id: shell_allow_push_location
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Push-Location *
+      severity: LOW
+    - id: shell_allow_pop_location
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Pop-Location *
+      severity: LOW
+    - id: shell_allow_sl
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: sl *
+      severity: LOW
+    - id: shell_allow_chdir
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: chdir *
+      severity: LOW
+    - id: shell_allow_get_location
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Get-Location *
+      severity: LOW
+    - id: shell_allow_gl
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: gl *
+      severity: LOW
+    - id: shell_allow_get_childitem
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Get-ChildItem *
+      severity: LOW
+    - id: shell_allow_gci
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: gci *
+      severity: LOW
+    - id: shell_allow_get_item
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Get-Item *
+      severity: LOW
+    - id: shell_allow_gi
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: gi *
+      severity: LOW
+    - id: shell_allow_get_content
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Get-Content *
+      severity: LOW
+    - id: shell_allow_gc
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: gc *
+      severity: LOW
+    - id: shell_allow_write_output
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Write-Output *
+      severity: LOW
+    - id: shell_allow_write_host
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Write-Host *
+      severity: LOW
+    - id: shell_allow_select_object
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: re:(?i)^Select-Object\b
+      severity: LOW
+    - id: shell_ask_rm
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: rm *
+      severity: HIGH
+    - id: shell_ask_del
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: del *
+      severity: HIGH
+    - id: shell_ask_rd
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: rd *
+      severity: HIGH
+    - id: shell_ask_remove_item
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: Remove-Item *
+      severity: HIGH
+    - id: shell_ask_ri
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: ri *
+      severity: HIGH
+    - id: shell_ask_rmdir
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: rmdir *
+      severity: HIGH
+    - id: shell_ask_erase
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: erase *
+      severity: HIGH
+    - id: shell_ask_sensitive_file_reads
+      tools:
+        - bash
+        - powershell
+        - mcp_exec_command
+        - create_terminal
+      pattern: re:(?i)(^|[\s;&|()])((cat|type|less|more|head|tail|grep|find|Get-Content|Select-String)\b[^;&|]*(id_rsa|id_ed25519|\.pem\b|\.pfx\b|\.key\b|\.kube/config|\.aws/(credentials|config)|\.npmrc\b|\.env(\.[A-Za-z0-9_-]+)?\b|authorized_keys|\.ssh/))
+      severity: HIGH
+  owner_scopes: {}
+  deny_guidance_message: ''
+  file_guard:
+    enabled: true
+    defaults:
+      read: ask
+      write: ask
+      exec: ask
+    workspace:
+      read: allow
+      write: allow
+      exec: ask
+    paths:
+      - path: '**/.ssh/**'
+        match: glob
+        read: ask
+        write: ask
+        exec: ask
+      - path: '**/.env*'
+        match: glob
+        read: ask
+        write: ask
+        exec: ask
+  external_directory:
+    '*': ask
+preferred_language: zh
+sandbox:
+  url: http://127.0.0.1:8321
+  type: jiuwenbox
+  enabled: false
+  startup_mode: external
+startup:
+  warmup:
+    enabled: false
