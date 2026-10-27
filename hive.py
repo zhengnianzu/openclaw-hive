@@ -1247,7 +1247,9 @@ class OpenClawDistillationTask:
                 await self._start_openclaw_gateway_windows(config_file)
             else:
                 await self._start_openclaw_gateway(config_file)
-        elif self.config.sandbox_config.harness_type.strip().lower() == "jiuwenswarm":
+        elif self.config.sandbox_config.harness_type.strip().lower() in {
+            "jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi",
+        }:
             # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
             await self._start_jiuwenswarm_gateway(config_file)
         else:

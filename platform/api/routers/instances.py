@@ -35,6 +35,8 @@ from . import resource_pools
 
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
+JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
+
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
 _OCCUPYING_STATUSES = OCCUPYING_STATUSES
 _OCCUPYING_PLACEHOLDERS = ",".join("?" * len(_OCCUPYING_STATUSES))
@@ -1054,7 +1056,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             credentials[api_key_env] = req.model_api_key
 
         OmegaConf.save(dsh_omega, dsh_path)
-    elif req.harness_type == "jiuwenswarm":
+    elif req.harness_type in JIUWENSWARM_TYPES:
         # jw_config.yaml: 模型真源是 models.defaults 列表, 默认模型由 is_default: true 标记。
         # 注意该文件大量使用 ${VAR:-default} 占位符(jiuwenswarm 自己的 env 模板语法),
         # OmegaConf 会当 interpolation 解析而抛 UnsupportedInterpolationType,
@@ -1062,6 +1064,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         jw_template = os.path.join(harness_settings_dir, "jw_config.yaml")
         if not os.path.exists(jw_template):
             jw_template = os.path.join(settings.SETTINGS_DIR, "jw_config.yaml")
+        if not os.path.exists(jw_template):
+            jw_template = os.path.join(settings.SETTINGS_DIR, "jw_config.yaml.example")
         import yaml
         with open(jw_template, "r", encoding="utf-8") as f:
             jw_cfg = yaml.safe_load(f) or {}
@@ -1202,7 +1206,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 credentials = dsh_omega.setdefault("credentials", OmegaConf.create({}))
                 credentials[api_key_env] = req.model_api_key
                 OmegaConf.save(dsh_omega, dsh_path)
-            elif req.harness_type == "jiuwenswarm" and os.path.exists(jw_config_path):
+            elif req.harness_type in JIUWENSWARM_TYPES and os.path.exists(jw_config_path):
                 import yaml
                 with open(jw_config_path, "r", encoding="utf-8") as f:
                     jw_cfg = yaml.safe_load(f) or {}

@@ -86,7 +86,7 @@ sandbox_id_prefix: zx
 sandbox_namespace: omni-env-default-worker
 
 run_config:
-  harness_type: jiuwenswarm
+  harness_type: jiuwenswarm-dev
   start_index: 0      # 开始执行任务的索引号，有时候需要跳过部分数据
   total_num: 0      # 任务总数, 0表示不限制任务数量
   concurrent_num: 3   # 并发数 claude 100~150

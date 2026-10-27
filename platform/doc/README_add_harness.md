@@ -177,5 +177,6 @@ elif req.harness_type == "myharness":
 | pi | Pi | models.json | #17a2b8 | pi_trajs |
 | grok | Grok | grok_config.toml | #00d084 | grok_trajs |
 | dsh | DeepSeek Harness | dsh_settings.yaml | #ff8c00 | dsh_trajs |
-| jiuwenswarm | JiuwenSwarm | jw_config.yaml | #e91e63 | jiuwenswarm_trajs |
+| jiuwenswarm-dev | JiuwenSwarm Dev | jw_config.yaml | #e91e63 | jiuwenswarm-dev_trajs |
+| jiuwenswarm-xiaoyi | JiuwenSwarm Xiaoyi | jw_config.yaml | #9c27b0 | jiuwenswarm-xiaoyi_trajs |
 | common | 通用 | (无) | #c0c4cc | (兜底 openclaw_trajs) |

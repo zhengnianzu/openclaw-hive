@@ -121,6 +121,18 @@
     "model_api_key": "models.defaults[is_default].model_client_config.api_key",
     "model_api_type": "models.defaults[is_default].model_client_config.client_provider"
   },
+  "jiuwenswarm-dev": {
+    "model_id": "models.defaults[is_default].model_client_config.model_name",
+    "model_base_url": "models.defaults[is_default].model_client_config.api_base",
+    "model_api_key": "models.defaults[is_default].model_client_config.api_key",
+    "model_api_type": "models.defaults[is_default].model_client_config.client_provider"
+  },
+  "jiuwenswarm-xiaoyi": {
+    "model_id": "models.defaults[is_default].model_client_config.model_name",
+    "model_base_url": "models.defaults[is_default].model_client_config.api_base",
+    "model_api_key": "models.defaults[is_default].model_client_config.api_key",
+    "model_api_type": "models.defaults[is_default].model_client_config.client_provider"
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",

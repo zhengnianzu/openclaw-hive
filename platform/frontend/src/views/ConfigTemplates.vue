@@ -55,7 +55,7 @@
             <el-form-item label="Invite Code">
               <el-input v-model="form.invite_code" placeholder="pangu" />
             </el-form-item>
-            <el-form-item v-if="['openclaw','opencode','pi','dsh','jiuwenswarm'].includes(form.harness_type)" label="API 类型">
+            <el-form-item v-if="['openclaw','opencode','pi','dsh','jiuwenswarm-dev','jiuwenswarm-xiaoyi'].includes(form.harness_type)" label="API 类型">
               <el-select v-model="form.model_api_type" clearable style="width:100%">
                 <el-option label="Anthropic Messages" value="anthropic-messages" />
                 <el-option label="OpenAI Completions" value="openai-completions" />
