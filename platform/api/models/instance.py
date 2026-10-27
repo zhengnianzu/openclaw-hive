@@ -58,6 +58,14 @@ class QueueTaskItem(BaseModel):
     position_label: str = ""           # 如 "1 (等待中)" / "-"
     created_at: str
     estimated_start_at: Optional[str] = None   # 预计开始时间
+    # 队列管理页右侧任务列表（设计稿 queue2.png）用到的展示字段
+    created_by: Optional[str] = None            # 负责人
+    started_at: Optional[str] = None            # 开始时间
+    stopped_at: Optional[str] = None            # 结束时间（终态才有）
+    duration_seconds: Optional[float] = None    # 运行时长（秒），未开始/运行中为 None
+    completed_tasks: int = 0                    # 成功数
+    failed_tasks: int = 0                       # 失败数
+    total_tasks: int = 0                        # 任务总数
 
 
 class InstanceCreate(BaseModel):

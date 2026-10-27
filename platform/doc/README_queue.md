@@ -346,6 +346,52 @@ status='preparing' AND pid IS NULL
 
 任务实例接口新增:`POST /api/instances` 支持 `queue_id`;`GET /api/instances` 返回 `queue_id` / `queue_position`。
 
+### 4.1 任务详情导出
+
+**队列管理页**(`frontend/src/views/Queues.vue`)是**队列列表**与**任务列表**两个并列面板,
+互不是从属关系:
+
+- 队列列表:管理队列(新建/启动/停止/编辑/删除),即原有功能。
+- 任务列表:就是「任务管理」的任务列表(`GET /api/instances`),放这里主要用于**筛选与批量导出** ——
+  避免在任务管理页本身堆导出入口。
+
+顶部概览条:队列数、**所有队列正在运行的任务数汇总**、**排队中的任务数汇总**、任务总数。
+
+导出入口(都走 `api/routers/task_export.py`,输出 `.xlsx`):
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/export/queues.xlsx` | 队列级汇总,body `{queue_ids: [...]}`;**空数组 = 全部队列**。页面入口是队列列表里的「导出选中队列」 |
+| POST | `/api/export/instances.xlsx` | 按 id 集合导出任务详情(POST 避免 URL 过长),body `{instance_ids: [...], include_task_records: bool}`。页面入口是任务列表里的「导出选中任务」 |
+| POST | `/api/export/all.xlsx` | 全部队列 + 全部任务;超过 200 条截断,概览页写明截断数(接口保留,页面暂无按钮) |
+| GET | `/api/export/queues/{id}.xlsx` | 导出单条队列的任务详情,按 `queue_position` 升序。页面入口是队列行「更多 → 导出任务详情」 |
+
+单次上限 200 个任务(「导出全部」超限时截断而非报错)。权限为 `require_operator`
+(导出含创建参数)。
+
+Sheet 结构:
+
+| Sheet | 内容 |
+|-------|------|
+| 导出概览 | 导出时间/范围/任务数/合计成功失败/整体成功率/数据口径/安全说明 |
+| 队列汇总 | 一行一队列:任务总数/运行中/排队中/已完成/成功任务数/失败任务数/成功率/并发/长尾跳过 |
+| 队列信息 | 仅单队列入口:队列ID、并发上限、有效并发、长尾跳过、描述、任务总数 |
+| 任务总览 | 一行一任务,**成功数/失败数** + 成功率等(末行合计) |
+| 创建参数-关键项 | 列顺序对齐「任务管理 → 配置信息 → 创建参数」卡片的五个分组(基本/OBS/模型/用户模拟/高级) |
+| 任务明细 | 可选,来自 `task_records`;超过 2 万行只留提示行 |
+
+口径与边界:
+
+- 关键项复用 `api/services/create_params.build_create_params`,与详情页是**同一份实现**。
+- 成功/失败数取 `task_instances.completed_tasks` / `failed_tasks`(即 output 目录
+  `complete.jsonl` / `failed.jsonl` 行数),与 Dashboard 列同源。`total_tasks` 是启动前估算,
+  实际 complete+failed 可能超出它,「未完成数」钳到 0,成功率按 `成功 ÷ (成功+失败)` 计算。
+- **敏感值只在后端脱敏**:`mask_secret` 处理 API Key(长度 ≤ 8 一律整体打码,比前端
+  `maskKey` 更严格)。
+- 历史实例无 `create_params` → 关键项 Sheet 整行标「—」,不中断整包。
+- 计数按只读路径刷新(`_sync_instance_status(persist=False)`),**不写库**,避免
+  read 路径争用 SQLite 写锁。
+
 ---
 
 ## 五、配置项
@@ -383,17 +429,22 @@ MOCK_TASK_SECONDS=10
 | `api/routers/queues.py` | 队列 CRUD + 启动/停止/取消队列 |
 | `api/routers/instances.py` | 创建/启动/停止任务时的队列逻辑;`_prepare_and_launch`;`_refresh_running_once`;`_is_pid_running`;`background_cache_refresher` |
 | `api/models/instance.py` | `QueueInfo` / `QueueCreate` / `QueueTaskItem`;`InstanceCreate.queue_id` |
+| `api/routers/task_export.py` | 任务详情导出两个端点(`/api/export/instances.xlsx`、`/api/export/queues/{id}.xlsx`) |
+| `api/services/task_export.py` | 导出数据收集、敏感值脱敏、Excel 多 Sheet 组装 |
+| `api/services/create_params.py` | `build_create_params`:详情页与导出共用的创建参数组装 |
 | `api/core/database.py` | `task_queues` 建表 + 迁移(加列,含 `prepare_started_at`) |
 | `api/core/config.py` | `PREPARE_TIMEOUT_SECONDS` / `ORPHAN_PREPARING_GRACE_SECONDS` / `MOCK_TASK_RUN` / `MOCK_TASK_SECONDS` |
 | `main.py` | 注册 queues router;startup 调 `resume_all_queues()` |
 | `test/test_queue_scheduler.py` | 调度器自动化用例 |
+| `test/test_task_export.py` | 导出用例:脱敏、`build_create_params` 回填、Sheet 结构 |
 
 ### 前端
 
 | 文件 | 作用 |
 |------|------|
 | `frontend/src/components/QueuePicker.vue` | **加入队列窗口**:选择/新建队列、筛选、队列详情 |
-| `frontend/src/views/Queues.vue` | 队列管理页:列表、分页、筛选、启动/停止/删除队列 |
+| `frontend/src/views/Queues.vue` | 队列管理页:**队列列表**(列表/分页/筛选/启动/停止/删除)与**任务列表**(任务管理同源,用于筛选与导出)两个并列面板 + 导出操作区 |
+| `frontend/src/utils/download.js` | `downloadBlob`:带 Authorization 的二进制下载(覆盖 120s 超时) |
 | `frontend/src/views/Dashboard.vue` | 任务实例列表:队列筛选、队列列、**排队名次**列、排队中状态 |
 | `frontend/src/views/CreateInstance.vue` | 高级配置:任务队列选择 + 新建队列入口 |
 | `frontend/src/views/InstanceDetail.vue` | 队列信息 tab:所属队列、名次、前方等待数、预计开始时间 |

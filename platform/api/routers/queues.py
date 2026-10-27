@@ -33,6 +33,23 @@ def _clamp_tail_percent(value: int | None) -> int:
     return max(TAIL_SKIP_MIN_PERCENT, min(TAIL_SKIP_MAX_PERCENT, v))
 
 
+def _duration_seconds(started_at, stopped_at) -> float | None:
+    """运行时长（秒）。未开始或还没结束（运行中/排队中）返回 None。
+
+    DB 里的时间列是 ISO 字符串（有的历史行带空格分隔），统一按 fromisoformat 解析；
+    解析失败按「没有时长」处理，不抛——列表接口不该因为一行脏数据整体 500。
+    """
+    if not started_at or not stopped_at:
+        return None
+    try:
+        a = datetime.fromisoformat(str(started_at).replace(' ', 'T'))
+        b = datetime.fromisoformat(str(stopped_at).replace(' ', 'T'))
+    except (ValueError, TypeError):
+        return None
+    sec = (b - a).total_seconds()
+    return sec if sec >= 0 else None
+
+
 def _queue_info(queue: dict, counts: dict, totals: dict) -> QueueInfo:
     """把队列表行 + 计数聚合成 QueueInfo。"""
     c = counts.get(queue['id'], {})
@@ -281,6 +298,13 @@ async def list_queue_tasks(
             position_label=label,
             created_at=r['created_at'],
             estimated_start_at=est,
+            created_by=r['created_by'],
+            started_at=r['started_at'],
+            stopped_at=r['stopped_at'],
+            duration_seconds=_duration_seconds(r['started_at'], r['stopped_at']),
+            completed_tasks=r['completed_tasks'] or 0,
+            failed_tasks=r['failed_tasks'] or 0,
+            total_tasks=r['total_tasks'] or 0,
         ))
 
     return items
