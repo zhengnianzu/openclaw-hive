@@ -37,18 +37,18 @@
     },
     "jiuwenswarm-dev": {
         "id": "jiuwenswarm-dev",
-        "name": "JiuwenSwarm Dev",
+        "name": "JiuwenSwarm-dev",
         "hive_config": "config.yaml",
         "user_config": "user_proxy_model.json",
-        "agent_config": "jw_config.yaml",
+        "agent_config": "jw_dev_config.yaml",
         "ui_color": "#e91e63"
     },
     "jiuwenswarm-xiaoyi": {
         "id": "jiuwenswarm-xiaoyi",
-        "name": "JiuwenSwarm Xiaoyi",
+        "name": "JiuwenSwarm-xiaoyi",
         "hive_config": "config.yaml",
         "user_config": "user_proxy_model.json",
-        "agent_config": "jw_config.yaml",
+        "agent_config": "jw_xiaoyi_config.yaml",
         "ui_color": "#9c27b0"
     },
     "openjiuwen": {

@@ -133,7 +133,7 @@ _FRAMEWORK_LAYOUTS: dict = {
         "workspace_base": "/home/ma-user/.dsh/workspace",
         "skill_subdir": ".agents/skills",
     },
-    # 保留旧标识仅用于兼容历史 config；新任务应使用下面两个明确版本。
+    # 保留旧标识，仅用于兼容历史 config / 仍在用的旧实例；新任务用下面两个明确版本。
     "jiuwenswarm": {
         "harness_dir":            "/home/ma-user/.jiuwenswarm",
         "harness_local_config":   "uploads/jw_config.yaml",
@@ -146,20 +146,23 @@ _FRAMEWORK_LAYOUTS: dict = {
     },
     "jiuwenswarm-dev": {
         "harness_dir":            "/home/ma-user/.jiuwenswarm",
-        "harness_local_config":   "uploads/jw_config.yaml",
+        "harness_local_config":   "uploads/jw_dev_config.yaml",
         "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
         "upload_paths": [
-            "/home/ma-user/.jiuwenswarm",
+            "/home/ma-user/.jiuwenswarm/service_default/.logs",
+            "/home/ma-user/.jiuwenswarm/service_default/agent_default/agent"
         ],
         "workspace_base": "/home/ma-user/.jiuwenswarm/agent/jiuwenclaw_workspace",
         "skill_subdir": "skills",
     },
     "jiuwenswarm-xiaoyi": {
         "harness_dir":            "/home/ma-user/.jiuwenswarm",
-        "harness_local_config":   "uploads/jw_config.yaml",
+        "harness_local_config":   "uploads/jw_xiaoyi_config.yaml",
         "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
         "upload_paths": [
-            "/home/ma-user/.jiuwenswarm",
+            "/home/ma-user/.jiuwenswarm/logs",
+            "/home/ma-user/.jiuwenswarm/agent/.logs",
+            "/home/ma-user/.jiuwenswarm/agent/sessions",
         ],
         "workspace_base": "/home/ma-user/.jiuwenswarm/agent/workspace",
         "skill_subdir": "skills",

@@ -27,10 +27,9 @@ _CONFIG_PATH = os.path.join(settings.SETTINGS_DIR, "harness_config.json")
 
 # traj_prefix 代码派生: claude-code 用 cc_trajs, 其余 {id}_trajs
 _TRAJ_SPECIAL = {"claude-code": "cc_trajs"}
-_MD_TEMPLATE_ALIASES = {
-    "jiuwenswarm-dev": "jiuwenswarm",
-    "jiuwenswarm-xiaoyi": "jiuwenswarm",
-}
+# md 模板目录默认与 harness id 同名（settings/harness_mds/<id>/）。
+# 这里只登记「目录名 != id」的例外；旧 jiuwenswarm 标识复用 jiuwenswarm 目录。
+_MD_TEMPLATE_ALIASES: dict[str, str] = {}
 
 
 @lru_cache(maxsize=1)
