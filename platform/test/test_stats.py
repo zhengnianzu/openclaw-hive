@@ -106,6 +106,54 @@ class DistributionTest(unittest.TestCase):
         self.assertEqual(out["linux"]["cpu"], 0.0)
 
 
+class SpecDistributionTest(unittest.TestCase):
+    """按单沙箱规格（cpu_request × memory_request）聚合，按沙箱数加权。"""
+
+    def test_same_spec_merged(self):
+        rows = [
+            _inst(cpu_request=2, memory_request=6, concurrent_num=3),
+            _inst(cpu_request=2, memory_request=6, concurrent_num=4),
+        ]
+        out = stats.sandbox_spec_distribution(rows)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["count"], 2)
+        self.assertEqual(out[0]["pods"], 7)
+        self.assertEqual(out[0]["cpu"], 14.0)
+        self.assertEqual(out[0]["memory_gb"], 42.0)
+
+    def test_sorted_by_pods_desc(self):
+        rows = [
+            _inst(cpu_request=16, memory_request=16, concurrent_num=2),
+            _inst(cpu_request=1, memory_request=4, concurrent_num=9),
+        ]
+        out = stats.sandbox_spec_distribution(rows)
+        self.assertEqual([x["cpu_request"] for x in out], [1.0, 16.0])
+        self.assertEqual([x["pods"] for x in out], [9, 2])
+
+    def test_queued_excluded(self):
+        rows = [_inst(cpu_request=1, memory_request=4, status="queued", concurrent_num=5)]
+        self.assertEqual(stats.sandbox_spec_distribution(rows), [])
+
+    def test_label_formatting(self):
+        rows = [
+            _inst(cpu_request=2, memory_request=6),
+            _inst(cpu_request=1.5, memory_request=2.5),
+        ]
+        out = {x["cpu_request"]: x["label"] for x in stats.sandbox_spec_distribution(rows)}
+        self.assertEqual(out[2.0], "2 核 / 6 GiB")     # 整数不带小数尾
+        self.assertEqual(out[1.5], "1.5 核 / 2.5 GiB")
+
+    def test_tail_folding_matches_effective_pods(self):
+        """与 effective_pods 同口径：尾部只剩少许任务时沙箱数被折下来。"""
+        rows = [
+            _inst(cpu_request=2, memory_request=6, concurrent_num=8,
+                  total_tasks=10, completed_tasks=9),
+        ]
+        out = stats.sandbox_spec_distribution(rows)
+        self.assertEqual(out[0]["pods"], 1)
+        self.assertEqual(out[0]["cpu"], 2.0)
+
+
 class LeaderboardTest(unittest.TestCase):
     def test_sorted_by_cpu_and_unknown_user(self):
         rows = [

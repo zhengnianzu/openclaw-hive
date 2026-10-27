@@ -50,6 +50,17 @@ class SandboxTypeCount(BaseModel):
     inferred_count: int = 0
 
 
+class SandboxSpecCount(BaseModel):
+    """按单沙箱规格（cpu_request × memory_request）分的一组。"""
+    cpu_request: float = 0.0
+    memory_request: float = 0.0
+    label: str = ""          # "2 核 / 6 GiB"，后端拼好，前端直接用
+    count: int = 0
+    pods: int = 0
+    cpu: float = 0.0
+    memory_gb: float = 0.0
+
+
 class OsUsage(BaseModel):
     instances: int = 0
     pods: int = 0
@@ -132,6 +143,8 @@ class StatsResponse(BaseModel):
     status_distribution: list[StatusCount] = []
     harness_distribution: list[HarnessCount] = []
     sandbox_type_distribution: list[SandboxTypeCount] = []
+    # 按单沙箱规格（cpu_request × memory_request）的分布，按沙箱数降序
+    spec_distribution: list[SandboxSpecCount] = []
     os_resource_comparison: OsComparison = OsComparison()
     user_leaderboard: list[UserUsage] = []
     pool_usage: list[PoolUsageItem] = []

@@ -110,84 +110,7 @@
             </div>
           </el-col>
 
-          <!-- harness 比例 -->
-          <el-col :xs="24" :md="12" :lg="6">
-            <div class="glass-card panel">
-              <div class="panel-head">
-                <span class="panel-title">Harness 类型比例</span>
-                <span class="panel-hint">按沙箱数</span>
-              </div>
-              <el-empty v-if="!harnessDist.length" description="无数据" :image-size="70" />
-              <template v-else>
-                <EChart :option="harnessOption" height="300px" />
-                <div class="legend-list">
-                  <span v-for="h in harnessDist" :key="h.harness_type" class="legend-chip">
-                    <i class="dot" :style="{ background: harnessStore.color(h.harness_type) }"></i>
-                    {{ harnessStore.label(h.harness_type) }} · {{ h.pods }}
-                  </span>
-                </div>
-              </template>
-            </div>
-          </el-col>
-
-          <!-- 沙箱类型比例 -->
-          <el-col :xs="24" :md="12" :lg="6">
-            <div class="glass-card panel">
-              <div class="panel-head">
-                <span class="panel-title">沙箱类型比例</span>
-                <span class="panel-hint">按沙箱数</span>
-              </div>
-              <el-empty v-if="!sandboxDist.length" description="无数据" :image-size="70" />
-              <template v-else>
-                <EChart :option="sandboxOption" height="300px" />
-                <div class="legend-list">
-                  <span v-for="s in sandboxDist" :key="s.sandbox_type" class="legend-chip">
-                    <i class="dot" :style="{ background: sandboxColor[s.sandbox_type] || '#909399' }"></i>
-                    {{ sandboxLabel[s.sandbox_type] || s.sandbox_type }} · {{ s.pods }}
-                  </span>
-                </div>
-                <div v-if="inferredCount" class="panel-foot">
-                  {{ inferredCount }} 个实例的类型由配置推断得出
-                </div>
-              </template>
-            </div>
-          </el-col>
-
-          <!-- 状态分布 -->
-          <el-col :xs="24" :md="12" :lg="6">
-            <div class="glass-card panel">
-              <div class="panel-head">
-                <span class="panel-title">沙箱状态分布</span>
-                <span class="panel-hint">全部实例</span>
-              </div>
-              <el-empty v-if="!statusCount" description="暂无实例" :image-size="70" />
-              <template v-else>
-                <EChart :option="statusOption" height="300px" />
-                <div class="legend-list">
-                  <span v-for="s in statusWithData" :key="s.status" class="legend-chip">
-                    <i class="dot" :style="{ background: STATUS_COLOR[s.status] || '#c4c7cc' }"></i>
-                    {{ s.label }} · {{ s.count }}
-                  </span>
-                </div>
-              </template>
-              <div class="panel-foot">
-                「已结束」表示有任务失败；「准备中」已占用资源；「排队中」不占资源
-              </div>
-            </div>
-          </el-col>
-
-          <!-- Linux vs Windows -->
-          <el-col :xs="24" :md="12" :lg="6">
-            <div class="glass-card panel">
-              <div class="panel-head">
-                <span class="panel-title">Linux / Windows</span>
-                <span class="panel-hint">资源对比</span>
-              </div>
-              <EChart :option="osOption" height="300px" />
-            </div>
-          </el-col>
-
-          <!-- 资源池：状态 6 + OS 6 + 池 12 = 24，正好填满这一行 -->
+          <!-- 资源池：与排行并排，两张 12 填满第一行 -->
           <el-col :xs="24" :lg="12">
             <div class="glass-card panel">
               <div class="panel-head">
@@ -242,6 +165,106 @@
                   </span>
                 </div>
               </div>
+            </div>
+          </el-col>
+
+          <!-- harness 比例 -->
+          <el-col :xs="24" :md="12" :lg="6">
+            <div class="glass-card panel">
+              <div class="panel-head">
+                <span class="panel-title">Harness 类型比例</span>
+                <span class="panel-hint">按沙箱数</span>
+              </div>
+              <el-empty v-if="!harnessDist.length" description="无数据" :image-size="70" />
+              <template v-else>
+                <EChart :option="harnessOption" height="200px" />
+                <div class="legend-list">
+                  <span v-for="h in harnessDist" :key="h.harness_type" class="legend-chip">
+                    <i class="dot" :style="{ background: harnessStore.color(h.harness_type) }"></i>
+                    {{ harnessStore.label(h.harness_type) }} · {{ h.pods }}
+                  </span>
+                </div>
+              </template>
+            </div>
+          </el-col>
+
+          <!-- 沙箱类型比例 -->
+          <el-col :xs="24" :md="12" :lg="6">
+            <div class="glass-card panel">
+              <div class="panel-head">
+                <span class="panel-title">沙箱类型比例</span>
+                <span class="panel-hint">按沙箱数</span>
+              </div>
+              <el-empty v-if="!sandboxDist.length" description="无数据" :image-size="70" />
+              <template v-else>
+                <EChart :option="sandboxOption" height="200px" />
+                <div class="legend-list">
+                  <span v-for="s in sandboxDist" :key="s.sandbox_type" class="legend-chip">
+                    <i class="dot" :style="{ background: sandboxColor[s.sandbox_type] || '#909399' }"></i>
+                    {{ sandboxLabel[s.sandbox_type] || s.sandbox_type }} · {{ s.pods }}
+                  </span>
+                </div>
+                <div v-if="inferredCount" class="panel-foot">
+                  {{ inferredCount }} 个实例的类型由配置推断得出
+                </div>
+              </template>
+            </div>
+          </el-col>
+
+          <!-- 状态分布 -->
+          <el-col :xs="24" :md="12" :lg="6">
+            <div class="glass-card panel">
+              <div class="panel-head">
+                <span class="panel-title">沙箱状态分布</span>
+                <span class="panel-hint">全部实例</span>
+              </div>
+              <el-empty v-if="!statusCount" description="暂无实例" :image-size="70" />
+              <template v-else>
+                <EChart :option="statusOption" height="200px" />
+                <div class="legend-list">
+                  <span v-for="s in statusWithData" :key="s.status" class="legend-chip">
+                    <i class="dot" :style="{ background: STATUS_COLOR[s.status] || '#c4c7cc' }"></i>
+                    {{ s.label }} · {{ s.count }}
+                  </span>
+                </div>
+              </template>
+              <div class="panel-foot">
+                「已结束」表示有任务失败；「准备中」已占用资源；「排队中」不占资源
+              </div>
+            </div>
+          </el-col>
+
+          <!-- Linux vs Windows -->
+          <el-col :xs="24" :md="12" :lg="6">
+            <div class="glass-card panel">
+              <div class="panel-head">
+                <span class="panel-title">Linux / Windows</span>
+                <span class="panel-hint">资源对比</span>
+              </div>
+              <EChart :option="osOption" height="200px" />
+            </div>
+          </el-col>
+
+          <!-- 沙箱规格分布：按单沙箱 cpu_request × memory_request 归并，条形长度是沙箱数 -->
+          <el-col :span="24">
+            <div class="glass-card panel">
+              <div class="panel-head">
+                <span class="panel-title">沙箱规格分布</span>
+                <span class="panel-hint">按沙箱数 · request 口径</span>
+              </div>
+              <el-empty v-if="!specDist.length" description="无数据" :image-size="70" />
+              <template v-else>
+                <EChart :option="specOption" :height="specChartHeight" />
+                <div class="legend-list">
+                  <span v-for="s in specDist" :key="s.label" class="legend-chip">
+                    <i class="dot" :style="{ background: specColor(s.label) }"></i>
+                    {{ s.label }} · {{ s.pods }} 个沙箱 · {{ fmtNum(s.cpu) }} 核 / {{ fmtGi(s.memory_gb) }}
+                  </span>
+                </div>
+                <div class="panel-foot">
+                  规格取自沙箱配置的 cpu_request / memory_request，未配置时回退 2 核 / 6 GiB
+                </div>
+              </template>
             </div>
           </el-col>
 
@@ -359,6 +382,7 @@ const summary = ref({
 const statusDist = ref([])
 const harnessDist = ref([])
 const sandboxDist = ref([])
+const specDist = ref([])
 const osCompare = ref({ linux: {}, windows: {} })
 const leaderboard = ref([])
 const pools = ref([])
@@ -506,8 +530,9 @@ function pieOption(items, nameKey, valueKey, colorFn, labelFn) {
     // 不用 echarts 的分页箭头（窄卡片里会挤出「1/3 ◀ ▶」）
     series: [{
       type: 'pie',
-      radius: ['42%', '66%'],
-      center: ['50%', '48%'],
+      // 卡片只有 200px 高，圆环占比拉大，否则会在卡内留出大片空白
+      radius: ['52%', '82%'],
+      center: ['50%', '50%'],
       avoidLabelOverlap: true,
       itemStyle: { borderColor: '#fff', borderWidth: 2 },
       label: { show: false },
@@ -548,6 +573,60 @@ const sandboxOption = computed(() =>
 
 const statusWithData = computed(() => statusDist.value.filter(s => s.count > 0))
 const statusCount = computed(() => statusWithData.value.length)
+
+// 沙箱规格：组合数可能上双，饼图会挤成一团，改用横向条形图（与用户排行同一套写法）。
+// 颜色仍按 label 哈希取固定槽位——30s 轮询一次，随机色会让人以为数据变了。
+function specColor(label) {
+  return userColor(label)
+}
+
+// 条形图高度随条目数走：通常只有 2~3 类，固定 300px 会在卡里留一大片空白。
+// 每条 34px，上下各留 16px 边距，最少 120px 保证空态也不塌。
+const specChartHeight = computed(() =>
+  `${Math.max(120, specDist.value.length * 34 + 32)}px`)
+
+const specOption = computed(() => {
+  const rows = [...specDist.value].reverse()   // 横向柱状图自下而上，最大值排最上
+  const total = specDist.value.reduce((s, x) => s + (x.pods || 0), 0)
+  return {
+    grid: { left: 8, right: 64, top: 8, bottom: 8, containLabel: true },
+    tooltip: {
+      trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: (ps) => {
+        const p = ps[0]
+        const it = specDist.value.find(x => x.label === p.name)
+        if (!it) return p.name
+        const share = total ? ((it.pods / total) * 100).toFixed(0) : 0
+        return `${it.label}<br/><b>${it.pods}</b> 个沙箱（${share}%）<br/>` +
+          `${it.count} 个实例 · ${fmtNum(it.cpu)} 核 / ${fmtGi(it.memory_gb)}`
+      },
+    },
+    xAxis: {
+      type: 'value',
+      axisLabel: { color: AXIS_LABEL, fontSize: 11 },
+      splitLine: SPLIT_LINE,
+    },
+    yAxis: {
+      type: 'category',
+      data: rows.map(x => x.label),
+      axisLabel: { color: AXIS_LABEL, fontSize: 11 },
+      axisLine: { show: false },
+      axisTick: { show: false },
+    },
+    series: [{
+      type: 'bar',
+      barMaxWidth: 22,
+      data: rows.map(x => ({
+        value: x.pods,
+        itemStyle: { color: specColor(x.label), borderRadius: [0, 4, 4, 0] },
+      })),
+      label: {
+        show: true, position: 'right', color: AXIS_LABEL, fontSize: 11,
+        formatter: ({ value }) => fmtNum(value),
+      },
+    }],
+  }
+})
 
 const statusOption = computed(() => {
   const items = statusWithData.value
@@ -665,6 +744,7 @@ async function load({ silent = false } = {}) {
     statusDist.value = d.status_distribution || []
     harnessDist.value = d.harness_distribution || []
     sandboxDist.value = d.sandbox_type_distribution || []
+    specDist.value = d.spec_distribution || []
     osCompare.value = d.os_resource_comparison || { linux: {}, windows: {} }
     leaderboard.value = d.user_leaderboard || []
     pools.value = d.pool_usage || []

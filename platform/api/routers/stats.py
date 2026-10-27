@@ -19,6 +19,7 @@ from ..core.database import async_query
 from ..core.security import require_operator
 from ..models.stats import (
     StatsResponse, StatsSummary, StatusCount, HarnessCount, SandboxTypeCount,
+    SandboxSpecCount,
     OsComparison, UserUsage, PoolUsageItem, ProxyUsageItem, Trend, TrendPoint,
 )
 from ..services import stats as stats_service
@@ -113,6 +114,9 @@ async def get_stats(
         ],
         sandbox_type_distribution=[
             SandboxTypeCount(**x) for x in stats_service.sandbox_type_distribution(active)
+        ],
+        spec_distribution=[
+            SandboxSpecCount(**x) for x in stats_service.sandbox_spec_distribution(active)
         ],
         os_resource_comparison=OsComparison(
             **stats_service.os_resource_comparison(active)

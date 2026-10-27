@@ -165,6 +165,42 @@ def sandbox_type_distribution(rows: list) -> list:
     return sorted(out, key=lambda x: (-x["cpu"], x["sandbox_type"]))
 
 
+def sandbox_spec_distribution(rows: list) -> list:
+    """按单沙箱规格（cpu_request × memory_request）聚合，按沙箱数降序。
+
+    与 `_group()` 同口径：只统计 running/preparing，`pods` 用 effective_pods（尾部折算），
+    cpu / memory_gb 用 instance_cpu / instance_mem。`queued` 不占资源，不计入。
+
+    规格组合数远多于 sandbox_type（2 种），所以是复合键而不是 `_group` 的单字段键；
+    `label` 在后端拼好（"2 核 / 6 GiB"），前端直接用，避免两边各写一套格式化。
+    """
+    g = {}
+    for r in rows:
+        if r.get("status") not in OCCUPYING:
+            continue
+        cpu = round(_num(r.get("cpu_request")), 2)
+        mem = round(_num(r.get("memory_request")), 2)
+        item = g.setdefault((cpu, mem), {"count": 0, "cpu": 0.0,
+                                         "memory_gb": 0.0, "pods": 0})
+        item["count"] += 1
+        item["cpu"] += instance_cpu(r)
+        item["memory_gb"] += instance_mem(r)
+        item["pods"] += int(effective_pods(r))
+    out = [
+        {"cpu_request": cpu, "memory_request": mem,
+         "label": f"{_fmt_num(cpu)} 核 / {_fmt_num(mem)} GiB",
+         "count": v["count"], "pods": v["pods"],
+         "cpu": round(v["cpu"], 2), "memory_gb": round(v["memory_gb"], 2)}
+        for (cpu, mem), v in g.items()
+    ]
+    return sorted(out, key=lambda x: (-x["pods"], -x["cpu"], -x["memory_request"]))
+
+
+def _fmt_num(v: float) -> str:
+    """2.0 → "2"，1.5 → "1.5"：整数不带小数尾。"""
+    return str(int(v)) if float(v).is_integer() else str(round(v, 2))
+
+
 def os_resource_comparison(rows: list) -> dict:
     """Linux / Windows 资源消耗对比（固定返回两键，缺的一侧补 0）。"""
     g = _group(rows, "sandbox_type")
