@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
 from ..core.config import settings, ARTIFACT_PRIORITY_USER
@@ -260,6 +260,7 @@ async def inline_artifact(
 
 @router.get("/{instance_id}/pdf")
 async def artifact_pdf(
+    request: Request,
     instance_id: str,
     task: str = Query(...),
     key: str = Query(...),
@@ -268,6 +269,8 @@ async def artifact_pdf(
     """office 文件转 PDF 预览。未安装 LibreOffice 时 503。
 
     转换是 CPU/进程密集（soffice 单实例），放到线程池里跑，不阻塞事件循环。
+    命中缓存时整条路径只是几次 stat + 读文件，所以做了 ETag：前端切回同一文件
+    时可以直接 304，省掉几十 MB 的 PDF 传输。
     """
     inst, obs_base, task_dir = await _resolve(instance_id, task)
     if not store.soffice_available():
@@ -284,14 +287,20 @@ async def artifact_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"转换失败: {str(e)[:300]}")
 
-    if os.path.getsize(pdf) > INLINE_MAX_BYTES:
+    st = os.stat(pdf)
+    if st.st_size > INLINE_MAX_BYTES:
         raise HTTPException(
             status_code=413,
             detail="转换后的 PDF 过大，不支持在线预览，请下载原始文件查看")
+    etag = f'"{int(st.st_mtime)}-{st.st_size}"'
+    headers = {"Content-Security-Policy": _PDF_CSP,
+               "X-Content-Type-Options": "nosniff",
+               "ETag": etag,
+               "Cache-Control": "private, max-age=0, must-revalidate"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
     body = await async_execute(_read_bytes, pdf)
-    return Response(content=body, media_type="application/pdf",
-                    headers={"Content-Security-Policy": _PDF_CSP,
-                             "X-Content-Type-Options": "nosniff"})
+    return Response(content=body, media_type="application/pdf", headers=headers)
 
 
 # ============ 按需下载 ============

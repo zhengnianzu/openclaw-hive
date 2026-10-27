@@ -15,11 +15,6 @@
       </div>
     </div>
 
-    <div v-if="inst.status === 'running'" class="glass-card" style="padding:16px 20px;margin-bottom:16px">
-      <el-progress :percentage="progressPct" :stroke-width="16" :status="progressStatus"
-        :color="[{color:'#6366f1',percentage:50},{color:'#8b5cf6',percentage:80},{color:'#10b981',percentage:100}]" />
-    </div>
-
     <div v-if="inst.status === 'preparing'" class="glass-card" style="padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:10px">
       <el-icon class="is-loading" :size="18" style="color:#e6a23c"><Loading /></el-icon>
       <span style="color:#e6a23c">准备中：正在下载配置</span>
@@ -38,16 +33,6 @@
           <div class="stat-card"><span class="stat-num" style="color:#6366f1">{{ overview.success_rate }}%</span><span class="stat-label">成功率</span></div>
         </div>
 
-        <div class="time-info glass-card" style="padding:12px 20px;margin-bottom:20px"
-          v-if="overview.elapsed_seconds != null || overview.avg_task_seconds || overview.estimated_remaining_seconds != null">
-          <span v-if="overview.elapsed_seconds != null">已用时间: <strong>{{ formatDuration(overview.elapsed_seconds) }}</strong></span>
-          <span v-if="overview.avg_task_seconds">平均耗时: <strong>{{ formatDuration(overview.avg_task_seconds) }}</strong></span>
-          <span v-if="overview.estimated_remaining_seconds != null && inst.status === 'running'">预计剩余: <strong>{{ formatDuration(overview.estimated_remaining_seconds) }}</strong></span>
-          <span v-if="overview.estimated_finish_time && inst.status === 'running'" style="color:var(--text-muted)">
-            (预计完成: {{ overview.estimated_finish_time?.replace('T', ' ') }})
-          </span>
-        </div>
-
         <el-row :gutter="20">
           <el-col :span="12">
             <el-card header="实例信息">
@@ -62,6 +47,20 @@
                 <el-descriptions-item label="并发数">{{ inst.concurrent_num }}</el-descriptions-item>
                 <el-descriptions-item label="创建时间">{{ inst.created_at }}</el-descriptions-item>
                 <el-descriptions-item label="启动时间">{{ inst.started_at || '-' }}</el-descriptions-item>
+                <!-- 耗时相关原先是一条横跨整页的浮动条，与「实例信息」同属实例自身属性，
+                     挪进来跟启动时间放一起才读得顺。 -->
+                <el-descriptions-item v-if="overview.elapsed_seconds != null" label="已用时间">
+                  {{ formatDuration(overview.elapsed_seconds) }}
+                </el-descriptions-item>
+                <el-descriptions-item v-if="overview.avg_task_seconds" label="平均耗时">
+                  {{ formatDuration(overview.avg_task_seconds) }}
+                </el-descriptions-item>
+                <el-descriptions-item v-if="overview.estimated_remaining_seconds != null && inst.status === 'running'" label="预计剩余">
+                  {{ formatDuration(overview.estimated_remaining_seconds) }}
+                </el-descriptions-item>
+                <el-descriptions-item v-if="overview.estimated_finish_time && inst.status === 'running'" label="预计完成">
+                  {{ overview.estimated_finish_time?.replace('T', ' ') }}
+                </el-descriptions-item>
                 <el-descriptions-item label="创建者">{{ inst.created_by }}</el-descriptions-item>
               </el-descriptions>
             </el-card>
@@ -69,11 +68,29 @@
           <el-col :span="12">
             <el-card header="任务执行情况">
               <div v-if="Object.keys(overview.error_breakdown || {}).length">
-                <!-- 顶层汇总：成功/失败/任务异常总数/未执行（不含 └ 前缀子行） -->
-                <div v-for="(count, category) in summaryBreakdown" :key="category" class="breakdown-row">
-                  <span>{{ category }}</span>
-                  <el-tag :type="taskTagType(category)" size="small">{{ count }}</el-tag>
+                <!-- 环形图：任务的最终归属（成功/失败/异常/未执行）。
+                     颜色是状态语义色，不随大小变；每段都带文字+数值图例，
+                     不靠色相单独承担含义。 -->
+                <div class="donut-wrap">
+                  <div class="donut-chart">
+                    <EChart :option="outcomeOption" height="240px" />
+                    <!-- 中心数字用 HTML 叠上去：echarts 的 center 标签是逐数据项渲染的，
+                         四段就会叠出四层同样的文字。 -->
+                    <div class="donut-center">
+                      <span class="donut-total">{{ outcomeTotal }}</span>
+                      <span class="donut-total-label">任务</span>
+                    </div>
+                  </div>
+                  <div class="donut-legend">
+                    <div v-for="o in outcomeItems" :key="o.key" class="donut-item">
+                      <i class="dot" :style="{ background: o.color }"></i>
+                      <span class="donut-name">{{ o.label }}</span>
+                      <span class="donut-count">{{ o.value }}</span>
+                      <span class="donut-pct">{{ o.pct }}%</span>
+                    </div>
+                  </div>
                 </div>
+
                 <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
                 <el-collapse v-if="overview.error_tree && overview.error_tree.length"
                   v-model="expandedErrorGroups" class="error-tree">
@@ -752,6 +769,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, Search, Folder, Document, Loading } from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
+import EChart from '../components/EChart.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 
@@ -795,23 +813,61 @@ const expandedPanels = ref([])
 const expandedErrorGroups = ref([])
 let timer = null
 
-// 顶层汇总：过滤掉后端返回的 └ 前缀子行（这些已移入折叠树展示）
-const summaryBreakdown = computed(() => {
-  const out = {}
-  for (const [k, v] of Object.entries(overview.value.error_breakdown || {})) {
-    if (!k.startsWith('└')) out[k] = v
-  }
-  return out
+// ── 任务执行情况环形图 ────────────────────────────────────────────────────
+// 四类最终归属：成功 / 失败 / 异常 / 未执行。颜色是状态语义色（good / critical /
+// warning / 中性灰），不随数据大小或排序变化，同一类永远是同一个色。
+// 「未执行」用中性灰：它不是一种结果，只是还没轮到。
+const OUTCOME_META = [
+  { key: '任务成功', label: '任务成功', color: '#0ca30c' },
+  { key: '任务失败', label: '任务失败', color: '#d03b3b' },
+  { key: '任务异常', label: '任务异常', color: '#c98500' },
+  { key: '未执行', label: '未执行', color: '#8a8a85' },
+]
+
+const outcomeItems = computed(() => {
+  // backend 的 error_breakdown 里带 └ 前缀的子行是异常分类明细，
+  // 已经由下面的折叠树承担，环形图只取四个顶层项。
+  const bd = overview.value.error_breakdown || {}
+  const total = OUTCOME_META.reduce((n, m) => n + (bd[m.key] || 0), 0)
+  return OUTCOME_META
+    .map(m => {
+      const value = bd[m.key] || 0
+      return { ...m, value, pct: total ? Math.round(value / total * 1000) / 10 : 0 }
+    })
+    .filter(o => o.value > 0)
 })
 
-const progressPct = computed(() => {
-  if (!overview.value.total) return 0
-  return Math.round(((overview.value.completed + overview.value.failed) / overview.value.total) * 100)
-})
-const progressStatus = computed(() => {
-  if (overview.value.failed > 0) return 'warning'
-  if (progressPct.value === 100) return 'success'
-  return ''
+const outcomeTotal = computed(() => outcomeItems.value.reduce((n, o) => n + o.value, 0))
+
+const outcomeOption = computed(() => {
+  const items = outcomeItems.value
+  return {
+    tooltip: {
+      trigger: 'item',
+      formatter: (p) => `${p.name}<br/><b>${p.value}</b> 个任务（${p.percent}%）`,
+    },
+    // 不在 echarts 里放 legend：四项固定在右侧自绘，数值和百分比能对齐成列，
+    // echarts 的 legend 只能排成一串。
+    series: [{
+      type: 'pie',
+      radius: ['58%', '82%'],
+      center: ['50%', '50%'],
+      avoidLabelOverlap: true,
+      // 2px 的表面色描边 = 段与段之间的留白，避免相邻色块直接贴边
+      itemStyle: { borderColor: '#fff', borderWidth: 2, borderRadius: 2 },
+      label: { show: false },
+      // 悬停不画 echarts 自己的标签：饼图的 emphasis label 默认落在扇区外侧，
+      // 小扇区上会直接压在圆环上（截图里「任务成功 3」就是这么糊上去的）。
+      // 中心总数由 HTML 叠加层渲染（见 .donut-center），悬停信息走 tooltip。
+      emphasis: { scale: false, label: { show: false } },
+      labelLine: { show: false },
+      data: items.map(o => ({
+        name: o.label,
+        value: o.value,
+        itemStyle: { color: o.color },
+      })),
+    }],
+  }
 })
 
 function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger', created: '' }[s] || '' }
@@ -861,19 +917,6 @@ async function loadQueueInfo() {
 }
 function harnessColor(t) { return harnessStore.color(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
-function taskTagType(category) {
-  const map = {
-    '任务成功': 'success',
-    '任务失败': 'danger',
-    '任务异常': 'warning',
-    '└ C 客户端': 'warning',
-    '└ S 服务端': 'warning',
-    '└ T 任务侧': 'warning',
-    '└ X 未分类': 'warning',
-    '未执行': 'info',
-  }
-  return map[category] || ''
-}
 function formatDuration(seconds) {
   if (seconds == null) return ''
   const s = Math.round(seconds)
@@ -1703,6 +1746,10 @@ onUnmounted(() => {
 
 /* ---- 配置信息 tab ---- */
 .stat-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 20px; }
+.progress-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 13px; color: var(--text-muted); margin-bottom: 10px;
+}
 .stat-card {
   background: #fff; border: 1px solid var(--border-color); border-radius: var(--radius-md);
   padding: 16px 20px; display: flex; flex-direction: column; align-items: center;
@@ -1710,10 +1757,27 @@ onUnmounted(() => {
 }
 .stat-num { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
 .stat-label { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
-.time-info { display: flex; gap: 24px; font-size: 13px; color: var(--text-secondary); flex-wrap: wrap; }
-.time-info strong { color: var(--text-primary); }
 .breakdown-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); }
 .breakdown-row:last-child { border-bottom: none; }
+/* 任务执行情况：左环形图 + 右图例。图例带文字和数值，色块只是辅助识别，
+   所以不依赖色相单独传达含义。 */
+.donut-wrap { display: flex; align-items: center; gap: 12px; }
+.donut-chart { position: relative; flex: 1 1 auto; min-width: 0; }
+.donut-center {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; pointer-events: none;
+}
+.donut-total { font-size: 22px; font-weight: 700; color: var(--text-primary); line-height: 1.1; font-variant-numeric: tabular-nums; }
+.donut-total-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.donut-legend { flex: 0 0 152px; display: flex; flex-direction: column; gap: 10px; }
+.donut-item {
+  display: grid; grid-template-columns: 10px 1fr auto auto; align-items: center;
+  gap: 6px; font-size: 13px; color: var(--text-secondary);
+}
+.donut-item .dot { width: 8px; height: 8px; border-radius: 50%; }
+.donut-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.donut-count { font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.donut-pct { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
 .breakdown-sub {
   padding: 4px 0 4px 16px;
   border-bottom: none;

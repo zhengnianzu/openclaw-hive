@@ -178,6 +178,12 @@ class PdfCacheTest(unittest.TestCase):
         b = store.pdf_cache_path("/t", "a/b.pptx")
         self.assertEqual(a, b)
 
+    def test_flattening_does_not_collide(self):
+        """压平后的路径必须仍然一一对应，否则两个文件会共用一份 PDF。"""
+        a = store.pdf_cache_path("/t", "a b/x.pptx")
+        b = store.pdf_cache_path("/t", "a_b/x.pptx")
+        self.assertNotEqual(a, b)
+
 
 if __name__ == "__main__":
     unittest.main()

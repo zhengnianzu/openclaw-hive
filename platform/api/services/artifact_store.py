@@ -15,11 +15,14 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Optional
 
@@ -253,27 +256,84 @@ def soffice_available() -> bool:
 
 
 _PDF_NAME = re.compile(r"[^\w.\-]+")
+# 指纹只取首尾各 64KB：office 文件动辄几十 MB，整文件哈希会把 /pdf 的耗时
+# 从「毫秒」抬到「秒级」，而交付件是整体重写的，首尾都变才说明内容变了。
+_FP_CHUNK = 64 * 1024
 
 
 def pdf_cache_path(task_dir: str, rel: str) -> str:
-    """office 文件对应的 PDF 缓存路径（放在 task 目录下的 _pdf/ 子目录）。"""
-    flat = _PDF_NAME.sub("_", rel.replace("/", "__")) + ".pdf"
-    return os.path.join(task_dir, "_pdf", flat)
+    """office 文件对应的 PDF 缓存路径（放在 task 目录下的 _pdf/ 子目录）。
+
+    名字 = rel 的 sha1 前 16 位 + 净化后的 basename。只用压平后的路径做键会撞车
+    （`a b/x.pptx` 与 `a_b/x.pptx` 压平后完全相同，会互相覆盖成别人的内容），
+    加哈希才能保证一文件一缓存。
+    """
+    base = rel.rsplit("/", 1)[-1]
+    digest = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(task_dir, "_pdf", f"{digest}_{_PDF_NAME.sub('_', base)}.pdf")
+
+
+def _fingerprint(path: str) -> dict:
+    """源文件的内容指纹：大小 + 首尾块 sha1。
+
+    用来判断缓存是否还有效。**不能用 mtime**：worker 的 `obsutil cp -r -f`
+    重新下载会重写源文件（内容一字未变、mtime 变成最新），只看 mtime 的话
+    每次重下都会把整库 PDF 缓存作废、逐页重跑 soffice。
+    """
+    size = os.path.getsize(path)
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        head = f.read(_FP_CHUNK)
+        h.update(head)
+        if size > _FP_CHUNK:
+            f.seek(max(size - _FP_CHUNK, _FP_CHUNK))
+            h.update(f.read(_FP_CHUNK))
+    return {"size": size, "sha1": h.hexdigest()}
+
+
+def _meta_path(pdf: str) -> str:
+    return pdf + ".meta.json"
 
 
 def _pdf_is_fresh(pdf: str, src: str) -> bool:
-    """PDF 比源文件新、且非空即视为有效。
+    """PDF 非空、且 sidecar 记录的源文件指纹与当前源文件一致，才算有效缓存。
 
     校验大小是必须的：NFSv3 上不能 rename，缓存只能原地覆盖写，
-    覆盖过程中崩溃会留下一个 mtime 很新的**半截文件**，只看 mtime 会把它
-    当成有效缓存一直返回。
+    覆盖过程中崩溃会留下一个**半截文件**，光看 sidecar 会把它当成有效缓存
+    一直返回。sidecar 缺失（老缓存 / 手删）一律视为不新鲜，重转一次即可。
     """
     try:
         if os.path.getsize(pdf) < 1024:      # 正常 PDF 不会小于 1KB
             return False
-        return os.path.getmtime(pdf) >= os.path.getmtime(src)
-    except OSError:
+        with open(_meta_path(pdf), "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta.get("src") == _fingerprint(src)
+    except (OSError, ValueError):
         return False
+
+
+# 同文件并发的请求只转换一次。uvicorn 开了 4 个 worker，进程间的去重做不到
+# （NFSv3 上 flock 语义不可靠），但单进程内把重复的 soffice 挡掉已经能消掉
+# 绝大多数「用户狂点同一个文件」的场景。
+_PDF_LOCKS: dict[str, threading.Lock] = {}
+_PDF_LOCKS_MAX = 256
+
+
+def _lock_for(key: str) -> threading.Lock:
+    with _LOCKS_GUARD:
+        lock = _PDF_LOCKS.get(key)
+        if lock is None:
+            if len(_PDF_LOCKS) >= _PDF_LOCKS_MAX:
+                # 只在空闲锁里回收，避免把正在转换的那个锁丢掉
+                for k in [k for k, v in _PDF_LOCKS.items() if not v.locked()]:
+                    _PDF_LOCKS.pop(k, None)
+                    if len(_PDF_LOCKS) < _PDF_LOCKS_MAX:
+                        break
+            lock = _PDF_LOCKS.setdefault(key, threading.Lock())
+        return lock
+
+
+_LOCKS_GUARD = threading.Lock()
 
 
 def ensure_pdf(task_dir: str, rel: str) -> str:
@@ -295,6 +355,33 @@ def ensure_pdf(task_dir: str, rel: str) -> str:
         return pdf
 
     os.makedirs(os.path.dirname(pdf), exist_ok=True)
+    fingerprint = _fingerprint(src)
+    with _lock_for(pdf):
+        # 排队期间别人可能已经转完了，进锁后再查一次缓存
+        if os.path.isfile(pdf) and _pdf_is_fresh(pdf, src):
+            return pdf
+        _convert_pdf(src, pdf)
+        _write_meta(pdf, rel, fingerprint)
+    return pdf
+
+
+def _write_meta(pdf: str, rel: str, fingerprint: dict) -> None:
+    """写 sidecar（JSON）。同样不能用 rename：先写 .part 再 copyfile 覆盖。"""
+    meta = {"rel": rel, "src": fingerprint, "pdf_size": os.path.getsize(pdf),
+            "ts": time.time()}
+    data = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    tmp = _meta_path(pdf) + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    shutil.copyfile(tmp, _meta_path(pdf))
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+
+
+def _convert_pdf(src: str, pdf: str) -> None:
+    """跑一次 soffice 并把结果写到 pdf（不含缓存判定，调用方需持锁）。"""
     workdir = tempfile.mkdtemp(prefix="lo-")
     profile = tempfile.mkdtemp(prefix="loprof-")
     try:
@@ -326,7 +413,6 @@ def ensure_pdf(task_dir: str, rel: str) -> str:
             os.unlink(tmp)
         except OSError:
             pass
-        return pdf
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         shutil.rmtree(profile, ignore_errors=True)

@@ -143,9 +143,10 @@
           <el-tab-pane label="属性" name="info" />
         </el-tabs>
 
-        <div class="aw-body" :class="{ 'is-full': full }" v-loading="previewLoading">
+        <div class="aw-body" :class="{ 'is-full': full, 'is-frame': isFrameBody }" v-loading="previewLoading">
           <template v-if="tab === 'preview'">
-            <div v-if="previewError" class="aw-notice">
+            <!-- office 的失败态由下面的分支单独渲染（要带「重试」），不能在这里先吃掉 -->
+            <div v-if="previewError && kind !== 'office'" class="aw-notice">
               <p>{{ previewError }}</p>
               <el-button size="small" @click="download">下载文件</el-button>
             </div>
@@ -167,11 +168,13 @@
               </div>
               <div v-else-if="pdfState === 'error'" class="aw-notice">
                 <p>{{ previewError }}</p>
+                <el-button size="small" type="primary" @click="loadOffice">重试</el-button>
                 <el-button size="small" @click="download">下载文件</el-button>
               </div>
-              <el-button v-else size="small" type="primary" :loading="pdfLoading" @click="loadOffice">
-                转换并预览
-              </el-button>
+              <!-- 点开文件即自动转换，这里只是转换中的占位说明 -->
+              <div v-else class="aw-notice">
+                <p>正在转换预览（首次转换通常需要 10–30 秒，之后会直接复用）。</p>
+              </div>
             </div>
 
             <div v-else-if="(kind === 'text' || kind === 'markdown') && isEmptyText" class="aw-notice">
@@ -246,7 +249,22 @@
             </div>
           </template>
 
-          <pre v-else-if="tab === 'source'" class="aw-text">{{ source }}</pre>
+          <template v-else-if="tab === 'source'">
+            <!-- 二进制文件（office / 图片 / PDF）没有文本原样可看，直接给一块空的
+                 深色代码框会让人以为是渲染坏了，这里说清楚并给下载入口。 -->
+            <div v-if="!sourceable" class="aw-notice">
+              <p>这是二进制文件（{{ kind === 'office' ? 'Office 文档' : kind === 'image' ? '图片' : 'PDF' }}），
+                没有可显示的文本内容。</p>
+              <el-button size="small" @click="download">下载文件</el-button>
+            </div>
+            <div v-else-if="!source && selected.size === 0" class="aw-notice">
+              <p>该文件是空的（0 字节）。</p>
+            </div>
+            <pre v-else-if="source" class="aw-text">{{ source }}</pre>
+            <div v-else class="aw-notice">
+              <p>{{ previewError || '原始内容尚未加载完成。' }}</p>
+            </div>
+          </template>
 
           <div v-else class="aw-props">
             <div class="aw-prop"><span>文件名</span><span>{{ selected.name }}</span></div>
@@ -324,7 +342,26 @@ const pdfLoading = ref(false)
 
 let assetBlobUrls = []
 
+// office → PDF 的会话内缓存。转换一次要十几秒到几十秒，用户在同一 tab 里来回
+// 点几个文件是常态，没有这份缓存的话每次点击都要重新走一遍 /pdf。
+// key = `${task}::${rel}`，value = { url }（已就绪）或 { promise }（转换中）。
+// 这里持有的 blob URL 生命周期归本 Map 所有：切文件时不 revoke，只切 task / 卸载时清空。
+const pdfCache = new Map()
+
 const kind = computed(() => (selected.value ? previewKindOf(selected.value.name) : ''))
+
+// 「原始内容」tab 只对文本类文件有意义：office/图片/PDF 是二进制，
+// loadPreview 里根本不会去取文本，硬渲染只会得到一块空的深色框。
+const sourceable = computed(() =>
+  ['text', 'table', 'markdown', 'json', 'jsonl', 'html'].includes(kind.value))
+
+// iframe 型预览（html / pdf / 已转换的 office）要撑满整个面板：外层不能再滚，
+// 否则 iframe 自己的滚动条和外层滚动条会打架。
+const isFrameBody = computed(() =>
+  (tab.value === 'preview' && !previewError)
+  && (kind.value === 'html'
+      || kind.value === 'pdf'
+      || (kind.value === 'office' && pdfState.value === 'ready')))
 const isEmptyText = computed(() =>
   ['text', 'table', 'markdown', 'json', 'jsonl'].includes(kind.value)
   && !text.value && selected.value?.size === 0)
@@ -476,6 +513,7 @@ function selectTask(name, force = false) {
   task.value = name
   selected.value = null
   revokeBlob()
+  clearPdfCache()
   resetPreview()
   loadTree()
 }
@@ -682,7 +720,33 @@ function iconOf(name) {
 function revokeBlob() {
   for (const u of assetBlobUrls) URL.revokeObjectURL(u)
   assetBlobUrls = []
-  if (blobUrl.value) { URL.revokeObjectURL(blobUrl.value); blobUrl.value = '' }
+  // blobUrl 在 office 预览时指向的是 pdfCache 里那个 URL（所有权在缓存手上）。
+  // 这里只负责「本函数自己创建、且没进缓存」的 URL；缓存里的留给切回来复用，
+  // 否则切走时把对象销毁了，切回来 iframe 拿到的是死链接，
+  // 浏览器会报「该文件可能已被移至别处、修改或删除」。
+  if (blobUrl.value && !isCachedBlob(blobUrl.value)) {
+    URL.revokeObjectURL(blobUrl.value)
+  }
+  blobUrl.value = ''
+}
+
+function isCachedBlob(url) {
+  for (const item of pdfCache.values()) if (item.url === url) return true
+  return false
+}
+
+// pdfCache 里的 blob URL 不能跟着「切换文件」一起 revoke —— 它们要留给用户
+// 切回来时秒开。只有换 task（缓存键已失效）和组件卸载时才真正释放。
+function clearPdfCache() {
+  for (const item of pdfCache.values()) {
+    if (item.url) URL.revokeObjectURL(item.url)
+  }
+  pdfCache.clear()
+}
+
+function pdfCacheKey() {
+  // 带上 task：同一个 rel 在不同 task 下是不同文件。rel 里本身不会出现 "::"。
+  return `${task.value}::${selected.value?.rel || ''}`
 }
 
 function resetPreview() {
@@ -691,6 +755,7 @@ function resetPreview() {
   source.value = ''
   htmlSrcdoc.value = ''
   pdfState.value = 'idle'
+  pdfLoading.value = false
 }
 
 async function onNodeClick(data) {
@@ -730,6 +795,11 @@ async function loadPreview() {
         params: { task: task.value, key: rel }, responseType: 'blob', silent: true,
       })
       blobUrl.value = URL.createObjectURL(blob)
+    } else if (kind.value === 'office') {
+      // 点开就转：office 文件没有「先点按钮」这一层了。转过的走 pdfCache 秒开。
+      previewLoading.value = false          // loadOffice 自己管遮罩
+      await loadOffice()
+      return
     }
   } catch (e) {
     previewError.value = e?.response?.data?.detail || '预览加载失败'
@@ -768,20 +838,44 @@ async function rewriteSiblingAssets(html, rel) {
 
 async function loadOffice() {
   if (!selected.value) return
+  const key = pdfCacheKey()
+  const hit = pdfCache.get(key)
+  // 已转换过：直接复用 blob，不再打接口
+  if (hit?.url) {
+    blobUrl.value = hit.url
+    pdfState.value = 'ready'
+    return
+  }
   pdfLoading.value = true
   pdfState.value = 'loading'
-  try {
+  previewLoading.value = true
+  // 同一文件被并发点开时复用同一次请求，别起两个 soffice
+  const promise = hit?.promise || (async () => {
     const blob = await api.get(`/artifacts/${props.instanceId}/pdf`, {
       params: { task: task.value, key: selected.value.rel },
       responseType: 'blob', silent: true,
     })
-    blobUrl.value = URL.createObjectURL(blob)
-    pdfState.value = 'ready'
+    return URL.createObjectURL(blob)
+  })()
+  pdfCache.set(key, { promise })
+  try {
+    const url = await promise
+    pdfCache.set(key, { url })
+    // 等待期间用户可能已经点了别的文件或换了 task，别把旧内容盖上去
+    if (pdfCacheKey() === key) {
+      blobUrl.value = url
+      pdfState.value = 'ready'
+    }
   } catch (e) {
+    pdfCache.delete(key)
+    if (pdfCacheKey() !== key) return
     previewError.value = e?.response?.data?.detail || '转换失败'
     pdfState.value = e?.response?.status === 503 ? 'unsupported' : 'error'
   } finally {
-    pdfLoading.value = false
+    if (pdfCacheKey() === key) {
+      pdfLoading.value = false
+      previewLoading.value = false
+    }
   }
 }
 
@@ -825,12 +919,12 @@ watch(() => props.initialTask, (name) => {
 
 onMounted(loadTasks)
 // 离开页面必须清掉轮询，否则组件销毁后定时器仍在打接口
-onBeforeUnmount(() => { stopPoll(); revokeBlob() })
+onBeforeUnmount(() => { stopPoll(); revokeBlob(); clearPdfCache() })
 </script>
 
 <style scoped>
 .artifact-workspace {
-  display: flex; height: calc(100vh - 260px); min-height: 540px;
+  display: flex; height: calc(100vh - 260px); min-height: 420px;
   border: 1px solid var(--el-border-color-lighter, #ebeef5);
   border-radius: 8px; background: #fff; overflow: hidden;
 }
@@ -838,7 +932,7 @@ onBeforeUnmount(() => { stopPoll(); revokeBlob() })
 .aw-pane + .aw-pane { border-left: 1px solid var(--el-border-color-lighter, #ebeef5); }
 .aw-tasks { width: 258px; flex-shrink: 0; }
 .aw-files { width: 310px; flex-shrink: 0; }
-.aw-main { flex: 1; }
+.aw-main { flex: 1; min-height: 0; overflow: hidden; }
 
 .aw-pane-head {
   padding: 12px 12px 10px; border-bottom: 1px solid var(--el-border-color-lighter, #ebeef5);
@@ -937,9 +1031,18 @@ onBeforeUnmount(() => { stopPoll(); revokeBlob() })
 }
 .aw-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .aw-tabs { padding: 0 14px; }
-.aw-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; }
+/* 高度必须给死：`.aw-body` 只写 flex:1 + min-height:0 时这个盒子的高度是
+   「不定」的，里面 height:100% 的 iframe 会退回到 min-height，于是 PPT 被挤在一个
+   四百像素高的窄条里。height:0 + flex-grow 是让 flex 子项「按剩余空间撑满且有确定
+   高度」的标准写法，iframe 的 100% 才有参照。 */
+.aw-body { flex: 1 1 auto; height: 0; min-height: 0; overflow: auto; padding: 12px 14px; }
+.aw-body.is-frame { overflow: hidden; padding: 0; }
 .aw-body.is-full { position: fixed; inset: 0; z-index: 2000; background: #fff; padding: 12px; }
-.aw-frame { width: 100%; height: 100%; min-height: 420px; border: 1px solid #eee; border-radius: 6px; background: #fff; }
+.aw-body.is-full.is-frame { padding: 0; }
+/* office 预览多包了一层 div：不给它高度的话，里面 iframe 的 height:100% 无处可依，
+   会退回到浏览器默认的 150px —— 表现就是幻灯片只在顶上露出一条。 */
+.aw-office { height: 100%; }
+.aw-frame { width: 100%; height: 100%; min-height: 0; border: 0; border-radius: 6px; background: #fff; }
 .aw-image-wrap { text-align: center; }
 .aw-image { max-width: 100%; max-height: 100%; }
 .aw-table-wrap { min-height: 200px; }
