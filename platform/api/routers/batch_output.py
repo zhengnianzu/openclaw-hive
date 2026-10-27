@@ -21,7 +21,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
-from ..core.config import settings
+from ..core.config import settings, ARTIFACT_PRIORITY_USER
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..services import proxy as proxy_service
@@ -307,179 +307,77 @@ async def shallow_tasks(
     return {"total": total, "page": page, "page_size": page_size, "tasks": tasks}
 
 
-# ============ 深层 ============
+# ============ 深层（会话详情） ============
+# 说明：原「深层轨迹/日志按需下载」已取消。产物下载（沙箱交付物）用
+# `obsutil cp -r` 把整个 task 前缀下到 **同一个** output_cache/<batch>/<leaf>/，
+# 是深层所需文件（主日志、gateway、eval log、轨迹、tsr）的严格超集。
+# 所以这里的接口只做两件事：读本地目录、把「想下载」转发到产物队列。
 
-# 漏斗等级（批量入队的合法 traj_level）
-_ENQUEUE_LEVELS = _TRAJ_LEVELS
-# 深层入队额外放行 'failed'：这一类是"有日志无轨迹"的任务（工具全失败/无助手回复/
-# 任务未跑完），轨迹列恒 NULL；旧逻辑把它们排除，导致批量下载永远拉不到、详情页
-# 只能靠单点触发。其下载量极小（主 log + 可选 gateway/eval + tsr，无轨迹文件），
-# 放行后批量按钮即可让这类任务的日志一并可见。level IS NULL（浅层未分级）仍排除——
-# 那批可能还没有 OBS 目录，量也可能极大，交给单点触发。
-_ENQUEUE_LEVELS_DEEP = _TRAJ_LEVELS + ["failed"]
-
-# ⚠ 静态批量端点（enqueue_all/queue）必须定义在参数路由 {traj_name} 之前，
-#   否则 FastAPI 按注册序匹配，POST /deep/enqueue_all 会被 trigger_deep 的
-#   {traj_name} 捕获（traj_name="enqueue_all"）→ 404。
-
-
-@router.post("/{instance_id}/deep/enqueue_all")
-async def deep_enqueue_all(instance_id: str, user: dict = Depends(require_operator)):
-    """把该实例所有已分级（L0-L3 + failed）且未下载的行批量置 pending 入队。
-
-    与单会话 trigger_deep 同款幂等保护：
-      - 已 downloading 的不打断（跳过）
-      - 已有任一深层路径列（此前下载成功过）的跳过，不重复拉 OBS
-      - level IS NULL（浅层未分级，可能还没有 OBS 目录）的行不参与
-      - 'failed' 行参与：这类是"有日志无轨迹"的任务，下载量极小（主 log + 可选
-        gateway/eval + tsr），放行后其日志也能在详情页直接看到。
-    返回 {queued, skipped_done, skipped_downloading, skipped_ungraded, total}。
-    """
-    inst = _get_instance(instance_id)
-    level_ph = ",".join("?" for _ in _ENQUEUE_LEVELS_DEEP)
-    # "已下载"判据 = 5 个路径列任一非空（worker 下载成功后回填）。不能只看
-    # assistant_traj_path：logs-only 任务（无轨迹）下载成功后该列仍为 NULL，
-    # 只看它会把这类行每轮重复入队、重复拉 OBS。
-    _any_path = ("(assistant_traj_path IS NOT NULL OR evaluator_traj_path IS NOT NULL "
-                 "OR task_log_path IS NOT NULL OR gateway_log_path IS NOT NULL "
-                 "OR eval_log_path IS NOT NULL)")
-    with get_connection() as conn:
-        # 已 done 且已下载过（有任一路径）——批量入队时跳过，不重复下载
-        skipped_done = conn.execute(
-            f"SELECT COUNT(*) FROM task_traj_records "
-            f"WHERE instance_id=? AND {_any_path} AND status='done'",
-            (instance_id,),
-        ).fetchone()[0]
-        # 正在下载的——不打断
-        skipped_downloading = conn.execute(
-            "SELECT COUNT(*) FROM task_traj_records "
-            "WHERE instance_id=? AND status='downloading'",
-            (instance_id,),
-        ).fetchone()[0]
-        # 入队：L0-L3 + failed 且未下载（无任一路径）且未 downloading 的行 → pending
-        cur = conn.execute(
-            f"UPDATE task_traj_records SET status='pending', updated_at=CURRENT_TIMESTAMP "
-            f"WHERE instance_id=? AND level IN ({level_ph}) "
-            f"AND NOT {_any_path} AND status NOT IN ('downloading')",
-            (instance_id, *_ENQUEUE_LEVELS_DEEP),
-        )
-        conn.commit()
-    queued = cur.rowcount or 0
-    with get_connection() as conn:
-        skipped_ungraded = conn.execute(
-            f"SELECT COUNT(*) FROM task_traj_records "
-            f"WHERE instance_id=? AND level IS NULL AND NOT {_any_path}",
-            (instance_id,),
-        ).fetchone()[0]
-    return {
-        "instance_id": instance_id,
-        "queued": queued,
-        "skipped_done": skipped_done,
-        "skipped_downloading": skipped_downloading,
-        "skipped_ungraded": skipped_ungraded,
-        "total": queued + skipped_done + skipped_downloading + skipped_ungraded,
-        "status": "queued" if queued else "noop",
-        "hint": "worker 常驻消费 pending 行，GET /deep/{traj}/status 或 /deep/queue 观察进度",
-    }
-
-
-@router.get("/{instance_id}/deep/queue")
-async def deep_queue(instance_id: str, page: int = 1, page_size: int = 50,
-                     user: dict = Depends(get_current_user)):
-    """该实例深层下载队列状态（前端轮询）。
-
-    返回 {summary, rows, total}：
-      summary = {pending, downloading, done, failed, total}（该实例 task_traj_records 计数）
-      rows    = 按「进行中优先」排序的分页行（pending/downloading 在前，再 failed/done），
-                每行含 traj_name/level/status/updated_at/error/assistant_traj_path。
-      total   = 满足排序的全部行数（用于前端分页 total）。
-    """
-    inst = _get_instance(instance_id)
-    page = max(1, page)
-    page_size = min(max(1, page_size), 200)
-    off = (page - 1) * page_size
-    with get_connection() as conn:
-        # summary 独立 COUNT，避免为拿计数而返回全量行（大实例全量行很重）
-        counted = conn.execute(
-            "SELECT status, COUNT(*) AS n FROM task_traj_records "
-            "WHERE instance_id=? GROUP BY status", (instance_id,),
-        ).fetchall()
-        total = 0
-        summary = {"pending": 0, "downloading": 0, "done": 0, "failed": 0}
-        for c in counted:
-            n = c["n"]
-            total += n
-            if c["status"] in summary:
-                summary[c["status"]] = n
-        summary["total"] = total
-
-        rows = conn.execute(
-            "SELECT traj_name, level, status, error, assistant_traj_path, updated_at "
-            "FROM task_traj_records WHERE instance_id=? "
-            "ORDER BY CASE status "
-            "           WHEN 'pending' THEN 0 WHEN 'downloading' THEN 1 "
-            "           WHEN 'failed' THEN 2 ELSE 3 END, updated_at DESC "
-            "LIMIT ? OFFSET ?",
-            (instance_id, page_size, off),
-        ).fetchall()
-        rows = [dict(r) for r in rows]
-
-    return {"instance_id": instance_id, "summary": summary, "rows": rows, "total": total}
+# ⚠ 静态端点必须定义在参数路由 {traj_name} 之前，否则 FastAPI 按注册序匹配，
+#   例如任意 /deep/<name> 会先撞上静态路径。目前静态端点已全部移除，仅留此注释备忘。
 
 
 @router.post("/{instance_id}/deep/{traj_name}")
 async def trigger_deep(instance_id: str, traj_name: str,
                        user: dict = Depends(require_operator)):
-    """请求深层加载：该 task 的 task_traj_records 行置 pending，worker 下载并回填路径列。"""
+    """请求下载某 task 的详情数据 —— 等价于把该行排进**产物下载队列**。
+
+    不再有独立的 deep 下载状态：下载由产物 worker 做，进度看 artifacts_status。
+    对 artifact_complete=0 的行（任务失败/未跑，complete.jsonl 里没有）也放行：
+    用户显式点开详情就是要看它的日志，把 artifact_complete 置 1 让它进队列。
+    """
     inst = _get_instance(instance_id)
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT id, status, assistant_traj_path, evaluator_traj_path, "
-            "task_log_path, gateway_log_path, eval_log_path "
+            "SELECT id, traj_name, artifacts_status, artifact_complete "
             "FROM task_traj_records WHERE instance_id=? AND traj_name=?",
             (instance_id, traj_name),
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404,
-                                detail=f"无轨迹记录: {traj_name}（浅层分级可能尚未完成）")
-        # 任一路径列已回填（此前下载成功过）→ 恢复 done，不重复下载。
-        # 判据取全部 5 列而非只 assistant_traj_path：logs-only 任务（无轨迹）下载成功后
-        # assistant_traj_path 仍为 NULL，只看它会把这类行反复重下。
-        if any(row[k] for k in ("assistant_traj_path", "evaluator_traj_path",
-                                "task_log_path", "gateway_log_path", "eval_log_path")):
-            conn.execute(
-                "UPDATE task_traj_records SET status='done', updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=?",
-                (row["id"],),
-            )
+                                detail=f"无轨迹记录: {traj_name}（worker 尚未扫过该实例）")
+        st = row["artifacts_status"] or "queued"
+        if st == "downloading":
             return {"instance_id": instance_id, "traj_name": traj_name,
-                    "status": "done"}
-        # 已在 downloading/进行中则幂等跳过（不打断正在下载的）
-        cur = conn.execute(
-            "UPDATE task_traj_records SET status='pending', updated_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND status NOT IN ('downloading')",
-            (row["id"],),
+                    "status": "downloading"}
+        if st == "done":
+            return {"instance_id": instance_id, "traj_name": traj_name, "status": "done"}
+        # 重试次数清零：这是用户显式重试，不该受此前自动重试上限（skipped）限制。
+        # artifact_priority=100 必须和 artifacts.py 的 POST /request 口径一致 ——
+        # 两条入口都自称「等价」，但这里原来不置优先级，于是从会话详情点
+        # 「下载交付物」实际排在数万条积压之后，而工作区里点同名按钮是即时的。
+        conn.execute(
+            "UPDATE task_traj_records SET artifacts_status='queued', "
+            "artifact_complete=1, artifact_attempts=0, artifact_priority=?, "
+            "error=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND artifacts_status<>'downloading'",
+            (ARTIFACT_PRIORITY_USER, row["id"]),
         )
-        already = cur.rowcount == 0
-    return {"instance_id": instance_id, "traj_name": traj_name,
-            "status": "queued" if not already else "in_progress"}
+        conn.commit()
+    return {"instance_id": instance_id, "traj_name": traj_name, "status": "queued"}
 
 
 @router.get("/{instance_id}/deep/{traj_name}/status")
 async def deep_status(instance_id: str, traj_name: str,
                       user: dict = Depends(get_current_user)):
-    """深层加载状态：前端 3s 轮询。done 时附带 5 个缓存路径。"""
+    """下载状态：读产物下载列（前端 3s 轮询）。
+
+    返回值保留 `status` 字段名（历史前端契约），取值已与产物状态机对齐：
+    queued / downloading / done / failed / skipped。
+    """
     inst = _get_instance(instance_id)
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT traj_name, status, error, assistant_traj_path, evaluator_traj_path, "
-            "task_log_path, gateway_log_path, eval_log_path "
+            "SELECT traj_name, artifacts_status, error, artifact_files, "
+            "artifact_bytes, artifact_downloaded_at, artifact_complete "
             "FROM task_traj_records WHERE instance_id=? AND traj_name=?",
             (instance_id, traj_name),
         ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail=f"无轨迹记录: {traj_name}")
-    return dict(row)
+    d = dict(row)
+    d["status"] = d.pop("artifacts_status") or "queued"
+    return d
 
 
 def _resolve_task_dir(inst: dict, tr: dict, cache_root: str) -> str | None:
@@ -527,10 +425,11 @@ def _resolve_task_dir(inst: dict, tr: dict, cache_root: str) -> str | None:
 @router.get("/{instance_id}/deep/{traj_name}/detail")
 async def deep_detail(instance_id: str, traj_name: str,
                       user: dict = Depends(get_current_user)):
-    """读取本地缓存的详情（assistant/evaluator 轨迹块 + 主 log/gateway/eval log 尾部）。
+    """读取本地产物目录里的详情（assistant/evaluator 轨迹块 + 主 log/gateway/eval log 尾部）。
 
-    需先 POST /deep/{traj_name} 触发下载、worker 状态 done 后调用；本地缓存无数据返回 409，
-    前端据 status 轮询后重试。只读 output_cache/<batch>/<traj_name>/，不触发 OBS 下载。
+    **只读本地**，不触发任何 OBS 调用。目录由产物下载（沙箱交付物）落地；
+    本地没有 → 409，前端提示「交付物未下载」并给一个入队按钮（POST /deep/{traj_name}
+    或 PA /artifacts/request 等价）。另：产物下载走 `cp -r`，目录里包含深层原来要的全部文件。
     """
     inst = _get_instance(instance_id)
     with get_connection() as conn:
@@ -546,8 +445,10 @@ async def deep_detail(instance_id: str, traj_name: str,
     from src import offline_analysis as oa
     task_dir = _resolve_task_dir(inst, tr, cache_root)
     if task_dir is None:
-        raise HTTPException(status_code=409,
-                            detail="本地缓存不存在，请先 POST /deep/{traj_name} 触发下载")
+        raise HTTPException(
+            status_code=409,
+            detail="该任务的交付物尚未下载到本地。点「下载交付物」入队，"
+                   "由产物 worker 全量下载（cp -r）后即可查看。")
 
     try:
         # harness 以实例为准（config_snapshot 的 run_config.harness_type）：task_traj_records.harness
@@ -562,30 +463,13 @@ async def deep_detail(instance_id: str, traj_name: str,
         detail = oa.load_task_detail(task_dir, traj_name,
                                      known_harness=inst_harness or tr.get("harness"))
         # 本地是否有真实 assistant 轨迹文件（多候选取最大者；任务确无回复时 OBS 无轨迹，为 None）
-        has_traj_file = bool(oa.find_primary_assistant_trajectory(task_dir))
-        if has_traj_file:
-            # 轨迹文件在但 stats 不可解析，且无 tsr 兜底 → 真异常
-            if not detail.get("assistant_stats") and not oa.read_tsr_stats(task_dir):
-                raise HTTPException(status_code=500,
-                                    detail=f"本地详情解析失败: 缓存目录 {task_dir} 无轨迹也无 stats")
-        else:
-            # 本地无轨迹文件。区分两种情形：
-            #   deep 已下载过（worker 会把可见产物回填到路径列；shallow 只拉 tsr 不碰主 log，
-            #   故仅浅层快照时五项路径列全 NULL 且本地无主 log）→ 任务确无 assistant 轨迹
-            #   （工具全失败/无助手回复）→ 不 409，tsr 兜底展示，前端渲染"无 assistant 轨迹"。
-            #   未触发 deep、无任何深层产物 → 本地仅 tsr 浅层快照 → 409 触发下载。
-            # 注：task_done 不作判据——它标"任务是否完成"，而 done 行里大量 task_done=0
-            #   的浅层产物同样无文件、轨迹仍在 OBS，仍需触发下载。
-            deep_ran = any(tr.get(k) for k in (
-                "assistant_traj_path", "evaluator_traj_path",
-                "task_log_path", "gateway_log_path", "eval_log_path"))
-            if deep_ran or oa.find_primary_log(task_dir, traj_name):
-                if not detail.get("assistant_stats") and not oa.read_tsr_stats(task_dir):
-                    raise HTTPException(status_code=500,
-                                        detail=f"本地详情解析失败: 缓存目录 {task_dir} 无轨迹也无 stats")
-            else:
-                raise HTTPException(status_code=409,
-                                    detail="本地轨迹未下载，请先加载详情触发下载")
+        if not detail.get("assistant_stats") and not oa.read_tsr_stats(task_dir) \
+                and not oa.find_primary_log(task_dir, traj_name):
+            # 目录在但既无轨迹也无 tsr 也无主日志 —— 只可能是产物没下完/下歪了。
+            # （任务本身无 assistant 回复时 OBS 里仍有 tsr 与日志，不会落到这里。）
+            raise HTTPException(
+                status_code=409,
+                detail=f"本地目录 {task_dir} 不完整（无轨迹/stats/主日志），可重新下载该任务")
     except HTTPException:
         raise
     except Exception as e:
@@ -599,17 +483,10 @@ async def deep_detail(instance_id: str, traj_name: str,
             elif t.get("role") == "evaluator" and not tr.get("evaluator_traj_path"):
                 tr["evaluator_traj_path"] = t["path"]
 
-    # 深层下载状态：以 DB 5 个路径列是否回填为准（worker 下载成功后落列）。
-    # 全 NULL = 深层从未成功回填（即便本地残留旧版缓存的轨迹文件），判 not_downloaded，
-    # 前端据 deep_status 触发重新下载补齐（网关/eval 日志随重构后的下载一并落盘并回填）。
-    # 例外：缓存目录是本次由实例 OBS 根派生定位到的（deep_paths 全 NULL 但本地确有主日志）——
-    # 说明深层其实跑过、只是路径列未回填（存量行），本地已有可展示内容，判 downloaded
-    # 避免前端无谓地再触发一次下载、也避免 409 轮询空转。
-    deep_paths = [tr.get(k) for k in (
-        "assistant_traj_path", "evaluator_traj_path",
-        "task_log_path", "gateway_log_path", "eval_log_path")]
-    local_log = oa.find_primary_log(task_dir, traj_name)
-    deep_status = ("downloaded" if any(deep_paths) or local_log else "not_downloaded")
+    # 能走到这里说明本地目录已有可读内容 → 一定算 downloaded。
+    # 不再看 5 个路径列：产物下载从不回填它们（那是旧 deep 下载路径的产物），
+    # 用路径列判断会让所有交付物已下好的行误报 not_downloaded。
+    deep_status = "downloaded"
 
     return {
         "traj_name": traj_name,
@@ -660,7 +537,7 @@ async def deep_extra_log(instance_id: str, traj_name: str,
     task_dir = _resolve_task_dir(inst, dict(tr), cache_root)
     if not task_dir:
         raise HTTPException(status_code=409,
-                            detail="本地缓存不存在，请先 POST /deep/{traj_name} 触发下载")
+                            detail="该任务的交付物尚未下载到本地")
 
     # 归一化后必须仍在 task_dir 内（realpath 比较，防 ../ 穿越与软链出逃）
     target = os.path.realpath(os.path.join(task_dir, path))

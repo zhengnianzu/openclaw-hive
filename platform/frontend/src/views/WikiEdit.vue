@@ -80,25 +80,15 @@
         </div>
 
         <el-form-item label="正文">
-          <el-tabs v-model="activeTab" style="width:100%">
-            <el-tab-pane label="编辑" name="edit">
-              <el-input
-                v-model="form.content_md"
-                type="textarea"
-                :rows="22"
-                placeholder="支持 Markdown：标题、列表、表格、代码块、外链图片"
-                class="md-input"
-              />
-              <div class="hint">
-                HTML 标签会被转义（不渲染）。图片请用 http/https 外链，暂不支持上传附件。
-              </div>
-            </el-tab-pane>
-            <el-tab-pane label="预览" name="preview">
-              <div class="preview-box">
-                <MarkdownView :content="form.content_md" />
-              </div>
-            </el-tab-pane>
-          </el-tabs>
+          <MarkdownEditor
+            v-model="form.content_md"
+            placeholder="开始写文档…支持标题、列表、表格、代码块；可拖拽或粘贴图片"
+            style="width:100%"
+          />
+          <div class="hint">
+            所见即所得编辑，底层仍是标准 Markdown。图片上传后自动压缩为 WebP，
+            存放在 wiki/assets/（不随 Git 同步）；拖拽图片右下角手柄可调整显示比例。
+          </div>
         </el-form-item>
 
         <el-form-item v-if="isEdit" label="发布">
@@ -151,7 +141,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
-import MarkdownView from '../components/MarkdownView.vue'
+import MarkdownEditor from '../components/MarkdownEditor.vue'
 import { useNotificationStore } from '../stores/notification'
 
 const route = useRoute()
@@ -161,7 +151,6 @@ const notificationStore = useNotificationStore()
 const isEdit = computed(() => !!route.params.slug)
 const loading = ref(false)
 const saving = ref(false)
-const activeTab = ref('edit')
 
 const ENTITY_LABELS = {
   image: '镜像',
@@ -254,6 +243,13 @@ async function loadDoc() {
     tagList.value = doc.tags ? doc.tags.split(',').map((s) => s.trim()).filter(Boolean) : []
     if (doc.linked_entity_type) await onEntityTypeChange(doc.linked_entity_type)
     form.value.linked_entity_key = doc.linked_entity_key
+  } catch (e) {
+    // 越权（改别人的文档）由保存时的 PUT 返回 403；这里先拦住的是「路由直接跳进来」的情况。
+    // 提示后退回列表，避免用户对着一个保存必失败的编辑页填半天。
+    if (e?.response?.status === 403 || e?.response?.status === 404) {
+      ElMessage.error('文档不存在，或你没有修改权限（只能编辑自己创建的文档）')
+      router.push('/wiki')
+    }
   } finally {
     loading.value = false
   }
@@ -334,7 +330,6 @@ function resetForm() {
   }
   tagList.value = []
   entityOptions.value = []
-  activeTab.value = 'edit'
 }
 </script>
 
@@ -353,20 +348,6 @@ function resetForm() {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
-}
-.md-input :deep(textarea) {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
-  line-height: 1.6;
-}
-.preview-box {
-  min-height: 460px;
-  max-height: 70vh;
-  overflow-y: auto;
-  padding: 16px 20px;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  background: var(--bg-secondary);
 }
 .hint {
   font-size: 12px;

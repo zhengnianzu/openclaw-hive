@@ -8,7 +8,7 @@ tags:
 - 入门
 summary: 如何创建配置方案、初始化文件、编辑保存、创建版本并发布，以及建任务时配置如何生效。
 is_pinned: false
-sort_order: 30
+sort_order: 60
 author: admin
 created_at: '2026-10-21T00:00:00'
 updated_at: '2026-10-21T00:00:00'

@@ -20,6 +20,9 @@ platform/instances/
 # obsutil 二进制（太大，各环境自行部署）
 platform/obsutil/
 
+# 离线分析缓存 + 沙箱产物缓存（「工作区」tab 的文件字节落在 output_cache/_artifacts/）
+platform/output_cache/
+
 # settings 实际配置文件（含密钥，不提交；.example 提交）
 platform/settings/config.yaml
 platform/settings/openclaw.json
@@ -57,3 +60,16 @@ worker.pid
 configs/hive_*.yaml
 
 
+
+# 文档中心：正文在 platform/wiki/md/*.md（提交）；
+# index.db 是纯派生索引（可由 sync_index() 从 md/ 完整重建），
+# 提交它会在多人编辑时产生无法合并的二进制冲突，故不跟踪。
+platform/wiki/index.db
+platform/wiki/index.db-wal
+platform/wiki/index.db-shm
+# 文档配图：体积大且非文本，单独备份，不进 Git
+platform/wiki/assets/
+
+# 其他运行时派生的空壳 / 缓存数据库
+platform/api/state.db
+platform/hive_platform.db

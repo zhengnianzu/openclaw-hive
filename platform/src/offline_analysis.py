@@ -164,16 +164,20 @@ _LOG_MAX_BYTES = 2 * 1024 * 1024    # 主 log 详情回传尾部 2MB（与 data_
 
 # ============ obsutil 薄封装 ============
 
-def _obsutil_cmd(obsutil: str, args: list[str]) -> subprocess.CompletedProcess:
+def _obsutil_cmd(obsutil: str, args: list[str], timeout: int = 180) -> subprocess.CompletedProcess:
     try:
         return subprocess.run([obsutil, *args], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=180)
+                              encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"obsutil 超时: {args[0]} {' '.join(args[1:3])}")
 
 
 def run_obsutil_ls(obsutil: str, prefix: str, one_level: bool = False) -> list[str]:
-    """obsutil ls 列对象/目录；one_level=True 用 -d 单层。返回行列表。"""
+    """obsutil ls 列对象/目录；one_level=True 用 -d 单层。返回行列表。
+
+    ⚠ 默认格式下 key 会被截断到 80 字符、size 在下一行。**要解析 key/size/etag
+    请用 `ls_objects()`**，不要用这个函数的输出做正则。
+    """
     cmd = ["ls", prefix]
     if one_level:
         cmd += ["-d"]
@@ -181,6 +185,118 @@ def run_obsutil_ls(obsutil: str, prefix: str, one_level: bool = False) -> list[s
     if res.returncode != 0:
         raise RuntimeError(f"obsutil ls 失败(exit {res.returncode}): {res.stdout}\n{res.stderr}")
     return (res.stdout or "").splitlines()
+
+
+# ---- 带结构化输出的一行一对象格式 ----
+# 默认格式（不带 -format=default）会把 key 截断到 80 字符，且 size 与 key 分行输出，
+# `line.split()[0]` 拿到的是截断路径。`-format=default -bf=raw` 才是一行一对象、
+# key 在末列且不截断、size 是字节数。下列正则按该格式解析。
+_OBJ_LINE = re.compile(
+    r'^(?P<mtime>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+'
+    r'(?P<size>\d+)B\s+'
+    r'(?P<storage>\S+)\s+'
+    r'"(?P<etag>[^"]*)"\s+'
+    r'(?P<key>obs://\S.*?)\s*$'
+)
+_NEXT_MARKER_RE = re.compile(r'^Next marker:\s*(.+?)\s*$')
+
+
+def parse_ls_objects(text: str, prefix: str) -> list[dict]:
+    """解析 `obsutil ls -format=default -bf=raw` 输出为对象列表。
+
+    只返回**文件**（不返回目录），每项 {name, path, size, mtime, etag}，
+    name 是相对 prefix 的路径。
+    """
+    prefix = prefix if prefix.endswith("/") else prefix + "/"
+    out: list[dict] = []
+    in_objects = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        low = stripped.lower()
+        if low.startswith("folder list"):
+            in_objects = False
+            continue
+        if low.startswith("object list"):
+            in_objects = True
+            continue
+        if low.startswith(("folder number", "file number", "total size of prefix",
+                           "next marker", "start at")):
+            in_objects = False
+            continue
+        if not in_objects:
+            continue
+        m = _OBJ_LINE.match(stripped)
+        if not m:
+            continue
+        key = m.group("key")
+        name = key[len(prefix):] if key.startswith(prefix) else ""
+        if not name:
+            continue
+        out.append({
+            "name": name.rstrip("/"),
+            "path": key,
+            "size": int(m.group("size")),
+            "mtime": m.group("mtime"),
+            "etag": m.group("etag"),
+        })
+    return out
+
+
+def ls_objects(obsutil: str, prefix: str, recursive: bool = False,
+               one_level: bool = False, timeout: int = 300) -> list[dict]:
+    """列 prefix 下的对象（带 size/etag），处理 Next marker 分页。
+
+    recursive=True 列整棵子树；one_level=True 只列一层。两者都不给 = 递归。
+    返回 [{name, path, size, mtime, etag}]。
+    """
+    prefix = prefix if prefix.endswith("/") else prefix + "/"
+    if one_level:
+        recursive = False
+    objects: list[dict] = []
+    seen: set[str] = set()
+    marker: str | None = None
+
+    for _ in range(50):          # 防御性上限；正常 1 页就够
+        cmd = ["ls", prefix, "-limit=0", "-format=default", "-bf=raw"]
+        if not recursive:
+            cmd.insert(1, "-d")
+        if marker:
+            cmd += ["-marker", marker]
+        res = _obsutil_cmd(obsutil, cmd, timeout=timeout)
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"obsutil ls 失败(exit {res.returncode}): "
+                f"{(res.stdout or '')[-400:]}{(res.stderr or '')[-400:]}")
+
+        text = res.stdout or ""
+        for o in parse_ls_objects(text, prefix):
+            if o["path"] not in seen:
+                seen.add(o["path"])
+                objects.append(o)
+
+        marker = None
+        for line in text.splitlines():
+            m = _NEXT_MARKER_RE.match(line.strip())
+            if m:
+                marker = m.group(1)
+                break
+        if not marker:
+            break
+    return objects
+
+
+def fingerprint_objects(objects: list[dict]) -> str:
+    """对象清单的稳定指纹：sorted(key|size|etag) 的 sha1。
+
+    用于判断「这个 task 前缀自上次扫描以来有没有变过」。OBS 上传是按源逐个
+    cp -r -f，失败会重试若干轮，期间前缀会继续增长——两轮指纹一致才认为冻结。
+    """
+    import hashlib
+    lines = sorted(f"{o.get('path')}|{o.get('size')}|{o.get('etag') or ''}" for o in objects)
+    return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
+
 
 
 def run_obsutil_cp(obsutil: str, src: str, dst: str, include=None, exclude=None,
@@ -779,20 +895,23 @@ def _parse_openclaw_traj_legacy(objs, tail=()) -> list[dict]:
                                    "content": content_text,
                                    "tool_name": tool_name, "args": args,
                                    "isError": None, "exitCode": None, "details": None})
-            elif role == "toolResult":
-                details = msg.get("details") or {}
-                blocks.append({"role": role, "part_type": "toolResult",
-                               "content": msg.get("content"),
-                               "tool_name": (msg.get("tool") or {}).get("name"),
-                               "args": None,
-                               "isError": bool(msg.get("isError")),
-                               "exitCode": (details.get("exitCode")
-                                            if isinstance(details, dict) else None),
-                               "details": details})
-            else:
-                blocks.append({"role": role, "part_type": "text", "content": content,
-                               "tool_name": None, "args": None, "isError": None,
-                               "exitCode": None, "details": None})
+        elif role == "toolResult":
+            # ⚠ 这一支必须与 `if role == "assistant"` 平级。历史上它被误缩进到
+            # assistant 的 `elif isinstance(content, list)` 里面 → 永不执行，
+            # 详情页因此完全看不到工具返回（单测 test_parse_blocks 抓到）。
+            details = msg.get("details") or {}
+            blocks.append({"role": role, "part_type": "toolResult",
+                           "content": msg.get("content"),
+                           "tool_name": (msg.get("tool") or {}).get("name"),
+                           "args": None,
+                           "isError": bool(msg.get("isError")),
+                           "exitCode": (details.get("exitCode")
+                                        if isinstance(details, dict) else None),
+                           "details": details})
+        else:
+            blocks.append({"role": role, "part_type": "text", "content": content,
+                           "tool_name": None, "args": None, "isError": None,
+                           "exitCode": None, "details": None})
     if tail:
         blocks.append({"role": None, "part_type": "truncated", "content": tail[0],
                        "tool_name": None, "args": None, "isError": None,

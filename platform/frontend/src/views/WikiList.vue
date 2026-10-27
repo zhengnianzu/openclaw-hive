@@ -2,7 +2,9 @@
   <div>
     <div class="header-row">
       <h2>文档中心</h2>
-      <el-button v-if="authStore.isAdmin" type="primary" @click="$router.push('/wiki/new')">
+      <!-- 新建开放给 admin + operator：运行者需要沉淀自己的经验。
+           分类管理 / 排序 / 发布仍是 admin（会跨用户批量写或全站广播）。 -->
+      <el-button v-if="authStore.isOperator" type="primary" @click="$router.push('/wiki/new')">
         <el-icon><Plus /></el-icon> 新建文档
       </el-button>
     </div>
@@ -61,15 +63,23 @@
         </el-table-column>
         <el-table-column prop="updated_by" label="更新人" width="110" />
         <el-table-column prop="updated_at" label="更新时间" width="180" />
-        <el-table-column label="操作" width="240" fixed="right" v-if="authStore.isAdmin">
+        <!-- 操作列对 admin+operator 可见，但每行按钮按归属判断：
+               上移/下移会调 reorder 批量重写所有文档的 frontmatter，必须 admin；
+               编辑/删除只给「自己的文档」，与后端 _load_owned 的口径一致。 -->
+        <el-table-column label="操作" width="240" fixed="right" v-if="authStore.isOperator">
           <template #default="{ row, $index }">
             <div class="op-cell">
-              <el-button size="small" text :disabled="$index === 0" title="上移"
-                @click="moveDoc($index, -1)"><el-icon><Top /></el-icon></el-button>
-              <el-button size="small" text :disabled="$index === docs.length - 1" title="下移"
-                @click="moveDoc($index, 1)"><el-icon><Bottom /></el-icon></el-button>
-              <el-button size="small" @click="$router.push(`/wiki/${row.slug}/edit`)">编辑</el-button>
-              <el-button size="small" type="danger" text @click="removeDoc(row)">删除</el-button>
+              <template v-if="authStore.isAdmin">
+                <el-button size="small" text :disabled="$index === 0" title="上移"
+                  @click="moveDoc($index, -1)"><el-icon><Top /></el-icon></el-button>
+                <el-button size="small" text :disabled="$index === docs.length - 1" title="下移"
+                  @click="moveDoc($index, 1)"><el-icon><Bottom /></el-icon></el-button>
+              </template>
+              <template v-if="canEdit(row)">
+                <el-button size="small" @click="$router.push(`/wiki/${row.slug}/edit`)">编辑</el-button>
+                <el-button size="small" type="danger" text @click="removeDoc(row)">删除</el-button>
+              </template>
+              <span v-else class="op-readonly">仅作者可改</span>
             </div>
           </template>
         </el-table-column>
@@ -112,6 +122,12 @@ import api from '../api'
 import { useAuthStore } from '../stores/auth'
 
 const authStore = useAuthStore()
+
+// 只有作者本人或 admin 能改/删某篇文档，与后端 _load_owned 的判断保持一致。
+// author 是服务端写入的可信字段（创建时取当前登录用户，请求体无法覆盖）。
+function canEdit(row) {
+  return authStore.isAdmin || row.author === authStore.username
+}
 
 const docs = ref([])
 const categories = ref([])

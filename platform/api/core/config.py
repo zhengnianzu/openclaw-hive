@@ -26,8 +26,22 @@ class Settings(BaseSettings):
     WIKI_DIR: str = ""
     WIKI_DB_PATH: str = ""
 
+    # 沙箱产物浏览（实例详情「工作区」tab）。
+    # 文件由 offline/output_worker.py 全量预下载到 OUTPUT_CACHE/<batch>/<leaf>/，
+    # 接口只读本地磁盘（零 obsutil 调用），所以这里没有单独的缓存根。
+    # LibreOffice headless，用于 pptx/docx/xlsx → PDF 预览。缺省命令不存在时接口返回 503。
+    SOFFICE_PATH: str = "soffice"
+
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
+
+    # 对外 API（/openapi/v1）的鉴权 key，逗号分隔可配多个。
+    # 留空 = 该接口整体不可用（返回 503），避免「没配 key 就等于无鉴权」。
+    PUBLIC_API_KEYS: str = ""
+
+    @property
+    def public_api_keys(self) -> set[str]:
+        return {k.strip() for k in self.PUBLIC_API_KEYS.split(",") if k.strip()}
 
     # 队列调度配置（已取消全局沙箱上限 MAX_TOTAL_SANDBOXES）
     ORPHAN_PREPARING_GRACE_SECONDS: int = 120
@@ -88,3 +102,10 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# 产物下载优先级：数值越大越先被 worker 领取。
+# 0 = 后台自动发现入队（按 updated_at FIFO）。
+# 100 = 用户显式请求（点「下载此任务」/「下载交付物」/打开工作区）。
+# 放在这里而不是某个 router 里：artifacts.py 与 batch_output.py 两条入口
+# 必须用同一个值，否则同一件事在两个界面上排到不同的队列位置。
+ARTIFACT_PRIORITY_USER = 100
