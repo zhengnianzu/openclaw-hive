@@ -187,6 +187,90 @@ class WorkbookTest(unittest.TestCase):
         self.assertEqual(wb.sheetnames[0], "导出概览")
         self.assertEqual(wb.sheetnames[1], "队列信息")
 
+    def test_overview_has_funnel_columns(self):
+        """漏斗列是 append-only：追加在原 18 列之后，既有列位置不变。"""
+        funnel = {
+            "inst-1": {"L0": 10, "L1": 8, "L1.5": 6, "L2": 4, "L3": 2,
+                       "graded": 30, "unevaluated": 5, "failed": 1,
+                       "total": 37, "task_done": 21},
+        }
+        wb = tex.build_workbook(self._rows(), conn=None,
+                                include_task_records=False)
+        # conn=None 时列仍在，值留空
+        headers_no_conn = [c.value for c in wb["任务总览"][1]]
+        self.assertEqual(headers_no_conn[18:], [
+            "会话L0", "会话L1", "会话L1.5", "会话L2", "会话L3",
+            "已分级", "未评估", "分级失败", "会话总数", "完成标记",
+        ])
+
+        ws = tex._sheet_overview(wb, self._rows(), funnel=funnel)
+        rows = [[c.value for c in r] for r in ws.iter_rows(min_row=2)]
+        first = rows[0]
+        # 前 18 列保持原样
+        self.assertEqual(first[12], 9)    # 成功数
+        self.assertEqual(first[13], 1)    # 失败数
+        self.assertEqual(first[18:], [10, 8, 6, 4, 2, 30, 5, 1, 37, 21])
+        # 合计行同步补齐漏斗列
+        last = rows[-1]
+        self.assertEqual(last[0], "合计")
+        self.assertEqual(last[18:], [10, 8, 6, 4, 2, 30, 5, 1, 37, 21])
+        # 不存在的任务：漏斗列留空而不是 0，避免误读成"跑了但全 0"
+        self.assertEqual(rows[1][18:], [""] * 10)
+
+
+class FunnelCountsTest(unittest.TestCase):
+    """collect_funnel_counts：口径必须与 batch_output.get_shallow 一致。"""
+
+    def setUp(self):
+        import sqlite3
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE task_records (
+                instance_id TEXT, config_name TEXT, task_idx INTEGER, traj_level TEXT);
+            CREATE TABLE task_traj_records (
+                instance_id TEXT, config_name TEXT, task_done INTEGER);
+        """)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _add(self, iid, levels, done_configs=()):
+        for i, lv in enumerate(levels):
+            self.conn.execute(
+                "INSERT INTO task_records VALUES (?,?,?,?)",
+                (iid, f"c{i}", i, lv))
+        for cfg in done_configs:
+            self.conn.execute(
+                "INSERT INTO task_traj_records VALUES (?,?,1)", (iid, cfg))
+
+    def test_buckets_match_get_shallow(self):
+        # L0/L1/L1.5/L2/L3 各 1，2 条 NULL，1 条 failed，1 条 'none' 残差
+        self._add("a", ["L0", "L1", "L1.5", "L2", "L3",
+                        None, None, "failed", "none"],
+                  done_configs=("c0", "c2"))
+        out = tex.collect_funnel_counts(self.conn, ["a"])
+        self.assertEqual(out["a"], {
+            "L0": 1, "L1": 1, "L1.5": 1, "L2": 1, "L3": 1,
+            "graded": 5, "unevaluated": 2, "failed": 1,
+            "total": 9,      # 'none' 残差只进 total
+            "task_done": 2,
+        })
+        # 关键不变式：graded + unevaluated + failed != total（残差），导出概览已写明
+        self.assertEqual(out["a"]["graded"] + out["a"]["unevaluated"]
+                         + out["a"]["failed"], 8)
+
+    def test_unknown_instance_and_empty_instance_are_zeroed(self):
+        out = tex.collect_funnel_counts(self.conn, ["never-seen", "b", "b"])
+        self.assertEqual(set(out), {"never-seen", "b"})   # 去重
+        for d in out.values():
+            self.assertEqual(d["total"], 0)
+            self.assertEqual(d["graded"], 0)
+            self.assertEqual(d["L0"], 0)
+
+    def test_empty_input(self):
+        self.assertEqual(tex.collect_funnel_counts(self.conn, []), {})
+
 
 if __name__ == "__main__":
     unittest.main()

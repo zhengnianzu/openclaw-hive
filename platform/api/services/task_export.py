@@ -111,6 +111,71 @@ def collect_rows(instance_ids: list[str], conn, sync_status=None, with_resources
     return out
 
 
+# 漏斗档位顺序：与 api/routers/batch_output.py 的 _TRAJ_LEVELS 必须一致。
+# 这里手写常量而不是 import，避免 services 反向依赖 routers。
+_FUNNEL_LEVELS = ["L0", "L1", "L1.5", "L2", "L3"]
+
+
+def _empty_funnel() -> dict:
+    d = {lv: 0 for lv in _FUNNEL_LEVELS}
+    d.update({"graded": 0, "unevaluated": 0, "failed": 0, "total": 0, "task_done": 0})
+    return d
+
+
+def collect_funnel_counts(conn, instance_ids: list[str]) -> dict[str, dict]:
+    """批量取各实例的「会话漏斗」计数（task_records.traj_level 聚合）。
+
+    口径逐字对齐 api/routers/batch_output.py 的 get_shallow，保证导出数字与详情页
+    「会话漏斗」卡片一致：
+      graded      = traj_level IN ('L0','L1','L1.5','L2','L3')
+      unevaluated = traj_level IS NULL（未被浅层分析覆盖 / 仍在排队）
+      failed      = traj_level = 'failed'
+      total       = 该实例全部行
+      task_done   = LEFT JOIN task_traj_records 后的 SUM(task_done)
+
+    注意 total 与 graded+unevaluated+failed 不一定相等：库里还存在 traj_level='none'
+    的残差行（采集侧过期 stats 的形态），三者都不算。
+
+    一条 SQL 出全部实例，走 idx_task_records_inst。不要复用
+    /instances/{id}/shallow/export 的实现——那是把整实例所有行拉进 Python 再数，
+    批量导出会变成 N 次全表扫。
+    """
+    ids = [i for i in dict.fromkeys(instance_ids) if i]
+    out = {i: _empty_funnel() for i in ids}
+    if not ids:
+        return out
+
+    levels = set(_FUNNEL_LEVELS)
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"""SELECT tr.instance_id AS iid, tr.traj_level AS lvl, COUNT(*) AS n,
+                   SUM(CASE WHEN ttr.task_done THEN 1 ELSE 0 END) AS done_n
+            FROM task_records tr
+            LEFT JOIN task_traj_records ttr
+              ON ttr.instance_id = tr.instance_id
+             AND ttr.config_name = tr.config_name
+            WHERE tr.instance_id IN ({placeholders})
+            GROUP BY tr.instance_id, tr.traj_level""",
+        tuple(ids),
+    ).fetchall()
+
+    for r in rows:
+        d = out[r["iid"]]
+        n = r["n"] or 0
+        lvl = r["lvl"]
+        d["total"] += n
+        d["task_done"] += r["done_n"] or 0
+        if lvl is None:
+            d["unevaluated"] += n
+        elif lvl == "failed":
+            d["failed"] += n
+        elif lvl in levels:
+            d[lvl] += n
+            d["graded"] += n
+        # 其余（如 'none'）只计入 total，不进任何桶——与 get_shallow 一致
+    return out
+
+
 def _fit_columns(ws):
     """列宽按内容最大宽 + 6（同 batch_output.export_shallow_funnel）。"""
     for col_idx, cell in enumerate(ws[1], start=1):
@@ -172,18 +237,30 @@ def _harness_label(params: dict) -> str:
 # Sheet 组装
 # ---------------------------------------------------------------------------
 
-def _sheet_overview(wb, rows, title="任务总览"):
+def _sheet_overview(wb, rows, funnel=None, title="任务总览"):
     ws = wb.create_sheet(title)
-    _write_header(ws, [
+    funnel = funnel or {}
+    funnel_headers = (
+        [f"会话{lv}" for lv in _FUNNEL_LEVELS]
+        + ["已分级", "未评估", "分级失败", "会话总数", "完成标记"]
+    )
+    headers = [
         "任务名称", "实例ID", "所属队列", "队列位置", "Harness", "状态",
         "创建者", "创建时间", "开始时间", "结束时间", "并发数",
         "任务总数", "成功数", "失败数", "未完成数", "成功率",
         "失败原因", "关键项来源",
-    ])
+    ] + funnel_headers
+    _write_header(ws, headers)
     tot_total = tot_ok = tot_fail = 0
+    tot_funnel = _empty_funnel()
     for r in rows:
+        f = funnel.get(r.get("id")) or _empty_funnel()
+        funnel_cells = [f[lv] for lv in _FUNNEL_LEVELS] + [
+            f["graded"], f["unevaluated"], f["failed"], f["total"], f["task_done"],
+        ]
         if r.get("missing"):
-            ws.append([f"（任务不存在：{r['id']}）", r["id"]] + [""] * 16)
+            ws.append([f"（任务不存在：{r['id']}）", r["id"]]
+                      + [""] * (len(headers) - 2))
             continue
         total = r.get("total_tasks") or 0
         ok = r.get("completed_tasks") or 0
@@ -191,6 +268,8 @@ def _sheet_overview(wb, rows, title="任务总览"):
         tot_total += total
         tot_ok += ok
         tot_fail += fail
+        for k in tot_funnel:
+            tot_funnel[k] += f[k]
         meta = r.get("_params_meta") or {}
         has_params = bool(r.get("_params"))
         if not has_params:
@@ -220,7 +299,7 @@ def _sheet_overview(wb, rows, title="任务总览"):
             _rate(ok, fail),
             r.get("error_summary") or "",
             source,
-        ])
+        ] + funnel_cells)
     if len(rows) > 1:
         done = tot_ok + tot_fail
         ws.append([
@@ -229,6 +308,9 @@ def _sheet_overview(wb, rows, title="任务总览"):
             max(0, tot_total - done) if tot_total else "",
             f"{tot_ok / done * 100:.1f}%" if done else "—",
             "", "",
+        ] + [tot_funnel[lv] for lv in _FUNNEL_LEVELS] + [
+            tot_funnel["graded"], tot_funnel["unevaluated"], tot_funnel["failed"],
+            tot_funnel["total"], tot_funnel["task_done"],
         ])
     _fit_columns(ws)
     return ws
@@ -422,6 +504,8 @@ def build_workbook(rows, conn=None, queue=None, effective_concurrent=None,
     tot_total = sum(r.get("total_tasks") or 0 for r in valid)
     tot_ok = sum(r.get("completed_tasks") or 0 for r in valid)
     tot_fail = sum(r.get("failed_tasks") or 0 for r in valid)
+    # 会话漏斗计数：一条聚合 SQL 出全部实例；conn 为 None（单元测试）时给空值，列仍在
+    funnel = collect_funnel_counts(conn, [r.get("id") for r in valid]) if conn is not None else {}
     from datetime import datetime as _dt
     if queue:
         scope = f"队列 {queue.get('id')}"
@@ -439,6 +523,10 @@ def build_workbook(rows, conn=None, queue=None, effective_concurrent=None,
         ("整体成功率", f"{tot_ok / (tot_ok + tot_fail) * 100:.1f}%" if (tot_ok + tot_fail) else "—"),
         ("数据口径", "成功/失败数取自各任务 output 目录的 complete.jsonl / failed.jsonl；"
                      "成功率 = 成功 ÷ (成功 + 失败)，任务总数为启动前的估算值，仅供参考"),
+        ("会话漏斗口径", "取自 task_records.traj_level（与详情页「会话漏斗」卡片同源）；"
+                        "已分级 = L0-L3 合计，未评估 = 尚未分析/排队中，分级失败单独计数。"
+                        "会话总数是实际会话行数，与上面「任务总数」（启动前估算值）口径不同，"
+                        "两者本就不相等；会话总数可能略大于三者之和（残差为 traj_level='none' 的无效分级记录）"),
         ("安全说明", "API Key / token 等敏感值已脱敏（掩码），本文件可对外流转"),
     ]
     if truncated_note:
@@ -453,7 +541,7 @@ def build_workbook(rows, conn=None, queue=None, effective_concurrent=None,
     if all_queues:
         _sheet_queue_summary(wb, all_queues[0], all_queues[1])
 
-    _sheet_overview(wb, rows)
+    _sheet_overview(wb, rows, funnel=funnel)
     _sheet_key_params(wb, rows)
 
     if include_task_records and conn is not None:
