@@ -909,30 +909,6 @@ class OpenClawDistillationTask:
         task_skills = [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]]
         default_skills = self.config.obs_config.default_skills or []
 
-        def normalize_skill_names(skills: list, kind: str) -> list[str]:
-            """校验为安全相对路径，并按配置顺序去重。"""
-            normalized: list[str] = []
-            seen: set[str] = set()
-            for raw in skills:
-                if not isinstance(raw, str):
-                    raise HiveError("S005", detail=f"invalid {kind} skill name: {raw!r}")
-                name = raw.strip().replace("\\", "/")
-                path = PurePosixPath(name)
-                if (
-                    not name
-                    or path.is_absolute()
-                    or PureWindowsPath(raw).is_absolute()
-                    or any(part in ("", ".", "..") for part in path.parts)
-                ):
-                    raise HiveError("S005", detail=f"invalid {kind} skill path: {raw!r}")
-                clean = path.as_posix()
-                if clean not in seen:
-                    seen.add(clean)
-                    normalized.append(clean)
-            return normalized
-
-        task_skills = normalize_skill_names(task_skills, "task")
-        default_skills = normalize_skill_names(default_skills, "default")
         if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
             return
