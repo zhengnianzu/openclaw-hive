@@ -716,7 +716,8 @@ class OpenClawDistillationTask:
             )
             gateway_cmd = [
                 "/bin/bash", "-c",
-                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
+                # mkdir 必须独占一条语句、且用 ';' 收尾。
+                f"mkdir -p {self.config.sandbox_config.result_workdir}; "
                 # 独立进程组 + PID 文件，任务结束后可先停止整个 JiuwenSwarm 服务树。
                 f"nohup setsid {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
                 f"echo $! > {gateway_pid_path}; "
