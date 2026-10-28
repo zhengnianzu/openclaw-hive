@@ -113,6 +113,26 @@ def get_obsutil_uploader_command(s3_config, local_folder_absolute_path, bucket_p
     return command
 
 
+# obsutil 把进度条和摘要写进 stderr（成功时也写）, 直接判定「stderr 非空即告警」
+# 会在每次成功上传时刷一串 WARNING。这里只剔除这些已知噪音行。
+_OBSUTIL_STDERR_NOISE = re.compile(
+    r"^\[[#\-]+\]"                      # 进度条行: [----] / [####] 开头
+    r"|\d+\.\d+%\s"                     # 任意进度百分比
+    r"|\btps:\S*"                       # ... tps:0.00 ?/s
+    r"|\bTotal Size\b"                  # 摘要: Total Size
+    r"|\bUpload successfully\b"         # 摘要: Upload successfully
+    r"|\bCost \[\d+\]"                  # 摘要: cost [41], status [200]
+)
+
+
+def _meaningful_stderr(stderr: str) -> str:
+    """剔除 obsutil 进度条/摘要行, 只留真正的报错文本。"""
+    return "\n".join(
+        line for line in (stderr or "").splitlines()
+        if line.strip() and not _OBSUTIL_STDERR_NOISE.search(line)
+    )
+
+
 class TaskFileHandler(logging.Handler):
     """Routes log records to per-task files based on ContextVar."""
 
@@ -1153,9 +1173,10 @@ class OpenClawDistillationTask:
         m = re.search(r"HIVE_RC=(-?\d+)", stdout)
         rc = int(m.group(1)) if m else None
         if rc == 0 and result.code == ErrorCode.SUCCESS[0]:
-            if stderr.strip():
+            noise = _meaningful_stderr(stderr)
+            if noise:
                 self.logger.warning(
-                    f"[upload_traj] obsutil stderr {src} -> {remote}:\n{stderr}"
+                    f"[upload_traj] obsutil stderr {src} -> {remote}:\n{noise}"
                 )
             return "ok"
         effective_rc = rc if rc is not None else result_data.get("exit_code")

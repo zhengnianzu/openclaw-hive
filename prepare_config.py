@@ -150,9 +150,9 @@ _FRAMEWORK_LAYOUTS: dict = {
         "harness_sandbox_config": "/home/ma-user/.jiuwenswarm/config/config.yaml",
         "upload_paths": [
             "/home/ma-user/.jiuwenswarm/service_default/.logs",
-            "/home/ma-user/.jiuwenswarm/service_default/agent_default/agent"
+            "/home/ma-user/.jiuwenswarm/service_default/agent_default/agent/sessions"
         ],
-        "workspace_base": "/home/ma-user/.jiuwenswarm/agent/jiuwenclaw_workspace",
+        "workspace_base": "/home/ma-user/.jiuwenswarm/service_default/agent_default/agent/jiuwenclaw_workspace",
         "skill_subdir": "skills",
     },
     "jiuwenswarm-xiaoyi": {

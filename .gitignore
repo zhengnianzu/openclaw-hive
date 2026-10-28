@@ -23,10 +23,39 @@ platform/obsutil/
 # 离线分析缓存 + 沙箱产物缓存（「工作区」tab 的文件字节落在 output_cache/_artifacts/）
 platform/output_cache/
 
-# settings 实际配置文件（含密钥，不提交；.example 提交）
+# settings 实际配置文件（含密钥，不提交；.example / *_example 提交）
+# 单文件实例
 platform/settings/config.yaml
 platform/settings/openclaw.json
 platform/settings/user_proxy_model.json
+platform/settings/jw_config.yaml
+# 实例化目录：只有模板进 Git（worker 用 *.yaml.example，sandbox 用 *_example.yaml）
+platform/settings/worker/*.yaml
+!platform/settings/worker/*.example
+!platform/settings/worker/*_example.yaml
+platform/settings/sandbox/*.yaml
+!platform/settings/sandbox/*.example
+!platform/settings/sandbox/*_example.yaml
+# 运行时派生：由 settings/harness_config.json 派生（见 api/routers/harness_configs.py），
+# 迁移备份与按模板展开的 openjiuwen 实例同理
+platform/settings/harness/
+platform/settings/harness.bak.*/
+platform/settings/openjiuwen/
+
+# ===== 运行时状态（进程 / 锁 / 派生缓存）=====
+platform/*.pid
+platform/*.lock
+platform/.res_cache.*.json
+platform/.analyze_snapshot.json
+# 缓存写入未完成时的 .tmp 中间文件也一并覆盖
+platform/analyze_file_state.json.gz*
+
+# ===== 数据库备份 / WAL =====
+platform/backup_*.db
+platform/*.db-shm
+platform/*.db-wal
+# 历史遗留的裸 db（hive_output.db 等），已在上方 *.db-shm/-wal 覆盖同名 WAL
+platform/hive_output.db
 
 # 通用
 .env
@@ -45,19 +74,30 @@ platform/settings/claude-code/
 platform/settings/hermes_config.yaml
 platform/settings/openclaw/
 platform/settings/key_gen.yaml
-backup_task_traj_20260826_172448.db
-deep_worker.pid
-hive_output.db
-hive_output.db-shm
-hive_output.db-wal
-platform.db.bak.20260809101613
 settings/proxy_name.json
-worker.pid
-*.json
-!platform/settings/openclaw_tui.json
 
 # 实际配置文件，含密钥
 configs/hive_*.yaml
+
+# ===== 本地实例 json（含密钥），只提交模板 =====
+platform/settings/*.json
+platform/settings/**/*.json
+!platform/settings/*.example
+!platform/settings/**/*.example
+!platform/settings/**/*_example.json
+# 以下 json 是共享的元配置/映射表，无密钥、已跟踪，显式放行
+!platform/settings/field_mappings.json
+!platform/settings/harness_config.json
+!platform/settings/models.json
+!platform/settings/openclaw_tui.json
+!platform/settings/opencode.json
+!platform/settings/openjiuwen.json
+!platform/settings/proxy_name.json
+
+# 原先仅靠裸 *.json 兜底、收紧后需显式忽略的路径
+configs/task_configs/
+downloads/
+.claude/settings.local.json
 
 
 
