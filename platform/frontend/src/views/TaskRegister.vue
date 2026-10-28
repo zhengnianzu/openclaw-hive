@@ -46,6 +46,13 @@
           </template>
         </el-input>
       </el-form-item>
+      <el-form-item label="默认技能源目录OBS">
+        <el-input v-model="form.default_skill_dir_obs" placeholder="留空则沿用技能目录OBS">
+          <template #append>
+            <el-button @click="openObsBrowser('default_skill_dir_obs')">浏览</el-button>
+          </template>
+        </el-input>
+      </el-form-item>
       <el-form-item label="默认技能">
         <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，可选）" />
       </el-form-item>
@@ -142,6 +149,7 @@ const form = ref({
   task_path_obs: '',
   data_total: 0,
   skill_dir_obs: '',
+  default_skill_dir_obs: '',
   agent_dir_obs: '',
   user_folder_obs: '',
   default_skills: '',
@@ -225,6 +233,7 @@ onMounted(async () => {
         task_path_obs: reg.task_path_obs || '',
         data_total: reg.data_total || 0,
         skill_dir_obs: reg.skill_dir_obs || '',
+        default_skill_dir_obs: reg.default_skill_dir_obs || '',
         agent_dir_obs: reg.agent_dir_obs || '',
         user_folder_obs: reg.user_folder_obs || '',
         default_skills: reg.default_skills || '',

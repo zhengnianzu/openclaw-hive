@@ -38,6 +38,8 @@ run_config:
   obs:
     traj_save_bucket: "obs://rl-agentdata"
     traj_save_path: "openclaw_trajs/traj_x"
+    skill_download_path: "skills/shared"
+    default_skill_download_path: ""
 """
 
 
@@ -57,6 +59,10 @@ class MaskTest(unittest.TestCase):
     def test_mask_secret_idempotent(self):
         once = tex.mask_secret("sk-1234567890abcdef")
         self.assertEqual(tex.mask_secret(once), once)
+
+    def test_obs_path_keeps_local_source_path(self):
+        self.assertEqual(tex._obs_path("/home/ma-user/skills", "obs://bucket"),
+                         "/home/ma-user/skills")
 
 
 class BuildCreateParamsTest(unittest.TestCase):
@@ -92,6 +98,7 @@ class BuildCreateParamsTest(unittest.TestCase):
         self.assertEqual(params["sandbox_namespace"], "omni-env-default-worker")
         self.assertEqual(params["sandbox_active_key"], "x86_cpu")
         self.assertEqual(params["traj_save_path"], "openclaw_trajs/traj_x")
+        self.assertEqual(params["default_skill_dir"], "skills/shared")
         self.assertFalse(params["suffix_api_keys"])
         self.assertNotIn("copy_complete_from", params)
 
@@ -106,6 +113,13 @@ class BuildCreateParamsTest(unittest.TestCase):
         self.assertIsNotNone(meta["snapshot_error"])
         # create_params 本身仍可用
         self.assertEqual(params["task_name"], "t1")
+
+    def test_registration_schema_has_default_skill_source(self):
+        with db.get_connection() as conn:
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(task_registrations)")
+            }
+        self.assertIn("default_skill_dir_obs", columns)
 
 
 class WorkbookTest(unittest.TestCase):
@@ -146,6 +160,8 @@ class WorkbookTest(unittest.TestCase):
         self.assertEqual(wb["任务总览"]["M1"].value, "成功数")
         self.assertEqual(wb["任务总览"]["N1"].value, "失败数")
         self.assertEqual(wb["创建参数-关键项"]["C1"].value, "基本.任务标识")
+        key_headers = [c.value for c in wb["创建参数-关键项"][1]]
+        self.assertIn("OBS.默认技能目录", key_headers)
 
         path = os.path.join(self._tmpdir.name, "out.xlsx")
         with open(path, "wb") as f:

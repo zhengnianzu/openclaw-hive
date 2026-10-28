@@ -88,6 +88,7 @@
         <el-descriptions-item label="任务路径OBS">{{ currentReg.task_path_obs }}</el-descriptions-item>
         <el-descriptions-item label="数据总量">{{ currentReg.data_total }}</el-descriptions-item>
         <el-descriptions-item label="技能目录OBS">{{ currentReg.skill_dir_obs }}</el-descriptions-item>
+        <el-descriptions-item label="默认技能源目录OBS">{{ currentReg.default_skill_dir_obs || currentReg.skill_dir_obs || '-' }}</el-descriptions-item>
         <el-descriptions-item label="默认技能">{{ currentReg.default_skills || '-' }}</el-descriptions-item>
         <el-descriptions-item label="Agent目录OBS">{{ currentReg.agent_dir_obs }}</el-descriptions-item>
         <el-descriptions-item label="用户文件夹OBS">{{ currentReg.user_folder_obs }}</el-descriptions-item>
@@ -124,6 +125,9 @@
         </el-form-item>
         <el-form-item label="技能目录OBS">
           <el-input v-model="editForm.skill_dir_obs" />
+        </el-form-item>
+        <el-form-item label="默认技能源目录OBS">
+          <el-input v-model="editForm.default_skill_dir_obs" placeholder="留空则沿用技能目录OBS" />
         </el-form-item>
         <el-form-item label="默认技能">
           <el-input v-model="editForm.default_skills" placeholder="逗号分隔" />
@@ -179,7 +183,7 @@ const detailVisible = ref(false)
 const currentReg = ref(null)
 
 const editVisible = ref(false)
-const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', eval_config_model: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '', task_path_obs: '', skill_dir_obs: '', agent_dir_obs: '', user_folder_obs: '', default_skills: '', config_template_id: null })
+const editForm = ref({ export_path_obs: '', traj_path: '', model_name: '', eval_model_name: '', eval_config_model: '', user_proxy_model_name: '', harness_type: 'openclaw', base_url: '', api_key: '', task_path_obs: '', skill_dir_obs: '', default_skill_dir_obs: '', agent_dir_obs: '', user_folder_obs: '', default_skills: '', config_template_id: null })
 const editLoading = ref(false)
 let editingId = null
 const templateList = ref([])
@@ -227,6 +231,7 @@ function openEditDialog(row) {
     api_key: '',
     task_path_obs: row.task_path_obs || '',
     skill_dir_obs: row.skill_dir_obs || '',
+    default_skill_dir_obs: row.default_skill_dir_obs || '',
     agent_dir_obs: row.agent_dir_obs || '',
     user_folder_obs: row.user_folder_obs || '',
     default_skills: row.default_skills || '',

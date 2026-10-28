@@ -459,6 +459,7 @@ def init_db_unlocked():
                 task_path_obs TEXT DEFAULT '',
                 data_total INTEGER DEFAULT 0,
                 skill_dir_obs TEXT DEFAULT '',
+                default_skill_dir_obs TEXT DEFAULT '',
                 agent_dir_obs TEXT DEFAULT '',
                 user_folder_obs TEXT DEFAULT '',
                 export_path_obs TEXT DEFAULT '',
@@ -609,6 +610,14 @@ def init_db_unlocked():
         # migrate: add default_skills to task_registrations
         try:
             conn.execute("ALTER TABLE task_registrations ADD COLUMN default_skills TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+        # migrate: add an independent source directory for default skills
+        try:
+            conn.execute(
+                "ALTER TABLE task_registrations ADD COLUMN default_skill_dir_obs TEXT DEFAULT ''"
+            )
         except Exception:
             pass
 

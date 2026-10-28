@@ -71,6 +71,8 @@ run_config:
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
     traj_save_path: openclaw_trajs/traj_0626_mem_change_general_opus47
     skill_download_path: skills/260325/skill_localize/skills_library
+    # 默认技能源目录；留空时沿用 skill_download_path
+    default_skill_download_path:
     user_profile_download_path: task_data/260519/轨迹任务0519_1
     user_config_download_path:
     agents_download_path: task_data/260604/0529记忆增删改_train_2160/0525_agent_general/agents

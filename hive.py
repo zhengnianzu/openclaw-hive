@@ -21,6 +21,7 @@ import os
 import re
 import random
 import shutil
+import shlex
 import subprocess
 import threading
 import time
@@ -185,6 +186,8 @@ class ObsBucketConfig:
     traj_save_bucket: str = "obs://rl-agentdata"
     traj_save_path: str = ""
     skill_download_path: str = "skills/260325/skill_localize/skills_library"
+    # 留空时兼容旧配置：默认技能继续从 skill_download_path 下载。
+    default_skill_download_path: str = ""
     user_profile_download_path: str = ""
     user_config_download_path: str = ""
     agents_download_path: str = ""
@@ -713,7 +716,8 @@ class OpenClawDistillationTask:
             )
             gateway_cmd = [
                 "/bin/bash", "-c",
-                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
+                # mkdir 必须独占一条语句、且用 ';' 收尾。
+                f"mkdir -p {self.config.sandbox_config.result_workdir}; "
                 # 独立进程组 + PID 文件，任务结束后可先停止整个 JiuwenSwarm 服务树。
                 f"nohup setsid {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
                 f"echo $! > {gateway_pid_path}; "
@@ -877,7 +881,8 @@ class OpenClawDistillationTask:
     async def _download_s3_skills(self, data_config_file: str, sandbox_type: str) -> None:
         """Fetch task/default skills into the sandbox.
 
-        skill_download_path 以 "/" 开头 → 视为沙箱本地路径, 否则视为 OBS bucket 前缀
+        每类技能源以 "/" 开头 → 视为沙箱本地路径, 否则视为 OBS bucket 前缀。
+        default_skill_download_path 留空时回退到 skill_download_path，兼容历史配置。
         """
         data_cfg = parse_data_config(data_config_file)
 
@@ -886,7 +891,10 @@ class OpenClawDistillationTask:
             project_dir = str(PureWindowsPath(self.config.sandbox_config.workspace, code_stem))
         else:
             project_dir = os.path.join(self.config.sandbox_config.workspace, code_stem)
-        skill_src = self.config.obs_config.skill_download_path
+        task_skill_src = self.config.obs_config.skill_download_path
+        default_skill_src = (
+            self.config.obs_config.default_skill_download_path or task_skill_src
+        )
         skill_dir = (data_cfg.input_dir or {}).get("skill_dir", "skills")
         if not isinstance(skill_dir, str):
             skill_dir = "skills"
@@ -900,45 +908,56 @@ class OpenClawDistillationTask:
         # 按需选取: task config 指定的 task_skills + 配置的 default_skills
         task_skills = [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]]
         default_skills = self.config.obs_config.default_skills or []
+
         if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
             return
 
-        # skill_src 以 "/" 开头 → 沙箱本地路径, 逐个 cp; 否则 → OBS 前缀, 逐个 obsutil
-        if not skill_src:
-            self.logger.warning("skill_download_path is empty, skipping skill download")
-            return
-        is_local = skill_src.startswith("/")
-
-        async def download_skill(skill_path: str, target_path: str) -> None:
+        async def download_skill(skill_path: str, source_path: str, target_path: str) -> None:
+            is_local = source_path.startswith("/")
             if is_local:
                 # 只 cp 需要的单个 skill; 先删旧的同名目录避免残留 / 嵌套
-                src = os.path.join(skill_src.rstrip("/"), skill_path)
+                src = os.path.join(source_path.rstrip("/"), skill_path)
                 dest = os.path.join(target_path, skill_path)
-                inner = (f"rm -rf {dest} && mkdir -p {target_path} "
-                         f"&& cp -r {src} {target_path}/")
+                inner = (
+                    f"rm -rf {shlex.quote(dest)} && mkdir -p {shlex.quote(target_path)} "
+                    f"&& cp -r {shlex.quote(src)} {shlex.quote(target_path + '/')}"
+                )
             else:
                 # windows 只支持obs桶下载的方式
-                bucket_path = os.path.join(skill_src, skill_path) + "/"
+                bucket_path = f"{source_path.rstrip('/')}/{skill_path}/"
                 obs_cmd = get_obsutil_downloader_command(
                     self.client_config.s3,
                     objects_storage_path=target_path,
                     bucket_path=bucket_path,
                 )
                 if sandbox_type == "windows":
-                    inner = f"mkdir {target_path} & {obs_cmd}"
+                    inner = f'mkdir "{target_path}" & {obs_cmd}'
                 else:
-                    inner = f"mkdir -p {target_path} && {obs_cmd}"
+                    inner = f"mkdir -p {shlex.quote(target_path)} && {obs_cmd}"
             await self._run_skill_cmd(inner, detail=skill_path)
 
         start_time = time.time()
-        tasks = [download_skill(s, task_target_path) for s in set(task_skills)]
-        tasks += [download_skill(s, default_target_path) for s in set(default_skills)]
+        tasks = []
+        if task_skills:
+            if not task_skill_src:
+                self.logger.warning("skill_download_path is empty, skipping task skill download")
+            else:
+                tasks += [download_skill(s, task_skill_src, task_target_path) for s in task_skills]
+        if default_skills:
+            if not default_skill_src:
+                self.logger.warning(
+                    "default_skill_download_path and skill_download_path are empty, "
+                    "skipping default skill download"
+                )
+            else:
+                tasks += [download_skill(s, default_skill_src, default_target_path) for s in default_skills]
+        if not tasks:
+            return
         await asyncio.gather(*tasks)
-        mode = "local-cp" if is_local else "obsutil"
         self.logger.info(
-            f"Downloaded skills ({mode}: task={len(set(task_skills))}, "
-            f"default={len(set(default_skills))}) in {time.time() - start_time:.1f}s"
+            f"Downloaded skills (task={len(task_skills)}, default={len(default_skills)}) "
+            f"in {time.time() - start_time:.1f}s"
         )
 
     async def _run_skill_cmd(self, bash: str, *, detail: str) -> None:
