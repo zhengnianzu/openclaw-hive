@@ -12,7 +12,9 @@ from fastapi import Depends, HTTPException, Query
 from typing import Optional
 
 from api.core.config import settings
-from api.core.database import init_db, init_db_lock, init_db_unlocked, get_connection
+from api.core.database import (
+    init_db, init_db_lock, init_db_unlocked, get_connection, optimize_after_migration,
+)
 from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues, sandbox_configs
 from api.routers import batch_output, resource_pools, stats
@@ -107,6 +109,13 @@ with init_db_lock():
                 print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
             except Exception:
                 pass
+
+# ANALYZE / wal_checkpoint 必须放在 init_db_lock() **之后**（锁外）执行：
+# 它们会长时间持写锁（ANALYZE 扫 560 万行 + 6 个索引），而 4 个 worker 会依次
+# 进锁，若留在锁内就等于连续占满写锁几分钟，调度器的 5s busy_timeout 必然超时。
+# 现在改成按 sqlite_stat1 的行数漂移判断是否需要（见 database._needs_analyze），
+# 通常直接跳过；即使要跑也走独立短连接 + 2s 超时，拿不到锁就放弃。
+optimize_after_migration()
 
 
 @app.get("/api/health")

@@ -50,6 +50,10 @@ ALLOWED_CONFIG_FILES = harness_meta.ALLOWED_CONFIG_FILES()
 _status_cache = {}
 _STATUS_CACHE_TTL = 5
 
+# _sync_task_records 每写入这么多行提交一次（见函数内注释）。
+# 与 offline/output_worker.py 的 _discover_artifacts 保持同一量级。
+_SYNC_BATCH_ROWS = 500
+
 _analyze_cache = {}
 _ANALYZE_CACHE_TTL = 10
 
@@ -2211,7 +2215,13 @@ def _sync_task_records(instance_id: str, config_path: str, full: bool = False) -
         return
     eval_map = _load_eval_cache(instance_id)
     traj_map = _load_traj_cache(instance_id)
+    # 分批提交：全量模式下 rows = 该实例全部任务行，实测最大实例 63,967 行。
+    # 原来整轮只在连接退出时 commit 一次，等于长时间独占 SQLite 的唯一写锁，
+    # 调度器/心跳/队列领取全被卡住（5s busy_timeout 一到就报 database is locked）。
+    # 每 _SYNC_BATCH_ROWS 行提交一次，把写锁持有时间从「数十秒」压到毫秒级。
+    # 同一口径见 offline/output_worker.py 的 _discover_artifacts（每 500 行提交）。
     with get_connection() as conn:
+        pending = 0
         for r in rows:
             stem = Path(r["config_name"]).stem
             ev = eval_map.get(stem) or {}
@@ -2240,6 +2250,10 @@ def _sync_task_records(instance_id: str, config_path: str, full: bool = False) -
                     tj.get("level"),
                 ),
             )
+            pending += 1
+            if pending >= _SYNC_BATCH_ROWS:
+                conn.commit()
+                pending = 0
 
 
 def recover_orphan_preparing() -> int:

@@ -13,6 +13,8 @@ concurrent_num 仅作为实例参数透传，不再参与放行判断。
 """
 import asyncio
 import logging
+import os
+import sqlite3
 
 from ..core.config import settings
 from ..core.database import (
@@ -24,6 +26,13 @@ logger = logging.getLogger(__name__)
 # 占用队列槽位的状态：preparing 也算占用，因为任务在 _prepare_instance（OBS 下载、
 # 打包、统计任务数）期间还没变成 running，若此刻放行下一个任务，队列就不再串行了。
 OCCUPYING_STATUSES = ("preparing", "running")
+
+# 领取任务遇到写锁冲突（database is locked）时的重试策略。
+# 3 次、200ms 起指数退避（0.2 + 0.4 = 0.6s 总阻塞）：
+# 抢锁本身已在 SQLite 内等过 busy_timeout(5s)，这里再等太久只会让
+# 事件循环里的调度任务堆积；实在抢不到就交给下一轮兜底扫描。
+_CLAIM_MAX_ATTEMPTS = 3
+_CLAIM_BACKOFF_BASE = 0.2
 
 
 def global_max_concurrent() -> int:
@@ -154,7 +163,33 @@ async def schedule_queue(queue_id: str):
     logger.info(f"Scheduling queue: {queue_id}")
 
     # 原子抢占队首排队任务（内含「队列无占用者」判断，多 worker 安全）
-    queued_task = await async_execute(_try_claim_next, queue_id)
+    #
+    # 这里必须重试：SQLite 只有一把写锁，库里有 3 个 output_worker 进程 + 4 个
+    # uvicorn worker 在写（外加启动期可能有人在跑 ANALYZE/checkpoint）。
+    # 某个写者持锁超过 busy_timeout(5s) 时这条 UPDATE 就抛 database is locked。
+    # 以前没有 try/except，异常顺着 create_task 变成一条没人接的堆栈，
+    # 这条队列就此静默停在 queued，要等下一轮 find_schedulable_queues 兜底才恢复。
+    # _try_claim_next 是单条原子 UPDATE，重复执行安全（抢不到就是返回 None）。
+    queued_task = None
+    for attempt in range(_CLAIM_MAX_ATTEMPTS):
+        try:
+            queued_task = await async_execute(_try_claim_next, queue_id)
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) and "busy" not in str(e):
+                raise
+            if attempt == _CLAIM_MAX_ATTEMPTS - 1:
+                logger.error(
+                    f"Queue {queue_id}: 领取任务连续 {_CLAIM_MAX_ATTEMPTS} 次遇到写锁冲突，"
+                    f"本轮放弃（兜底扫描会重试）: {e}"
+                )
+                return
+            delay = _CLAIM_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                f"Queue {queue_id}: 写锁冲突，{delay:.1f}s 后重试 "
+                f"({attempt + 1}/{_CLAIM_MAX_ATTEMPTS})"
+            )
+            await asyncio.sleep(delay)
 
     if not queued_task:
         logger.info(f"Queue {queue_id}: no claimable task (occupied or empty)")
@@ -284,6 +319,38 @@ def recover_stuck_preparing(timeout_seconds: int | None = None) -> set[str]:
     return queues
 
 
+_resume_lock_fh = None
+
+
+def _acquire_resume_leader():
+    """启动期 resume_all_queues 的 leader 选举（跨进程非阻塞 flock）。
+
+    uvicorn --workers 4 时每个 worker 都会跑一次 startup hook，各自把「有排队任务的
+    队列」（实测 18 条）全部 create_task(schedule_queue(...)) —— 启动瞬间就是
+    4×18=72 条 UPDATE ... RETURNING 同时抢同一把写锁，正是 database is locked
+    最容易发生的时刻。而 resume 本身只是「兜底补一次调度」，一份就够。
+
+    拿到锁的进程返回句柄（必须持有到进程退出，关闭即释放），其余返回 None。
+    拿不到文件锁的环境（只读目录等）退化为 True，保持旧行为。
+    """
+    global _resume_lock_fh
+    if _resume_lock_fh is not None:
+        return True
+    try:
+        import fcntl
+        lock_path = os.path.join(os.path.dirname(settings.DB_PATH), ".queue_resume.lock")
+        fh = open(lock_path, "a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        _resume_lock_fh = fh  # 故意不关闭：关闭即释放锁
+        return True
+    except Exception:
+        return True
+
+
 async def resume_all_queues():
     """
     启动时对所有「有排队任务」的队列做一次调度。
@@ -293,8 +360,15 @@ async def resume_all_queues():
     调度——后台 refresher 只扫 running/preparing/终态行，看不到这些 queued 任务，
     它们会被永久搁死。这里在 startup 时兜底补一次。
 
-    返回触发的队列数。
+    多 worker 下只有 leader 执行（见 _acquire_resume_leader）：4 份并发领取只会
+    在启动瞬间放大写锁争用，没有任何收益。
+
+    返回触发的队列数；非 leader 返回 0。
     """
+    if _acquire_resume_leader() is None:
+        logger.info("resume_all_queues: 本进程非 leader，跳过（由 leader worker 负责）")
+        return 0
+
     try:
         rows = await async_query(
             "SELECT DISTINCT queue_id FROM task_instances "

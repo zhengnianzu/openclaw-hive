@@ -345,6 +345,125 @@ def init_db():
         init_db_unlocked()
 
 
+# ANALYZE 的「够用即跳过」阈值：统计信息里的行数与当前实际行数偏离在此比例内就跳过。
+# 采样 ANALYZE 本身有误差，5% 以内的偏差不影响优化器选索引。
+_ANALYZE_DRIFT_RATIO = 0.05
+# 统计信息刷新用的短超时：拿不到写锁就放弃，绝不阻塞启动。
+# 5s 是 get_connection() 的默认值，这里再压到 2s —— 它跑在 init_db_lock 之外，
+# 没有 flock 兜底，等太久只会让 4 个并发 worker 排队放大启动时间。
+_OPTIMIZE_BUSY_TIMEOUT_MS = 2000
+
+
+def _needs_analyze(conn, table: str = "task_traj_records") -> bool:
+    """判断统计信息是否已经过时到值得重跑 ANALYZE。
+
+    原先无条件跑 `ANALYZE task_traj_records`：这张表 560 万行 + 6 个索引，一次要
+    扫全表再扫每个索引（实测单次全表扫描 21.6s），期间一直持有 SQLite 的唯一写锁。
+    而这段代码挂在**每个进程 import main 时**（--workers 4 就是 4 遍），
+    init_db_lock() 只负责排队，于是启动那几分钟写锁几乎被连续占满 ——
+    调度器 5s 的 busy_timeout 一到就把 `database is locked` 抛出来，
+    队列静默停摆直到下一轮兜底扫描。
+
+    统计信息只在「数据规模明显变化」时才有重跑价值，平时跳过即可。
+    sqlite_stat1 里 stat 的第一列就是上次 ANALYZE 时的行数。
+    """
+    try:
+        # 优先取索引行的 stat（它记录的也是表行数），没有索引行时退回表级行
+        # （idx IS NULL）。两种行都要认：只认索引行的话，一张没有显式索引的
+        # 表会被永久判成「统计信息缺失」，每次启动都白跑一遍 ANALYZE。
+        row = conn.execute(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl = ? ORDER BY (idx IS NULL) LIMIT 1",
+            (table,),
+        ).fetchone()
+        if not row or not row[0]:
+            return True  # 从未跑过：统计信息缺失，值得跑
+        stat_rows = int(str(row[0]).split()[0])
+        actual = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        if stat_rows <= 0:
+            return actual > 0
+        return abs(actual - stat_rows) / stat_rows > _ANALYZE_DRIFT_RATIO
+    except Exception:
+        return True  # 读不到就按「需要」处理，失败会在调用处被吞掉
+
+
+_optimize_guard_fh = None
+
+
+def _acquire_optimize_guard():
+    """optimize_after_migration 的跨进程非阻塞守卫（flock）。
+
+    拿到返回句柄（held 到进程退出），拿不到返回 None；文件锁不可用的环境（只读
+    目录等）退化为 True，保持「单进程」的旧行为。用法与
+    instances._acquire_refresher_leader 一致。
+    """
+    global _optimize_guard_fh
+    if _optimize_guard_fh is not None:
+        return True
+    try:
+        import fcntl
+        path = os.path.join(os.path.dirname(get_db_path()) or ".", ".db_optimize.lock")
+        fh = open(path, "a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        _optimize_guard_fh = fh  # 故意不关闭：关闭即释放锁
+        return True
+    except Exception:
+        return True
+
+
+def optimize_after_migration():
+    """迁移之后的统计信息刷新 + WAL 回收（**必须在 init_db_lock 之外调用**）。
+
+    为什么单独拿出来：
+      1. 这两步会长时间独占写锁（ANALYZE 扫 560 万行 + 6 个索引），原来挂在
+         init_db_unlocked 的迁移连接上，把启动期的写锁窗口拉长到分钟级。
+      2. ANALYZE 现在按 sqlite_stat1 的行数漂移判断是否需要（见 _needs_analyze），
+         绝大多数启动直接跳过。
+      3. wal_checkpoint(TRUNCATE) 只有在本次真的重跑了 ANALYZE 才做：TRUNCATE 要求
+         排除所有读者，会主动阻塞其他进程。平时退化成 PASSIVE —— 它不阻塞任何人，
+         能回收多少回收多少。
+
+    用独立短连接 + 2s busy_timeout：拿不到锁就安静跳过。迁移本身是幂等的，
+    统计信息和 WAL 回收都只是优化收益，不该影响启动，更不该拖住别的写者。
+    """
+    try:
+        conn = sqlite3.connect(get_db_path(), timeout=_OPTIMIZE_BUSY_TIMEOUT_MS / 1000)
+    except Exception as e:
+        print(f"[db] optimize 跳过（无法连接）: {str(e)[:120]}", flush=True)
+        return
+    analyzed = False
+    # 非阻塞守卫：这一步现在跑在 init_db_lock 之外，--workers 4 就是 4 个进程同时
+    # 判断「需要 ANALYZE」。不加守卫的话它们会同时开跑，反而比原来更糟。
+    # 只有拿到守卫的进程干活，其余立即跳过（不等待，否则又把启动串行化了）。
+    guard = _acquire_optimize_guard()
+    if guard is None:
+        conn.close()
+        return
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_OPTIMIZE_BUSY_TIMEOUT_MS}")
+        if _needs_analyze(conn):
+            try:
+                conn.execute("ANALYZE task_traj_records")
+                conn.commit()
+                analyzed = True
+                print("[db] ANALYZE task_traj_records 已刷新", flush=True)
+            except Exception as e:
+                conn.rollback()
+                print(f"[db] ANALYZE 跳过: {str(e)[:120]}", flush=True)
+        # 平时用 PASSIVE：不阻挡任何读者写者，能回收多少回收多少。
+        # 只有本次真的重跑过 ANALYZE（说明启动期库比较闲）才做 TRUNCATE。
+        mode = "TRUNCATE" if analyzed else "PASSIVE"
+        try:
+            conn.execute(f"PRAGMA wal_checkpoint({mode})")
+        except Exception as e:
+            print(f"[db] wal_checkpoint 跳过: {str(e)[:120]}", flush=True)
+    finally:
+        conn.close()
+
+
 # task_traj_records 的「新增可选列」。建表语句、重建表语句、ADD COLUMN 迁移三处
 # 必须同步，否则重建表迁移一旦发生就会把列丢掉。这里集中一份，供轻量自愈复用。
 TRAJ_EXTRA_COLUMNS = (
@@ -1025,25 +1144,5 @@ def init_db_unlocked():
         except Exception:
             pass
 
-        # 补统计信息 + 回收 WAL。
-        #
-        # ANALYZE：全库从未跑过，sqlite_stat1 不存在 → 优化器无法评估部分索引的
-        # 收益，产物队列的专用索引 idx_traj_artifact_queue 建了却从未被选中
-        # （实测走了 idx_traj_artifact_complete + USE TEMP B-TREE FOR ORDER BY，
-        # 领取查询 67ms；强制走队列索引后 0ms）。
-        #
-        # wal_checkpoint：全仓没有任何 checkpoint 调用，WAL 曾涨到 2.37GB。
-        # WAL 越大 checkpoint 越贵，而 checkpoint 又要等所有 reader 让出读锁 ——
-        # 一个慢查询就能让 WAL 在那段时间里无法推进，形成正反馈。
-        # 这里只在启动时做一次 TRUNCATE（4 个 uvicorn worker 由 init_db_lock 串行化），
-        # 不影响运行期。
-        for stmt, label in (
-            ("ANALYZE task_traj_records", "ANALYZE"),
-            ("PRAGMA wal_checkpoint(TRUNCATE)", "wal_checkpoint"),
-        ):
-            try:
-                conn.execute(stmt)
-                conn.commit()
-            except Exception as e:
-                # 失败不能影响启动：ANALYZE 只是优化收益，checkpoint 拿不到锁是常态。
-                print(f"[db] {label} 跳过: {str(e)[:120]}")
+    # 统计信息刷新 + WAL 回收挪到 init_db_lock() 之外单独执行，
+    # 见 optimize_after_migration()：它会长时间持有写锁，不能再挂在迁移连接上。
