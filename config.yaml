@@ -113,6 +113,8 @@ run_config:
     # 注意，traj_save_path 后面不要加 "/"，否则会有两个 "//"在OBS路径上
     traj_save_path:
     skill_download_path: /home/ma-user/skills_library
+    # 默认技能源目录；留空时沿用 skill_download_path
+    default_skill_download_path:
     user_config_download_path:
     user_profile_download_path:
     agents_download_path:

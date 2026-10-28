@@ -55,6 +55,14 @@
             </el-input>
           </el-form-item>
 
+          <el-form-item label="默认技能源目录">
+            <el-input v-model="form.default_skill_dir" placeholder="留空则沿用技能目录">
+              <template #append>
+                <el-button @click="openObsBrowser('default_skill_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+              </template>
+            </el-input>
+          </el-form-item>
+
           <el-form-item label="默认技能">
             <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，留空使用模板默认值）" />
           </el-form-item>
@@ -381,7 +389,7 @@ function genTaskId() {
 
 const form = ref({
   name: '', task_name: genTaskId(), concurrent_num: 100,
-  skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
+  skill_dir: '', default_skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   suffix_api_keys: true,
@@ -668,6 +676,7 @@ onMounted(async () => {
       form.value.harness_type = reg.harness_type || 'openclaw'
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
+      form.value.default_skill_dir = stripObsPrefix(reg.default_skill_dir_obs)
       form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
       form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
       form.value.default_skills = reg.default_skills || ''

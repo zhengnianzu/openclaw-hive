@@ -739,6 +739,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
     if req.skill_dir:
         base.run_config.obs.skill_download_path = req.skill_dir
+    if req.default_skill_dir:
+        base.run_config.obs.default_skill_download_path = req.default_skill_dir
     if req.default_skills:
         base.run_config.obs.default_skills = [s.strip() for s in req.default_skills.split(",") if s.strip()]
     if req.agent_dir:

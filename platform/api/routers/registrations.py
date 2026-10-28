@@ -30,6 +30,7 @@ def _build_info(row, conn, user) -> RegistrationInfo:
     info.setdefault("eval_config_base_url", "")
     info.setdefault("eval_config_api_key", "")
     info.setdefault("eval_config_api", "")
+    info.setdefault("default_skill_dir_obs", "")
     info.setdefault("default_skills", "")
     info.setdefault("config_template_id", None)
     if info.get("linked_instance_id"):
@@ -57,14 +58,15 @@ def create_registration(req: RegistrationCreate, user: dict = Depends(get_curren
         cursor = conn.execute(
             """INSERT INTO task_registrations
                (created_by, task_name, requester, task_path_obs, data_total,
-                skill_dir_obs, agent_dir_obs, user_folder_obs,
+                skill_dir_obs, default_skill_dir_obs, agent_dir_obs, user_folder_obs,
                 model_name, eval_model_name, user_proxy_model_name, harness_type,
                 base_url, api_key,
                 eval_config_model, eval_config_base_url, eval_config_api_key, eval_config_api,
                 default_skills, config_template_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user["username"], req.task_name, req.requester, req.task_path_obs,
-             req.data_total, req.skill_dir_obs, req.agent_dir_obs, req.user_folder_obs,
+             req.data_total, req.skill_dir_obs, req.default_skill_dir_obs,
+             req.agent_dir_obs, req.user_folder_obs,
              req.model_name, req.eval_model_name, req.user_proxy_model_name, req.harness_type,
              req.base_url, req.api_key,
              req.eval_config_model, req.eval_config_base_url, req.eval_config_api_key, req.eval_config_api,

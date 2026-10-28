@@ -206,7 +206,7 @@ def _obs_path(dir_path: str, bucket: str) -> str:
     if not dir_path:
         return ""
     d = str(dir_path)
-    if "://" in d or not bucket:
+    if "://" in d or d.startswith("/") or not bucket:
         return d
     b = str(bucket).rstrip("/")
     return f"{b}/{d.lstrip('/')}"
@@ -332,7 +332,7 @@ def _sheet_key_params(wb, rows, title="创建参数-关键项"):
         # 基本配置
         "基本.任务标识", "基本.Harness类型", "基本.Invite Code", "基本.Harness配置",
         # OBS配置
-        "OBS.技能目录", "OBS.默认技能", "OBS.Agent目录",
+        "OBS.技能目录", "OBS.默认技能目录", "OBS.默认技能", "OBS.Agent目录",
         "OBS.用户Config目录", "OBS.用户Profile目录", "OBS.轨迹保存路径",
         # 模型配置
         "模型.Base URL", "模型.API Key", "模型.API类型", "模型.模型ID",
@@ -369,6 +369,7 @@ def _sheet_key_params(wb, rows, title="创建参数-关键项"):
             p.get("invite_code") or "",
             _harness_label(p),
             _obs_path(p.get("skill_dir"), bucket),
+            _obs_path(p.get("default_skill_dir") or p.get("skill_dir"), bucket),
             p.get("default_skills") or "",
             _obs_path(p.get("agent_dir"), bucket),
             _obs_path(p.get("user_config_dir"), bucket),

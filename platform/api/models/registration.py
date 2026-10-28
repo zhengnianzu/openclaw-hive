@@ -8,6 +8,7 @@ class RegistrationCreate(BaseModel):
     task_path_obs: str = ""
     data_total: int = 0
     skill_dir_obs: str = ""
+    default_skill_dir_obs: str = ""
     agent_dir_obs: str = ""
     user_folder_obs: str = ""
     model_name: str = ""
@@ -32,6 +33,7 @@ class RegistrationUpdate(BaseModel):
     task_path_obs: Optional[str] = None
     data_total: Optional[int] = None
     skill_dir_obs: Optional[str] = None
+    default_skill_dir_obs: Optional[str] = None
     agent_dir_obs: Optional[str] = None
     user_folder_obs: Optional[str] = None
     model_name: Optional[str] = None
@@ -57,6 +59,7 @@ class RegistrationInfo(BaseModel):
     task_path_obs: str = ""
     data_total: int = 0
     skill_dir_obs: str = ""
+    default_skill_dir_obs: str = ""
     agent_dir_obs: str = ""
     user_folder_obs: str = ""
     export_path_obs: str = ""

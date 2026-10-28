@@ -6,6 +6,7 @@
     "start_index": "run_config.start_index",
     "total_num": "run_config.total_num",
     "skill_dir": "run_config.obs.skill_download_path",
+    "default_skill_dir": "run_config.obs.default_skill_download_path",
     "default_skills": {
       "path": "run_config.obs.default_skills",
       "transform": "comma_to_list"

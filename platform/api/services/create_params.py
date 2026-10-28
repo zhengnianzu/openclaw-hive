@@ -62,6 +62,15 @@ def build_create_params(row: dict) -> tuple[dict, dict]:
                 params["traj_save_path"] = (
                     OmegaConf.select(snap, "run_config.obs.traj_save_path") or ""
                 )
+            # 新字段在历史 create_params 中不存在；详情、导出和复制统一展示快照中的
+            # 最终有效值。新目录为空时沿用普通技能目录，保持旧任务行为不变。
+            if not params.get("default_skill_dir"):
+                params["default_skill_dir"] = (
+                    OmegaConf.select(snap, "run_config.obs.default_skill_download_path")
+                    or OmegaConf.select(snap, "run_config.obs.skill_download_path")
+                    or params.get("skill_dir")
+                    or ""
+                )
         except Exception as e:
             snap = None
             meta["snapshot_error"] = str(e)[:200]
