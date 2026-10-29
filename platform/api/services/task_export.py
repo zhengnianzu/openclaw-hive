@@ -369,7 +369,7 @@ def _sheet_key_params(wb, rows, title="创建参数-关键项"):
             p.get("invite_code") or "",
             _harness_label(p),
             _obs_path(p.get("skill_dir"), bucket),
-            _obs_path(p.get("default_skill_dir") or p.get("skill_dir"), bucket),
+            _obs_path(p.get("default_skill_dir"), bucket),
             p.get("default_skills") or "",
             _obs_path(p.get("agent_dir"), bucket),
             _obs_path(p.get("user_config_dir"), bucket),

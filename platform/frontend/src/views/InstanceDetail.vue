@@ -144,9 +144,9 @@
 
             <el-collapse-item title="OBS配置" name="obs">
               <el-descriptions :column="1" border size="small">
-                <el-descriptions-item label="技能目录">{{ obsPath(createParams.skill_dir) }}</el-descriptions-item>
-                <el-descriptions-item label="默认技能源目录">{{ obsPath(createParams.default_skill_dir || createParams.skill_dir) }}</el-descriptions-item>
+                <el-descriptions-item label="默认技能源目录">{{ obsPath(createParams.default_skill_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="默认技能">{{ createParams.default_skills || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="技能目录">{{ obsPath(createParams.skill_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="Agent目录">{{ obsPath(createParams.agent_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="用户Config目录">{{ obsPath(createParams.user_config_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="用户Profile目录">{{ obsPath(createParams.user_profile_dir) }}</el-descriptions-item>

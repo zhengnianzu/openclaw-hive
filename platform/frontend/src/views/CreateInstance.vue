@@ -676,10 +676,13 @@ onMounted(async () => {
       form.value.harness_type = reg.harness_type || 'openclaw'
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
-      form.value.default_skill_dir = stripObsPrefix(reg.default_skill_dir_obs) || 'qianmin/skill_test'
+      // 登记值为空串时尊重「不下默认技能」的语义，只在字段缺失时才用前端默认值
+      form.value.default_skill_dir = reg.default_skill_dir_obs === undefined || reg.default_skill_dir_obs === null
+        ? 'qianmin/skill_test'
+        : stripObsPrefix(reg.default_skill_dir_obs)
       form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
       form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
-      form.value.default_skills = reg.default_skills || 'image-search'
+      form.value.default_skills = reg.default_skills ?? 'image-search'
       form.value.total_num = reg.data_total || 0
       if (reg.model_name) form.value.model_id = reg.model_name
       if (reg.base_url) form.value.model_base_url = reg.base_url

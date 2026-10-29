@@ -187,18 +187,18 @@ class ObsBucketConfig:
     traj_save_path: str = ""
     skill_download_path: str = "skills/260325/skill_localize/skills_library"
     # 默认技能源目录：留空时回退到 skill_download_path（兼容旧配置）。
-    # 模板与前端表单默认填 qianmin/skill_test，两者保持一致。
-    default_skill_download_path: str = "qianmin/skill_test"
+    # 「默认技能」的取值不在这里兜底 —— 默认值由平台前端表单负责，
+    # 本地 yaml 不填即表示不下默认技能，两边互不影响。
+    default_skill_download_path: str = ""
     user_profile_download_path: str = ""
     user_config_download_path: str = ""
     agents_download_path: str = ""
-    default_skills: list = field(default_factory=lambda: ["image-search"])
+    default_skills: list = field(default_factory=list)
 
     def __post_init__(self):
-        # 部分 harness 版本模板里 default_skills 显式写成 null，会覆盖上面的
-        # field default；这里统一归一化为默认技能，保证「不填即 image-search」。
+        # 只做类型归一化：字符串按逗号拆分，None 视为空。空表示不下默认技能。
         if self.default_skills is None:
-            self.default_skills = ["image-search"]
+            self.default_skills = []
         elif isinstance(self.default_skills, str):
             self.default_skills = [s.strip() for s in self.default_skills.split(",") if s.strip()]
         for field_name, field_value in self.__dataclass_fields__.items():
@@ -918,9 +918,39 @@ class OpenClawDistillationTask:
             task_target_path = os.path.join(project_dir, skill_dir)
         default_target_path = self.config.sandbox_config.default_skill_path
 
+        def dedup_skills(skills: list, kind: str) -> list[str]:
+            """校验为安全相对路径，并按配置顺序去重。
+
+            同一 (target, skill) 只能下载一次: 多个 agent 引用同一个 skill 时,
+            gather 会把两条 `rm -rf <dest> && cp -r` 并发跑在同一个目录上,
+            rm 常在拷贝过程中撞上 `Directory not empty` 而使整条链失败 (S005)。
+            """
+            normalized: list[str] = []
+            seen: set[str] = set()
+            for raw in skills:
+                if not isinstance(raw, str):
+                    raise HiveError("S005", detail=f"invalid {kind} skill name: {raw!r}")
+                name = raw.strip().replace("\\", "/")
+                path = PurePosixPath(name)
+                if (
+                    not name
+                    or path.is_absolute()
+                    or PureWindowsPath(raw).is_absolute()
+                    or any(part in ("", ".", "..") for part in path.parts)
+                ):
+                    raise HiveError("S005", detail=f"invalid {kind} skill path: {raw!r}")
+                clean = path.as_posix()
+                if clean not in seen:
+                    seen.add(clean)
+                    normalized.append(clean)
+            return normalized
+
         # 按需选取: task config 指定的 task_skills + 配置的 default_skills
-        task_skills = [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]]
-        default_skills = self.config.obs_config.default_skills or []
+        task_skills = dedup_skills(
+            [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]],
+            "task",
+        )
+        default_skills = dedup_skills(self.config.obs_config.default_skills or [], "default")
 
         if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
