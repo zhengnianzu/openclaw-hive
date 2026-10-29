@@ -912,11 +912,11 @@ class OpenClawDistillationTask:
 
         async def download_skill(skill_path: str, target_path: str) -> None:
             if is_local:
-                # 只 cp 需要的单个 skill; 先删旧的同名目录避免残留 / 嵌套
+                # 只 cp 需要的单个 skill。目标目录本身已是新沙箱, 且 openclaw-task
+                # 里一般没有 skills 目录, 不需要先删 —— 两个 workspace 并发复制同一个
+                # skill 时, 多余的 rm -rf 会让另一条链撞上 "Directory not empty" 而失败。
                 src = os.path.join(skill_src.rstrip("/"), skill_path)
-                dest = os.path.join(target_path, skill_path)
-                inner = (f"rm -rf {dest} && mkdir -p {target_path} "
-                         f"&& cp -r {src} {target_path}/")
+                inner = (f"mkdir -p {target_path} && cp -r {src} {target_path}/")
             else:
                 # windows 只支持obs桶下载的方式
                 bucket_path = os.path.join(skill_src, skill_path) + "/"
