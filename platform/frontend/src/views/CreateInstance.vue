@@ -47,16 +47,8 @@
 
       <el-tabs v-model="activeTab" style="margin-top:8px">
         <el-tab-pane label="OBS配置" name="obs">
-          <el-form-item label="技能目录">
-            <el-input v-model="form.skill_dir" placeholder="skills/260325/skill_localize/skills_library">
-              <template #append>
-                <el-button @click="openObsBrowser('skill_dir')"><el-icon><FolderOpened /></el-icon></el-button>
-              </template>
-            </el-input>
-          </el-form-item>
-
           <el-form-item label="默认技能源目录">
-            <el-input v-model="form.default_skill_dir" placeholder="留空则沿用技能目录">
+            <el-input v-model="form.default_skill_dir" placeholder="qianmin/skill_test">
               <template #append>
                 <el-button @click="openObsBrowser('default_skill_dir')"><el-icon><FolderOpened /></el-icon></el-button>
               </template>
@@ -64,7 +56,15 @@
           </el-form-item>
 
           <el-form-item label="默认技能">
-            <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，留空使用模板默认值）" />
+            <el-input v-model="form.default_skills" placeholder="image-search（逗号分隔，留空使用模板默认值）" />
+          </el-form-item>
+
+          <el-form-item label="技能目录">
+            <el-input v-model="form.skill_dir" placeholder="skills/260325/skill_localize/skills_library">
+              <template #append>
+                <el-button @click="openObsBrowser('skill_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+              </template>
+            </el-input>
           </el-form-item>
 
           <el-form-item label="Agent 目录">
@@ -389,7 +389,7 @@ function genTaskId() {
 
 const form = ref({
   name: '', task_name: genTaskId(), concurrent_num: 100,
-  skill_dir: '', default_skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
+  skill_dir: '', default_skill_dir: 'qianmin/skill_test', default_skills: 'image-search', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   suffix_api_keys: true,
@@ -676,10 +676,13 @@ onMounted(async () => {
       form.value.harness_type = reg.harness_type || 'openclaw'
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
-      form.value.default_skill_dir = stripObsPrefix(reg.default_skill_dir_obs)
+      // 登记值为空串时尊重「不下默认技能」的语义，只在字段缺失时才用前端默认值
+      form.value.default_skill_dir = reg.default_skill_dir_obs === undefined || reg.default_skill_dir_obs === null
+        ? 'qianmin/skill_test'
+        : stripObsPrefix(reg.default_skill_dir_obs)
       form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
       form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
-      form.value.default_skills = reg.default_skills || ''
+      form.value.default_skills = reg.default_skills ?? 'image-search'
       form.value.total_num = reg.data_total || 0
       if (reg.model_name) form.value.model_id = reg.model_name
       if (reg.base_url) form.value.model_base_url = reg.base_url

@@ -98,7 +98,9 @@ class BuildCreateParamsTest(unittest.TestCase):
         self.assertEqual(params["sandbox_namespace"], "omni-env-default-worker")
         self.assertEqual(params["sandbox_active_key"], "x86_cpu")
         self.assertEqual(params["traj_save_path"], "openclaw_trajs/traj_x")
-        self.assertEqual(params["default_skill_dir"], "skills/shared")
+        # 默认技能源目录为空表示「不下默认技能」，不再回退到 skill_download_path；
+        # 详情/导出如实展示空值，避免显示一个实际未使用的路径。
+        self.assertEqual(params["default_skill_dir"], "")
         self.assertFalse(params["suffix_api_keys"])
         self.assertNotIn("copy_complete_from", params)
 

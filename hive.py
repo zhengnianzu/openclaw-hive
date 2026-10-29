@@ -186,7 +186,9 @@ class ObsBucketConfig:
     traj_save_bucket: str = "obs://rl-agentdata"
     traj_save_path: str = ""
     skill_download_path: str = "skills/260325/skill_localize/skills_library"
-    # 留空时兼容旧配置：默认技能继续从 skill_download_path 下载。
+    # 默认技能源目录：留空时回退到 skill_download_path（兼容旧配置）。
+    # 「默认技能」的取值不在这里兜底 —— 默认值由平台前端表单负责，
+    # 本地 yaml 不填即表示不下默认技能，两边互不影响。
     default_skill_download_path: str = ""
     user_profile_download_path: str = ""
     user_config_download_path: str = ""
@@ -194,6 +196,11 @@ class ObsBucketConfig:
     default_skills: list = field(default_factory=list)
 
     def __post_init__(self):
+        # 只做类型归一化：字符串按逗号拆分，None 视为空。空表示不下默认技能。
+        if self.default_skills is None:
+            self.default_skills = []
+        elif isinstance(self.default_skills, str):
+            self.default_skills = [s.strip() for s in self.default_skills.split(",") if s.strip()]
         for field_name, field_value in self.__dataclass_fields__.items():
             value = getattr(self, field_name)
             if isinstance(value, str):
@@ -231,7 +238,13 @@ class SandboxConfig:
         if not self.data_config_path:
             self.data_config_path = str(cls(self.workspace, "config"))
         if not self.default_skill_path:
-            self.default_skill_path = str(cls(self.harness_dir, "skills"))
+            # 默认技能目录的基准由 _FRAMEWORK_LAYOUTS 的 default_skill_base 指定：
+            # jiuwenswarm 三个变体技能实际落在各自的 workspace 下，只能按 workspace_base 派生；
+            # 其余 harness未声明该键，保持原有 harness_dir/skills 行为不变。
+            skill_base = self.harness_dir
+            if self.harness_type in _JIUWENSWARM_TYPES and "workspace_base" in _FW:
+                skill_base = _FW["workspace_base"]
+            self.default_skill_path = str(cls(skill_base, "skills"))
         if self.sandbox_type == "windows":
             self.openclaw_bash = "openclaw"
 
@@ -905,9 +918,39 @@ class OpenClawDistillationTask:
             task_target_path = os.path.join(project_dir, skill_dir)
         default_target_path = self.config.sandbox_config.default_skill_path
 
+        def dedup_skills(skills: list, kind: str) -> list[str]:
+            """校验为安全相对路径，并按配置顺序去重。
+
+            同一 (target, skill) 只能下载一次: 多个 agent 引用同一个 skill 时,
+            gather 会把两条 `rm -rf <dest> && cp -r` 并发跑在同一个目录上,
+            rm 常在拷贝过程中撞上 `Directory not empty` 而使整条链失败 (S005)。
+            """
+            normalized: list[str] = []
+            seen: set[str] = set()
+            for raw in skills:
+                if not isinstance(raw, str):
+                    raise HiveError("S005", detail=f"invalid {kind} skill name: {raw!r}")
+                name = raw.strip().replace("\\", "/")
+                path = PurePosixPath(name)
+                if (
+                    not name
+                    or path.is_absolute()
+                    or PureWindowsPath(raw).is_absolute()
+                    or any(part in ("", ".", "..") for part in path.parts)
+                ):
+                    raise HiveError("S005", detail=f"invalid {kind} skill path: {raw!r}")
+                clean = path.as_posix()
+                if clean not in seen:
+                    seen.add(clean)
+                    normalized.append(clean)
+            return normalized
+
         # 按需选取: task config 指定的 task_skills + 配置的 default_skills
-        task_skills = [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]]
-        default_skills = self.config.obs_config.default_skills or []
+        task_skills = dedup_skills(
+            [skill for agent in data_cfg.agents if agent.get("skills") for skill in agent["skills"]],
+            "task",
+        )
+        default_skills = dedup_skills(self.config.obs_config.default_skills or [], "default")
 
         if not task_skills and not default_skills:
             self.logger.warning("No skills found, skipping download")
