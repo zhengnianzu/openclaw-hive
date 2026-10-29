@@ -186,14 +186,21 @@ class ObsBucketConfig:
     traj_save_bucket: str = "obs://rl-agentdata"
     traj_save_path: str = ""
     skill_download_path: str = "skills/260325/skill_localize/skills_library"
-    # 留空时兼容旧配置：默认技能继续从 skill_download_path 下载。
-    default_skill_download_path: str = ""
+    # 默认技能源目录：留空时回退到 skill_download_path（兼容旧配置）。
+    # 模板与前端表单默认填 qianmin/skill_test，两者保持一致。
+    default_skill_download_path: str = "qianmin/skill_test"
     user_profile_download_path: str = ""
     user_config_download_path: str = ""
     agents_download_path: str = ""
-    default_skills: list = field(default_factory=list)
+    default_skills: list = field(default_factory=lambda: ["image-search"])
 
     def __post_init__(self):
+        # 部分 harness 版本模板里 default_skills 显式写成 null，会覆盖上面的
+        # field default；这里统一归一化为默认技能，保证「不填即 image-search」。
+        if self.default_skills is None:
+            self.default_skills = ["image-search"]
+        elif isinstance(self.default_skills, str):
+            self.default_skills = [s.strip() for s in self.default_skills.split(",") if s.strip()]
         for field_name, field_value in self.__dataclass_fields__.items():
             value = getattr(self, field_name)
             if isinstance(value, str):
@@ -231,7 +238,13 @@ class SandboxConfig:
         if not self.data_config_path:
             self.data_config_path = str(cls(self.workspace, "config"))
         if not self.default_skill_path:
-            self.default_skill_path = str(cls(self.harness_dir, "skills"))
+            # 默认技能目录的基准由 _FRAMEWORK_LAYOUTS 的 default_skill_base 指定：
+            # jiuwenswarm 三个变体技能实际落在各自的 workspace 下，只能按 workspace_base 派生；
+            # 其余 harness未声明该键，保持原有 harness_dir/skills 行为不变。
+            skill_base = self.harness_dir
+            if self.harness_type in _JIUWENSWARM_TYPES and "workspace_base" in _FW:
+                skill_base = _FW["workspace_base"]
+            self.default_skill_path = str(cls(skill_base, "skills"))
         if self.sandbox_type == "windows":
             self.openclaw_bash = "openclaw"
 

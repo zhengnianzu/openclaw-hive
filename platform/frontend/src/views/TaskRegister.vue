@@ -39,22 +39,22 @@
       <el-form-item label="数据总量">
         <el-input-number v-model="form.data_total" :min="0" :step="100" />
       </el-form-item>
-      <el-form-item label="技能目录OBS">
-        <el-input v-model="form.skill_dir_obs" placeholder="OBS路径">
-          <template #append>
-            <el-button @click="openObsBrowser('skill_dir_obs')">浏览</el-button>
-          </template>
-        </el-input>
-      </el-form-item>
       <el-form-item label="默认技能源目录OBS">
-        <el-input v-model="form.default_skill_dir_obs" placeholder="留空则沿用技能目录OBS">
+        <el-input v-model="form.default_skill_dir_obs" placeholder="qianmin/skill_test">
           <template #append>
             <el-button @click="openObsBrowser('default_skill_dir_obs')">浏览</el-button>
           </template>
         </el-input>
       </el-form-item>
       <el-form-item label="默认技能">
-        <el-input v-model="form.default_skills" placeholder="find-skills,skill-scope（逗号分隔，可选）" />
+        <el-input v-model="form.default_skills" placeholder="image-search（逗号分隔，可选）" />
+      </el-form-item>
+      <el-form-item label="技能目录OBS">
+        <el-input v-model="form.skill_dir_obs" placeholder="OBS路径">
+          <template #append>
+            <el-button @click="openObsBrowser('skill_dir_obs')">浏览</el-button>
+          </template>
+        </el-input>
       </el-form-item>
       <el-form-item label="Agent目录OBS">
         <el-input v-model="form.agent_dir_obs" placeholder="OBS路径">
@@ -149,10 +149,10 @@ const form = ref({
   task_path_obs: '',
   data_total: 0,
   skill_dir_obs: '',
-  default_skill_dir_obs: '',
+  default_skill_dir_obs: 'qianmin/skill_test',
   agent_dir_obs: '',
   user_folder_obs: '',
-  default_skills: '',
+  default_skills: 'image-search',
   model_name: '',
   eval_model_name: '',
   user_proxy_model_name: '',
