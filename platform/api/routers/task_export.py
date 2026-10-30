@@ -89,7 +89,7 @@ def export_instances_xlsx(
 
 @router.get("/queues/{queue_id}.xlsx")
 def export_queue_xlsx(queue_id: str, user: dict = Depends(require_operator)):
-    """导出整条队列的任务详情（按 queue_position 升序，与队列详情弹窗同序）。"""
+    """导出整条队列的任务详情（按放行顺序，与队列详情弹窗同序）。"""
     with get_connection() as conn:
         queue = conn.execute("SELECT * FROM task_queues WHERE id = ?", (queue_id,)).fetchone()
         if not queue:
@@ -97,7 +97,8 @@ def export_queue_xlsx(queue_id: str, user: dict = Depends(require_operator)):
         queue = dict(queue)
 
         id_rows = conn.execute(
-            "SELECT id FROM task_instances WHERE queue_id = ? ORDER BY queue_position ASC",
+            "SELECT id FROM task_instances WHERE queue_id = ? "
+            "ORDER BY queue_priority DESC, queue_position ASC",
             (queue_id,),
         ).fetchall()
         ids = [r["id"] for r in id_rows]

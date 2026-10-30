@@ -9,7 +9,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..core.security import get_current_user, require_operator
-from ..core.database import async_query, async_query_one, async_db_execute
+from ..core.database import async_query, async_query_one, async_db_execute, async_execute
 from ..models.instance import QueueInfo, QueueCreate, QueueUpdate, InstanceInfo, QueueTaskItem
 from .instances import _with_harness_type, _sync_instance_status
 from ..services.queue_scheduler import effective_concurrent, global_max_concurrent
@@ -231,7 +231,7 @@ async def list_queue_tasks(
     rows = await async_query(
         """SELECT * FROM task_instances
            WHERE queue_id = ?
-           ORDER BY queue_position ASC""",
+           ORDER BY queue_priority DESC, queue_position ASC""",
         (queue_id,)
     )
 
@@ -295,6 +295,8 @@ async def list_queue_tasks(
             name=r['name'],
             status=status,
             queue_position=r['queue_position'] or 0,
+            queue_priority=r.get('queue_priority') or 0,
+            is_jumped=(r.get('queue_priority') or 0) > 0,
             position_label=label,
             created_at=r['created_at'],
             estimated_start_at=est,
@@ -308,6 +310,88 @@ async def list_queue_tasks(
         ))
 
     return items
+
+
+@router.post("/{queue_id}/tasks/{task_id}/jump")
+async def jump_queue_task(
+    queue_id: str,
+    task_id: str,
+    current_user: dict = Depends(require_operator),
+):
+    """插队：把排队中的任务提到本队列最优先的放行顺序。
+
+    只调整**顺序**，不突破并发额度：队列槽位已满时插队任务照样得等，
+    只是下一个空出来的槽位会归它。语义上要和「立即运行」区分开——后者会
+    让 active_tasks 超过 effective_concurrent，看板资源估算和「已满」判断都会失真。
+
+    改完立即生效：调度器每次抢占都重新读 priority，不需要重新入队或重启。
+    若此刻队列正好有空槽位，主动触发一次调度，让插队立即被放行。
+    """
+    from ..services.queue_scheduler import jump_task, schedule_queue
+
+    task = await async_query_one(
+        "SELECT id, queue_id, status FROM task_instances WHERE id = ?", (task_id,)
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail=f"任务 '{task_id}' 不存在")
+    if task["queue_id"] != queue_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"任务 '{task_id}' 不属于队列 '{queue_id}'（当前队列: {task['queue_id']}）",
+        )
+
+    updated = await async_execute(jump_task, task_id)
+    if not updated:
+        # 状态不是 queued：可能已被调度器领走（preparing/running），也可能是终态/已停止
+        cur = await async_query_one(
+            "SELECT status FROM task_instances WHERE id = ?", (task_id,)
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"只有「排队中」的任务可以插队，当前状态: {(cur or {}).get('status') or '未知'}",
+        )
+
+    asyncio.create_task(schedule_queue(queue_id))
+
+    return {
+        "message": f"任务 '{task_id}' 已插队，将优先放行",
+        "id": task_id,
+        "queue_priority": updated["queue_priority"],
+    }
+
+
+@router.post("/{queue_id}/tasks/{task_id}/cancel-jump")
+async def cancel_queue_task_jump(
+    queue_id: str,
+    task_id: str,
+    current_user: dict = Depends(require_operator),
+):
+    """取消插队：priority 置回 0，任务回到它原本的排队名次。
+
+    插队只改 priority、不动 queue_position，所以取消后无需重排，
+    任务直接落回加入队列时的位置。
+    """
+    from ..services.queue_scheduler import cancel_jump
+
+    task = await async_query_one(
+        "SELECT id, queue_id, status FROM task_instances WHERE id = ?", (task_id,)
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail=f"任务 '{task_id}' 不存在")
+    if task["queue_id"] != queue_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"任务 '{task_id}' 不属于队列 '{queue_id}'",
+        )
+
+    updated = await async_execute(cancel_jump, task_id)
+    if not updated:
+        raise HTTPException(
+            status_code=400,
+            detail="该任务当前没有插队（或已不在排队中），无法取消",
+        )
+
+    return {"message": f"任务 '{task_id}' 已取消插队", "id": task_id}
 
 
 @router.post("/{queue_id}/stop-all")

@@ -27,7 +27,7 @@ OCCUPYING_STATUSES = ("preparing", "running")
 
 
 def global_max_concurrent() -> int:
-    """全局并发上限（QUEUE_MAX_CONCURRENT，默认 2）。
+    """全局并发上限（QUEUE_MAX_CONCURRENT，默认 10）。
 
     任何队列的实际并发都不会超过它。设为 1 则所有队列严格串行。
     """
@@ -119,6 +119,10 @@ def _try_claim_next(queue_id: str) -> dict | None:
                  —— 仅当队列开启长尾跳过、且已有一个 running 任务进入尾部窗口
                  窗口不存在时回落到基础额度。
 
+    队首口径：`ORDER BY queue_priority DESC, queue_position ASC`。插队任务
+    （priority > 0）一律排在普通任务（priority = 0）前面，插队任务之间仍按
+    queue_position 先来后到。插队只改放行顺序，不改额度——槽位满了照样排队。
+
     Returns:
         抢到的任务行（dict），未抢到返回 None。
     """
@@ -132,12 +136,59 @@ def _try_claim_next(queue_id: str) -> dict | None:
                  WHERE id = (
                      SELECT id FROM task_instances
                       WHERE queue_id = ? AND status = 'queued'
-                      ORDER BY queue_position ASC
+                      ORDER BY queue_priority DESC, queue_position ASC
                       LIMIT 1
                  )
                    AND {slot_condition_sql(occ)}
              RETURNING *""",
             (queue_id, *slot_condition_params())
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def jump_task(task_id: str) -> dict | None:
+    """把排队中的任务插到队首（调度顺序上最优先）。
+
+    只对 `queued` 生效：已经 preparing/running 的任务无队可插（它已经在跑了），
+    终态任务也不该被插队。原子地「校验状态 + 提高优先级」放在同一条 UPDATE 里，
+    避免与调度器抢占赛跑：若此刻它刚好被 _try_claim_next 领走，这里的
+    `status='queued'` 条件就会落空，返回 None 让调用方提示用户。
+
+    priority 取「本队列当前最大 priority + 1」，于是后插队的排在前插队的前面
+    （最新的一次插队最优先），符合「刚才那个我现在就要」。
+
+    Returns:
+        更新后的任务行（dict）；任务不存在、不在排队中、或已被调度器领走时返回 None。
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """UPDATE task_instances
+                  SET queue_priority = COALESCE((
+                          SELECT MAX(queue_priority) FROM task_instances o
+                           WHERE o.queue_id = task_instances.queue_id
+                      ), 0) + 1
+                WHERE id = ? AND status = 'queued'
+            RETURNING *""",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def cancel_jump(task_id: str) -> dict | None:
+    """取消插队：priority 置回 0，任务回到普通队列里它原来的位置。
+
+    position 从未被插队改动（插队只动 priority），所以取消后不需要重排，
+    直接落回它加入队列时的名次。
+
+    同样只认 queued：已经放行的任务不能「退回」排队——那会把一个正在下载或
+    正在跑的任务重新标成 queued，破坏槽位统计。
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """UPDATE task_instances SET queue_priority = 0
+                WHERE id = ? AND status = 'queued' AND queue_priority > 0
+            RETURNING *""",
+            (task_id,),
         ).fetchone()
         return dict(row) if row else None
 

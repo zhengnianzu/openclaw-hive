@@ -590,6 +590,8 @@
             <el-descriptions-item label="队列并发量">{{ queueInfo.max_concurrent }}</el-descriptions-item>
             <el-descriptions-item label="当前状态">
               <el-tag :type="queueStatusType(inst.status)" size="small">{{ statusText(inst.status) }}</el-tag>
+              <el-tag v-if="inst.status === 'queued' && myTaskJumped" type="danger" size="small"
+                effect="dark" style="margin-left:8px">已插队</el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="队列位置">
               {{ inst.status === 'queued' ? `${myQueueRank} (等待中)` : '-' }}
@@ -602,13 +604,29 @@
             </el-descriptions-item>
           </el-descriptions>
 
+          <div class="queue-actions">
+            <el-button v-if="inst.status === 'queued' && !myTaskJumped" size="small" type="warning"
+              :loading="jumping" @click="jumpMyTask">插队</el-button>
+            <el-button v-if="inst.status === 'queued' && myTaskJumped" size="small"
+              :loading="jumping" @click="cancelMyJump">取消插队</el-button>
+            <span class="queue-actions-hint">
+              插队只调整放行顺序：下一个空出来的槽位优先给插队任务，不突破队列并发上限。
+            </span>
+          </div>
+
           <el-alert type="info" :closable="false" show-icon style="margin-top:16px"
             title="停止：退出当前队列，不再参与队列排队；启动：重新加入队列排队。" />
 
           <div style="margin-top:20px;font-weight:600">当前队列任务列表</div>
           <el-table :data="queueTasks" v-loading="loadingQueueTasks" size="small" style="width:100%;margin-top:10px">
             <el-table-column prop="queue_position" label="入队序号" width="90" align="center" />
-            <el-table-column prop="name" label="任务名称" min-width="160" show-overflow-tooltip />
+            <el-table-column label="任务名称" min-width="160" show-overflow-tooltip>
+              <template #default="{row}">
+                <span>{{ row.name }}</span>
+                <el-tag v-if="row.is_jumped" type="danger" size="small" effect="plain"
+                  style="margin-left:6px">插队</el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="状态" width="100">
               <template #default="{row}">
                 <el-tag :type="queueStatusType(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
@@ -616,6 +634,15 @@
             </el-table-column>
             <el-table-column label="创建时间" width="170">
               <template #default="{row}"><span class="mono-num">{{ fmtTime(row.created_at) }}</span></template>
+            </el-table-column>
+            <el-table-column label="操作" width="96" align="center">
+              <template #default="{row}">
+                <el-button v-if="row.status === 'queued' && !row.is_jumped" link type="warning"
+                  size="small" @click="jumpTask(row)">插队</el-button>
+                <el-button v-else-if="row.status === 'queued' && row.is_jumped" link
+                  size="small" @click="cancelJumpTask(row)">取消插队</el-button>
+                <span v-else style="color:#c0c4cc">—</span>
+              </template>
             </el-table-column>
           </el-table>
         </div>
@@ -780,7 +807,10 @@ const router = useRouter()
 const id = route.params.id
 
 // ============ 共享 / tab 管理 ============
-const VALID_TABS = ['config', 'logs', 'outputs', 'artifacts']
+// queue tab 由 v-if="inst.queue_id" 控制是否出现，但 URL 里带 ?tab=queue 时
+// 必须先通过这里的白名单校验，否则会被回落成 config —— 用户点重定向过来的
+// 队列链接只会落到「配置信息」，看起来像「队列信息没了」。
+const VALID_TABS = ['config', 'logs', 'outputs', 'artifacts', 'queue']
 const activeTab = ref(VALID_TABS.includes(route.query.tab) ? route.query.tab : 'config')
 const loadedTabs = new Set()   // 记录已懒加载过的 tab，避免重复拉取
 const loading = ref(false)
@@ -803,6 +833,9 @@ function ensureTabLoaded(tab) {
   if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
   else if (tab === 'logs') { loadTaskLogFiles(); loadTaskStatusMap(); loadLogs() }
   else if (tab === 'outputs') { loadShallow(false); loadArtifactProgress(); loadProxyConfig(); setTimeout(refreshProxyExportStatus, 500) }
+  // 队列 tab 不单独拉：loadData() 末尾会调 loadQueueInfo()。但切到该 tab 时
+  // 不能干等下一次 10s 轮询，这里直接触发一次，插队按钮/名次才不会延迟 10 秒才出来。
+  else if (tab === 'queue') { loadQueueInfo() }
 }
 
 // ============ 配置信息 tab ============
@@ -887,19 +920,58 @@ function fmtTime(t) {
 const queueInfo = ref({})
 const queueTasks = ref([])
 const loadingQueueTasks = ref(false)
+const jumping = ref(false)
 const myEstimatedStart = computed(() => {
   const me = queueTasks.value.find(t => t.id === inst.value.id)
   return me?.estimated_start_at ? fmtTime(me.estimated_start_at) : ''
 })
 
+// 本实例是否已插队（用队列详情里自己那一行的派生字段，避免另发一次请求）
+const myTaskJumped = computed(() => {
+  const me = queueTasks.value.find(t => t.id === inst.value.id)
+  return !!me?.is_jumped
+})
+
 // 排队名次：本实例在同队列 queued 任务里排第几（不是绝对 queue_position）。
 // queue_position 只增不减、会有空洞，直接显示会误导。
+// 后端已按完整放行顺序（priority DESC, position ASC）返回，这里只需按 queued 过滤后
+// 取下标；**不能**再按 position 重排，否则插队任务会被排到名次后面，与调度器不一致。
 const myQueueRank = computed(() => {
-  const waiting = queueTasks.value
-    .filter(t => t.status === 'queued')
-    .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0))
+  const waiting = queueTasks.value.filter(t => t.status === 'queued')
   return waiting.findIndex(t => t.id === inst.value.id) + 1
 })
+
+async function jumpTask(row) {
+  jumping.value = true
+  try {
+    await api.post(`/queues/${encodeURIComponent(inst.value.queue_id)}/tasks/${encodeURIComponent(row.id)}/jump`)
+    ElMessage.success('已插队，将优先放行')
+    await loadQueueInfo()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '插队失败')
+  } finally { jumping.value = false }
+}
+
+async function cancelJumpTask(row) {
+  jumping.value = true
+  try {
+    await api.post(`/queues/${encodeURIComponent(inst.value.queue_id)}/tasks/${encodeURIComponent(row.id)}/cancel-jump`)
+    ElMessage.success('已取消插队')
+    await loadQueueInfo()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '取消插队失败')
+  } finally { jumping.value = false }
+}
+
+function jumpMyTask() {
+  const me = queueTasks.value.find(t => t.id === inst.value.id)
+  return jumpTask(me || { id: inst.value.id })
+}
+
+function cancelMyJump() {
+  const me = queueTasks.value.find(t => t.id === inst.value.id)
+  return cancelJumpTask(me || { id: inst.value.id })
+}
 
 async function loadQueueInfo() {
   if (!inst.value.queue_id) return
@@ -1932,6 +2004,11 @@ onUnmounted(() => {
 }
 .verdict-item { display: flex; flex-direction: column; gap: 4px; }
 .verdict-label { font-size: 12px; color: var(--text-muted); }
+.queue-actions {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 16px;
+}
+.queue-actions-hint { font-size: 12px; color: var(--text-muted); }
 </style>
 
 

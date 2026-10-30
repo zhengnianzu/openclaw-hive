@@ -51,8 +51,19 @@
             <span>排队中任务：<b>{{ picked.queued_tasks }}</b></span>
           </div>
           <el-table :data="pickedTasks" v-loading="loadingTasks" height="180" size="small" style="width:100%">
-            <el-table-column prop="queue_position" label="序号" width="60" align="center" />
-            <el-table-column prop="name" label="任务名称" min-width="120" show-overflow-tooltip />
+            <!-- 序号用「列表下标」而不是绝对 queue_position：后者只增不减、每次重新
+                 启动都会 +1，会跳号（第 4 个排队任务显示 9）。接口已按调度顺序
+                 （priority DESC, position ASC）返回，下标即真实名次。 -->
+            <el-table-column label="序号" width="60" align="center">
+              <template #default="{ $index }">{{ $index + 1 }}</template>
+            </el-table-column>
+            <el-table-column label="任务名称" min-width="120" show-overflow-tooltip>
+              <template #default="{row}">
+                <span>{{ row.name }}</span>
+                <el-tag v-if="row.is_jumped" type="danger" size="small" effect="plain"
+                  style="margin-left:4px">插队</el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="状态" width="90">
               <template #default="{row}">
                 <el-tag :type="taskStatusType(row.status)" size="small">{{ taskStatusText(row.status) }}</el-tag>

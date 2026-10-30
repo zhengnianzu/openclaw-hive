@@ -57,15 +57,16 @@ class QueueTestBase(unittest.TestCase):
 
     def _add_task(self, task_id, status="queued", queue_id="q1", pos=1,
                   concurrent_num=10, created_at=None, total_tasks=0,
-                  completed_tasks=0, failed_tasks=0):
+                  completed_tasks=0, failed_tasks=0, priority=0):
         with db.get_connection() as conn:
             conn.execute(
                 """INSERT INTO task_instances
                    (id, name, config_path, status, total_tasks, completed_tasks, failed_tasks,
-                    concurrent_num, created_at, queue_id, queue_position)
-                   VALUES (?, ?, '/tmp/none.yaml', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    concurrent_num, created_at, queue_id, queue_position, queue_priority)
+                   VALUES (?, ?, '/tmp/none.yaml', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (task_id, task_id, status, total_tasks, completed_tasks, failed_tasks,
-                 concurrent_num, created_at or datetime.now().isoformat(), queue_id, pos),
+                 concurrent_num, created_at or datetime.now().isoformat(), queue_id, pos,
+                 priority),
             )
 
     def _set_queue_max(self, n, queue_id="q1"):
@@ -561,6 +562,213 @@ class StatusWriteGuardTest(QueueTestBase):
             conn.execute("UPDATE task_instances SET status='stopped' WHERE id='a'")
         inst_mod._sync_instance_status(inst, persist=True)
         self.assertEqual(self._status("a"), "stopped")
+
+
+class JumpQueueTest(QueueTestBase):
+    """插队：只调整放行顺序，不突破并发额度
+
+    排序口径统一为 ORDER BY queue_priority DESC, queue_position ASC。
+    插队任务之间仍按 queue_position 先来后到；后插队的因为 priority 更大而更靠前。
+    """
+
+    def _jump(self, task_id):
+        return qs.jump_task(task_id)
+
+    def _cancel(self, task_id):
+        return qs.cancel_jump(task_id)
+
+    def test_jump_makes_task_claim_first(self):
+        """插队任务挤到队首，先于 position 更小的普通任务被放行。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        self.assertIsNotNone(self._jump("b"))
+        self.assertEqual(self._claim()["id"], "b")
+
+    def test_without_jump_respects_position(self):
+        """对照组：不插队时仍按 position 顺序。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        self.assertEqual(self._claim()["id"], "a")
+
+    def test_jump_does_not_break_concurrency_limit(self):
+        """插队只改顺序不改额度：槽位被占时插队任务照样要等。"""
+        self._add_task("a", status="running", pos=1)
+        self._add_task("b", pos=2)
+        self._jump("b")
+        self.assertIsNone(self._claim())
+        self.assertEqual(self._status("b"), "queued")
+
+    def test_jump_released_as_soon_as_slot_frees(self):
+        """槽位一空，插队任务立刻拿到（而不是让 position 更小的先上）。"""
+        self._add_task("a", status="running", pos=1)
+        self._add_task("b", pos=2)
+        self._add_task("c", pos=3)
+        self._jump("c")
+        with db.get_connection() as conn:
+            conn.execute("UPDATE task_instances SET status='completed' WHERE id='a'")
+        self.assertEqual(self._claim()["id"], "c")
+
+    def test_latest_jump_wins(self):
+        """两次插队：后插队的优先级更高，排在前插队的前面。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        self._add_task("c", pos=3)
+        self._jump("b")
+        self._jump("c")
+        self.assertEqual(self._claim()["id"], "c")
+
+    def test_jumped_tasks_ordered_by_position_among_themselves(self):
+        """同为插队时仍按 position 先来后到（不会因为都插队而顺序随机）。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        self._add_task("c", pos=3)
+        # 直接给相同 priority，模拟同一批插队；此时 position 决定顺序
+        with db.get_connection() as conn:
+            conn.execute("UPDATE task_instances SET queue_priority=5 WHERE id IN ('b','c')")
+        self.assertEqual(self._claim()["id"], "b")
+
+    def test_jump_only_affects_own_queue(self):
+        """插队是队列内的：别的队列不受影响，仍按自己的 position 放行。"""
+        self._create_queue("q2")
+        self._add_task("a", queue_id="q1", pos=1)
+        self._add_task("b", queue_id="q2", pos=1)
+        self._add_task("c", queue_id="q2", pos=2)
+        self._jump("c")
+        self.assertEqual(self._claim("q1")["id"], "a")
+        self.assertEqual(self._claim("q2")["id"], "c")
+
+    def test_jump_rejected_for_running(self):
+        """已在跑的任务无队可插。"""
+        self._add_task("a", status="running", pos=1)
+        self.assertIsNone(self._jump("a"))
+
+    def test_jump_rejected_for_preparing(self):
+        """preparing 已经在准备中，也不再是排队候选。"""
+        self._add_task("a", status="preparing", pos=1)
+        self.assertIsNone(self._jump("a"))
+
+    def test_jump_rejected_for_created(self):
+        """未启动的任务不在队列里，没有「排队顺序」可言。"""
+        self._add_task("a", status="created", pos=1)
+        self.assertIsNone(self._jump("a"))
+
+    def test_jump_rejected_for_terminal(self):
+        for st in ("completed", "finished", "stopped", "failed"):
+            with self.subTest(status=st):
+                self._add_task(f"t_{st}", status=st, pos=1)
+                self.assertIsNone(self._jump(f"t_{st}"))
+
+    def test_jump_missing_task(self):
+        self.assertIsNone(self._jump("nope"))
+
+    def test_jump_twice_increases_priority(self):
+        """重复插队只会把自己顶得更高，不会把自己挤到别人后面。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        first = self._jump("b")
+        second = self._jump("b")
+        self.assertGreater(second["queue_priority"], first["queue_priority"])
+
+    def test_jump_position_unchanged(self):
+        """插队不动 queue_position —— 取消插队才能落回原来的名次。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        before = self._row("b")["queue_position"]
+        self._jump("b")
+        self.assertEqual(self._row("b")["queue_position"], before)
+
+    def test_cancel_jump_restores_original_order(self):
+        """取消插队后回到 position 决定的名次。"""
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        self._jump("b")
+        self.assertIsNotNone(self._cancel("b"))
+        self.assertEqual(self._row("b")["queue_priority"], 0)
+        self.assertEqual(self._claim()["id"], "a")
+
+    def test_cancel_jump_without_jump_is_noop(self):
+        self._add_task("a", pos=1)
+        self.assertIsNone(self._cancel("a"))
+
+    def test_cancel_jump_rejected_when_not_queued(self):
+        """已经放行的任务不能「退回」排队——那会把跑着的任务标成 queued。"""
+        self._add_task("a", status="running", pos=1, priority=3)
+        self.assertIsNone(self._cancel("a"))
+        self.assertEqual(self._status("a"), "running")
+
+    def test_jump_then_claim_clears_nothing_else(self):
+        """插队不影响抢占时对陈旧字段的清理。"""
+        self._add_task("a", pos=1)
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE task_instances SET pid=12345, error_summary='x' WHERE id='a'"
+            )
+        self._jump("a")
+        claimed = self._claim()
+        self.assertEqual(claimed["id"], "a")
+        self.assertIsNone(claimed["pid"])
+        self.assertIsNone(claimed["error_summary"])
+
+    def test_jump_concurrent_with_claim_is_atomic(self):
+        """插队与调度赛跑：只有一个能赢，不会出现「已放行却仍是 queued」的中间态。
+
+        调度器把任务领走（status→preparing）后，插队的 UPDATE 必须落空；
+        反之插队先落库时抢占仍能正常拿到它。
+        """
+        for i in range(1, 4):
+            self._add_task(f"t{i}", pos=i)
+        results = {}
+
+        def jumper():
+            results["jump"] = self._jump("t3")
+
+        def claimer():
+            results["claim"] = self._claim()
+
+        threads = [threading.Thread(target=jumper), threading.Thread(target=claimer)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        claimed = results["claim"]
+        jumped = results["jump"]
+        # 抢占一定成功（队列空）；插队是否成功取决于先后，但两者不能矛盾
+        self.assertIsNotNone(claimed)
+        if jumped:
+            # 插队成功说明它在抢占之前落库，于是抢占应该拿到 t3
+            self.assertEqual(claimed["id"], "t3")
+        else:
+            # 插队落空说明 t3 已被领走或已被改状态，抢占拿到的仍是队首
+            self.assertIn(claimed["id"], ("t1", "t2", "t3"))
+
+
+class ScheduleQueueJumpTest(QueueTestBase):
+    """schedule_queue 走同一套排序，插队对自动调度同样生效"""
+
+    def test_schedule_releases_jumped_task_first(self):
+        self._add_task("a", pos=1)
+        self._add_task("b", pos=2)
+        qs.jump_task("b")
+        self._run_schedule_with_stub("q1")
+        self.assertEqual(self._status("b"), "preparing")
+        self.assertEqual(self._status("a"), "queued")
+
+
+class JumpSchemaTest(QueueTestBase):
+    """迁移：老库补 queue_priority 列，默认 0"""
+
+    def test_column_exists_with_default_zero(self):
+        self._add_task("a", pos=1)
+        self.assertEqual(self._row("a")["queue_priority"], 0)
+
+    def test_column_is_not_null(self):
+        with db.get_connection() as conn:
+            info = conn.execute("PRAGMA table_info(task_instances)").fetchall()
+        col = [c for c in info if c["name"] == "queue_priority"]
+        self.assertEqual(len(col), 1)
+        self.assertEqual(col[0]["dflt_value"], "0")
+        self.assertEqual(col[0]["notnull"], 1)
 
 
 if __name__ == "__main__":

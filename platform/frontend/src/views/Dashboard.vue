@@ -143,10 +143,13 @@
         <el-option label="失败" value="failed" />
         <el-option label="待启动" value="created" />
       </el-select>
-      <el-select v-model="queueFilter" placeholder="任务队列" size="default" style="width:170px">
+      <!-- filterable：队列可能上百个，下拉里直接带输入框过滤，按 id 子串匹配。
+           clearable 让「取消队列筛选」不用再滚到顶部点「全部」。 -->
+      <el-select v-model="queueFilter" placeholder="任务队列" clearable filterable
+        size="default" style="width:200px" :filter-method="onQueueFilterInput">
         <el-option label="全部" value="" />
         <el-option label="未入队" value="__none__" />
-        <el-option v-for="q in queueOptions" :key="q.id" :label="q.id" :value="q.id" />
+        <el-option v-for="q in matchedQueueOptions" :key="q.id" :label="q.id" :value="q.id" />
       </el-select>
       <el-select v-model="harnessFilter" placeholder="Harness筛选" clearable size="default" style="width:140px">
         <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
@@ -188,12 +191,16 @@
             <span v-else style="color:var(--text-muted)">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="队列位置" width="110" align="center" resizable>
+        <el-table-column label="队列位置" width="130" align="center" resizable>
           <template #default="{row}">
             <span v-if="row.status === 'queued'" class="mono-num" style="color:#e6a23c">
               {{ queuePositionLabel(row) }}
             </span>
             <span v-else class="mono-num">-</span>
+            <el-tooltip v-if="row.status === 'queued' && isJumped(row)"
+              content="已插队：下一个空出的槽位优先放行" placement="top">
+              <el-tag type="danger" size="small" effect="plain" style="margin-left:4px">插队</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="进度" width="160" resizable>
@@ -234,19 +241,37 @@
               <el-button size="small" @click="router.push(`/instance/${row.id}`)">详情</el-button>
               <el-button size="small" type="primary" @click="router.push(`/instance/${row.id}?tab=logs`)">日志</el-button>
               <el-button size="small" @click="router.push(`/instance/${row.id}?tab=outputs`)">输出</el-button>
-              <el-dropdown v-if="authStore.isOperator" trigger="click" @command="cmd => handleCommand(cmd, row)">
+              <!-- 「更多」对所有人可见：里面的「队列信息 / 沙箱交付物」是只读页面跳转，
+                   不该被 operator 权限挡住。写操作（插队/启动/停止/删除）各自带
+                   v-if="authStore.isOperator" 单独控制。 -->
+              <el-dropdown trigger="click" @command="cmd => handleCommand(cmd, row)">
                 <el-button size="small">更多<el-icon style="margin-left:4px"><ArrowDown /></el-icon></el-button>
                 <template #dropdown>
                   <el-dropdown-menu>
-                    <el-dropdown-item command="copy">复制</el-dropdown-item>
-                    <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="start">
+                    <el-dropdown-item v-if="row.queue_id"
+                      @click="router.push(`/instance/${row.id}?tab=queue`)">
+                      队列信息
+                    </el-dropdown-item>
+                    <el-dropdown-item @click="router.push(`/instance/${row.id}?tab=artifacts`)">
+                      沙箱交付物
+                    </el-dropdown-item>
+                    <!-- 插队：只对「排队中」的任务显示。已插队的换成「取消插队」，
+                         否则给了入口也只会报错（后端只接受 queued 状态）。 -->
+                    <el-dropdown-item v-if="authStore.isOperator && row.queue_id
+                        && row.status === 'queued' && !row.is_jumped"
+                      command="jump" divided>插队</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator && row.queue_id
+                        && row.status === 'queued' && row.is_jumped"
+                      command="cancelJump" divided>取消插队</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator" command="copy" divided>复制</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator && !['running','preparing'].includes(row.status)" command="start">
                       {{ row.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
                     </el-dropdown-item>
-                    <el-dropdown-item v-if="['running','queued'].includes(row.status)" command="stop">
+                    <el-dropdown-item v-if="authStore.isOperator && ['running','queued'].includes(row.status)" command="stop">
                       {{ row.status === 'queued' ? '停止（退出队列）' : '停止' }}
                     </el-dropdown-item>
-                    <el-dropdown-item v-if="row.failed_tasks > 0 && !['running','preparing'].includes(row.status)" command="retry">重跑失败</el-dropdown-item>
-                    <el-dropdown-item v-if="!['running','preparing'].includes(row.status)" command="delete" divided>删除</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator && row.failed_tasks > 0 && !['running','preparing'].includes(row.status)" command="retry">重跑失败</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator && !['running','preparing'].includes(row.status)" command="delete" divided>删除</el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -286,6 +311,10 @@ const prepareProgress = ref({})
 const statusFilter = ref('')
 const queueFilter = ref('')
 const queueOptions = ref([])
+// 队列下拉的实时搜索词（el-select 的 filter-method 给的输入）。
+// 只做「下拉里显示哪些选项」的过滤，不改 queueFilter 的选中值 ——
+// 用内联 filter 时用户打完字一失焦，选项会缩成一条，看起来像筛选失效了。
+const queueSearch = ref('')
 const harnessFilter = ref('')
 const userFilter = ref('')
 const dateRange = ref(null)
@@ -385,6 +414,17 @@ const userOptions = computed(() => {
   instances.value.forEach(i => { if (i.created_by) set.add(i.created_by) })
   return Array.from(set).sort()
 })
+
+// 队列下拉的搜索：按 id 子串过滤候选项（队列常有上百个，纯下拉翻不动）。
+// 「全部 / 未入队」两个固定项始终保留，否则搜到一半就没法清筛选了。
+const matchedQueueOptions = computed(() => {
+  const kw = queueSearch.value.trim().toLowerCase()
+  if (!kw) return queueOptions.value
+  return queueOptions.value.filter(q => (q.id || '').toLowerCase().includes(kw))
+})
+function onQueueFilterInput(val) {
+  queueSearch.value = val || ''
+}
 
 const filteredInstances = computed(() => {
   let list = instances.value
@@ -536,14 +576,25 @@ function statusText(s) {
 
 // 队列位置：显示「在当前排队队列里的名次」，而不是绝对序号。
 // queue_position 是只增不减的序号（每次「启动」重新入队都会 +1），会有空洞，
-// 直接显示会误导（例如队里第 4 个任务却显示 9）。这里按同队列 queued 任务
-// 的 queue_position 排序后算出名次，与设计图的「1 (等待中)」一致。
+// 直接显示会误导（例如队里第 4 个任务却显示 9）。这里算出名次，与设计图的
+// 「1 (等待中)」一致。
+//
+// 排序口径必须与调度器（queue_scheduler._try_claim_next）完全一致：
+//   ORDER BY queue_priority DESC, queue_position ASC
+// 只按 position 排的话，插队任务会被算成名次靠后，与它「下一个就被放行」的实际
+// 行为相反 —— 用户插完队看到名次反而变大，会以为没生效。
 function queuePositionLabel(row) {
   const waiting = instances.value
     .filter(i => i.queue_id === row.queue_id && i.status === 'queued')
-    .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0))
+    .sort((a, b) =>
+      ((b.queue_priority || 0) - (a.queue_priority || 0))
+      || ((a.queue_position || 0) - (b.queue_position || 0)))
   const rank = waiting.findIndex(i => i.id === row.id) + 1
   return rank > 0 ? `${rank} (等待中)` : '-'
+}
+// 已插队标记：名次本身看不出「为什么排第一」，列表里补一个角标说明
+function isJumped(row) {
+  return (row.queue_priority || 0) > 0
 }
 function harnessColor(t) { return harnessStore.color(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
@@ -558,8 +609,37 @@ async function retryFailed(id) { router.push(`/create?copy_from=${id}&copy_compl
 async function deleteInstance(id) { await ElMessageBox.confirm('确认删除该实例？配置文件也会被删除。', '提示', { type: 'warning' }); await api.delete(`/instances/${id}`); ElMessage.success('已删除'); loadInstances() }
 
 function handleCommand(cmd, row) {
-  const actions = { copy: () => router.push(`/create?copy_from=${row.id}`), start: () => startInstance(row.id), stop: () => stopInstance(row.id), retry: () => retryFailed(row.id), delete: () => deleteInstance(row.id) }
+  const actions = {
+    copy: () => router.push(`/create?copy_from=${row.id}`),
+    start: () => startInstance(row.id),
+    stop: () => stopInstance(row.id),
+    retry: () => retryFailed(row.id),
+    delete: () => deleteInstance(row.id),
+    jump: () => jumpTask(row),
+    cancelJump: () => cancelJumpTask(row),
+  }
   actions[cmd]?.()
+}
+
+// 插队 / 取消插队：成功后立即重拉列表，否则首页要等下一轮 20s 轮询才更新名次，
+// 用户点完看不到变化会以为没生效。
+async function jumpTask(row) {
+  try {
+    await api.post(`/queues/${encodeURIComponent(row.queue_id)}/tasks/${encodeURIComponent(row.id)}/jump`)
+    ElMessage.success('已插队，将优先放行')
+    loadInstances()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '插队失败')
+  }
+}
+async function cancelJumpTask(row) {
+  try {
+    await api.post(`/queues/${encodeURIComponent(row.queue_id)}/tasks/${encodeURIComponent(row.id)}/cancel-jump`)
+    ElMessage.success('已取消插队')
+    loadInstances()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '取消插队失败')
+  }
 }
 
 // 轮询间隔从 10s 放宽到 20s：首页数据本身不是秒级敏感，而每轮都要拉

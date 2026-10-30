@@ -48,8 +48,9 @@ class Settings(BaseSettings):
 
     # 全局并发上限：任何队列同时占用的任务数都不能超过它。
     # 队列实际并发 = min(QUEUE_MAX_CONCURRENT, 该队列的 max_concurrent)。
-    # 默认 2；设为 1 则所有队列都只能跑 1 个（严格串行）。
-    QUEUE_MAX_CONCURRENT: int = 2
+    # 默认 10；设为 1 则所有队列都只能跑 1 个（严格串行）。
+    # 与 .env 里的同名键一致，改动需重启后端（进程启动时读取）。
+    QUEUE_MAX_CONCURRENT: int = 10
 
     # preparing 状态超时（秒）：准备阶段会做 OBS 下载（单次最长 600s，可能两次）
     # 与打包（120s）。若协程异常消失（reload/事件循环错误），实例会永久卡在

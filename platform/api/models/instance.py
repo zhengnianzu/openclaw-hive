@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 from typing import Optional, List
 
 
@@ -55,6 +55,8 @@ class QueueTaskItem(BaseModel):
     name: str
     status: str
     queue_position: int = 0
+    queue_priority: int = 0            # 插队优先级：>0 表示已插队，越大越靠前
+    is_jumped: bool = False            # 派生：queue_priority > 0（前端画「插队」角标）
     position_label: str = ""           # 如 "1 (等待中)" / "-"
     created_at: str
     estimated_start_at: Optional[str] = None   # 预计开始时间
@@ -141,7 +143,10 @@ class InstanceInfo(BaseModel):
     # 用户点「启动」重试时会清空。
     error_summary: Optional[str] = None
     queue_id: Optional[str] = None      # 所属队列ID
-    queue_position: int = 0              # 在队列中的位置
+    queue_position: int = 0              # 在队列中的位置（入队序号，只增不减，会有空洞）
+    # 插队优先级：>0 表示已插队。前端算「队列位置」名次时必须按
+    # (queue_priority DESC, queue_position ASC) 排，否则插队任务的名次会反过来。
+    queue_priority: int = 0
     # 单沙箱资源（从 config_snapshot 解析；内存单位 GiB）。前端用
     # concurrent_num × 这些值算首页看板的核数/内存占用。
     cpu_request: float = 0.0
@@ -153,6 +158,15 @@ class InstanceInfo(BaseModel):
     # inferred=True 表示这是推断值（历史 env_make 形态 / 快照缺失）。
     sandbox_type: str = "linux"
     sandbox_type_inferred: bool = False
+
+    # 派生字段：是否已插队。**必须用 computed_field 从 queue_priority 推导**，
+    # 不能写成 `is_jumped: bool = False` —— 那样它只是个默认值，调用方（list_instances
+    # / get_instance）都是 `InstanceInfo(**row)` 直接用 DB 行构造，DB 里没有这一列，
+    # 于是它永远是 False，前端点完插队永远看不到「取消插队」。
+    @computed_field
+    @property
+    def is_jumped(self) -> bool:
+        return (self.queue_priority or 0) > 0
 
 
 class OverviewBatchRequest(BaseModel):

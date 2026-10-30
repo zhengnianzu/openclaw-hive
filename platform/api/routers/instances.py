@@ -1556,6 +1556,8 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
         # 「启动」= 重新加入队列排队：排到队尾。停止后再启动若沿用旧的 queue_position，
         # 会插回原来的位置，而不是按设计图「重新加入队列排队」。
         # 重排与抢占放在同一事务里，避免并发启动拿到相同的 position。
+        # queue_priority 一并清 0：上一次那轮插队不该跟着这次重跑一起复活，
+        # 否则用户以为排到队尾，实际却被旧优先级顶到了队首。
         with get_connection() as conn:
             max_pos = conn.execute(
                 "SELECT MAX(queue_position) AS m FROM task_instances WHERE queue_id = ?",
@@ -1563,7 +1565,7 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
             ).fetchone()
             new_pos = (max_pos["m"] or 0) + 1
             conn.execute(
-                "UPDATE task_instances SET queue_position=? WHERE id=?",
+                "UPDATE task_instances SET queue_position=?, queue_priority=0 WHERE id=?",
                 (new_pos, instance_id)
             )
 

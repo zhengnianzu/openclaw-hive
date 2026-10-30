@@ -561,9 +561,27 @@ def init_db_unlocked():
         except Exception:
             pass
 
+        # 插队优先级：越大的越先放行，0 表示正常排队（默认值，入队/重新入队都是 0）。
+        # 排序口径统一为 ORDER BY queue_priority DESC, queue_position ASC：
+        # 插队任务互相之间仍按 queue_position 先来后到，不会因为都是「插队」而顺序随机。
+        # 「取消插队」= 置回 0，任务回到普通排队序列里原来的位置（position 从未被改过）。
+        try:
+            conn.execute("ALTER TABLE task_instances ADD COLUMN queue_priority INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+
         # 创建队列索引
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_task_queue ON task_instances(queue_id, queue_position)")
+        except Exception:
+            pass
+
+        # 调度抢占按 (queue_id, queue_priority DESC, queue_position) 取队首，给这条路径单独建索引
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_queue_priority "
+                "ON task_instances(queue_id, queue_priority DESC, queue_position)"
+            )
         except Exception:
             pass
 
