@@ -94,39 +94,37 @@
           </div>
         </div>
 
-        <!-- 任务统计 -->
+        <!-- 任务统计：与「沙箱并发」卡同构（左侧数值 + 进度条，右侧图例）。
+             进度条口径是「最近 200 条任务里，运行 + 排队占多少」，
+             全量会被历史终态任务稀释，看不出当下的负载。 -->
         <div class="resource-card task-card">
           <div class="resource-card-head">
             <el-icon :size="18" style="color:#64748b"><Histogram /></el-icon>
             <span>任务统计</span>
           </div>
-          <div class="task-stats">
-            <div class="task-stat">
-              <span class="task-stat-label"><i class="dot" style="background:#94a3b8"></i>全部</span>
-              <span class="task-stat-value">{{ instances.length }}</span>
+          <div class="resource-main">
+            <div class="resource-main-left">
+              <div class="resource-value">
+                <span class="resource-used">{{ fmtNum(recentRunning) }}</span>
+                <span class="resource-sep">/</span>
+                <span class="resource-total">{{ fmtNum(recentQueued) }}</span>
+                <span class="resource-unit">运行 / 排队</span>
+              </div>
+              <div class="resource-sub">最近 {{ recentTasks.length }} 条任务</div>
+              <el-progress
+                :percentage="activePercent" :show-text="false" :stroke-width="10"
+                :color="percentColor(activePercent)" />
+              <div class="resource-percent">
+                运行 {{ recentRunning }} / 排队 {{ recentQueued }} ·
+                {{ recentActive ? activePercent.toFixed(0) + '%' : '无活跃任务' }}
+              </div>
             </div>
-            <div class="task-stat">
-              <span class="task-stat-label"><i class="dot" style="background:#10b981"></i>运行中</span>
-              <span class="task-stat-value" style="color:#10b981">{{ runningInstances.length }}</span>
-            </div>
-            <div class="task-stat">
-              <span class="task-stat-label"><i class="dot" style="background:#3b82f6"></i>排队中</span>
-              <span class="task-stat-value" style="color:#3b82f6">{{ queuedInstances.length }}</span>
-            </div>
-            <div class="task-stat">
-              <span class="task-stat-label"><i class="dot" style="background:#059669"></i>已完成</span>
-              <span class="task-stat-value" style="color:#059669">{{ doneCount }}</span>
-            </div>
-            <div class="task-stat">
-              <span class="task-stat-label"><i class="dot" style="background:#ef4444"></i>失败</span>
-              <span class="task-stat-value" style="color:#ef4444">{{ failedCount }}</span>
-            </div>
-            <div class="task-stat">
-              <span class="task-stat-label"><i class="dot" style="background:#f59e0b"></i>运行中沙箱</span>
-              <span class="task-stat-value" style="color:#f59e0b">{{ totalRunningPods }}</span>
+            <div class="legend">
+              <div class="legend-row"><i class="dot" style="background:#94a3b8"></i>全部<b>{{ fmtNum(instances.length) }}</b></div>
+              <div class="legend-row"><i class="dot" style="background:#059669"></i>已完成<b>{{ fmtNum(doneCount) }}</b></div>
+              <div class="legend-row"><i class="dot" style="background:#ef4444"></i>失败<b>{{ fmtNum(failedCount) }}</b></div>
             </div>
           </div>
-
         </div>
       </div>
     </div>
@@ -175,7 +173,10 @@
         </el-table-column>
         <el-table-column prop="harness_type" label="Harness" width="160" align="center" resizable>
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type), maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}" effect="dark" size="default">
+            <!-- 柔和标签：浅底 + 同色深字。原先 effect="dark" 是主色铺底 + 白字，
+                 遇到 Grok 的 #00d084、通用的 #c0c4cc 这类高明度色时白字几乎看不清，
+                 整列排开非常刺眼。样式统一由 store.tagStyle 派生。 -->
+            <el-tag :style="{ ...harnessTagStyle(row.harness_type), maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }" size="default">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
@@ -331,8 +332,6 @@ const progressColor = [
   { color: '#10b981', percentage: 100 },
 ]
 
-const runningInstances = computed(() => instances.value.filter(i => i.status === 'running'))
-
 // ===== 资源使用情况 =====
 // 口径与后端 stats.effective_pods 一致：「已用」= running + preparing（preparing
 // 期间已占住队列槽位，仍全额计入）；「排队中」单列，不计入已用。
@@ -341,6 +340,26 @@ const resourcePools = ref({ total_cpu: 0, total_memory_gb: 0, max_sandboxes: 0, 
 const activeInstances = computed(() => instances.value.filter(i => ['running', 'preparing'].includes(i.status)))
 const queuedInstances = computed(() => instances.value.filter(i => i.status === 'queued'))
 const doneCount = computed(() => instances.value.filter(i => ['completed', 'finished'].includes(i.status)).length)
+
+// ===== 任务统计（进度条口径：最近 200 条）=====
+// instances 由后端按 created_at DESC 返回，所以「最近」= 列表前 200 条。
+// 用固定样本而不是全量：全量被大量历史终态任务稀释，进度条永远贴着 100%，
+// 看不出当下的运行/排队状况。
+const RECENT_TASK_WINDOW = 200
+const recentTasks = computed(() => instances.value.slice(0, RECENT_TASK_WINDOW))
+const recentRunning = computed(() => recentTasks.value.filter(i => i.status === 'running').length)
+const recentQueued = computed(() => recentTasks.value.filter(i => i.status === 'queued').length)
+const recentDone = computed(() =>
+  recentTasks.value.filter(i => ['completed', 'finished'].includes(i.status)).length)
+
+// 进度条 = 运行 + 排队 占样本的比例，和「运行 xx / 排队 xx」是同一个分母，
+// 避免出现「写了 40% 但分子对不上」的困惑。
+const recentActive = computed(() => recentRunning.value + recentQueued.value)
+const activePercent = computed(() => {
+  const n = recentTasks.value.length
+  if (!n) return 0
+  return Math.min(100, (recentActive.value / n) * 100)
+})
 
 // 实例此刻真实占用的沙箱数，与后端 stats.effective_pods 同口径。
 // hive.py 是 concurrent_num 个 worker 各领一个任务、每个任务一个沙箱，所以尾部
@@ -597,6 +616,7 @@ function isJumped(row) {
   return (row.queue_priority || 0) > 0
 }
 function harnessColor(t) { return harnessStore.color(t) }
+function harnessTagStyle(t) { return harnessStore.tagStyle(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
 function progress(row) {
   if (!row.total_tasks) return 0
@@ -735,20 +755,8 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
 .legend-row b { margin-left: auto; font-weight: 600; color: var(--text-primary); padding-left: 10px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 
-.task-card .task-stats {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px 12px;
-}
-.task-stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.task-stat-label {
-  display: flex; align-items: center; gap: 5px;
-  font-size: 12px; color: var(--text-muted); white-space: nowrap;
-}
-.task-stat-value {
-  font-size: 22px; font-weight: 700; color: var(--text-primary);
-  font-variant-numeric: tabular-nums; padding-left: 13px;
-}
+/* 任务卡已改成与「沙箱并发」同构（resource-main + legend），不再需要
+   .task-stats / .task-stat* 这套独立网格样式。 */
 
 @media (max-width: 1400px) {
   /* 四张卡挤一行会压扁数值，先退成两行两列 */

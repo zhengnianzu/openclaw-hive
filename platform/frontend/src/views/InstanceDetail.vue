@@ -122,7 +122,7 @@
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="Harness类型">
-                  <el-tag size="small" :color="harnessColor(createParams.harness_type)" :style="{borderColor: harnessColor(createParams.harness_type)}" effect="dark">
+                  <el-tag size="small" :style="harnessTagStyle(createParams.harness_type)">
                     {{ harnessLabel(createParams.harness_type) }}
                   </el-tag>
                 </el-descriptions-item>
@@ -659,7 +659,7 @@
       <template v-else-if="detailData">
         <el-descriptions :column="3" border size="small" style="margin-bottom:16px">
           <el-descriptions-item label="Harness">
-            <el-tag size="small" :color="harnessColor(detailData.harness)" :style="{borderColor: harnessColor(detailData.harness)}" effect="dark">{{ harnessLabel(detailData.harness) }}</el-tag>
+            <el-tag size="small" :style="harnessTagStyle(detailData.harness)">{{ harnessLabel(detailData.harness) }}</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="状态">
             <el-tag size="small" :type="detailData.verdict?.has_eval ? 'success' : 'info'">
@@ -988,6 +988,7 @@ async function loadQueueInfo() {
   } finally { loadingQueueTasks.value = false }
 }
 function harnessColor(t) { return harnessStore.color(t) }
+function harnessTagStyle(t) { return harnessStore.tagStyle(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
 function formatDuration(seconds) {
   if (seconds == null) return ''
