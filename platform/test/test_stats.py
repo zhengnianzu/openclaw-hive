@@ -9,17 +9,20 @@
 
 运行：cd platform && python -m unittest test.test_stats -v
 """
+import asyncio
 import json
 import os
 import sys
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PLATFORM_DIR not in sys.path:
     sys.path.insert(0, PLATFORM_DIR)
 
 from api.routers import instances  # noqa: E402
+from api.services import export_meta  # noqa: E402
 from api.services import proxy  # noqa: E402
 from api.services import stats  # noqa: E402
 
@@ -444,6 +447,92 @@ class ProxyLoadTest(unittest.TestCase):
         # 同角色内按 pods 降序
         self.assertEqual(out[1]["pods"], 50)
         self.assertEqual(out[2]["pods"], 5)
+
+
+class ExportMetaTest(unittest.TestCase):
+    """导出服务元数据：远端列表解析 + 不可达时的本地兜底。
+
+    不打真实网络：统一 mock export_meta 的取数层。
+    """
+
+    def setUp(self):
+        export_meta._cache.clear()
+
+    tearDown = setUp  # 别把缓存留给后面的用例
+
+    def test_proxy_map_expands_ips(self):
+        got = export_meta.proxy_map_from_proxies([
+            {"source": "jumper-002", "ips": ["115.33.106.42", "10.0.0.1"]},
+            {"source": "proxy8", "ips": ["115.120.50.8"]},
+        ])
+        self.assertEqual(got, {
+            "115.33.106.42": "jumper-002",
+            "10.0.0.1": "jumper-002",
+            "115.120.50.8": "proxy8",
+        })
+
+    def test_proxy_map_skips_incomplete_entries(self):
+        got = export_meta.proxy_map_from_proxies([
+            {"source": "", "ips": ["1.1.1.1"]},     # 无名字
+            {"source": "no-ip", "ips": []},          # 无 IP
+            {"source": "blank-ip", "ips": ["  "]},   # 空白 IP
+            {"source": "ok", "ips": ["2.2.2.2"]},
+        ])
+        self.assertEqual(got, {"2.2.2.2": "ok"})
+
+    def test_list_modes_filters_non_public(self):
+        payload = {"modes": [
+            {"id": "export", "mode_label": "导出", "public": True},
+            {"id": "secret", "mode_label": "内部", "public": False},
+            {"id": "legacy", "mode_label": "老版本无 public 字段"},
+            {"mode_label": "没有 id 的脏数据"},
+        ]}
+        with mock.patch.object(export_meta, "_get_json",
+                               mock.AsyncMock(return_value=payload)):
+            modes = asyncio.run(export_meta.list_modes())
+        self.assertEqual([m["id"] for m in modes], ["export", "legacy"])
+
+    def test_mode_options_prefers_mode_label(self):
+        got = export_meta.mode_options([
+            {"id": "export", "mode_label": "导出", "label": "导出原始文件（三元组）"},
+            {"id": "bare"},  # 两个 label 都缺 → 退回 id
+        ])
+        self.assertEqual(got[0], {"value": "export", "label": "导出",
+                                  "desc": "导出原始文件（三元组）"})
+        self.assertEqual(got[1], {"value": "bare", "label": "bare", "desc": ""})
+
+    def test_list_modes_empty_when_unconfigured(self):
+        """未配 EXPORT_BASE 时直接返回空，不打网络、不写缓存。"""
+        with mock.patch.object(export_meta, "_configured", return_value=False), \
+             mock.patch.object(export_meta, "_get_json",
+                               mock.AsyncMock(side_effect=AssertionError("不该打网络"))):
+            self.assertEqual(asyncio.run(export_meta.list_modes()), [])
+        self.assertEqual(export_meta._cache, {})
+
+    def test_remote_failure_is_negative_cached(self):
+        """远端报错只打一次，30s 内复用空结果（看板每 30s 轮询，不能每次吃超时）。"""
+        fetch = mock.AsyncMock(side_effect=RuntimeError("导出服务不可达"))
+        with mock.patch.object(export_meta, "_configured", return_value=True), \
+             mock.patch.object(export_meta, "_get_json", fetch):
+            self.assertEqual(asyncio.run(export_meta.list_modes()), [])
+            self.assertEqual(asyncio.run(export_meta.list_modes()), [])
+        self.assertEqual(fetch.await_count, 1)
+
+    def test_proxy_map_async_prefers_remote(self):
+        remote = [{"source": "jumper-002", "ips": ["1.2.3.4"]}]
+        with mock.patch.object(export_meta, "list_proxies",
+                               mock.AsyncMock(return_value=remote)):
+            got = asyncio.run(proxy.load_proxy_map_async())
+        self.assertEqual(got, {"1.2.3.4": "jumper-002"})
+
+    def test_proxy_map_async_falls_back_to_local_file(self):
+        with mock.patch.object(export_meta, "list_proxies",
+                               mock.AsyncMock(return_value=[])), \
+             mock.patch.object(proxy, "load_proxy_map",
+                               return_value={"9.9.9.9": "local-only"}) as local:
+            got = asyncio.run(proxy.load_proxy_map_async())
+        self.assertEqual(got, {"9.9.9.9": "local-only"})
+        local.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -451,14 +451,26 @@
               <el-input v-model="exportDialogName" placeholder="导出名称（默认任务名，建议纯英文）" maxlength="64" />
             </el-form-item>
             <el-form-item label="导出方式">
-              <el-select v-model="exportDialogMode" style="width:100%">
-                <el-option v-for="m in exportModes" :key="m.value" :label="m.label" :value="m.value" />
+              <!-- 选项来自导出服务实时接口；label 是中文简称，desc 是括号里的长说明 -->
+              <el-select v-model="exportDialogMode" style="width:100%"
+                         no-data-text="导出方式列表加载中或不可用">
+                <el-option v-for="m in exportModes" :key="m.value" :label="m.label" :value="m.value">
+                  <span>{{ m.label }}</span>
+                  <span v-if="m.desc" style="float:right;color:var(--text-muted);font-size:12px;margin-left:12px">
+                    {{ m.value }}
+                  </span>
+                </el-option>
               </el-select>
+              <div v-if="currentModeDesc" style="color:var(--text-muted);font-size:12px;line-height:1.5;margin-top:4px">
+                {{ currentModeDesc }}
+              </div>
             </el-form-item>
           </el-form>
           <template #footer>
             <el-button @click="exportDialogVisible = false">取消</el-button>
-            <el-button type="primary" :loading="submittingExport" @click="submitProxyExport">提交</el-button>
+            <!-- 模式列表没拉到就不让提交：此时下拉是空的，提交等于发一个用户没看见的 mode -->
+            <el-button type="primary" :loading="submittingExport"
+                       :disabled="!exportModes.length" @click="submitProxyExport">提交</el-button>
           </template>
         </el-dialog>
 
@@ -1564,7 +1576,8 @@ function openArtifacts(row) {
 
 // ============ 输出 tab: 模型配置 / 用户模拟配置信息面板 ============
 // 数据源: GET /instances/{id}/proxy-config（create_params 加工：key 后四位 + 代理名映射 + 实例起止）。
-// 代理名由 settings/proxy_name.json 做 IP→名称映射，未命中留空；导出走后端 openpyxl 生成 .xlsx。
+// 代理名由后端查导出服务 /export/proxy_list 实时映射（本地 proxy_name.json 兜底），未命中留空；
+// 导出走后端 openpyxl 生成 .xlsx。
 const proxyRows = ref([])
 const proxyLoading = ref(false)
 const proxyStartedAt = ref('')
@@ -1615,14 +1628,29 @@ const exportDialogMode = ref('export')
 const submittingExport = ref(false)
 let exportPollTimer = null
 
-const exportModes = [
-  { value: 'export', label: 'export（默认导出）' },
-  { value: 'reformat', label: 'reformat' },
-  { value: 'eval', label: 'eval' },
-  { value: 'reconstruct', label: 'reconstruct' },
-  { value: 'full_reformat', label: 'full_reformat（全量）' },
-  { value: 'jiuwen_reformat', label: 'jiuwen_reformat（九问导出）' },
-]
+// 导出方式下拉：从 /export-meta/modes 实时取（后端转发导出服务 /export/mode_list），
+// 不再硬编码——远端新增模式（小艺导出/关键帧导出…）无需改前端。
+const exportModes = ref([])
+const exportModeDefault = ref('export')
+let exportModesLoaded = false
+
+async function loadExportModes() {
+  if (exportModesLoaded) return   // 一个页面生命周期内取一次就够（后端还有 60s 缓存）
+  try {
+    const res = await api.get('/export-meta/modes')
+    exportModes.value = res.modes || []
+    exportModeDefault.value = res.default || 'export'
+    exportModesLoaded = true
+    if (res.source === 'fallback') {
+      ElMessage.warning('导出服务暂时不可达，导出方式列表为本地兜底，可能不是最新')
+    }
+  } catch { /* interceptor 已提示；下拉留空，用户可重开弹窗重试 */ }
+}
+
+// 当前选中模式的长说明（远端 label 字段，如「导出原始文件（三元组，不分析）」）
+const currentModeDesc = computed(
+  () => exportModes.value.find(m => m.value === exportDialogMode.value)?.desc || ''
+)
 
 async function browseProxyExport(row) {
   // 后端鉴权接口，裸 window.open 不带 Bearer token 会 401。走带 token 的 axios 取外部
@@ -1636,8 +1664,9 @@ async function browseProxyExport(row) {
 function openExportDialog(row) {
   exportDialogRole.value = row.role
   exportDialogName.value = inst.value?.name || ''
-  exportDialogMode.value = 'export'
   exportDialogVisible.value = true
+  // 弹窗打开时才拉模式列表（而不是进 tab 就拉）：导出是低频操作
+  loadExportModes().then(() => { exportDialogMode.value = exportModeDefault.value })
 }
 
 async function submitProxyExport() {

@@ -268,6 +268,24 @@ stop_shallow_auto() {
     _stop_pidfile shallow_auto.pid "shallow-auto"
 }
 
+# auto-tracker：历史实例的发现投递（背景车道）。
+# task_tracker 是纯点击驱动,没点过的实例一行都不投 —— 实测全库 2126 个已结束实例
+# 只有 16 个被跟踪,243 个实例共 301 万行永远等不到分析,而 shallow-auto 全程闲着。
+# 本进程每轮挑**一个**「已结束+有缺口」的历史实例投进背景车道,逐个推进。
+start_auto_tracker() {
+    if [ -f auto_tracker.pid ] && kill -0 "$(cat auto_tracker.pid)" 2>/dev/null; then
+        echo "auto-tracker 已在运行 (PID: $(cat auto_tracker.pid))"
+        return
+    fi
+    rm -f auto_tracker.pid
+    nohup $PYTHON offline/auto_tracker.py > auto_tracker.log 2>&1 &
+    echo $! > auto_tracker.pid
+    echo "auto-tracker 已启动 (PID: $(cat auto_tracker.pid))"
+}
+stop_auto_tracker() {
+    _stop_pidfile auto_tracker.pid "auto-tracker"
+}
+
 # ── 旧的按阶段拆分的两个进程（已被 shallow-realtime/auto 取代）──
 # 保留启停函数仅为回滚方便；正常不要和新进程同时跑 —— 它们的 claim 不带车道过滤，
 # 会和新进程抢同一批行（CAS 不会重复处理，但会互相拖慢并打乱车道隔离）。
@@ -403,6 +421,7 @@ case "$ACTION" in
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
         # 目标架构 4 进程（不含旧单体循环与 deep-auto 背景全量下载）
         start_tracker
+        start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
         start_realtime_worker
@@ -441,6 +460,7 @@ case "$ACTION" in
         # 停全部：目标架构 4 进程 + 旧进程（单体循环 / deep-auto），
         # 两边都停才不会在升级期间留下孤儿进程继续抢队列。
         stop_tracker
+        stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
         stop_realtime_worker
@@ -469,6 +489,7 @@ case "$ACTION" in
         # 停全部：目标架构 4 进程 + 旧进程（单体循环 / deep-auto），
         # 两边都停才不会在升级期间留下孤儿进程继续抢队列。
         stop_tracker
+        stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
         stop_realtime_worker
@@ -492,6 +513,7 @@ case "$ACTION" in
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
         # 目标架构 4 进程（不含旧单体循环与 deep-auto 背景全量下载）
         start_tracker
+        start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
         start_realtime_worker
@@ -519,9 +541,10 @@ case "$ACTION" in
 
     # 单个 worker 的实时日志。这 4 个就是当前架构的全部常驻进程。
     #   ./run.sh logs-tracker | logs-rt | logs-auto | logs-dl
-    logs-tracker|logs-rt|logs-auto|logs-dl)
+    logs-tracker|logs-atracker|logs-rt|logs-auto|logs-dl)
         case "$ACTION" in
-            logs-tracker) _f=tracker.log;          _n="tracker（发现投递）" ;;
+            logs-tracker) _f=tracker.log;          _n="tracker（发现投递/点击）" ;;
+            logs-atracker) _f=auto_tracker.log;    _n="auto-tracker（历史实例投递）" ;;
             logs-rt)      _f=shallow_realtime.log; _n="shallow-realtime（实时分析/点击）" ;;
             logs-auto)    _f=shallow_auto.log;     _n="shallow-auto（背景分析/全量）" ;;
             logs-dl)      _f=realtime_worker.log;  _n="deep-realtime（实时下载/交付物）" ;;
@@ -567,13 +590,14 @@ case "$ACTION" in
         # $2 可能是子目标（tracker/rt/auto/...），也可能是 start 时的 host，这里只认前者
         case "$2" in
             tracker) _logs=(tracker.log) ;;
+            atracker) _logs=(auto_tracker.log) ;;
             rt|realtime) _logs=(shallow_realtime.log) ;;
             auto)    _logs=(shallow_auto.log) ;;
             dl|download) _logs=(realtime_worker.log) ;;
             local)   _logs=(shallow_local.log) ;;      # 旧进程
             obs)     _logs=(shallow_obs.log) ;;        # 旧进程
-            *)       _logs=(tracker.log shallow_realtime.log shallow_auto.log
-                            realtime_worker.log) ;;
+            *)       _logs=(tracker.log auto_tracker.log shallow_realtime.log
+                            shallow_auto.log realtime_worker.log) ;;
         esac
         _present=()
         for f in "${_logs[@]}"; do
@@ -599,7 +623,8 @@ case "$ACTION" in
                 printf "  %-34s 未运行\n" "$2"
             fi
         }
-        _ws tracker.pid          "tracker（发现投递）"              tracker.log
+        _ws tracker.pid          "tracker（发现投递/点击）"         tracker.log
+        _ws auto_tracker.pid     "auto-tracker（历史实例投递）"      auto_tracker.log
         _ws shallow_realtime.pid "shallow-realtime（实时分析/点击）" shallow_realtime.log
         _ws shallow_auto.pid     "shallow-auto（背景分析/全量）"      shallow_auto.log
         _ws realtime_worker.pid  "deep-realtime（实时下载）"         realtime_worker.log
@@ -614,6 +639,7 @@ case "$ACTION" in
         echo ""
         echo "=== 各 worker 日志尾部 5 行 ==="
         for _pair in "tracker.log:tracker" \
+                     "auto_tracker.log:auto-tracker" \
                      "shallow_realtime.log:shallow-realtime" \
                      "shallow_auto.log:shallow-auto" \
                      "realtime_worker.log:deep-realtime"; do
@@ -631,6 +657,7 @@ case "$ACTION" in
     # 要跑旧进程用 ./run.sh shallow-start / deep-start 单独起。
     worker-start)
         start_tracker
+        start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
         start_realtime_worker
@@ -638,6 +665,7 @@ case "$ACTION" in
 
     worker-stop)
         stop_tracker
+        stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
         stop_realtime_worker
@@ -645,11 +673,13 @@ case "$ACTION" in
 
     worker-restart)
         stop_tracker
+        stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
         stop_realtime_worker
         sleep 1
         start_tracker
+        start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
         start_realtime_worker
@@ -669,6 +699,13 @@ case "$ACTION" in
             tracker-start) start_tracker ;;
             tracker-stop)  stop_tracker ;;
             tracker-restart) stop_tracker; sleep 1; start_tracker ;;
+        esac
+        ;;
+    atracker-start|atracker-stop|atracker-restart)
+        case "$ACTION" in
+            atracker-start) start_auto_tracker ;;
+            atracker-stop)  stop_auto_tracker ;;
+            atracker-restart) stop_auto_tracker; sleep 1; start_auto_tracker ;;
         esac
         ;;
     rt-start|rt-stop|rt-restart)
@@ -705,15 +742,19 @@ case "$ACTION" in
         # 不含 deep-auto（产物纯点击驱动，全量下载会写爆磁盘）。
         case "$ACTION" in
             shallow-all-start)
-                start_tracker; start_shallow_realtime; start_shallow_auto
+                start_tracker; start_auto_tracker
+                start_shallow_realtime; start_shallow_auto
                 start_realtime_worker ;;
             shallow-all-stop)
-                stop_tracker; stop_shallow_realtime; stop_shallow_auto
+                stop_tracker; stop_auto_tracker
+                stop_shallow_realtime; stop_shallow_auto
                 stop_realtime_worker ;;
             shallow-all-restart)
-                stop_tracker; stop_shallow_realtime; stop_shallow_auto
+                stop_tracker; stop_auto_tracker
+                stop_shallow_realtime; stop_shallow_auto
                 stop_realtime_worker; sleep 1
-                start_tracker; start_shallow_realtime; start_shallow_auto
+                start_tracker; start_auto_tracker
+                start_shallow_realtime; start_shallow_auto
                 start_realtime_worker ;;
         esac
         ;;
@@ -747,7 +788,8 @@ case "$ACTION" in
         echo "  logs             查看主服务日志（uvicorn，实时）"
         echo ""
         echo "  —— 四个 worker 的日志（当前架构）——"
-        echo "  logs-tracker     tracker 发现投递        → tracker.log"
+        echo "  logs-tracker     tracker 发现投递(点击)   → tracker.log"
+        echo "  logs-atracker    auto-tracker 历史实例投递 → auto_tracker.log"
         echo "  logs-rt          shallow-realtime 实时分析 → shallow_realtime.log"
         echo "  logs-auto        shallow-auto 背景分析     → shallow_auto.log"
         echo "  logs-dl          deep-realtime 实时下载    → realtime_worker.log"
@@ -764,8 +806,9 @@ case "$ACTION" in
         echo "  worker-stop      停止浅层 + 产物下载"
         echo "  worker-restart   重启浅层 + 产物下载"
         echo "  shallow-all-start|stop|restart  目标架构 4 进程一起启停"
-        echo "                   （tracker + shallow-realtime + shallow-auto + deep-realtime）"
-        echo "  tracker-start|stop|restart   只动发现投递"
+        echo "                   （tracker + auto-tracker + shallow-realtime + shallow-auto + deep-realtime）"
+        echo "  tracker-start|stop|restart   只动发现投递(点击驱动)"
+        echo "  atracker-start|stop|restart  只动历史实例投递(每轮一个实例)"
         echo "  rt-start|stop|restart        只动实时分析（用户点击，两阶段，2s）"
         echo "  auto-start|stop|restart      只动背景分析（全量，最新优先）"
         echo "  realtime-start|stop|restart  只动实时下载（点击的交付物，2s 轮询）"

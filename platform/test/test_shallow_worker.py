@@ -30,6 +30,7 @@ from api.core.database import get_connection, init_db  # noqa: E402
 from offline import shallow_local as sl  # noqa: E402
 from offline import shallow_obs as so  # noqa: E402
 from offline import task_tracker as tt  # noqa: E402
+from offline import auto_tracker as at  # noqa: E402
 
 IID = "__sw_test_instance__"
 
@@ -250,6 +251,55 @@ class TrackerOrderTest(unittest.TestCase):
         # queued 的排最前（哪怕它登记时间最老），其余按时间倒序
         self.assertEqual(got, ["__tk_fresh__", "__tk_new__", "__tk_mid__", "__tk_old__"])
 
+    def test_running_auto_tracked_without_click(self):
+        """running 实例不需要点击就被跟踪 —— 实例还在产出,结果随时在变。
+
+        实测 26 个 running 实例只有 6 个被点过,另外 20 个正在产出却零分析。
+        """
+        iid = "__tk_autorun__"
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO task_instances (id, name, config_path, status, created_at) "
+                "VALUES (?,?,?,'running',datetime('now'))",
+                (iid, iid, "/nonexistent.yaml"))
+            conn.commit()
+            got = {r["instance_id"]: dict(r) for r in tt.pick_clicked(conn)}
+            conn.execute("DELETE FROM task_instances WHERE id=?", (iid,))
+            conn.commit()
+        self.assertIn(iid, got, "running 实例必须被自动跟踪")
+        self.assertEqual(got[iid]["req_status"], "tracking")
+        self.assertEqual(got[iid]["src"], 1, "src=1 表示自动跟踪（非点击）")
+
+    def test_clicked_before_auto_tracked(self):
+        """点击的排在自动跟踪的前面 —— 用户在等。"""
+        self._seed()
+        auto = "__tk_autorun2__"
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO task_instances (id, name, config_path, status, created_at) "
+                "VALUES (?,?,?,'running',datetime('now'))",
+                (auto, auto, "/nonexistent.yaml"))
+            conn.commit()
+            rows = tt.pick_clicked(conn)
+            conn.execute("DELETE FROM task_instances WHERE id=?", (auto,))
+            conn.commit()
+        srcs = [r["src"] for r in rows]
+        self.assertEqual(srcs, sorted(srcs), "src=0(点击) 必须全部排在 src=1(自动) 之前")
+
+    def test_ended_unclicked_not_tracked(self):
+        """已结束且没点过的实例不在这里处理 —— 交给 auto_tracker 逐个补全。"""
+        iid = "__tk_endedonly__"
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO task_instances (id, name, config_path, status, created_at) "
+                "VALUES (?,?,?,'finished',datetime('now'))",
+                (iid, iid, "/nonexistent.yaml"))
+            conn.commit()
+            got = {r["instance_id"] for r in tt.pick_clicked(conn)}
+            conn.execute("DELETE FROM task_instances WHERE id=?", (iid,))
+            conn.commit()
+        self.assertNotIn(iid, got)
+
     def test_newest_tracking_before_oldest(self):
         """只有 tracking 时，最新登记的必须排在最老的前面。"""
         self._seed()
@@ -346,6 +396,191 @@ class SubmitResetTest(unittest.TestCase):
             tt.submit_batch(conn, self.IID, ["a.json"], priority=0, reset=True)
             conn.commit()
             self.assertEqual(self._state(conn)[2], 100)
+
+
+class AutoTrackerPickTest(unittest.TestCase):
+    """auto_tracker 的实例挑选：已结束 + 有缺口 + 没被点过 + 没投过。
+
+    存在意义:task_tracker 纯点击驱动,没点过的实例一行都不投 ——
+    实测全库 2126 个已结束实例只有 16 个被跟踪,243 个实例共 301 万行
+    永远等不到分析,而 shallow-auto 的 64 并发全程闲着。
+    """
+
+    IIDS = ("__at_fin__", "__at_run__", "__at_clicked__",
+            "__at_nogap__", "__at_done__")
+
+    def setUp(self):
+        init_db()
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        with get_connection() as conn:
+            at._ensure_state_table(conn)
+            for i in self.IIDS:
+                conn.execute("DELETE FROM task_instances WHERE id=?", (i,))
+                conn.execute("DELETE FROM task_records WHERE instance_id=?", (i,))
+                conn.execute("DELETE FROM shallow_requests WHERE instance_id=?", (i,))
+                conn.execute("DELETE FROM auto_tracker_state WHERE instance_id=?", (i,))
+            conn.commit()
+
+    def _mk(self, iid, status, gap_rows=3, clicked=False, submitted=False):
+        with get_connection() as conn:
+            at._ensure_state_table(conn)
+            conn.execute(
+                "INSERT INTO task_instances (id, name, config_path, status, created_at) "
+                "VALUES (?,?,?,?,datetime('now'))",
+                (iid, iid, "/nonexistent.yaml", status))
+            for i in range(gap_rows):
+                conn.execute(
+                    "INSERT INTO task_records (instance_id, config_name, task_idx, "
+                    " status, traj_level) VALUES (?,?,?,'任务成功',NULL)",
+                    (iid, f"{iid}_{i}.json", i))
+            if clicked:
+                conn.execute(
+                    "INSERT INTO shallow_requests (instance_id, created_by, status) "
+                    "VALUES (?,'t','tracking')", (iid,))
+            if submitted:
+                at._mark_done(conn, iid, 1, "test")
+            conn.commit()
+
+    def _pick(self, min_gap=1):
+        with get_connection() as conn:
+            got = at.pick_one_instance(conn, min_gap)
+            conn.commit()
+        return got["id"] if got else None
+
+    def test_picks_ended_instance_with_gap(self):
+        self._mk("__at_fin__", "finished", gap_rows=5)
+        self.assertEqual(self._pick(), "__at_fin__")
+
+    def test_skips_running(self):
+        """running 由 task_tracker 负责（还在产出,点击驱动的增量更合适）。"""
+        self._mk("__at_run__", "running", gap_rows=5)
+        self.assertIsNone(self._pick())
+
+    def test_skips_clicked(self):
+        """已登记的交给 task_tracker,本进程不重复投。"""
+        self._mk("__at_clicked__", "finished", gap_rows=5, clicked=True)
+        self.assertIsNone(self._pick())
+
+    def test_skips_already_submitted(self):
+        """投过的不重复选 —— 缺口要等 shallow-auto 慢慢消化,期间 traj_level 仍是 NULL,
+        不记状态会每轮重新选到它、每轮整扫一遍 jsonl。"""
+        self._mk("__at_done__", "finished", gap_rows=5, submitted=True)
+        self.assertIsNone(self._pick())
+
+    def test_skips_no_gap(self):
+        """全部已定级的实例没有缺口,不该被选。"""
+        self._mk("__at_nogap__", "finished", gap_rows=2)
+        with get_connection() as conn:
+            conn.execute("UPDATE task_records SET traj_level='L2' WHERE instance_id=?",
+                         ("__at_nogap__",))
+            conn.commit()
+        self.assertIsNone(self._pick())
+
+    def test_min_gap_filters_and_marks(self):
+        """缺口小于 min_gap 时跳过,并记一笔 —— 否则每轮都会重新选到它。"""
+        self._mk("__at_fin__", "finished", gap_rows=2)
+        self.assertIsNone(self._pick(min_gap=100))
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT note FROM auto_tracker_state WHERE instance_id=?",
+                ("__at_fin__",)).fetchone()
+        self.assertIsNotNone(row, "跳过的实例必须记状态,否则会被反复选中")
+
+    def test_lane_is_background(self):
+        """本进程恒投背景车道 —— 历史补全是吞吐活,不该占实时车道。"""
+        self.assertEqual(at.LANE_AUTO, 0)
+
+    def test_newest_first(self):
+        """最近结束的实例先补 —— 刚跑完的自动插队到历史积压前面。"""
+        with get_connection() as conn:
+            at._ensure_state_table(conn)
+            for iid, ts in (("__at_fin__", "2026-07-01 00:00:00"),
+                            ("__at_run__", "2026-11-03 00:00:00")):
+                conn.execute(
+                    "INSERT INTO task_instances (id, name, config_path, status, "
+                    " created_at, stopped_at) VALUES (?,?,?,'finished',?,?)",
+                    (iid, iid, "/nonexistent.yaml", ts, ts))
+                conn.execute(
+                    "INSERT INTO task_records (instance_id, config_name, task_idx, "
+                    " status, traj_level) VALUES (?,?,0,'任务成功',NULL)",
+                    (iid, f"{iid}.json"))
+            conn.commit()
+        # 11-03 的那个必须先被选中，而不是 7 月的
+        self.assertEqual(self._pick(), "__at_run__")
+
+
+class AutoLanePendingTest(unittest.TestCase):
+    """水位控制:背景车道待办超过上限就不投新实例。
+
+    没有水位时本进程是「60s 无条件投一个实例」,而历史实例缺口差异极大
+    (实测最大 61,808 行、最小 3 行) —— 连投 5 个大实例就是 20 万行涌入。
+    """
+
+    IID = "__wl_test__"
+
+    def setUp(self):
+        init_db()
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        with get_connection() as conn:
+            conn.execute("DELETE FROM shallow_queue WHERE instance_id=?", (self.IID,))
+            conn.execute("DELETE FROM task_records WHERE instance_id=?", (self.IID,))
+            conn.commit()
+
+    def test_counts_stage1_queued(self):
+        with get_connection() as conn:
+            before = at.auto_lane_pending(conn)
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,'a.json',0,'queued','done','pending_click')", (self.IID,))
+            conn.commit()
+            self.assertEqual(at.auto_lane_pending(conn), before + 1)
+
+    def test_ignores_realtime_lane(self):
+        """实时车道的行不算进背景水位。"""
+        with get_connection() as conn:
+            before = at.auto_lane_pending(conn)
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,'b.json',100,'queued','done','pending_click')", (self.IID,))
+            conn.commit()
+            self.assertEqual(at.auto_lane_pending(conn), before)
+
+    def test_ignores_already_graded_obs_rows(self):
+        """obs_state='queued' 但 traj_level 已写好的遗留行不算水位。
+
+        线上有 2.5 万行这种,worker 根本不会领;算进水位会让本进程
+        误以为队列很满、永远不投新实例。
+        """
+        with get_connection() as conn:
+            before = at.auto_lane_pending(conn)
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,'c.json',0,'done','queued','pending_click')", (self.IID,))
+            conn.execute(
+                "INSERT INTO task_records (instance_id, config_name, task_idx, "
+                " status, task_done, traj_level) "
+                "VALUES (?,'c.json',0,'任务成功',1,'L2')", (self.IID,))
+            conn.commit()
+            self.assertEqual(at.auto_lane_pending(conn), before)
+
+    def test_run_once_skips_when_full(self):
+        """水位满时 run_once 不选实例(也就不读 jsonl)。"""
+        st = at.run_once(min_gap=1, max_pending=1)
+        self.assertIsNone(st["instance"])
+        self.assertEqual(st["submitted"], 0)
 
 
 if __name__ == "__main__":

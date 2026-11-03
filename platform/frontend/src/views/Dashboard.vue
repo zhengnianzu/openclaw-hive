@@ -155,6 +155,17 @@
       <el-select v-model="userFilter" placeholder="创建者筛选" clearable filterable size="default" style="width:160px">
         <el-option v-for="u in userOptions" :key="u" :label="u" :value="u" />
       </el-select>
+      <!-- 镜像类型：四十多个镜像，filterable 直接输入过滤。选项只取当前实际在用的，
+           避免把历史上注册过但没人用的镜像也列进来。 -->
+      <el-select v-model="imageFilter" placeholder="镜像筛选" clearable filterable
+        size="default" style="width:200px">
+        <el-option v-for="img in imageOptions" :key="img.value"
+          :label="img.label" :value="img.value" />
+      </el-select>
+      <el-select v-model="imageOsFilter" placeholder="镜像系统" clearable size="default" style="width:130px">
+        <el-option label="Linux" value="linux" />
+        <el-option label="Windows" value="windows" />
+      </el-select>
       <el-date-picker v-model="dateRange" type="daterange" range-separator="~"
         start-placeholder="开始" end-placeholder="结束" value-format="YYYY-MM-DD"
         size="default" style="width:220px" clearable />
@@ -179,6 +190,21 @@
             <el-tag :style="{ ...harnessTagStyle(row.harness_type), maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }" size="default">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <!-- 镜像列默认隐藏（表already 15 列，再加一列横向就撑不开了），
+             按「镜像」筛选时才出现，这样筛完能看到筛的是哪个镜像。 -->
+        <el-table-column v-if="imageFilter || imageOsFilter" label="镜像" width="200"
+          align="center" show-overflow-tooltip resizable>
+          <template #default="{row}">
+            <el-tooltip :content="row.image_address || '未记录镜像'" placement="top">
+              <span style="display:inline-flex;align-items:center;gap:4px">
+                <el-tag :type="row.sandbox_type === 'windows' ? 'warning' : 'success'" size="small">
+                  {{ row.sandbox_type === 'windows' ? 'Win' : 'Linux' }}
+                </el-tag>
+                <span class="img-name">{{ row.image_name || '—' }}</span>
+              </span>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column prop="status" label="状态" width="90" resizable>
@@ -336,6 +362,8 @@ const queueOptions = ref([])
 // 用内联 filter 时用户打完字一失焦，选项会缩成一条，看起来像筛选失效了。
 const queueSearch = ref('')
 const harnessFilter = ref('')
+const imageFilter = ref('')
+const imageOsFilter = ref('')
 const userFilter = ref('')
 const dateRange = ref(null)
 const nameSearch = ref('')
@@ -489,6 +517,17 @@ const userOptions = computed(() => {
   return Array.from(set).sort()
 })
 
+// 镜像下拉：只列当前实例实际用到的镜像，按名称排序。
+// 筛选值用 image_address（同一短名理论上唯一，但地址才是实例里存的原值）。
+const imageOptions = computed(() => {
+  const map = new Map()
+  instances.value.forEach(i => {
+    if (i.image_address) map.set(i.image_address, i.image_name || i.image_address)
+  })
+  return Array.from(map, ([value, label]) => ({ value, label }))
+    .sort((a, b) => a.label.localeCompare(b.label))
+})
+
 // 队列下拉的搜索：按 id 子串过滤候选项（队列常有上百个，纯下拉翻不动）。
 // 「全部 / 未入队」两个固定项始终保留，否则搜到一半就没法清筛选了。
 const matchedQueueOptions = computed(() => {
@@ -509,6 +548,10 @@ const filteredInstances = computed(() => {
       : list.filter(i => i.queue_id === queueFilter.value)
   }
   if (harnessFilter.value) list = list.filter(i => (i.harness_type || 'openclaw') === harnessFilter.value)
+  if (imageFilter.value) list = list.filter(i => i.image_address === imageFilter.value)
+  // 镜像系统复用 sandbox_type（沙箱配置里的 OS）——实测与镜像自身的 os 标签
+  // 在全部 2191 个实例上完全一致，且它已经在接口里了，不必再按镜像查一次。
+  if (imageOsFilter.value) list = list.filter(i => (i.sandbox_type || 'linux') === imageOsFilter.value)
   if (userFilter.value) list = list.filter(i => i.created_by === userFilter.value)
   if (dateRange.value && dateRange.value.length === 2) {
     const [start, end] = dateRange.value
@@ -538,7 +581,8 @@ const pagedInstances = computed(() => {
 })
 
 // 筛选/每页条数变化时回到第一页；当前页因数据减少而越界时也回退，避免停在空白页
-watch([statusFilter, queueFilter, harnessFilter, userFilter, dateRange, nameSearch, pageSize], () => {
+watch([statusFilter, queueFilter, harnessFilter, imageFilter, imageOsFilter,
+       userFilter, dateRange, nameSearch, pageSize], () => {
   if (restoring) return
   currentPage.value = 1
   syncQuery()
@@ -557,6 +601,8 @@ function syncQuery() {
   if (statusFilter.value) q.status = statusFilter.value
   if (queueFilter.value) q.queue = queueFilter.value
   if (harnessFilter.value) q.harness = harnessFilter.value
+  if (imageFilter.value) q.image = imageFilter.value
+  if (imageOsFilter.value) q.imageos = imageOsFilter.value
   if (userFilter.value) q.user = userFilter.value
   if (dateRange.value && dateRange.value.length === 2) q.date = dateRange.value.join(',')
   if (nameSearch.value) q.q = nameSearch.value
@@ -570,6 +616,8 @@ function restoreFromQuery() {
   if (q.status) statusFilter.value = String(q.status)
   if (q.queue) queueFilter.value = String(q.queue)
   if (q.harness) harnessFilter.value = String(q.harness)
+  if (q.image) imageFilter.value = String(q.image)
+  if (q.imageos) imageOsFilter.value = String(q.imageos)
   if (q.user) userFilter.value = String(q.user)
   if (q.date) dateRange.value = String(q.date).split(',')
   if (q.q) nameSearch.value = String(q.q)
@@ -829,7 +877,9 @@ h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
   .resource-panel-body { grid-template-columns: 1fr; }
 }
 
-.filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+/* 镜像名偏长（multiharness:26.10.12-test-trajfix-1021），超出省略，完整地址看 tooltip */
+.img-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .mono-num { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-secondary); white-space: nowrap; }
 .pagination-bar { display: flex; justify-content: flex-end; margin-top: 16px; }
 </style>

@@ -12,6 +12,9 @@
         <el-option label="通用" value="common" />
         <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
       </el-select>
+      <el-select v-model="osFilter" placeholder="操作系统" clearable size="default" style="width:140px">
+        <el-option v-for="o in OS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
@@ -24,6 +27,21 @@
             <el-tag :style="harnessTagStyle(row.harness_type)" size="small">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="os" label="操作系统" width="120" align="center">
+          <template #default="{ row }">
+            <!-- 运维可直接在列表里改：历史镜像的 os 是按名称回填的，个别需要人工纠正 -->
+            <el-select
+              v-if="authStore.isOperator"
+              :model-value="row.os || 'linux'"
+              size="small"
+              style="width:96px"
+              @change="val => handleOsChange(row, val)"
+            >
+              <el-option v-for="o in OS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+            </el-select>
+            <el-tag v-else :type="osTagType(row.os)" size="small">{{ osLabel(row.os) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="created_by" label="注册人" width="120" />
@@ -50,6 +68,11 @@
             <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
           </el-select>
         </el-form-item>
+        <el-form-item label="操作系统" required>
+          <el-radio-group v-model="form.os">
+            <el-radio v-for="o in OS_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -72,17 +95,33 @@ const loading = ref(false)
 const creating = ref(false)
 const dialogVisible = ref(false)
 const typeFilter = ref('')
+const osFilter = ref('')
 const images = ref([])
 
-const form = ref({ name: '', address: '', harness_type: 'openclaw' })
+const OS_OPTIONS = [
+  { value: 'linux', label: 'Linux' },
+  { value: 'windows', label: 'Windows' },
+]
+
+const form = ref({ name: '', address: '', harness_type: 'openclaw', os: 'linux' })
 
 function harnessColor(type) { return harnessStore.color(type) }
 function harnessTagStyle(type) { return harnessStore.tagStyle(type) }
 function harnessLabel(type) { return harnessStore.label(type) }
 
+// 历史行在后端迁移时已回填，这里的兜底只为「字段还没下发」的瞬间
+function osLabel(os) {
+  return OS_OPTIONS.find(o => o.value === os)?.label || 'Linux'
+}
+function osTagType(os) {
+  return os === 'windows' ? 'warning' : 'success'
+}
+
 const filteredImages = computed(() => {
-  if (!typeFilter.value) return images.value
-  return images.value.filter(i => i.harness_type === typeFilter.value)
+  return images.value.filter(i =>
+    (!typeFilter.value || i.harness_type === typeFilter.value) &&
+    (!osFilter.value || (i.os || 'linux') === osFilter.value)
+  )
 })
 
 async function loadImages() {
@@ -102,9 +141,20 @@ async function handleCreate() {
     await api.post('/images', form.value)
     ElMessage.success('镜像注册成功')
     dialogVisible.value = false
-    form.value = { name: '', address: '', harness_type: 'openclaw' }
+    form.value = { name: '', address: '', harness_type: 'openclaw', os: 'linux' }
     loadImages()
   } finally { creating.value = false }
+}
+
+async function handleOsChange(row, os) {
+  const prev = row.os
+  row.os = os  // 乐观更新，失败再回滚，避免下拉闪回
+  try {
+    await api.patch(`/images/${row.id}`, { os })
+    ElMessage.success(`已标记为 ${osLabel(os)}`)
+  } catch (e) {
+    row.os = prev  // 失败提示由 api 拦截器统一弹，这里只回滚
+  }
 }
 
 async function handleDelete(row) {

@@ -146,6 +146,11 @@ class InstanceInfo(BaseModel):
     done_tasks: int = 0
     concurrent_num: int = 100
     harness_type: str = "openclaw"
+    # 镜像：create_params.image_name 存的是完整地址，这里拆成筛选值 + 展示名。
+    # 首页「镜像」下拉按 image_address 筛（唯一稳定），显示 image_name（注册短名；
+    # 未注册的镜像回退地址末段）。沙箱 OS 不在这里，用已有的 sandbox_type。
+    image_address: str = ""
+    image_name: str = ""
     suffix_api_keys: bool = False       # 创建时是否开启 key 沙箱后缀（列表标识用）
     output_status: Optional[str] = None  # NULL=未做浅层/未输出, done=浅层完成可直接用
     # 准备/拉起进程失败的原因（status='failed' 时展示给用户）。

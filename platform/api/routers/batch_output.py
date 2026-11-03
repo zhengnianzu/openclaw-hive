@@ -24,6 +24,7 @@ from fastapi.responses import Response
 from ..core.config import settings, ARTIFACT_PRIORITY_USER
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
+from ..services import export_meta
 from ..services import proxy as proxy_service
 
 router = APIRouter(prefix="/api/instances", tags=["batch-output"])
@@ -44,9 +45,20 @@ _ROLE_TO_KEY = {
     _EVALUATOR_ROLE: (_EVALUATOR, "api_key", "base_url", "model"),
 }
 
-# 导出方式（外部服务允许的 mode）+ 默认 mode
-_EXPORT_MODES = ["export", "reformat", "eval", "reconstruct", "full_reformat",
-                 "jiuwen_reformat"]
+# 导出方式：权威源是导出服务 GET /export/mode_list（services/export_meta.py），
+# 下面这份只在远端不可达时作兜底白名单用（与远端当前 public 模式对齐）。
+# 新增模式不要改这里：远端加一条，平台前后端自动跟上。
+_FALLBACK_EXPORT_MODES = [
+    {"id": "export", "mode_label": "导出"},
+    {"id": "reformat", "mode_label": "合并导出"},
+    {"id": "reconstruct", "mode_label": "重构导出"},
+    {"id": "full_reformat", "mode_label": "全量导出"},
+    {"id": "jiuwen_reformat", "mode_label": "九问导出"},
+    {"id": "jiuwenswarm_dev", "mode_label": "Jiuwenswarm 开发"},
+    {"id": "jiuwenswarm_xiaoyi", "mode_label": "小艺导出"},
+    {"id": "key_frame_export", "mode_label": "关键帧导出"},
+    {"id": "eval", "mode_label": "质检"},
+]
 _DEFAULT_MODE = "export"
 
 # 导出任务状态：外部 queued/running/success/failed + 本地未导出
@@ -597,9 +609,9 @@ async def deep_extra_log(instance_id: str, traj_name: str,
 # Evaluator = agents[] 中 name == 'evaluator' 的项。
 
 
-def _load_proxy_map() -> dict:
-    """读取 proxy_name.json（IP → 代理名）。映射缺失/损坏时返回空字典。"""
-    return proxy_service.load_proxy_map()
+async def _load_proxy_map() -> dict:
+    """IP → 代理名：导出服务 /export/proxy_list 优先，失败回退本地 proxy_name.json。"""
+    return await proxy_service.load_proxy_map_async()
 
 
 def _proxy_name_for(baseurl: str, proxy_map: dict) -> str:
@@ -614,11 +626,14 @@ def _key_suffix(api_key) -> str:
     return api_key[-4:] if len(api_key) >= 4 else api_key
 
 
-def _build_proxy_rows(create_params) -> list:
-    """从 create_params dict 拼出面板 rows（key 已截后四位、代理名已映射）。"""
+def _build_proxy_rows(create_params, proxy_map: dict) -> list:
+    """从 create_params dict 拼出面板 rows（key 已截后四位、代理名已映射）。
+
+    proxy_map 由调用方 `await _load_proxy_map()` 传入：取代理名要打远端接口，
+    不能在这个同步函数里做网络 IO（会阻塞事件循环）。
+    """
     if not create_params or not isinstance(create_params, dict):
         return []
-    proxy_map = _load_proxy_map()
     rows = []
 
     # 主Agent：顶层字段
@@ -767,15 +782,17 @@ async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_us
     """模型配置/用户模拟配置信息面板数据。
 
     读 task_instances.create_params → 主Agent/用户模拟/Evaluator 三组 rows
-    （baseurl / key 后四位 / 代理名称 / 模型），key 已截尾，代理名由 settings/proxy_name.json
-    做 IP→名称映射（无映射留空）。运行时间取实例级 started_at ~ stopped_at。
+    （baseurl / key 后四位 / 代理名称 / 模型），key 已截尾，代理名走导出服务
+    /export/proxy_list 实时映射（远端不可达时回退本地 proxy_name.json，均未命中留空）。
+    运行时间取实例级 started_at ~ stopped_at。
     每行并回带对话导出信息（export_status / session_path / total_sessions，来自 model_export_tasks）。
     """
     inst = _get_instance(instance_id)
+    proxy_map = await _load_proxy_map()
     rows = []
     try:
         if inst.get("create_params"):
-            rows = _build_proxy_rows(json.loads(inst["create_params"]))
+            rows = _build_proxy_rows(json.loads(inst["create_params"]), proxy_map)
     except (ValueError, TypeError):
         rows = []  # create_params 非法时静默降级为空，不 500
 
@@ -804,10 +821,11 @@ async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_us
 async def export_proxy_config(instance_id: str, user: dict = Depends(get_current_user)):
     """导出模型配置面板为 .xlsx（openpyxl 生成，FileResponse 下载）。"""
     inst = _get_instance(instance_id)
+    proxy_map = await _load_proxy_map()
     rows = []
     try:
         if inst.get("create_params"):
-            rows = _build_proxy_rows(json.loads(inst["create_params"]))
+            rows = _build_proxy_rows(json.loads(inst["create_params"]), proxy_map)
     except (ValueError, TypeError):
         rows = []
 
@@ -900,8 +918,11 @@ async def submit_proxy_export(instance_id: str, body: dict, user: dict = Depends
         raise HTTPException(status_code=400, detail=f"非法角色: {role}")
     export_name = (body or {}).get("export_name") or ""
     mode = (body or {}).get("mode") or _DEFAULT_MODE
-    if mode not in _EXPORT_MODES:
-        raise HTTPException(status_code=400, detail=f"非法 mode {mode}（allowed: {', '.join(_EXPORT_MODES)}）")
+    # 白名单取远端实时列表；远端不可达时退回本地兜底，避免「远端挂了连导出都提不了」
+    allowed = [m["id"] for m in await export_meta.list_modes()] or \
+        [m["id"] for m in _FALLBACK_EXPORT_MODES]
+    if mode not in allowed:
+        raise HTTPException(status_code=400, detail=f"非法 mode {mode}（allowed: {', '.join(allowed)}）")
 
     inst = _get_instance(instance_id)
     key, model = _role_cred_from(inst.get("create_params"), role, inst)
@@ -984,7 +1005,9 @@ async def proxy_export_status(instance_id: str, user: dict = Depends(get_current
             cp = json.loads(inst["create_params"])
     except (ValueError, TypeError):
         cp = None
-    for r in _build_proxy_rows(cp):
+    # 这里只用 rows 的 role 做角色枚举，不回显代理名，传空 map 省掉一次远端取数
+    # （本端点被前端 5s 轮询，没必要每次都问 /export/proxy_list）
+    for r in _build_proxy_rows(cp, {}):
         ex = export_map.get(r["role"])
         rows.append({
             "role": r["role"],

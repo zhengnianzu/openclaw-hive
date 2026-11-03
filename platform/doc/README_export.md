@@ -12,8 +12,11 @@
 | 项 | 现在 | 目标 |
 |---|---|---|
 | 模型连接信息 | 散落在实例目录 `openclaw.json` / `user_proxy_model.json`，需逐个打开文件 | 「输出」页直接一个面板看到三组 baseurl / key 后4位 / 代理名 / 运行时间 |
-| 代理识别 | 需人工对照 IP 记忆 | 自动把 baseurl 里的 IP 映射成代理名（`proxy_name.json`），无映射则留空 |
+| 代理识别 | 需人工对照 IP 记忆 | 自动把 baseurl 里的 IP 映射成代理名（导出服务 `/export/proxy_list` 实时取，`proxy_name.json` 兜底），无映射则留空 |
 | 导出 | 无 | 一键导出 Excel（`.xlsx`） |
+| 导出方式下拉 | 前后端各一份硬编码（易与远端不一致） | 取导出服务 `/export/mode_list` 实时列表，远端新增模式自动出现 |
+
+> `settings/proxy_name.json` 自此**只作降级兜底**：正常路径走远端实时接口，不必再手工维护。
 
 ## 二、数据来源：任务创建表单信息（`task_instances.create_params`）
 
@@ -43,24 +46,31 @@
 
 > user 确认：运行时间取 **实例级**，不从各角色会话/日志单独解析。
 
-## 三、代理映射文件 `settings/proxy_name.json`
+## 三、代理映射：导出服务实时接口（本地文件兜底）
 
-新增 `platform/settings/proxy_name.json`（与 `settings.SETTINGS_DIR` 目录一致），格式为 **IP → 代理名** 的 JSON 字典：
+代理名（IP → 名称）的**权威源是导出服务**，不再是手写的本地文件：
 
-```json
-{
-  "115.120.113.66": "jumper003",
-  "115.120.62.121": "jumper001",
-  "115.33.106.42": "jumper002",
-  "115.120.48.151": "jumper",
-  "115.33.106.57": "proxy-004"
-}
+```bash
+curl -s "$EXPORT_BASE/export/proxy_list?access-key=$AK" | python3 -m json.tool
+# {"proxies":[{"source":"jumper-002","root_id":"52e24556",
+#              "root_path":"/mnt/sfs_turbo/.../jumper-002/...","ips":["115.33.106.42"]}, ...]}
 ```
 
+`source` 即代理名，`ips[]` 逐个展开成 `{IP: source}` 映射。实现见
+`api/services/export_meta.py`（取数 + 60s 缓存）与 `api/services/proxy.py:load_proxy_map_async()`。
+
 匹配逻辑：
-1. 从角色 `baseurl` 用正则提取 IP（`re.search(r'https?://([0-9.]+)', baseurl)`）；
-2. 用 IP 查 `proxy_name.json`，命中 → 代理名称；未命中 / 文件不存在 / 无 IP → **代理名称留空**；
-3. 文件不存在或 JSON 解析失败时静默降级为空映射（不报错、不影响面板其他列）。
+1. 从角色 `baseurl` 用正则提取 IP（`_IP_RE`，非 IP 时退回 host 段）；
+2. 用 IP 查映射，命中 → 代理名称；未命中 / 无 IP → **代理名称留空**；
+3. **降级**：远端不可达或未配 `EXPORT_BASE` 时，回退本地 `settings/proxy_name.json`
+   （同样是 IP → 名称的 JSON 字典）；该文件也缺失/损坏则静默降级为空映射，
+   不报错、不影响面板其他列。
+
+> 两边命名略有差异：远端是 `jumper-002` / `proxy-004-latest`，本地兜底文件里是
+> `jumper002` / `proxy-004`。降级时面板上的名字会跟着变，属预期行为。
+
+缓存：成功 60s、失败 30s（负缓存）。`/api/stats` 每 30s 被每个打开看板的客户端拉一次，
+远端故障时若不做负缓存，每次请求都要吃一个 5s 超时。
 
 ## 四、后端接口
 
@@ -98,9 +108,44 @@
 > 选后端 openpyxl 而非前端引 xlsx 库：零新依赖、不破坏现有 vite 构建、后端直接产 `.xlsx`。
 > 与 `logs.py` 已有 `FileResponse` 模式一致。
 
+### `GET /api/export-meta/modes`
+
+「导出方式」下拉的选项来源（`api/routers/export_meta.py`），转发导出服务
+`GET /export/mode_list`，裁剪成前端要的字段：
+
+```json
+{
+  "modes": [
+    { "value": "export",   "label": "导出",     "desc": "导出原始文件（三元组，不分析）" },
+    { "value": "reformat", "label": "合并导出", "desc": "合并导出（三元组合并成单 JSON，不质检）" }
+  ],
+  "default": "export",
+  "source": "remote"
+}
+```
+
+- `label` 取远端 `mode_label`（中文简称），`desc` 取远端 `label`（括号长说明）；
+- `source`：`remote` = 取到远端实时列表；`fallback` = 远端不可达，用的是
+  `batch_output._FALLBACK_EXPORT_MODES` 本地兜底白名单，前端会提示「可能不是最新」；
+- 只返回 `public=True` 的模式（缺省视为 `True`，兼容远端老版本无该字段）。
+
+**新增导出模式不需要改平台代码**：远端 `/export/mode_list` 加一条，前后端自动跟上。
+兜底白名单只在远端挂掉时生效，可按需补齐。
+
+`POST /proxy-config/export` 的 mode 校验同样以远端列表为准（远端不可达时退回兜底白名单），
+避免「远端挂了连导出都提不了」。
+
+### `GET /api/export-meta/proxies`
+
+代理（src 来源）列表：`{proxies: [{source, root_id, ips}], source}`。
+`root_path` 不外露（导出服务那边的内部挂载路径，前端用不到）。
+
 ### 路由注册顺序
 
 `/proxy-config` 与 `/proxy-config/export` 均为静态段，无 `{traj_name}` 类参数路由冲突，直接注册即可。
+
+导出元数据端点**必须单独开 router**（前缀 `/api/export-meta`），不能挂在 `/api/instances` 下：
+`instances.py` 有 `GET /{instance_id}` 通配路由，会把 `/api/instances/export-meta` 当成实例 ID 吃掉。
 
 ## 五、前端（`frontend/src/views/InstanceDetail.vue`）
 

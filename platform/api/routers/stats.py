@@ -64,6 +64,10 @@ async def get_stats(
     )
     active = _enrich(active_rows)
 
+    # 2.5) 代理名映射：导出服务 /export/proxy_list 实时取（60s 缓存），
+    # 远端不可达时回退本地 settings/proxy_name.json
+    proxy_map = await proxy_service.load_proxy_map_async()
+
     # 3) 趋势重建窗口内启动过的实例（只取需要的列）
     now = datetime.now()
     start_ts = now.timestamp() - hours * 3600
@@ -129,7 +133,7 @@ async def get_stats(
         ],
         proxy_usage=[
             ProxyUsageItem(**x)
-            for x in stats_service.proxy_load(active, proxy_service.load_proxy_map())
+            for x in stats_service.proxy_load(active, proxy_map)
         ],
         trend=Trend(
             source="estimated",

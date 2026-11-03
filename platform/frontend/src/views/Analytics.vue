@@ -310,7 +310,7 @@
                 </el-col>
               </el-row>
               <div class="panel-foot">
-                代理名来自 settings/proxy_name.json（IP → 名称）；未登记的 IP 直接显示地址。结尾的 <code>/v1</code> 与尾斜杠已归并
+                代理名来自导出服务实时接口（IP → 名称，本地 proxy_name.json 兜底）；未登记的 IP 直接显示地址。结尾的 <code>/v1</code> 与尾斜杠已归并
               </div>
             </div>
           </el-col>

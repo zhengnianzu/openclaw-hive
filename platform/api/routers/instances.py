@@ -442,6 +442,40 @@ def _resolve_suffix_api_keys(d: dict) -> bool:
     return bool(d.get("suffix_api_keys"))
 
 
+# 镜像地址 → 注册短名。/instances 一轮要给 2000+ 行填这个名字，
+# 逐行查库等于把刚优化掉的耗时加回来；镜像表只有几十行且极少变动，
+# 所以整表缓存 60s（新注册的镜像最多 1 分钟后在筛选里显示正确短名）。
+_IMAGE_NAME_CACHE: dict = {}
+_IMAGE_NAME_CACHE_AT = 0.0
+_IMAGE_NAME_TTL = 60.0
+
+
+def _image_name_map() -> dict:
+    global _IMAGE_NAME_CACHE, _IMAGE_NAME_CACHE_AT
+    now = time.time()
+    if _IMAGE_NAME_CACHE_AT and (now - _IMAGE_NAME_CACHE_AT) < _IMAGE_NAME_TTL:
+        return _IMAGE_NAME_CACHE
+    try:
+        with get_connection() as conn:
+            rows = conn.execute("SELECT name, address FROM images").fetchall()
+        _IMAGE_NAME_CACHE = {r["address"]: r["name"] for r in rows}
+        _IMAGE_NAME_CACHE_AT = now
+    except Exception:
+        # 查不到就沿用上一份（或空表），不能让首页因为镜像表问题整个 500
+        pass
+    return _IMAGE_NAME_CACHE
+
+
+def _image_display_name(address: str) -> str:
+    """镜像展示名：优先注册短名，未注册的回退地址末段（repo:tag）。"""
+    if not address:
+        return ""
+    name = _image_name_map().get(address)
+    if name:
+        return name
+    return address.rsplit("/", 1)[-1]
+
+
 def _with_harness_type(d: dict) -> dict:
     params = {}
     if d.get("create_params"):
@@ -450,6 +484,13 @@ def _with_harness_type(d: dict) -> dict:
         except Exception:
             params = {}
     d["harness_type"] = params.get("harness_type", "openclaw")
+    # 首页「镜像」筛选用。create_params 里存的是镜像完整地址，
+    # 下拉要显示的是注册时的短名（multiharness:26.9.24v1），所以这里同时给出两个：
+    # image_address 做筛选值（唯一且稳定），image_name 做展示。
+    # 未注册/已删除的镜像查不到短名，回退取地址末段（仍可筛，只是名字长一点）。
+    address = params.get("image_name") or ""
+    d["image_address"] = address
+    d["image_name"] = _image_display_name(address)
     # 列表/详情页的标识用：该实例创建时是否开启 key 沙箱后缀
     d["suffix_api_keys"] = _resolve_suffix_api_keys(d)
     return d

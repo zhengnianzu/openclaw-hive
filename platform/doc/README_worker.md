@@ -10,11 +10,12 @@
 
 ## 一、四个 Worker
 
-当前架构共 **4 个常驻进程**。切分维度是**场景**(是不是用户在等),不是阶段(读本地还是读 OBS)。
+当前架构共 **5 个常驻进程**。切分维度是**场景**(是不是用户在等),不是阶段(读本地还是读 OBS)。
 
 | 进程 | 启动命令 | 职责 | 车道 | 日志 |
 |------|---------|------|------|------|
-| **tracker** | `offline/task_tracker.py` | 发现投递:增量读 jsonl,把新完成的 config 投进队列 | — | `tracker.log` |
+| **tracker** | `offline/task_tracker.py` | 发现投递(**点击 + running 自动**):增量读 jsonl,把新完成的 config 投进队列 | 按实例状态 | `tracker.log` |
+| **auto-tracker** | `offline/auto_tracker.py` | 发现投递(**历史补全**):每轮挑一个已结束+有缺口的实例 | 恒 `priority=0` | `auto_tracker.log` |
 | **shallow-realtime** | `offline/shallow_worker.py --mode realtime` | 浅层分析(两阶段),**仍在跑的实例** | `priority >= 100` | `shallow_realtime.log` |
 | **shallow-auto** | `offline/shallow_worker.py --mode auto` | 浅层分析(两阶段),**已结束实例**,批量补全,最新优先 | `priority < 100` | `shallow_auto.log` |
 | **deep-realtime** | `offline/output_worker.py --realtime-only` | 交付物下载,只处理用户点击的 | `artifact_priority >= 100` | `realtime_worker.log` |
@@ -57,10 +58,54 @@
 > 实测 73,334 行、1.2s 降完(其中 22,489 行仍待处理,随即被 auto 的 64 并发清空)。
 > 以后实例自然结束时新行会直接进背景车道,不需要再手工降。
 
-### 1.2 tracker 日志怎么读
+### 1.2 两个 tracker 的分工
+
+`task_tracker` 覆盖两类实例:
+
+1. **点击登记的**(`shallow_requests`)—— 任意状态,用户显式要求
+2. **所有 running/preparing 的**(自动,**无需点击**)—— 实例还在产出就说明结果随时在变,
+   用户点开输出页时应该已经有数据,而不是「点一下、等 5 秒、才开始分析」。
+   实测 26 个 running 实例里只有 6 个被点过,另外 20 个正在产出却零分析
+   (`complete.jsonl` 已攒到 230KB);开启自动跟踪后一轮补投 **64,710 行**。
+
+> 自动跟踪的实例**不写 `shallow_requests`** —— 那张表的语义是「用户显式要求」,
+> 污染它会带偏 `_clear_shallow_request` 的出队回收和 `output_status` 门控。
+> 查询里用 `src` 列区分(0=点击,1=自动),排序上点击的优先(用户在等)。
+
+剩下的缺口是**已结束且没点过**的实例:实测全库 **2126 个已结束实例只有 16 个被跟踪**,
+其中 243 个实例共 **301 万行** `traj_level IS NULL` —— tracker 不碰它们
+(已结束的实例不该每 5 秒重扫一遍几十万行 jsonl),交给 `auto_tracker` 逐个补全。
+
+`auto_tracker` 补这个缺口:
+
+|            | `task_tracker`            | `auto_tracker`                 |
+|------------|---------------------------|--------------------------------|
+| 实例来源   | 点击登记 **+ 所有 running/preparing**(自动,无需点击) | 全库扫「已结束 + 有缺口」 |
+| 实例状态   | 任意(点击) / running(自动) | 仅 `finished`/`stopped`/`completed` |
+| 车道       | 按实例状态(100 / 0)       | **恒 0**(背景)                  |
+| 粒度       | 每轮扫全部被跟踪实例      | **每轮一个实例**                |
+| 增量       | offset + inode + 头指纹   | 同款(复用 tracker 的函数)       |
+| 间隔       | 5s                        | 60s(没活时 ×5 退避)             |
+
+**为什么每轮只投一个实例**:历史缺口 301 万行,一次全投会把 `shallow_queue`
+瞬间灌成几百万行、单次写持锁过久(实测一条 876 万行的 UPDATE 持锁 22.8s,
+期间用户点下载全部 500),还会把新点击的实例挤在几百万条历史后面。
+每轮一个、投完等 shallow-auto 消化,历史缺口以「实例」为粒度稳步推进,
+任何时刻队列里的背景行都是有界的。实测单实例投 10,000 行耗时 0.48s。
+
+`auto_tracker_state` 表记录投过哪些实例。必须记 —— 投完后缺口要等 shallow-auto
+慢慢消化,期间 `traj_level` 仍是 NULL,不记状态下一轮又会选中它、又整扫一遍 jsonl。
+缺口小于 `--min-gap` 的实例也记一笔(跳过),同样是防反复选中。
+
+两者写同一张 `shallow_queue`,靠 `ON CONFLICT(instance_id, config_name)` 去重,
+同时跑安全:某实例既被点过又被 auto_tracker 选中时,`priority=MAX()` 保证它
+留在实时车道(用户在等,优先级更高)。
+
+### 1.3 两个 tracker 的日志怎么读
 
 ```
-[tracker] 跟踪=26 新行=5 投递=5 0.41s | 2611031737-8c24(3,rt)  2611031441-a5bc(1,rt)
+[tracker] 跟踪=26 新行=5 投递=5 0.41s
+[auto-tracker] 2611022313-c92d 缺口=6,468 新行=10000 投递=10000 0.48s
 ```
 
 | 字段 | 含义 |
@@ -68,16 +113,16 @@
 | `跟踪=26` | 当前 `shallow_requests` 里被跟踪的实例**总数**(不是编号) |
 | `新行=5` | 本轮从这些实例的 jsonl 里增量读到的新完成任务数 |
 | `投递=5` | 实际投进队列的行数(与新行数通常相等,去重后可能略少) |
-| `2611031737-8c24(3,rt)` | **本轮真正有产出的实例**:短ID(行数,车道) |
+| `2611022313-c92d` | auto-tracker 本轮选中的实例短 ID(首段时间 + 末段后缀) |
+| `缺口=6,468` | 该实例 `traj_level IS NULL` 的行数 |
+
+auto-tracker 每轮只处理一个实例,所以直接打实例 ID;tracker 每轮扫全部被跟踪实例,
+只报总数(每轮通常只有 1~2 个有新行,逐个列出反而刷屏)。
 
 短 ID 取 `instance_id` 的**首段时间 + 末段后缀**
 (`2611031754-wanyi26110317530533-70b2` → `2611031754-70b2`),固定 15 字符。
-
-> 不用 `name`:实测同批次的 name 只差末尾几个字(「…lego」/「…lego-copy」/
-> 「…lego-copy-copy」),截断后完全分不出谁是谁;而且 name 含中文、长度到 50+,对齐难看。
->
-> 只列**有产出**的实例:26 个实例里每轮通常只有 1~2 个有新行,
-> 全列出来反而看不清。超过 4 个显示 `+N个`。
+不用 `name`:实测同批次的 name 只差末尾几个字(「…lego」/「…lego-copy」/
+「…lego-copy-copy」),截断后分不出谁是谁;而且含中文、长到 50+,对齐难看。
 
 ### 为什么没有 deep-auto
 
@@ -400,19 +445,21 @@ SQLite 的 WAL **只允许一个写者**。`BUSY_TIMEOUT_MS=15000`(`DB_BUSY_TIME
 cd /root/openclaw-hive/platform
 
 # ── 启停(4 个进程一起)──
-./run.sh worker-start          # = tracker + shallow-realtime + shallow-auto + deep-realtime
+./run.sh worker-start          # = tracker + auto-tracker + shallow-realtime + shallow-auto + deep-realtime
 ./run.sh worker-stop           # 停新旧全部(含历史进程,避免升级期留孤儿)
 ./run.sh worker-restart
 ./run.sh shallow-all-start     # 同 worker-start
 
 # ── 单个进程 ──
-./run.sh tracker-start|tracker-stop|tracker-restart
+./run.sh tracker-start|tracker-stop|tracker-restart       # 点击驱动投递
+./run.sh atracker-start|atracker-stop|atracker-restart    # 历史实例投递
 ./run.sh rt-start|rt-stop|rt-restart            # shallow-realtime
 ./run.sh auto-start|auto-stop|auto-restart      # shallow-auto
 ./run.sh realtime-start|realtime-stop|realtime-restart   # deep-realtime
 
 # ── 日志 ──
 ./run.sh logs-tracker          # tracker.log
+./run.sh logs-atracker         # auto_tracker.log
 ./run.sh logs-rt               # shallow_realtime.log
 ./run.sh logs-auto             # shallow_auto.log
 ./run.sh logs-dl               # realtime_worker.log
@@ -421,6 +468,8 @@ cd /root/openclaw-hive/platform
 
 # ── 调试(跑一轮即退出)──
 python offline/task_tracker.py --once
+python offline/auto_tracker.py --once            # 投一个历史实例
+python offline/auto_tracker.py --once --min-gap 100
 python offline/shallow_worker.py --mode realtime --once
 python offline/shallow_worker.py --mode auto --once
 ```
@@ -468,7 +517,8 @@ python offline/shallow_worker.py --mode auto --once
 
 | 代码 | 职责 |
 |------|------|
-| `offline/task_tracker.py` | 发现投递、增量读 jsonl |
+| `offline/task_tracker.py` | 发现投递(点击驱动)、增量读 jsonl |
+| `offline/auto_tracker.py` | 发现投递(历史补全),每轮一个实例 |
 | `offline/shallow_worker.py` | 浅层双模式、两阶段串联、车道过滤 |
 | `offline/shallow_local.py` | 阶段 1 的 `claim` / `judge_one` / `apply_results` |
 | `offline/shallow_obs.py` | 阶段 2 的 `claim` / `grade_one` / `apply_results` |
@@ -478,6 +528,6 @@ python offline/shallow_worker.py --mode auto --once
 | `api/routers/worker_monitor.py` | 监控接口(overview/queue/trend/eta/reclaim) |
 | `api/routers/artifacts.py` | 交付物工作区(列表/树/内容/入队) |
 | `api/routers/batch_output.py` | 浅层登记、会话详情(deep) |
-| `test/test_shallow_worker.py` | 车道隔离、最新优先、阶段串联、投递顺序、车道分配、reset 语义(21 项) |
+| `test/test_shallow_worker.py` | 车道隔离、最新优先、阶段串联、投递顺序、车道分配、reset 语义、auto-tracker 挑选(28 项) |
 | `test/test_artifact_queue.py` | 产物状态机(20 项) |
 | `test/test_worker_monitor.py` | 心跳、ETA、回收(11 项) |

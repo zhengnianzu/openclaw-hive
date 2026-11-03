@@ -269,7 +269,14 @@ def pick_clicked(conn) -> list[dict]:
     处理哪些实例，但新架构三个进程都不读它 —— 所以点击必须在这里接上，
     否则用户点完什么都不会发生。
 
-    status 两态：
+    **除了点击登记的，还自动带上「正在跑（running/preparing）」的实例** ——
+    实例还在产出就说明结果随时在变，用户点开输出页时应该已经有数据，而不是
+    「点一下、等 5 秒、才开始分析」。实测 26 个 running 实例里只有 6 个被点过，
+    另外 20 个正在产出却零分析（complete.jsonl 已攒到 230KB）。
+    自动跟踪的实例**不写 shallow_requests** —— 那张表的语义是「用户显式要求」，
+    污染它会带偏 _clear_shallow_request 的出队逻辑和 output_status 门控。
+
+    status 两态（仅对点击登记的有意义）：
       'queued'   —— 刚点，还没扫过。首轮要从头(offset=0)整扫一遍，之后转 'tracking'
       'tracking' —— 已在增量跟踪。运行中实例每轮只读新增行，结束后自然安静
 
@@ -288,12 +295,44 @@ def pick_clicked(conn) -> list[dict]:
     就把全部实例扫完（增量读只有几行），所以顺序在实例数少时无感；
     但实例数多、或某实例首轮要整扫几十万行时，顺序就决定了谁先拿到结果。
     """
+    marks = ",".join("?" * len(ACTIVE_STATUSES))
     rows = conn.execute(
-        "SELECT sr.instance_id, sr.status AS req_status, ti.config_path, ti.status "
-        "FROM shallow_requests sr "
-        "JOIN task_instances ti ON ti.id = sr.instance_id "
-        "ORDER BY CASE WHEN sr.status='queued' THEN 0 ELSE 1 END, "
-        "         sr.created_at DESC",
+        # 外层包一次：复合查询（UNION ALL）的 ORDER BY 只能引用结果列的位置或
+        # 第一个 SELECT 的列名，CASE 表达式里引用别名会报
+        # 「2nd ORDER BY term does not match any column」。
+        "SELECT * FROM ( "
+        # ① 点击登记的（任意状态）
+        "SELECT sr.instance_id AS instance_id, sr.status AS req_status, "
+        "       ti.config_path AS config_path, ti.status AS status, "
+        "       0 AS src, sr.created_at AS ord_at "
+        "  FROM shallow_requests sr "
+        "  JOIN task_instances ti ON ti.id = sr.instance_id "
+        "UNION ALL "
+        # ② **正在跑但没点过**的实例：自动跟踪，不需要点击。
+        #
+        # 实例还在产出就说明结果随时在变，用户点开输出页时应该已经有数据，
+        # 而不是「点一下、等 5 秒、才开始分析」。实测 26 个 running 实例里
+        # 只有 6 个被点过 —— 另外 20 个正在产出却零分析，complete.jsonl 已经
+        # 攒到几十上百 KB（单实例实测 230,571 字节）。
+        #
+        # req_status 固定 'tracking'：不需要「首轮清零整扫」那套 —— 那是给
+        # 「用户点击一个早已跑过的实例」用的（offset 可能已到文件尾）。
+        # running 实例是边跑边读，offset 自然从 0 开始递增。
+        # 也不写 shallow_requests：那张表的语义是「用户显式要求」，
+        # 自动跟踪不该污染它（否则实例结束后 _clear_shallow_request 的
+        # 出队逻辑、以及 output_status 门控都会被带偏）。
+        f"SELECT ti.id, 'tracking', ti.config_path, ti.status, "
+        f"       1 AS src, COALESCE(ti.started_at, ti.created_at) "
+        f"  FROM task_instances ti "
+        f" WHERE ti.status IN ({marks}) "
+        f"   AND NOT EXISTS(SELECT 1 FROM shallow_requests sr2 "
+        f"                   WHERE sr2.instance_id = ti.id) "
+        ") "
+        # 排序：点击的优先于自动跟踪的（用户在等）；组内未扫过的优先、再按时间倒序
+        "ORDER BY src, "
+        "         CASE WHEN req_status='queued' THEN 0 ELSE 1 END, "
+        "         ord_at DESC",
+        ACTIVE_STATUSES,
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -395,18 +434,16 @@ def _submit_incremental(conn, instance_id: str, out_dir: str, priority: int) -> 
 
 
 def run_once(limit: int) -> dict:
-    """只投递「用户点击过」的实例（shallow_requests 登记的），且**只投新增 config**。
+    """投递「点击过的」+「正在跑的」实例，且**只投新增 config**。
 
-    纯点击驱动：不再自动扫描最近 N 个实例。没点过的任务不触发浅层分析。
+    点击驱动 + running 自动跟踪：已结束且没点过的实例不在这里处理
+    （交给 offline/auto_tracker.py 按实例逐个补全）。
     点击后按 offset 增量读 jsonl（tracker_state 记录偏移），不每轮全量重拉：
       · 首轮（status='queued'）：清零 offset → 从头整扫已完成的 config → 转 'tracking'
       · 之后（status='tracking'）：只读新增行，运行中实例新完成的 config 逐轮带进来
     `limit` 参数保留仅为兼容 CLI，不再用于发现范围。
     """
-    stats = {"instances": 0, "lines": 0, "submitted": 0, "clicked": 0,
-             # 本轮真正投出行的实例（(短ID, 行数, 车道) 三元组），供日志打明细。
-             # 只记有产出的：24 个实例里通常只有 1~2 个有新行，全列出来反而看不清。
-             "detail": []}
+    stats = {"instances": 0, "lines": 0, "submitted": 0, "clicked": 0}
     with get_connection() as conn:
         for inst in pick_clicked(conn):
             iid = inst["instance_id"]
@@ -423,15 +460,11 @@ def run_once(limit: int) -> dict:
                     "UPDATE shallow_requests SET status='tracking' WHERE instance_id=?",
                     (iid,))
 
-            pri = _lane_priority(inst.get("status"))
-            n_lines, n_sub = _submit_incremental(conn, iid, out_dir, priority=pri)
+            n_lines, n_sub = _submit_incremental(
+                conn, iid, out_dir, priority=_lane_priority(inst.get("status")))
             stats["lines"] += n_lines
             stats["submitted"] += n_sub
             stats["clicked"] += n_sub
-            if n_lines:
-                stats["detail"].append(
-                    (_short_iid(iid), n_lines,
-                     "rt" if pri >= LANE_REALTIME else "auto"))
         conn.commit()
     return stats
 
@@ -457,16 +490,8 @@ def main() -> None:
         try:
             st = run_once(a.limit)
             if st["submitted"] or st["lines"]:
-                # 列出**真正投出行的实例**（短ID + 行数 + 车道），而不是只报一个
-                # 「实例=24」的总数 —— 24 是「在跟踪的实例数」，每轮通常只有 1~2 个
-                # 有新行，报总数看不出是谁在动、进了哪条车道。
-                # 超过 4 个就省略尾部，避免单行过长。
-                det = st.get("detail") or []
-                shown = "  ".join(f"{iid}({n},{lane})" for iid, n, lane in det[:4])
-                more = f" +{len(det)-4}个" if len(det) > 4 else ""
                 print(f"[tracker] 跟踪={st['instances']} 新行={st['lines']} "
-                      f"投递={st['submitted']} {time.time()-t0:.2f}s | {shown}{more}",
-                      flush=True)
+                      f"投递={st['submitted']} {time.time()-t0:.2f}s", flush=True)
             # 每轮都写心跳（哪怕本轮没有新行）：监控页靠最后心跳时间判断进程存活。
             # processed 记「新投递数」，这才是 tracker 的产出；scanned 放 note 里。
             write_heartbeat(

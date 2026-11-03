@@ -6,6 +6,11 @@ class ImageCreate(BaseModel):
     name: str
     address: str
     harness_type: str = "openclaw"
+    os: str = "linux"
+
+
+class ImageUpdate(BaseModel):
+    os: str
 
 
 class ImageInfo(BaseModel):
@@ -13,5 +18,6 @@ class ImageInfo(BaseModel):
     name: str
     address: str
     harness_type: str
+    os: str = "linux"
     created_at: str
     created_by: str = ""

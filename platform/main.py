@@ -21,6 +21,8 @@ from api.routers import wiki, notifications, settings_overview
 from api.routers import public_api
 from api.routers import artifacts
 from api.routers import worker_monitor
+# 导出方式 / 代理来源下拉选项：转发导出服务 (EXPORT_BASE) 的实时接口
+from api.routers import export_meta
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
 # 子目录项（worker/config.yaml）也在这里，os.path.join 能正常处理；
 # 复制前需要先确保父目录存在，否则 copy2 会 FileNotFoundError。
@@ -63,6 +65,7 @@ app.include_router(code_repos.router)
 app.include_router(config_templates.router)
 app.include_router(harness_configs.router)
 app.include_router(harness_meta.router)
+app.include_router(export_meta.router)
 app.include_router(sandbox_configs.router)
 # 资源池总量（首页看板的分母），只读 settings/sandbox/resource_pools.yaml
 app.include_router(resource_pools.router)
@@ -168,7 +171,12 @@ if os.path.isdir(static_dir):
     class NoCacheHTMLStaticFiles(StaticFiles):
         async def get_response(self, path, scope):
             resp = await super().get_response(path, scope)
-            if path in ("", "index.html") or (path or "").endswith("/"):
+            # 判断依据用响应的 content-type，不用 path：StaticFiles.get_path() 会把
+            # "/" 规范化成 "."，SPA 深链（/instances/xxx）又会 html=True 回落到
+            # index.html，两者都不等于 "index.html"，按 path 匹配会漏掉最常见的入口，
+            # index.html 就发不出 no-cache —— 正是上面注释要防的那个线上问题。
+            ctype = resp.headers.get("content-type", "")
+            if ctype.startswith("text/html"):
                 resp.headers["Cache-Control"] = "no-cache, must-revalidate"
             elif (path or "").startswith("assets/"):
                 # Vite 产出的文件名带内容 hash，内容变了名字就变，可以放心长期缓存。

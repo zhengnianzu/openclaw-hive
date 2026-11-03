@@ -2,22 +2,29 @@
 """代理（自部署模型网关）识别工具。
 
 数据侧只有实例 create_params 里的 base_url（形如 http://115.120.62.121:8082/v1），
-而运营上关心的是「这批请求压在哪台 jumper 上」。两者通过 settings/proxy_name.json
-的 IP → 代理名映射接上。
+而运营上关心的是「这批请求压在哪台 jumper 上」。两者通过 IP → 代理名映射接上。
+
+映射来源（优先级从高到低）：
+  1. 导出服务 `GET /export/proxy_list` 实时接口（services/export_meta.py）——权威源，
+     新增/改名代理立刻生效；
+  2. 本地 settings/proxy_name.json —— 仅兜底（远端不可达或未配 EXPORT_BASE 时）。
+
+注意两边命名略有差异（远端 `jumper-002`/`proxy-004-latest`，本地 `jumper002`/`proxy-004`），
+降级时前端展示的名字会跟着变，这是预期行为。
 
 base_url 的写法并不统一：主 Agent 常见 `http://ip:8082`，user_simulator 要求带
 `/v1`，还有带尾斜杠的历史数据。这里统一归一化成 `http://ip:port`，否则同一台
 代理会被拆成三行。
 
-本模块只做纯字符串处理 + 读一个小 JSON，不碰 DB。
+本模块只做纯字符串处理 + 读一个小 JSON + 转发一次远端取数，不碰 DB。
 """
 import json
 import os
 import re
-import time
 from typing import Optional
 
 from ..core.config import settings
+from . import export_meta
 
 _PROXY_NAME_FILE = os.path.join(settings.SETTINGS_DIR, "proxy_name.json")
 
@@ -30,7 +37,11 @@ _cache = {"mtime": None, "map": {}}
 
 
 def load_proxy_map() -> dict:
-    """IP → 代理名。文件缺失/解析失败/非 dict 一律返回空映射。"""
+    """【兜底】从本地 settings/proxy_name.json 读 IP → 代理名。
+
+    文件缺失/解析失败/非 dict 一律返回空映射。正常路径请用 load_proxy_map_async()，
+    这里只在远端不可达时被回退调用（以及离线脚本/测试里直接用）。
+    """
     try:
         st = os.stat(_PROXY_NAME_FILE)
     except OSError:
@@ -46,6 +57,19 @@ def load_proxy_map() -> dict:
     _cache["mtime"] = st.st_mtime
     _cache["map"] = out
     return out
+
+
+async def load_proxy_map_async() -> dict:
+    """IP → 代理名：远端 /export/proxy_list 优先，失败回退本地文件。
+
+    远端取数自带 60s 缓存（export_meta），所以这里每次请求都调是安全的。
+    """
+    try:
+        proxies = await export_meta.list_proxies()
+    except Exception:
+        proxies = []  # export_meta 内部已吞掉网络异常，这里只兜意外
+    remote = export_meta.proxy_map_from_proxies(proxies)
+    return remote or load_proxy_map()
 
 
 def normalize_base_url(url: Optional[str]) -> str:
