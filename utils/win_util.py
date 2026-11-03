@@ -133,19 +133,22 @@ def decode_remote_b64(stdout: str) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-# Windows 沙箱辅助目录: (本地源目录, 相对 home 的 tar arcname)。
-# 打包后统一解压到 sandbox home, 三个目录即落到各自目标位置。
-# 注意: 这些目录只对下面白名单里的镜像有意义 —— 只有那个镜像缺内置依赖,
-# 需要从宿主机补进去; 其余镜像自带, 传过去反而可能覆盖掉镜像里的新版。
-_WINDOWS_AUX_DIRS = [
-    ("/root/sandbox-log/windows/skills/serper", ".openclaw/skills/serper"),
-    ("/root/sandbox-log/windows/xiaoyi-device-env", "xiaoyi-device-env"),
-    ("/root/sandbox-log/windows/claude_code_image_reading_tool", "claude_code_image_reading_tool"),
-]
-
-# 仅这些镜像执行 _setup_windows_obsutil(上传辅助目录)。其余镜像跳过。
-_WINDOWS_AUX_IMAGE_ALLOWLIST = {
-    "swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:windows-openclaw-2026.6.6-harness-20261010-2177eeb0-defaultpy-noagentd-v2",
+# Windows 沙箱辅助目录: 镜像 -> [(本地源目录, 相对 home 的 tar arcname), ...]。
+# 打包后统一解压到 sandbox home, 各目录即落到各自目标位置。
+# 注意: 每个镜像需要的目录不同, 只补该镜像缺的东西 —— 传多余目录会覆盖掉
+# 镜像里更新的版本。不在表里的镜像完全跳过(它们自带这些依赖)。
+_WINDOWS_AUX_DIRS_BY_IMAGE: dict[str, list[tuple[str, str]]] = {
+    # 老镜像: 缺 serper 技能、xiaoyi 设备侧环镜和图片读取工具
+    "swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:windows-openclaw-2026.6.6-harness-20261010-2177eeb0-defaultpy-noagentd-v2": [
+        ("/root/sandbox-log/windows/skills/serper", ".openclaw/skills/serper"),
+        ("/root/sandbox-log/windows/xiaoyi-device-env", "xiaoyi-device-env"),
+        ("/root/sandbox-log/windows/claude_code_image_reading_tool", "claude_code_image_reading_tool"),
+    ],
+    # fix1: 缺 serper 技能。jiuwenswarm 按 <home>/.jiuwenswarm/agent/workspace 找项目技能
+    "swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:windows-jiuwenswarm-xiaoyi-0.2.4.beta3-toc-stable-20261103-fix1": [
+        ("/root/sandbox-log/windows/skills/serper",
+         ".jiuwenswarm/agent/workspace/skills/serper"),
+    ],
 }
 
 
@@ -178,13 +181,13 @@ def _read_obs_credentials() -> tuple[str, str, str]:
     return ik, kk, ek
 
 
-def _build_windows_aux_tar() -> str:
-    """把 _WINDOWS_AUX_DIRS 打成一个 tar (arcname 相对 home), 返回本地 tar 路径。"""
+def _build_windows_aux_tar(aux_dirs: list[tuple[str, str]]) -> str:
+    """把给定辅助目录打成一个 tar (arcname 相对 home), 返回本地 tar 路径。"""
     fd, tar_path = tempfile.mkstemp(suffix=".tar")
     os.close(fd)
     try:
         with tarfile.open(tar_path, "w") as tar:
-            for src, arc in _WINDOWS_AUX_DIRS:
+            for src, arc in aux_dirs:
                 if os.path.isdir(src):
                     tar.add(src, arcname=arc, recursive=True)
     except Exception:
@@ -229,13 +232,16 @@ async def _setup_windows_obsutil(self) -> None:
 
     1. obsutil config 的 -i/-k/-e 从 <project>/platform/.env 读 (IK/KK/EK),
         .env 不存在时回落 .env.example, 不再硬编码。每个镜像都配置一遍。
-    2. 三个辅助目录 (tar 打包 + 沙箱内 tar -xf, 与 _upload_and_extract_code 同
-        套路 —— ExtendUploadFile 传目录只会把 zip 字节写成一个文件, 不解压):
-            /root/sandbox-log/windows/skills/serper/            -> ~/.openclaw/skills/serper/
-            /root/sandbox-log/windows/xiaoyi-device-env/        -> ~/xiaoyi-device-env/
-            /root/sandbox-log/windows/claude_code_image_reading_tool/ -> ~/claude_code_image_reading_tool/
-       这一步只在镜像命中 _WINDOWS_AUX_IMAGE_ALLOWLIST 时执行; 其他镜像自带这些
-       目录, 覆盖会顶掉镜像内更新的版本。
+    2. 该镜像需要的辅助目录 (tar 打包 + 沙箱内 tar -xf, 与 _upload_and_extract_code
+        同套路 —— ExtendUploadFile 传目录只会把 zip 字节写成一个文件, 不解压),
+        按 _WINDOWS_AUX_DIRS_BY_IMAGE 取。例如:
+            multiharness 老镜像:
+                /root/sandbox-log/windows/skills/serper/            -> ~/.openclaw/skills/serper/
+                /root/sandbox-log/windows/xiaoyi-device-env/        -> ~/xiaoyi-device-env/
+                /root/sandbox-log/windows/claude_code_image_reading_tool/ -> ~/claude_code_image_reading_tool/
+            jiuwenswarm-xiaoyi ...-fix1:
+                /root/sandbox-log/windows/skills/serper/            -> ~/.jiuwenswarm/agent/workspace/skills/serper/
+        不在表里的镜像自带这些目录, 整个第 2 步跳过, 避免覆盖镜像内更新的版本。
     """
     s3 = self.client_config.s3
     obsutil_exe = s3.s3_download_script
@@ -253,18 +259,21 @@ async def _setup_windows_obsutil(self) -> None:
         raise HiveError("C001", detail="obsutil config", sandbox_result=result)
     self.logger.info(f"obsutil configured successfully: {obsutil_exe}")
 
-    # ---- 2. 上传三个辅助目录 ----
-    # 只有白名单镜像需要这部分: 它们缺内置依赖, 靠宿主机补进去。
-    # 其余镜像自带, 传过去会覆盖镜像里更新的版本。
+    # ---- 2. 上传该镜像需要的辅助目录 ----
+    # 每个镜像补的量不同, 按 _WINDOWS_AUX_DIRS_BY_IMAGE 取; 不在表里的镜像跳过。
     image = (getattr(self.config.sandbox_config, "image", "") or "").strip()
-    if image not in _WINDOWS_AUX_IMAGE_ALLOWLIST:
+    aux_dirs = _WINDOWS_AUX_DIRS_BY_IMAGE.get(image)
+    if not aux_dirs:
+        self.logger.info(
+            "skip windows aux dirs: image %s has no patch entry", image or "<unset>"
+        )
         return
-    if not any(os.path.isdir(src) for src, _ in _WINDOWS_AUX_DIRS):
+    if not any(os.path.isdir(src) for src, _ in aux_dirs):
         self.logger.warning("no windows aux dirs found, skip upload")
         return
     home = self.config.sandbox_config.home
     tar_name = "hive_aux_dirs.tar"
-    tar_local = _build_windows_aux_tar()
+    tar_local = _build_windows_aux_tar(aux_dirs)
     try:
         tar_remote = str(PureWindowsPath(home, tar_name))
         await self._upload_file("windows aux dirs", tar_local, tar_remote)
@@ -277,7 +286,10 @@ async def _setup_windows_obsutil(self) -> None:
         if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
             _log_sandbox_detail(self.logger, "extract aux dirs failed", result, level=logging.ERROR)
             raise HiveError("C001", detail="extract aux dirs", sandbox_result=result)
-        self.logger.info(f"uploaded aux dirs -> {home}")
+        self.logger.info(
+            "uploaded aux dirs -> %s (%d dirs: %s)",
+            home, len(aux_dirs), ", ".join(arc for _, arc in aux_dirs),
+        )
     finally:
         os.unlink(tar_local)
 
