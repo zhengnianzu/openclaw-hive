@@ -1,6 +1,7 @@
 import sqlite3
 import asyncio
 import os
+import re
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -14,11 +15,142 @@ def get_db_path():
     return settings.DB_PATH
 
 
+# ── 分库：两张巨表搬到独立文件，用 ATTACH 挂回同一个连接 ──
+#
+# 为什么分：task_records(1030 万行) + task_traj_records(915 万行) 连同索引占了
+# platform.db 的 85%（9.1GB / 10.6GB）。SQLite 的 WAL checkpoint 要把 WAL 回写进
+# 主库，库越大越久，而 checkpoint **独占写锁** —— 10GB 的库在 NFS 盘上轻易超过
+# busy_timeout(15s)，于是 queue_scheduler / 各 worker 到处报 `database is locked`
+# （实测连待办 0 行的 worker 也在撞锁）。把大表移出去，主库缩到约 1.5GB，
+# checkpoint 回到秒级，而两张大表自己的 WAL 由离线 worker 低频写入。
+#
+# 为什么用 ATTACH 而不是独立连接：全仓有 58 处 SQL 引用这两张表，大量是跨表
+# JOIN（如 `task_records tr LEFT JOIN task_traj_records ttr`、shallow_obs 的
+# EXISTS 子查询）。ATTACH 后这些 SQL **一行都不用改** —— SQLite 允许跨 attached
+# 库 JOIN，表名不带库前缀时会在 main 和已挂载库里依次查找。
+TASK_DATA_SCHEMA = "taskdata"
+# 搬到独立库的表。只搬「行数巨大且只被离线链路高频写」的，不搬 task_instances
+# （仅 2167 行，且是在线路径的核心，留在主库最省事）。
+TASK_DATA_TABLES = ("task_records", "task_traj_records")
+
+
+def get_task_data_path():
+    """两张巨表所在的库文件路径。默认 <主库同级>/database/task_data.db。
+
+    settings.TASK_DATA_DB_PATH 可覆盖（测试用临时库时会设）。
+    """
+    override = getattr(settings, "TASK_DATA_DB_PATH", None)
+    if override:
+        return override
+    main = get_db_path()
+    return os.path.join(os.path.dirname(os.path.abspath(main)),
+                        "database", "task_data.db")
+
+
+def _attach_task_data(conn):
+    """把 task_data.db 挂到当前连接的 `taskdata` schema 上。
+
+    **文件不存在就不挂**：迁移前（或全新部署还没建库）两张表仍在主库里，
+    照旧能查到；迁移后主库的同名表被删除，查询自动落到 attached 库。
+    这样代码可以先上线、迁移另行安排，不存在「必须同时切换」的窗口。
+
+    失败静默：ATTACH 不该让整个连接不可用（比如并发建目录时的瞬时竞争）。
+    真正用不到这两张表的请求（登录、wiki、队列）不受影响。
+    """
+    path = get_task_data_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        conn.execute(f"ATTACH DATABASE ? AS {TASK_DATA_SCHEMA}", (path,))
+        # attached 库要单独设 PRAGMA —— journal_mode 是 per-database 的。
+        # 不设的话新库会用默认的 delete 模式，读写互斥，比不分库还糟。
+        conn.execute(f"PRAGMA {TASK_DATA_SCHEMA}.journal_mode=WAL")
+        conn.execute(f"PRAGMA {TASK_DATA_SCHEMA}.synchronous=NORMAL")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def qualify_task_data_ddl(sql: str, schema: str) -> str:
+    """把 SQL 里对两张巨表的引用加上 schema 前缀（schema='main' 时原样返回）。
+
+    为什么要在**执行时改写**而不是把前缀写进每条 DDL：全仓有 20 多处 DDL
+    （CREATE TABLE / CREATE INDEX / ALTER TABLE）和 58 处查询引用这两张表，
+    逐条硬编码前缀既啰嗦又容易漏，漏一处就是一张空表遮蔽 1030 万行。
+    这里只在一个地方做替换，DDL 字符串保持可读。
+
+    注意只改写 DDL，**查询不需要改写** —— 查询不带前缀时 SQLite 会按
+    main → attached 顺序查找，迁移后 main 里没有这两张表，自然落到 taskdata。
+    DDL 不行的原因见 task_data_schema 的说明（IF NOT EXISTS 只看 main）。
+    """
+    if schema == "main":
+        return sql
+    out = sql
+    # CREATE INDEX 的 schema 必须加在**索引名**上，不是表名上：
+    #   对   CREATE INDEX taskdata.idx_x ON task_records(col)
+    #   错   CREATE INDEX idx_x ON taskdata.task_records(col)   → near ".": syntax error
+    # 索引隐式属于它所在的库，所以表名反而不能带前缀。
+    out = re.sub(
+        r"\b(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)(IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)",
+        lambda m: (f"{m.group(1)}{m.group(2) or ''}{schema}.{m.group(3)} ON {m.group(4)}"
+                   if m.group(4) in TASK_DATA_TABLES
+                   else m.group(0)),
+        out, flags=re.IGNORECASE)
+    for t in TASK_DATA_TABLES:
+        # 其余语句（CREATE TABLE / ALTER TABLE / INSERT INTO / FROM / UPDATE）
+        # 把前缀加在表名上。关键字与表名之间可能夹着 `IF NOT EXISTS` ——
+        # 必须一起匹配，否则这条最危险的 DDL 恰好漏掉，在 main 里建出空表
+        # 把 attached 库的 1030 万行遮蔽掉。
+        out = re.sub(
+            rf"\b(TABLE|INTO|FROM|UPDATE)\s+(IF\s+NOT\s+EXISTS\s+)?{t}\b",
+            lambda m: f"{m.group(1)} {m.group(2) or ''}{schema}.{t}",
+            out, flags=re.IGNORECASE)
+    return out
+
+
+def exec_task_data_ddl(conn, sql: str) -> None:
+    """执行一条针对巨表的 DDL，自动加上当前的 schema 前缀。失败静默（自愈补列用）。"""
+    try:
+        conn.execute(qualify_task_data_ddl(sql, task_data_schema(conn)))
+    except sqlite3.Error:
+        pass
+
+
+def task_data_schema(conn) -> str:
+    """这两张巨表当前实际所在的 schema 名（`main` 或 `taskdata`）。
+
+    **DDL 必须用它做前缀**，不能裸写表名。原因：`CREATE TABLE IF NOT EXISTS
+    task_records` 在 ATTACH 之后仍然会建到 **main** 里（SQLite 的 IF NOT EXISTS
+    只看 main，不看 attached 库），而不带前缀的查询又是 main 优先 ——
+    结果就是一张空表把 attached 库里的 1030 万行**整个遮蔽掉**，
+    而且不报任何错。实测验证过这个行为。
+
+    所以：迁移后 taskdata 里有表 → 返回 'taskdata'；否则返回 'main'（迁移前）。
+    """
+    if not os.path.exists(get_task_data_path()):
+        return "main"
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM {TASK_DATA_SCHEMA}.sqlite_master "
+            "WHERE type='table' AND name='task_records' LIMIT 1").fetchone()
+        return TASK_DATA_SCHEMA if row else "main"
+    except sqlite3.Error:
+        return "main"
+
+
+# SQLite 写锁等待上限（毫秒）。默认 5s 对「uvicorn 4 worker + 3 个离线进程」
+# 偏小：产物发现一轮要写十几万行，其它连接 5s 等不到就报 database is locked。
+# 放长只是等待、不是失败，真正的解法是让写事务变短（见 output_worker 的产物队列）。
+BUSY_TIMEOUT_MS = int(os.environ.get("DB_BUSY_TIMEOUT", "15000"))
+
+
 def _configure_connection(conn):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # 挂载巨表所在的独立库（文件不存在时静默跳过，见 _attach_task_data）
+    _attach_task_data(conn)
     return conn
 
 
@@ -78,14 +210,26 @@ async def async_execute_returning(sql, params=None):
 
 
 def _table_exists(conn, name: str) -> bool:
+    """表是否存在。两张巨表要查它们实际所在的 schema（迁移后在 taskdata）。
+
+    裸 `sqlite_master` 只看 main —— 迁移后查 task_records 会得到「不存在」，
+    于是 _ensure_traj_indexes 直接 return、索引永远补不上。
+    """
+    if name in TASK_DATA_TABLES:
+        sch = task_data_schema(conn)
+        return conn.execute(
+            f"SELECT 1 FROM {sch}.sqlite_master WHERE type='table' AND name=?",
+            (name,)).fetchone() is not None
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
         (name,)).fetchone() is not None
 
 
 def _index_names(conn, table: str) -> set[str]:
+    """表上已有的索引名。同 _table_exists，巨表要查对应 schema。"""
+    sch = task_data_schema(conn) if table in TASK_DATA_TABLES else "main"
     return {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+        f"SELECT name FROM {sch}.sqlite_master WHERE type='index' AND tbl_name=?",
         (table,))}
 
 
@@ -114,6 +258,13 @@ TRAJ_INDEXES = (
     ("idx_traj_artifact_complete",
      "CREATE INDEX IF NOT EXISTS idx_traj_artifact_complete "
      "ON task_traj_records(artifact_complete)"),
+    # 首页「成功轨迹」：按实例聚合 task_done=1。
+    # 全表 GROUP BY 要 1.97s（360 万行 × 每行回表判断 task_done），首页每次轮询都跑不起。
+    # 部分索引只收 task_done=1 的行（约 290 万），且 instance_id 就在索引里，
+    # COUNT(*) 可走 covering index，实测降到 0.10s。
+    ("idx_traj_task_done_inst",
+     "CREATE INDEX IF NOT EXISTS idx_traj_task_done_inst "
+     "ON task_traj_records(instance_id) WHERE task_done=1"),
 )
 
 # 其它表上被看板高频查询打到、但一直没建索引的列。
@@ -121,6 +272,20 @@ OTHER_INDEXES = (
     # shallow_pending = WHERE traj_level IS NULL，330 万行全表扫 ≈2.3s
     ("idx_task_records_level",
      "CREATE INDEX IF NOT EXISTS idx_task_records_level ON task_records(traj_level)"),
+    # 浅层 worker 每轮挑实例：WHERE EXISTS (SELECT 1 FROM task_records
+    #   WHERE instance_id=? AND traj_level IS NULL) ORDER BY ...
+    # 没有它时每个实例都要回表判断 traj_level，实测整条查询 68.6s（928 个实例）。
+    # 部分索引只收未分级的行（当前约 346 万，清完积压后会迅速缩小），
+    # EXISTS 能直接命中，不再扫已分级的 500 万行。
+    ("idx_task_records_ungraded",
+     "CREATE INDEX IF NOT EXISTS idx_task_records_ungraded "
+     "ON task_records(instance_id) WHERE traj_level IS NULL"),
+    # 首页「DONE」列：按实例聚合 task_done=1。task_records 有 984 万行，
+    # 全表 COUNT 太慢；部分索引只收已判定为 done 的行（且 instance_id 就在索引里，
+    # COUNT(*) 走 covering index）。
+    ("idx_task_records_done",
+     "CREATE INDEX IF NOT EXISTS idx_task_records_done "
+     "ON task_records(instance_id) WHERE task_done=1"),
 )
 
 
@@ -139,27 +304,31 @@ def _ensure_traj_indexes(conn) -> list[str]:
     """
     if not _table_exists(conn, "task_traj_records"):
         return []
+    sch = task_data_schema(conn)
     have = _index_names(conn, "task_traj_records")
     created = []
     for name, ddl in TRAJ_INDEXES:
         if name in have:
             continue
         shadow = conn.execute(
-            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
+            f"SELECT tbl_name FROM {sch}.sqlite_master WHERE type='index' AND name=?",
             (name,)).fetchone()
         if shadow and shadow[0] != "task_traj_records":
-            conn.execute(f"DROP INDEX IF EXISTS {name}")
-        conn.execute(ddl)
+            conn.execute(f"DROP INDEX IF EXISTS {sch}.{name}")
+        conn.execute(qualify_task_data_ddl(ddl, sch))
         created.append(name)
 
-    # 其它表的看板索引：同样要防「索引名被 _ttr_old 之类占用」的静默 no-op
+    # 其它表的看板索引：同样要防「索引名被 _ttr_old 之类占用」的静默 no-op。
+    # OTHER_INDEXES 里混着 task_records（巨表，可能在 taskdata）和别的表，
+    # 所以要按每条 DDL 实际命中的表决定去哪个 schema 查重名。
     for name, ddl in OTHER_INDEXES:
+        tgt = sch if any(t in ddl for t in TASK_DATA_TABLES) else "main"
         shadow = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            f"SELECT name FROM {tgt}.sqlite_master WHERE type='index' AND name=?",
             (name,)).fetchone()
         if shadow:
             continue
-        conn.execute(ddl)
+        conn.execute(qualify_task_data_ddl(ddl, sch))
         created.append(name)
     return created
 
@@ -367,7 +536,107 @@ TRAJ_EXTRA_COLUMNS = (
 # 上、而 SQL 查的是 task_instances，worker 一启动就 no such column 直接崩。
 INSTANCE_EXTRA_COLUMNS = (
     "last_artifact_discover_at REAL",
+    # 重跑来源：本实例是「重跑失败」新建出来的，指向源实例 id；普通实例为 NULL。
+    # 原先只存在 create_params JSON 里，汇总 SQL 每行都要 json_extract 一次，
+    # 提成真实列后可以直接建索引式过滤。语义见 _leaf_instance_filter()。
+    "copied_from TEXT",
 )
+
+# task_records 的「新增可选列」。
+# task_done = 本地 task-N.log 是否含【Task_Done】标记（agent 自己声明做完）。
+#   NULL = 还没扫过；0/1 = 已判定。
+# 与 task_traj_records.task_done 是**两个口径**：后者来自 OBS 的 tsr / 慢路径，
+# 且补全快路径刻意不拉（output_worker._fetch_tsr_entries_fast 注释），导致 254 个实例
+# 的该列恒为 0。这一列是worker 直接扫本地日志得到的，不依赖 OBS。
+# 之所以落在 task_records 而不是 task_traj_records：前者 UNIQUE(instance_id, config_name)
+# 一任务一行，增量扫描只需 WHERE task_done IS NULL；后者一个 config 可能多行（多轨迹），
+# 会把同一个日志判多次。
+TASK_EXTRA_COLUMNS = (
+    "task_done INTEGER",
+)
+
+# shallow_queue 的「新增可选列」。产物下载维（artifact_*）是为了让 task_tracker
+# 成为唯一的发现方：它在 complete.jsonl 增量读时把 artifact_state 标 'queued'，
+# output_worker 只领取、不再全量 UPSERT task_traj_records。
+# 单独一套而不是复用 local_state/obs_state：三套状态机的进度完全独立
+# （本地判定 900/s、OBS 0.4~2s、产物 cp 1~100s），挤在一起快的会被慢的 claimed 卡住。
+SHALLOW_EXTRA_COLUMNS = (
+    # local / obs 两维是浅层重构时用 ALTER 加到线上库的，建表 DDL 里一直没补，
+    # 于是全新库（init_db 从零建）会缺这两维，shallow-local / shallow-obs 直接
+    # no such column。这里一并纳入，保证新库与线上库同构。
+    "local_state TEXT NOT NULL DEFAULT 'queued'",
+    "obs_state TEXT NOT NULL DEFAULT 'queued'",
+    "obs_claimed_by TEXT",
+    "obs_claimed_at REAL",
+    "obs_attempts INTEGER NOT NULL DEFAULT 0",
+    "artifact_state TEXT NOT NULL DEFAULT 'queued'",
+    "artifact_claimed_by TEXT",
+    "artifact_claimed_at REAL",
+    "artifact_attempts INTEGER NOT NULL DEFAULT 0",
+    "artifact_retry_at REAL",
+    "artifact_note TEXT",
+    # 产物维自己的优先级。**不能复用 priority**：priority 是浅层「用户点了输出，
+    # 整实例插队」的语义，一个实例一旦被点过，它的全部 config 都变成 100。
+    # 若产物车道也用 priority 分流，那 9000+ 行会整批涌进实时车道，
+    # 真正的「下载此任务」点击反而排在它们后面（实测 9572 行 priority=100）。
+    # artifact_priority 只由「下载此任务 / 会话详情下载」写 100，tracker 一律留 0。
+    "artifact_priority INTEGER NOT NULL DEFAULT 0",
+)
+
+# shallow_queue 上的部分索引。索引名在 SQLite 里是全局唯一的，所以同样要防
+# 「名字被别的表占着 → IF NOT EXISTS 静默 no-op」（见 _ensure_traj_indexes 的说明）。
+SHALLOW_INDEXES = (
+    ("idx_shallow_queue_claim",
+     "CREATE INDEX IF NOT EXISTS idx_shallow_queue_claim "
+     "ON shallow_queue(priority DESC, id) WHERE state='queued'"),
+    ("idx_shallow_queue_state",
+     "CREATE INDEX IF NOT EXISTS idx_shallow_queue_state "
+     "ON shallow_queue(state, claimed_at)"),
+    ("idx_shallow_queue_artifact",
+     "CREATE INDEX IF NOT EXISTS idx_shallow_queue_artifact "
+     "ON shallow_queue(artifact_priority DESC, id) WHERE artifact_state='queued'"),
+    ("idx_shallow_queue_artifact_claimed",
+     "CREATE INDEX IF NOT EXISTS idx_shallow_queue_artifact_claimed "
+     "ON shallow_queue(artifact_state, artifact_claimed_at)"),
+)
+
+
+def ensure_shallow_extra_columns() -> None:
+    """shallow_queue 的幂等补列 + 补索引。
+
+    和 ensure_traj_extra_columns 同样的理由：task_tracker / shallow-local /
+    shallow-obs / output_worker 都是独立进程、不跑 init_db，只靠 uvicorn 启动时迁移。
+    「加了列 + 只重启 worker」会让 SQL 直接报 no such column，而症状只是日志里一句
+    笼统的「本轮异常」——所以每个离线进程启动时都该调一次。
+    """
+    try:
+        with get_connection() as conn:
+            if not _table_exists(conn, "shallow_queue"):
+                return
+            have = {r[1] for r in conn.execute("PRAGMA table_info(shallow_queue)")}
+            added = []
+            for col in SHALLOW_EXTRA_COLUMNS:
+                name = col.split()[0]
+                if name in have:
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE shallow_queue ADD COLUMN {col}")
+                    added.append(name)
+                except Exception:
+                    pass
+            if added:
+                conn.commit()
+                print(f"[db] shallow_queue 补列: {', '.join(added)}")
+            for name, ddl in SHALLOW_INDEXES:
+                shadow = conn.execute(
+                    "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
+                    (name,)).fetchone()
+                if shadow and shadow[0] != "shallow_queue":
+                    conn.execute(f"DROP INDEX IF EXISTS {name}")
+                conn.execute(ddl)
+            conn.commit()
+    except Exception as e:
+        print(f"[db] shallow_queue 补列失败（worker 可能仍能用已有列）: {str(e)[:150]}")
 
 
 def ensure_traj_extra_columns() -> None:
@@ -382,7 +651,8 @@ def ensure_traj_extra_columns() -> None:
     这里只做 ALTER TABLE ADD COLUMN（纯元数据操作，秒级），可以每次启动都跑。
     """
     for table, columns in (("task_traj_records", TRAJ_EXTRA_COLUMNS),
-                           ("task_instances", INSTANCE_EXTRA_COLUMNS)):
+                           ("task_instances", INSTANCE_EXTRA_COLUMNS),
+                           ("task_records", TASK_EXTRA_COLUMNS)):
         try:
             with get_connection() as conn:
                 if not _table_exists(conn, table):
@@ -748,7 +1018,7 @@ def init_db_unlocked():
                 pass
 
         # 每任务明细表：把散落在文件系统里的 per-task 状态/评分聚合进 DB，便于筛选与将来着色
-        conn.executescript("""
+        conn.executescript(qualify_task_data_ddl("""
             CREATE TABLE IF NOT EXISTS task_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 instance_id TEXT NOT NULL,           -- 对应 task_instances.id
@@ -767,7 +1037,7 @@ def init_db_unlocked():
 
             CREATE INDEX IF NOT EXISTS idx_task_records_inst ON task_records(instance_id);
             CREATE INDEX IF NOT EXISTS idx_task_records_cat  ON task_records(instance_id, error_category);
-        """)
+        """, task_data_schema(conn)))
 
         # migrate: 为已存在的 task_records 补列（IF NOT EXISTS 不会加列），风格同上
         for col in [
@@ -782,7 +1052,7 @@ def init_db_unlocked():
             "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]:
             try:
-                conn.execute(f"ALTER TABLE task_records ADD COLUMN {col}")
+                exec_task_data_ddl(conn, f"ALTER TABLE task_records ADD COLUMN {col}")
             except Exception:
                 pass
 
@@ -792,7 +1062,7 @@ def init_db_unlocked():
         #   深层: status pending → downloading → done | failed（用户点开会话详情时才触发）
         # 注意：worker 回填本表与 task_records.traj_level 时用「不触碰 updated_at」的 UPDATE，
         # 否则会与在线 _sync_task_records 的 CURRENT_TIMESTAMP 触碰互相干扰（详见 worker 注释）。
-        conn.executescript("""
+        conn.executescript(qualify_task_data_ddl("""
             CREATE TABLE IF NOT EXISTS task_traj_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 instance_id TEXT NOT NULL,           -- 对应 task_instances.id
@@ -838,7 +1108,7 @@ def init_db_unlocked():
 
             CREATE INDEX IF NOT EXISTS idx_traj_records_inst ON task_traj_records(instance_id);
             CREATE INDEX IF NOT EXISTS idx_traj_records_task ON task_traj_records(instance_id, config_name);
-        """)
+        """, task_data_schema(conn)))
 
         # 沙箱产物下载记账 —— 已并入 task_traj_records（artifacts_status 等列）。
         # 原 task_artifacts 表废弃：它与 task_traj_records 是同一套「待下载→领取→完成」
@@ -874,9 +1144,20 @@ def init_db_unlocked():
         # 复用同一份 —— 三处（建表 / 重建表 / ADD COLUMN）不同步时，重建一次就会丢列。
         for col in TRAJ_EXTRA_COLUMNS:
             try:
-                conn.execute(f"ALTER TABLE task_traj_records ADD COLUMN {col}")
+                exec_task_data_ddl(conn, f"ALTER TABLE task_traj_records ADD COLUMN {col}")
             except Exception:
                 pass
+        # migrate: task_records 的可选列（task_done 等）。
+        # 必须放在 self_heal_traj_level_nullable **之前**：它内部会调
+        # _ensure_traj_indexes 建 OTHER_INDEXES，其中
+        # `ON task_records(instance_id) WHERE task_done=1` 是部分索引 ——
+        # 列不存在时 init_db 会直接死在 no such column（全新库实测必现）。
+        for col in TASK_EXTRA_COLUMNS:
+            try:
+                exec_task_data_ddl(conn, f"ALTER TABLE task_records ADD COLUMN {col}")
+            except Exception:
+                pass
+
         # migrate: 产物下载相关列（老库升级路径）。
         # level 的 NOT NULL 放开需要重建表；SQLite 不能 ALTER COLUMN，只能建新表搬数据。
         # 只在检测到旧约束时做一次，正常库不受影响。
@@ -886,9 +1167,41 @@ def init_db_unlocked():
         # 两种情况都要再过一遍补列 —— 必须放在 self_heal 之后。
         for col in TRAJ_EXTRA_COLUMNS:
             try:
-                conn.execute(f"ALTER TABLE task_traj_records ADD COLUMN {col}")
+                exec_task_data_ddl(conn, f"ALTER TABLE task_traj_records ADD COLUMN {col}")
             except Exception:
                 pass
+
+        # migrate: task_instances 的可选列。
+        # 原先只有 worker 进程的 ensure_traj_extra_columns() 会补这些列，
+        # 于是「只重启 API、不重启 worker」时 API 侧写入就会 no such column
+        # （copied_from 是创建实例时写的，必须由 API 进程自己保证列存在）。
+        for col in INSTANCE_EXTRA_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE task_instances ADD COLUMN {col}")
+            except Exception:
+                pass
+
+        # migrate: task_records 的可选列（task_done 等）。
+        # 必须放在 _ensure_traj_indexes / OTHER_INDEXES 建索引**之前**：
+        # OTHER_INDEXES 里有 `ON task_records(instance_id) WHERE task_done=1`
+        # 这类部分索引，列不存在时 init_db 会直接死在 no such column。
+        for col in TASK_EXTRA_COLUMNS:
+            try:
+                exec_task_data_ddl(conn, f"ALTER TABLE task_records ADD COLUMN {col}")
+            except Exception:
+                pass
+
+        # 回填 copied_from：历史重跑实例只在 create_params JSON 里记过来源。
+        # 只填 NULL 行，幂等；json_extract 在 create_params 为空/非法时返回 NULL，
+        # 不会写进脏值。json1 是 SQLite 3.38+ 的默认编译项，生产实测 3.45.1 可用。
+        try:
+            conn.execute(
+                "UPDATE task_instances "
+                "SET copied_from = json_extract(create_params, '$.copy_complete_from') "
+                "WHERE copied_from IS NULL AND create_params IS NOT NULL"
+            )
+        except Exception:
+            pass
 
         # 迁移回填：已有行都是浅层处理过的——有分级 → processed；failed 占位 → 无轨迹 empty。
         # 无 level 的 NULL 行保持待处理，交给浅层首次分析。
@@ -911,6 +1224,93 @@ def init_db_unlocked():
                 created_by TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'queued'
+            );
+        """)
+
+        # ── 浅层分析重构：config 级领取队列 + tracker 增量读状态 ──
+        #
+        # shallow_queue 与上面的 shallow_requests 粒度不同，不能混用：
+        #   shallow_requests = 实例级（PRIMARY KEY instance_id，一个实例一行），
+        #                      仅供详情页轮询「我这个实例排上了没」
+        #   shallow_queue    = config 级（一个实例 N 行），worker 从这里 CAS 领取
+        #
+        # state 是领取状态机（借鉴 artifacts_status 的做法）：
+        #   queued   待领取
+        #   claimed  已被某个 worker 领走（claimed_by / claimed_at 用于回收超时）
+        #   done     处理完毕
+        #   skipped  无法处理（本地日志缺失等），不再重试
+        #
+        # 一行为三套**互相独立**的状态机（各自 claimed_by/claimed_at/attempts）：
+        #   local/local_state    —— shallow-local 判 task_done
+        #   obs/obs_state        —— shallow-obs 定级
+        #   artifact/artifact_*  —— 产物下载（output_worker --deep-only / --realtime-only）
+        # 拆维的理由同三个进程的拆分：快慢相差一个数量级，挤在一个 state 上会互相拖住
+        # （快的被慢的 claimed 占住）。产物下载由 task_tracker 在 complete.jsonl 增量
+        # 投递时标 artifact_state='queued'，worker 只领取、不再自己做全量发现。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS shallow_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                config_name TEXT NOT NULL,
+                task_idx    INTEGER,
+                -- 用户点击 = 100，普通 = 0。领取时 ORDER BY priority DESC, id，
+                -- 保证「点开的任务」插队，其余按发现顺序（即最新优先）
+                priority    INTEGER NOT NULL DEFAULT 0,
+                state       TEXT NOT NULL DEFAULT 'queued',
+                claimed_by  TEXT,
+                claimed_at  REAL,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                note        TEXT,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- 本地判定维（shallow-local）
+                local_state TEXT NOT NULL DEFAULT 'queued',
+                -- OBS 定级维（shallow-obs）
+                obs_state       TEXT NOT NULL DEFAULT 'queued',
+                obs_claimed_by  TEXT,
+                obs_claimed_at  REAL,
+                obs_attempts    INTEGER NOT NULL DEFAULT 0,
+                -- 产物下载维（第三套状态机，与 local/obs 互不干扰）
+                artifact_state      TEXT NOT NULL DEFAULT 'queued',
+                artifact_claimed_by TEXT,
+                artifact_claimed_at REAL,
+                artifact_attempts   INTEGER NOT NULL DEFAULT 0,
+                artifact_retry_at   REAL,
+                artifact_note       TEXT,
+                artifact_priority   INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(instance_id, config_name)
+            );
+
+            -- 领取走这个部分索引：只收 queued 行，随队列消化自动变小
+            CREATE INDEX IF NOT EXISTS idx_shallow_queue_claim
+                ON shallow_queue(priority DESC, id) WHERE state='queued';
+            -- 回收超时 claimed（worker 被 kill）
+            CREATE INDEX IF NOT EXISTS idx_shallow_queue_state
+                ON shallow_queue(state, claimed_at);
+            -- 产物下载的领取索引，与 idx_shallow_queue_claim 同构：
+            -- 只收 artifact_state='queued' 的行，队列消化后索引自动变小。
+            CREATE INDEX IF NOT EXISTS idx_shallow_queue_artifact
+                ON shallow_queue(artifact_priority DESC, id) WHERE artifact_state='queued';
+            -- 产物下载的超时回收（worker 被 kill 时行会停在 claimed）
+            CREATE INDEX IF NOT EXISTS idx_shallow_queue_artifact_claimed
+                ON shallow_queue(artifact_state, artifact_claimed_at);
+        """)
+
+        # tracker 的增量读状态：每个 (实例, jsonl 文件) 记一条。
+        # offset 只读新增部分；inode + head_hash 两个指纹用来判断「文件被换掉了」，
+        # 任一变化都要把 offset 归零，否则会漏读。
+        # 为什么需要 head_hash：hive 的 _rewrite_failed_record 是**原地 truncate 重写**
+        # （NFSv3 不支持 rename），inode 不变。只靠 inode 时，重写后文件变长会让旧
+        # offset 指到新内容的中间，前面的行被整段跳过。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tracker_state (
+                instance_id TEXT NOT NULL,
+                file_path   TEXT NOT NULL,
+                inode       INTEGER,
+                offset      INTEGER NOT NULL DEFAULT 0,
+                head_hash   TEXT,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (instance_id, file_path)
             );
         """)
 

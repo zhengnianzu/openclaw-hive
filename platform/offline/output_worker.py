@@ -38,7 +38,6 @@ task_records.updated_at 语义 =「在线 _sync_task_records 最后写入时间�
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import os
 import re
@@ -55,24 +54,31 @@ if PLATFORM_DIR not in sys.path:
 
 from src import offline_analysis as oa            # noqa: E402
 from api.core.config import settings               # noqa: E402
-from api.core.database import get_connection, ensure_traj_extra_columns  # noqa: E402
+from api.core.database import (                       # noqa: E402
+    get_connection, ensure_traj_extra_columns, ensure_shallow_extra_columns)
 # 默认常驻轮询间隔（秒）
 DEFAULT_INTERVAL = 60
 # （已废弃）分级 stale 阈值：浅层只做一次，不再按此阈值重算。保留仅为 --stale-after 默认值兼容。
 STALE_AFTER_SECONDS = 600
-# finished 实例补全每轮预算：有缺口的 finished 实例可能数十个、单实例 OBS 枚举+拉 tsr
-# 要几十秒。限制每轮处理数，避免一轮全量扫 OBS 卡死数小时；其余实例摊到后续轮次。
-# 预算只约束 finished 补全，不约束 running/preparing（分级很快）。
-BACKFILL_MAX_INSTANCES_PER_ROUND = 8
-# 每实例每轮补全缺口配额：大缺口实例（数千~数万行）一轮补不完，
-# 限制单实例单轮处理行数，避免一轮卡死；剩余缺口留到后续轮次。
-BACKFILL_MAX_TASKS_PER_INSTANCE = 300
+# 浅层每轮处理的实例数上限。已结束实例自动入队后，缺口实例可能有数百个
+# （实测 400 个实例积压 159 万行），沿用 8 会让队列以「每轮 8 个」的速度爬。
+# 提高到一个能在一轮内覆盖大部分活跃实例的量级；真正限速交给下面的
+# BACKFILL_CONCURRENCY 和每实例行配额。
+BACKFILL_MAX_INSTANCES_PER_ROUND = int(
+    os.environ.get("BACKFILL_MAX_INSTANCES_PER_ROUND", "40"))
+# 每实例每轮补全缺口配额。原 300 对 3 万行的实例要 100 轮才能清完
+# （一轮动辄 2000s+），实际永远追不上。2000 行 × 16 并发 ≈ 25s/实例，
+# 一轮 40 个实例仍在可接受范围内。
+BACKFILL_MAX_TASKS_PER_INSTANCE = int(
+    os.environ.get("BACKFILL_MAX_TASKS_PER_INSTANCE", "2000"))
 # 补全循环并发度：OBS 拉 tsr 是 I/O 密集，串行逐行等下载极慢。实测 16 并发 74行/s、
 # 24-32 并发 85-90行/s（OBS 在 ~32 以上饱和回落）。默认 16 已达成 200 行 <3s。
 BACKFILL_CONCURRENCY = int(os.environ.get("BACKFILL_CONCURRENCY", "16"))
 # 浅层分级并发度：同一实例内并行处理多个 task 行（OBS 下载是 I/O 密集，串行太慢）。
 # obsutil 走独立 subprocess、DB 写用独立连接（WAL），线程安全。过高会打爆 OBS 带宽。
-SHALLOW_CONCURRENCY = int(os.environ.get("SHALLOW_CONCURRENCY", "16"))
+# 实测 32 是 OBS 侧的饱和点（再高回落），浅层为此单独开一个进程、与产物下载分账，
+# 所以可以按饱和点取。
+SHALLOW_CONCURRENCY = int(os.environ.get("SHALLOW_CONCURRENCY", "32"))
 
 # ── 沙箱产物全量下载（_consume_artifacts）──
 # 参数来自 settings/worker/config.yaml；环境变量可临时覆盖（优先级最高）。
@@ -112,22 +118,28 @@ def _cfg(section: str, key: str, default, env: str | None = None):
 
 
 ARTIFACT_CONCURRENCY = _cfg("download", "concurrency", 3, "ARTIFACT_CONCURRENCY")
+# 以下三项自「发现」迁到 task_tracker 后已无调用方（保留常量是为了
+# settings/worker/config.yaml 里的同名键仍能解析，不会因未知键报错）。
 ARTIFACT_MAX_TASKS_PER_ROUND = _cfg("download", "max_tasks_per_round", 20,
                                     "ARTIFACT_MAX_TASKS_PER_ROUND")
 ARTIFACT_MAX_INSTANCES_PER_ROUND = _cfg("download", "max_instances_per_round", 4,
                                         "ARTIFACT_MAX_INSTANCES_PER_ROUND")
-# 后台自动发现只覆盖最近 N 天内有活动的实例。历史实例不自动入队，
-# 改为用户点开「沙箱交付物」时按需下载并插队（priority=100）。
-# 注意这是「自动」窗口，不是「能下载」窗口：窗口外仍可点击，只是不主动缓存。
-# 设 0 表示不限制（回到全量自动发现的老行为）。
 ARTIFACT_AUTO_DISCOVER_DAYS = _cfg("download", "auto_discover_days", 1,
                                    "ARTIFACT_AUTO_DISCOVER_DAYS")
 ARTIFACT_MAX_TASK_BYTES = _cfg("download", "max_task_bytes", 2 * 1024 ** 3,
                                "ARTIFACT_MAX_TASK_BYTES")
+# 积压 worker 单轮下载预算（秒）。一轮内连续领取直到队列空或超时；
+# 0 表示只领一批就返回（老行为）。初值 300s 是因为单 task 中位 1.6s、
+# 长尾 85s，给够时间才能把 190 万条队列真正推进，而不是每轮 8 条 + 60s 睡。
+ARTIFACT_ROUND_BUDGET_SEC = _cfg("download", "round_budget_seconds", 300,
+                                 "ARTIFACT_ROUND_BUDGET_SEC")
 
 # ── 实时下载 worker（--realtime-only）──
-# 与积压 worker 彻底隔离：积压 worker 只领 priority < REALTIME_PRIORITY 的行，
-# 实时 worker 只领 priority >= REALTIME_PRIORITY（用户点击置 100）。
+# 与积压 worker 彻底隔离：积压 worker 只领 artifact_priority < REALTIME_PRIORITY
+# 的行，实时 worker 只领 >= 阈值的行（「下载此任务 / 会话详情下载」置 100）。
+# 注意用的是 **artifact_priority** 而不是 priority：后者是浅层「用户点了输出、
+# 整实例插队」的语义，一个实例被点过它的全部 config 都是 100，拿它分车道会让
+# 上千行涌进实时车道、真正的单任务点击反而排在后面。
 # 这样用户点「下载此任务」不会被 4 万条积压拖住 —— 实测积压 worker 一轮要
 # 3~40 秒，即使插队也要等当前轮跑完；实时 worker 用 2 秒间隔独立轮询。
 ARTIFACT_REALTIME_PRIORITY = _cfg("realtime", "priority_threshold", 100,
@@ -163,23 +175,39 @@ def _obs_base_path(config_path: str) -> str:
 
 
 def _pick_running_instances(conn) -> list[dict]:
-    """浅层队列来源：running/preparing 的实例（其 task_records 由在线 _sync_task_records 维护）
-    + 被点击登记的 finished/completed/stopped 实例（shallow_requests 表，见 POST /{instance_id}/shallow）。
+    """浅层队列来源：**全部有缺口的实例**，按最近活动时间排序。
 
-    finished/completed/stopped 实例不再无条件全量拉取（历史缺口动辄数十万行，全量扫永远追不完）；
-    只有用户打开详情页 POST /{id}/shallow 登记过的才进队列。worker 处理完（实例无缺口）由
-    _clear_shallow_request 删登记出队（completed 同时置 output_status='done'）。
+    优先级（都是「越新越先」）：
+      1. running / preparing —— 正在产出，实时分级，用户此刻就在看；
+      2. 已结束（finished/completed/stopped）—— 按 COALESCE(stopped_at, created_at) 倒序，
+         最近结束的先补。stopped 实例里往往还有大量没跑完的任务，之前只靠用户点开详情页
+         登记才入队（shallow_requests 表），结果 94 个 stopped 实例积压 75.9 万行、
+         队列一条都取不到。现在自动入队。
+      3. 用户点击登记的（shallow_requests）—— 置顶插队，保证「点完几秒内看到结果」。
 
-    不用时间窗口：stopped_at 是本地时间（UTC+8）而 SQLite datetime('now') 是 UTC，直接
-    比较错位 8h；且按"是否有缺口"过滤是零成本（有索引/聚合），只有缺口实例才碰 OBS。
+    历史包袱：这里**不按天数截断**。目标是最终把全部缺口消化掉；用时间排序而不是
+    一刀切时间窗，既保证新实例优先，又不会把老实例永久排除在外。
+
+    stopped_at 是本地时间（UTC+8）而 SQLite datetime('now') 是 UTC，所以排序只在
+    同一列内比，不做跨时区跟 now 的比较——只排序、不筛选，这个坑就不存在了。
     """
     rows = conn.execute(
         "SELECT ti.id, ti.name, ti.config_path, ti.status, ti.config_snapshot "
         "FROM task_instances ti "
-        "WHERE ti.status IN ('running','preparing') "
-        "OR (ti.status IN ('finished','completed','stopped') AND EXISTS ("
-        "    SELECT 1 FROM shallow_requests sr WHERE sr.instance_id = ti.id)) "
-        "ORDER BY ti.created_at DESC"
+        # 只取真有缺口的实例：没有缺口的不碰 OBS（_has_shallow_gaps 同款判据，
+        # 走 idx_task_records_level 索引，零成本）。
+        "WHERE EXISTS ("
+        "    SELECT 1 FROM task_records tr "
+        "    WHERE tr.instance_id = ti.id AND tr.traj_level IS NULL) "
+        "ORDER BY "
+        # 1) 点击登记的置顶
+        "  CASE WHEN EXISTS (SELECT 1 FROM shallow_requests sr "
+        "                     WHERE sr.instance_id = ti.id) THEN 0 ELSE 1 END, "
+        # 2) 运行中的优先（此刻正在产出）
+        "  CASE WHEN ti.status IN ('running','preparing') THEN 0 ELSE 1 END, "
+        # 3) 其余按最近活动时间倒序
+        "  COALESCE(ti.stopped_at, ti.created_at) DESC, "
+        "  ti.created_at DESC"
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -193,8 +221,24 @@ def _has_shallow_gaps(conn, instance_id: str) -> bool:
 
 
 def _clear_shallow_request(conn, instance_id: str) -> None:
-    """实例浅层处理完（无缺口）后删除登记，出队。幂等：无登记时静默。"""
+    """实例浅层处理完（无缺口）后删除登记，出队。幂等：无登记时静默。
+
+    同时回收该实例的两类残留 —— 这是 92.6 万条孤儿产物行的产生机制：
+      1. 仍 queued 的**背景**产物行（artifact_priority<100）置 pending_click。
+         实例已经出队、没人在看它了，不该继续占用下载配额和磁盘。
+         用户点击入队的行（>=100）保留 —— 那是显式要求，必须下完。
+      2. tracker_state 的 offset 记录。该实例不再被 tracker 跟踪，留着只是垃圾
+         （线上实测 321 行从未清理过），且下次重新点击时 pick_clicked 会
+         _reset_offsets 清零重扫，不依赖这些行。
+    """
     conn.execute("DELETE FROM shallow_requests WHERE instance_id=?", (instance_id,))
+    conn.execute(
+        "UPDATE shallow_queue SET artifact_state='pending_click', "
+        "  artifact_note='实例已出队，背景产物行回收' "
+        "WHERE instance_id=? AND artifact_state='queued' AND artifact_priority < ?",
+        (instance_id, ARTIFACT_REALTIME_PRIORITY),
+    )
+    conn.execute("DELETE FROM tracker_state WHERE instance_id=?", (instance_id,))
 
 
 def _pick_pending_rows(conn, instance_id: str | None = None) -> list[dict]:
@@ -400,19 +444,28 @@ def _read_task_log_map(inst: dict) -> dict:
     finished 实例在线 _sync_task_records 可能因竞态漏写部分行（多 task 并发终止时
     8s 轮询只捕获部分文件变化），这里从任务日志补齐缺失行的 status/code/task_idx。
     日志不存在/读不到时返回空 dict（调用方退化为默认值）。
+
+    **并行读**：单个日志 34.7ms（NFS 上 3.5 万个小文件），1 万行的实例串行要 348s，
+    足以让一轮卡死十几分钟。改成 32 并发后 1 万行约 11s。obsutil 不参与、只读本地
+    NFS，线程安全。
     """
-    out = {}
-    logs_dir = os.path.join(os.path.dirname(inst["config_path"]), "outputs", "config", "logs")
+    logs_dir = _logs_dir(inst)
     if not os.path.isdir(logs_dir):
-        return out
-    for fn in sorted(os.listdir(logs_dir)):
-        m = re.match(r"task-(\d+)\.log$", fn)
-        if not m:
-            continue
-        idx = int(m.group(1))
-        config_name = None
-        status = None
-        code = None
+        return {}
+    try:
+        names = []
+        for fn in os.listdir(logs_dir):
+            m = re.match(r"task-(\d+)\.log$", fn)
+            if m:
+                names.append((int(m.group(1)), fn))
+    except OSError:
+        return {}
+    if not names:
+        return {}
+
+    def scan_one(item):
+        idx, fn = item
+        config_name = status = code = None
         task_done = False
         try:
             with open(os.path.join(logs_dir, fn), errors="replace") as f:
@@ -427,10 +480,21 @@ def _read_task_log_map(inst: dict) -> dict:
                     if not task_done and oa.TRAJ_DONE_MARKER in line:
                         task_done = True
         except OSError:
-            continue
-        if config_name:
-            out[config_name] = {"task_idx": idx, "status": status or "任务异常",
-                                "code": code, "task_done": task_done}
+            return None
+        if not config_name:
+            return None
+        # status 保持原始值（None = 日志里还没有终态行，任务可能仍在跑或被 kill）。
+        # 调用方自己决定怎么兜底：INSERT status 列用 "任务异常"，但 task_done 要留 NULL。
+        # 不能在这里就兜底成 "任务异常"，否则「没跑完」和「真异常」再也分不开，
+        # task_done 会被永久写成 0 且不再重扫。
+        return (config_name, {"task_idx": idx, "status": status,
+                              "code": code, "task_done": task_done})
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=BACKFILL_CONCURRENCY) as pool:
+        for res in pool.map(scan_one, names):
+            if res:
+                out[res[0]] = res[1]
     return out
 
 
@@ -456,13 +520,23 @@ def _seed_task_records_from_logs(inst: dict) -> int:
     if not log_map:
         return 0
     rows = []
+    done_rows = []
     for config_name, meta in log_map.items():
         code = meta.get("code")
         if code in ("-", "", None):
             code = None
         category = code[0] if code else None
+        # 日志里没有终态行（还在写 / 被 kill）→ task_done 留 NULL，下一轮再扫。
+        # 不能当 0：那会把「还没跑完」误判成「没做完」，且再也不会重判。
+        has_status = meta.get("status") is not None
+        done_val = (1 if meta.get("task_done") else 0) if has_status else None
+        # status 列保持原行为（无终态行按「任务异常」写），只有 task_done 区分 NULL。
+        # 两者分开是为了：task_records.status 下游有既有依赖（缺口查询、错误分布），
+        # 不能凭空多出 NULL；而 task_done 必须能表达「还没扫过」。
         rows.append((inst["id"], meta.get("task_idx"), config_name,
-                     meta.get("status"), code, category))
+                     meta.get("status") or "任务异常", code, category, done_val))
+        if has_status:
+            done_rows.append((done_val, inst["id"], config_name))
     with get_connection() as conn:
         before = conn.execute(
             "SELECT COUNT(*) FROM task_records WHERE instance_id=?", (inst["id"],)
@@ -470,11 +544,20 @@ def _seed_task_records_from_logs(inst: dict) -> int:
         conn.executemany(
             "INSERT INTO task_records "
             "(instance_id, task_idx, config_name, status, error_code, "
-            " error_category, traj_level, updated_at) "
-            "VALUES (?,?,?,?,?,?,NULL,CURRENT_TIMESTAMP) "
+            " error_category, traj_level, task_done, updated_at) "
+            "VALUES (?,?,?,?,?,?,NULL,?,CURRENT_TIMESTAMP) "
             "ON CONFLICT(instance_id, config_name) DO NOTHING",
             rows,
         )
+        # 已有行的 task_done 单独回填：上面的 DO NOTHING 不会碰已存在的行，
+        # 而在线 _sync_task_records 建的行 task_done 恒为 NULL。
+        # 只填 NULL 的：扫过一次就不再重扫（增量语义）。
+        if done_rows:
+            conn.executemany(
+                "UPDATE task_records SET task_done=? "
+                "WHERE instance_id=? AND config_name=? AND task_done IS NULL",
+                done_rows,
+            )
         conn.commit()
         after = conn.execute(
             "SELECT COUNT(*) FROM task_records WHERE instance_id=?", (inst["id"],)
@@ -483,6 +566,90 @@ def _seed_task_records_from_logs(inst: dict) -> int:
 
 
 # ============ 单任务日志（按需，仅补齐缺失 config 的 status/code） ============
+
+def _logs_dir(inst: dict) -> str:
+    """实例本地 logs 目录。优先级与 _local_complete_records 一致：config.yaml 的
+    task_output_path 优先，取不到再回退 <inst_dir>/outputs/<stem>/logs。
+
+    原来这里（以及 _task_log_path/_read_task_log_map）硬编码 outputs/config/logs，
+    而实例搬迁过之后 config.yaml 里记的是别处的绝对路径，会扫不到任何日志。
+    """
+    inst_dir = os.path.dirname(inst.get("config_path") or "")
+    stem = os.path.splitext(os.path.basename(inst.get("config_path") or ""))[0]
+    candidates = []
+    try:
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load(inst["config_path"])
+        out = str(cfg.run_config.task.task_output_path or "")
+        if out:
+            # task_output_path 可能是 outputs 或 outputs/<stem>，两种都试
+            candidates.append(os.path.join(out, "logs"))
+            candidates.append(os.path.join(out, stem, "logs"))
+    except Exception:
+        pass
+    candidates.append(os.path.join(inst_dir, "outputs", stem, "logs"))
+    candidates.append(os.path.join(inst_dir, "outputs", "config", "logs"))
+    for d in candidates:
+        if os.path.isdir(d):
+            return d
+    return candidates[-1]
+
+
+def _scan_done_for_running(inst: dict) -> int:
+    """只扫「task_records.task_done IS NULL」的那些 config 对应的日志，回填 DONE 标记。
+
+    为什么单独一个函数、而不是复用 _read_task_log_map：
+    _read_task_log_map 会遍历整个 logs 目录（运行中的实例可能有 1.8 万个文件），
+    每轮都全量扫一遍太贵。这里先用 SQL 查出还没判过的行（通常只有本轮新增的几十上百条），
+    只读这些 task-<idx>.log，成本正比于增量。
+
+    返回本轮判定成功的行数。
+    """
+    with get_connection() as conn:
+        pending = [dict(r) for r in conn.execute(
+            "SELECT config_name, task_idx FROM task_records "
+            "WHERE instance_id=? AND task_done IS NULL",
+            (inst["id"],),
+        ).fetchall()]
+    if not pending:
+        return 0
+
+    logs_dir = _logs_dir(inst)
+    if not os.path.isdir(logs_dir):
+        return 0
+
+    def scan_one(row):
+        idx = row.get("task_idx")
+        if idx is None:
+            return None
+        p = os.path.join(logs_dir, f"task-{idx}.log")
+        if not os.path.isfile(p):
+            return None
+        try:
+            with open(p, errors="replace") as f:
+                txt = f.read()
+        except OSError:
+            return None
+        # 没有终态行的日志（还在写 / 被 kill）本轮跳过，留 NULL 下轮再判。
+        # 否则会把「还没跑完」永久写成 0。
+        if not _FINAL_STATUS_RE.search(txt):
+            return None
+        return (1 if oa.TRAJ_DONE_MARKER in txt else 0, inst["id"], row["config_name"])
+
+    with ThreadPoolExecutor(max_workers=SHALLOW_CONCURRENCY,
+                            thread_name_prefix=f"done-{inst['id'][:8]}") as pool:
+        updates = [r for r in pool.map(scan_one, pending) if r]
+    if not updates:
+        return 0
+    with get_connection() as conn:
+        conn.executemany(
+            "UPDATE task_records SET task_done=? "
+            "WHERE instance_id=? AND config_name=? AND task_done IS NULL",
+            updates,
+        )
+        conn.commit()
+    return len(updates)
+
 
 def _read_task_log_for(inst: dict, task_idx: int) -> dict:
     """读单个 task-<idx>.log，返回 {task_idx, config_name, status, code, task_done}。
@@ -611,17 +778,6 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
         ).fetchall()]
     if not gaps:
         return n_seeded
-    print(f"    [backfill] {inst['id']}: 缺口 {len(gaps)} 行，枚举 OBS 叶子目录", flush=True)
-
-    # 首目录探测：区分"轨迹整批在 OBS"（在线竞态漏写，逐行拉 tsr 分级）和"轨迹已失效"
-    # （历史死数据，逐行探测连续未命中后整批占位）。不用天数猜测：8/18 大批量实例缺口
-    # 数千行，逐行拉 tsr 会让每轮卡死分钟级。注意混合实例（同一实例部分 config 上传、
-    # 部分未上传）也存在——所以首目录未命中时不整批占位，而是逐行 ls 探测，命中才拉 tsr。
-    # 一次 obsutil ls -d 枚举 obs_base 全部 task 叶子目录，与缺口行做集合差：
-    # 命中 → 拉 tsr 分级；未命中 → failed 占位（不可分级，退出缺口队列）。
-    # 替代旧的「首目录探测 + 逐行 _obs_dir_exists + miss 计数整批占位」，
-    # 把 N 次 OBS 往返降为 1 次（OBS 侧一次拿到整批目录集合）。
-    obs_leaves = _list_obs_leaves(obsutil, obs_base)
 
     # 补全同样要顺手写 artifact_complete：否则 finished 实例这批行建出来仍是 0，
     # 交付物列表按 complete 过滤后一条不显示。每个实例只读一次 complete.jsonl。
@@ -638,10 +794,33 @@ def _backfill_finished_tasks(inst: dict, origin: str, obsutil: str) -> int:
     # failed 占位退出缺口队列（避免每轮逐行探测 OBS）。已分级/占位的行不再进入缺口查询。
     # 例外：stopped 实例（如中途中止）轨迹往往已部分上传，任务异常 ≠ 无轨迹——仍逐行探测
     # OBS（见下 _backfill_one 的 obs_leaves 集合差），避免把有真实轨迹的会话误标 failed。
+    #
+    # ⚠ 必须在 _list_obs_leaves 之前做：批量占位不用 obs_leaves，先做能让「缺口全是
+    # 任务异常」的实例（实测 161 个 / 7.6 万行）完全不碰 OBS。此前顺序反了，这些实例
+    # 每轮都白枚举一次（2~11s），然后一行都不用。
+    remaining = gaps
     if inst["status"] != "stopped":
         failed_rows = [g for g in gaps if g["status"] == "任务异常"]
         if failed_rows:
             _batch_placeholder_failed(inst, failed_rows, "任务异常缺口批量占位")
+            remaining = [g for g in gaps if g["status"] != "任务异常"]
+
+    # 没有剩余待定级的行 → 一次 OBS 都不碰。
+    if not remaining:
+        return n_seeded
+
+    print(f"    [backfill] {inst['id']}: 缺口 {len(gaps)} 行（其中 "
+          f"{len(gaps) - len(remaining)} 行本地占位），枚举 OBS 叶子目录", flush=True)
+
+    # 首目录探测：区分"轨迹整批在 OBS"（在线竞态漏写，逐行拉 tsr 分级）和"轨迹已失效"
+    # （历史死数据，逐行探测连续未命中后整批占位）。不用天数猜测：8/18 大批量实例缺口
+    # 数千行，逐行拉 tsr 会让每轮卡死分钟级。注意混合实例（同一实例部分 config 上传、
+    # 部分未上传）也存在——所以首目录未命中时不整批占位，而是逐行 ls 探测，命中才拉 tsr。
+    # 一次 obsutil ls -d 枚举 obs_base 全部 task 叶子目录，与缺口行做集合差：
+    # 命中 → 拉 tsr 分级；未命中 → failed 占位（不可分级，退出缺口队列）。
+    # 替代旧的「首目录探测 + 逐行 _obs_dir_exists + miss 计数整批占位」，
+    # 把 N 次 OBS 往返降为 1 次（OBS 侧一次拿到整批目录集合）。
+    obs_leaves = _list_obs_leaves(obsutil, obs_base)
 
     # 任务成功/未知/stopped 的缺口行：轨迹可能在 OBS（在线竞态漏写分级），逐行拉 tsr 分级。
     # OBS 集合里没有的 → 轨迹整批已失效/未上传，直接 failed 占位（不再逐行探测）。
@@ -838,6 +1017,16 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
         return {"n_processed": n_backfilled, "n_failed": 0}
 
     rows = _level_rows_for_instance(inst)
+
+    # 运行中实例也要扫 DONE 标记：_read_task_log_map 只在 finished/stopped 分支被调用过，
+    # 导致 running 实例的 task_done 永远是 NULL，首页 DONE 列一直为空。
+    # 它内部只扫「task_records 里 task_done IS NULL」的 config —— 已判过的不重扫，
+    # 所以每轮成本正比于本轮新增的日志数，不是全量。
+    try:
+        _scan_done_for_running(inst)
+    except Exception as e:
+        print(f"    [warn] {inst['id']} 扫 DONE 标记失败: {e}", flush=True)
+
     # 驱动源：尚未做过浅层分析（shallow_status IS NULL）的行。若已分析过（processed/empty/error）
     # 直接跳过，不重复处理。traj_level IS NULL（未分级）或 ='failed'（可能被在线同步误标，
     # 而该行从未被 worker 浅层分析过）都需重新过一遍 OBS 定级；真实定级过的行（L0-L3）
@@ -870,6 +1059,19 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
         """config 是否在 complete.jsonl 里。config_name 带 .json，集合里存的是去掉后缀的叶子名。"""
         stem = config_name[:-5] if config_name.endswith(".json") else config_name
         return 1 if (stem in _complete_set or config_name in _complete_set) else 0
+
+    # 运行中的实例：只分级「已经跑完」的任务。
+    #
+    # 为什么：running 实例的轨迹是边跑边传的，对还没跑完的任务去 OBS 找目录/找 tsr，
+    # 必然是空的——以前会把这种「还没传到」当成异常，每轮重试一遍，把整轮时间耗在
+    # 空探测上（实测单轮 5192s、每轮 4 万行里大半是这种空转）。complete.jsonl 是
+    # hive 在任务收尾时 append 的权威完成信号，拿它当门闸后，每个任务只在真正
+    # 跑完后的那一轮被分级一次，既不会漏也不会空转。
+    #
+    # 注意只在 running 时收紧：preparing 也走这个分支（还没开始跑，同样没有轨迹），
+    # 但 stopped/finished 已在上面的分支返回。
+    if is_running and _complete_set:
+        pending = [r for r in pending if _is_complete(r["config_name"])]
 
     def grade_log_fallback_or_failed(inst: dict, config_name: str, task_idx,
                                      ht: str, shallow_status: str,
@@ -1079,201 +1281,6 @@ def _cp_retry(obsutil: str, task_obs: str, dest_parent: str, attempts: int = 4) 
     raise last
 
 
-def _instance_config_names(inst: dict) -> list[str]:
-    """实例的**全部** task config 名（= OBS 叶子目录名）。
-
-    这是子任务行的权威来源：configs/ 下有几个 json 就有几个子任务，与是否跑完无关。
-    task_traj_records 的行就是按这个列表建的（而不是按 complete.jsonl ——
-    它只标出「哪些已完成」，不决定有哪些任务）。
-    """
-    out_dir = None
-    try:
-        from omegaconf import OmegaConf
-        cfg = OmegaConf.load(inst["config_path"])
-        out_dir = str(cfg.run_config.task.task_input_path or "")
-    except Exception:
-        out_dir = None
-    if not out_dir or not os.path.isdir(out_dir):
-        inst_dir = os.path.dirname(inst.get("config_path") or "")
-        out_dir = os.path.join(inst_dir, "configs") if inst_dir else ""
-    if not out_dir or not os.path.isdir(out_dir):
-        return []
-    # 穿透单层嵌套（configs/configs/*.json）
-    for _ in range(4):
-        try:
-            entries = os.listdir(out_dir)
-        except OSError:
-            return []
-        subdirs = [e for e in entries if os.path.isdir(os.path.join(out_dir, e))]
-        files = [e for e in entries if e.endswith(".json")]
-        if files or not subdirs or len(subdirs) > 1:
-            break
-        out_dir = os.path.join(out_dir, subdirs[0])
-    try:
-        return sorted(f[:-5] for f in os.listdir(out_dir) if f.endswith(".json"))
-    except OSError:
-        return []
-
-
-def _discover_artifacts(obsutil: str, inst: dict, budget: dict) -> int:
-    """按实例的 config 列表建子任务行，并用 complete.jsonl 标记完成状态。
-
-    模型（用户定稿）：
-      - 行 = 实例的**全部** config（99 个），不是只建 complete 里的（82 个）；
-        config 列表是固定的，落在 DB 里，complete 只决定 artifact_complete 标志。
-      - artifacts_status 只在 artifact_complete=1 时才排进下载队列；
-        failed/未跑的 config 保持 queued，永不下载。
-      - 行已存在就不重复插（UNIQUE(instance_id, config_name, traj_name)）。
-
-    返回本轮新入队数。
-    """
-    if budget["tasks"] <= 0:
-        return 0
-
-    configs = _instance_config_names(inst)
-    if not configs:
-        return 0
-    completed = set(_local_complete_records(inst))
-    obs_base = _make_obs_base_for(inst)
-    base = obs_base.rstrip("/") + "/"
-    now = time.time()
-    new_queued = 0
-    # harness_type 对同一个实例是常量，但 _instance_harness_type 内部要
-    # yaml.safe_load 整份 config_snapshot（实测 11.9ms/次）。放在循环里对
-    # 上万个 config 各调一次 = 单实例 200+ 秒，是发现阶段的主要耗时。
-    harness = _instance_harness_type(inst)
-
-    with get_connection() as conn:
-        # 一次性取回该实例已有的行状态，避免每个 config 都回查一次。
-        # 原来循环里每条都 `SELECT artifacts_status`，2 万 config 的实例 = 2 万次往返。
-        # 同时要带上 artifact_complete：只比 artifacts_status 的话，一行从
-        # 「complete=0 的 queued」翻转成「complete=1 的 queued」时状态没变，
-        # 会被下面 `st == 'queued': continue` 跳过 —— 于是它进了队列却不计入发现数。
-        # 实测该缺口让心跳合计发现 60 条、而队列实际涨了 700+。
-        existing: dict[str, tuple[str, int]] = {
-            r["traj_name"]: (r["artifacts_status"], r["artifact_complete"] or 0)
-            for r in conn.execute(
-                "SELECT traj_name, artifacts_status, artifact_complete "
-                "FROM task_traj_records "
-                "INDEXED BY idx_traj_records_inst WHERE instance_id=?",
-                (inst["id"],))
-        }
-
-        # 分批提交：一个实例最多有 3.6 万个 config（实测 2608020017-ChanghaoLau-21f8
-        # = 36346 行），原来整轮循环只在末尾 commit 一次，等于长时间独占 SQLite
-        # 的写锁 —— API 的调度器、心跳、队列领取全被阻塞，报 database is locked。
-        # 每 500 行提交一次，写锁持有时间从「几十秒」压到毫秒级。
-        pending = 0
-        for leaf in configs:
-            is_done = 1 if leaf in completed else 0
-            # config_name 必须与 task_records 同款（**带 .json 的完整文件名**）：
-            # 全站的 task_records ⟕ task_traj_records JOIN 都按 instance_id+config_name 匹配
-            # （batch_output.py 的分页/漏斗、worker 的 _level_rows_for_instance）。
-            # 早先这里写的是去掉扩展名的 OBS 叶子名，于是浅层写 task_000001.json、
-            # 产物发现写 task_000001，UNIQUE 撞不上 → 同一 task 两行，JOIN 也接不到。
-            # traj_name 仍用叶子名，因为它是 OBS 目录名、也是产物下载的定位键。
-            config_name = leaf if leaf.endswith(".json") else leaf + ".json"
-            prev = existing.get(leaf)
-            is_new = prev is None
-            st = prev[0] if prev else None
-            was_complete = prev[1] if prev else 0
-            conn.execute(
-                "INSERT INTO task_traj_records "
-                "(instance_id, config_name, traj_name, level, harness, "
-                " traj_status, artifacts_status, artifact_complete, updated_at) "
-                "VALUES (?,?,?,NULL,?,'done',?,?,CURRENT_TIMESTAMP) "
-                # artifact_complete 用 MAX：1 可能来自用户显式「下载交付物」
-                # （POST /deep/{traj} 会置 1），不能被 complete.jsonl 的 0 覆盖回去，
-                # 否则下一轮发现就把这行踢出队列、用户点了也永远下不下来。
-                "ON CONFLICT(instance_id, config_name, traj_name) DO UPDATE SET "
-                "artifact_complete=MAX(COALESCE(task_traj_records.artifact_complete,0), "
-                "excluded.artifact_complete)",
-                (inst["id"], config_name, leaf, harness,
-                 "queued", is_done))
-
-            if not is_done:
-                continue
-            if budget["tasks"] <= 0:
-                continue
-            # 已下完 / 正在下 / 已跳过 / 已确认无产出 的不再排。
-            # st 来自循环外一次性取回的快照，不再逐行回查。
-            # empty 必须在这里：它是终态（OBS 前缀确实为空），不是待重试的失败。
-            if st in ("downloading", "done", "skipped", "empty"):
-                continue
-            # 新插入的行本来就已经是 queued（INSERT 里写死了），它**必须**计入
-            # new_queued —— 原实现走到这里就把新行也 continue 掉了，于是
-            # `new_queued += 1` 永远不为新行执行，心跳恒定「产物发现=0」，
-            # 而积压其实在涨。运维完全看不出发现阶段在工作。
-            if is_new:
-                new_queued += 1
-                budget["tasks"] -= 1
-                pending += 1
-                if pending >= 500:
-                    conn.commit()
-                    pending = 0
-                continue
-            # 已经在队列里的行不占预算、也不重复 UPDATE。
-            # 原来没有这一条：queued 行会落到下面的 UPDATE（幂等空操作）然后
-            # budget -= 1。而 configs 是字典序、每轮都从头扫，于是**同一批前 20 行
-            # 被反复「入队」并把预算吃光**，后面的行永远轮不到 —— 线上表现为
-            # 每轮恒定「发现=20」，done 却几乎不涨。
-            if st == "queued":
-                # 例外：这一行本来是 complete=0 的 queued（不在队列里，worker 不领），
-                # 本轮 complete.jsonl 确认它跑完了 → complete 翻到 1，实际是**新进队列**。
-                # 只按 artifacts_status 判断的话会被这里跳过，于是进了队列却不计数。
-                if not was_complete:
-                    new_queued += 1
-                    budget["tasks"] -= 1
-                    pending += 1
-                    if pending >= 500:
-                        conn.commit()
-                        pending = 0
-                continue
-            if st == "failed":
-                # 达到重试上限：判死，永远不再排（用户要求：失败就失败，不无限重试）
-                row = conn.execute(
-                    "SELECT artifact_started_at, artifact_attempts "
-                    "FROM task_traj_records "
-                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                    (inst["id"], config_name, leaf)).fetchone()
-                attempts = (row["artifact_attempts"] if row else 0) or 0
-                if attempts >= ARTIFACT_MAX_ATTEMPTS:
-                    conn.execute(
-                        "UPDATE task_traj_records SET artifacts_status='skipped', "
-                        "updated_at=CURRENT_TIMESTAMP "
-                        "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                        (inst["id"], config_name, leaf))
-                    continue
-                # 未达上限：退避窗口内不重试
-                started = (row["artifact_started_at"] if row else None) or 0
-                if now - float(started) < ARTIFACT_FAIL_RETRY_SECONDS:
-                    continue
-            # 注意：不清 error —— 清了就看不出上次为什么失败（曾导致 168 次重试无痕）
-            conn.execute(
-                "UPDATE task_traj_records SET artifacts_status='queued', "
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE instance_id=? AND config_name=? AND traj_name=? "
-                "AND artifacts_status NOT IN ('downloading','done','skipped')",
-                (inst["id"], config_name, leaf))
-            new_queued += 1
-            budget["tasks"] -= 1
-            pending += 1
-            if pending >= 500:
-                conn.commit()          # 让出写锁，别把 API 那边饿死
-                pending = 0
-        conn.commit()
-        # 记录本轮发现时间，供下一轮按「最久没被发现」轮转实例使用。
-        # 失败不影响发现结果本身，吞掉即可。
-        try:
-            conn.execute(
-                "UPDATE task_instances SET last_artifact_discover_at=? WHERE id=?",
-                (time.time(), inst["id"]))
-            conn.commit()
-        except Exception:
-            pass
-    return new_queued
-
-
 def _download_artifact_task(inst: dict, tr: dict, origin: str, obsutil: str) -> tuple:
     """下载单个 task 的全量产物到 output_cache/<batch>/<leaf>/。
 
@@ -1340,11 +1347,61 @@ def _download_artifact_task(inst: dict, tr: dict, origin: str, obsutil: str) -> 
     return ("ok", (n, total, time.time(), inst["id"], tr["config_name"], leaf), None)
 
 
-def _reclaim_stuck_hours(timeout_minutes: int | None = None) -> int:
-    """回收卡死的 downloading 行。
+def _leaf_of(config_name: str) -> str:
+    """config_name（带 .json）→ OBS 叶子目录名。与 _discover_artifacts 同口径。"""
+    return config_name[:-5] if config_name.endswith(".json") else config_name
 
-    worker 中途被 kill 时不会回滚，行会永久停在 downloading（CAS 只认 queued，
-    再也捡不起来）。用 artifact_started_at（epoch）判断，比 updated_at 更准 ——
+
+def _requeue_due_failed(limit: int = 200) -> int:
+    """把退避到期的 failed 行排回 queued。
+
+    没有这一步的话 failed 就是事实终态：`_claim_and_download` 只领
+    artifact_state='queued'，而 failed 行不会再有任何东西把它们改回来
+    （tracker 的普通增量刻意不动已 failed 的行，否则每轮都会把失败行打回队列）。
+    原来这套重排在 _discover_artifacts 里，发现阶段删掉后必须补上，
+    否则一次瞬时故障（obsutil 被 kill、NFS 抖动）就永久丢掉那个 task。
+
+    LIMIT 是必须的：几万条同时到期时不能一次全排回，否则 worker 会被
+    同一批失败行反复占满。
+    """
+    now = time.time()
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE shallow_queue SET artifact_state='queued', "
+                "artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+                "artifact_note=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id IN ("
+                "  SELECT id FROM shallow_queue "
+                "   WHERE artifact_state='failed' "
+                "     AND (artifact_retry_at IS NULL OR artifact_retry_at <= ?) "
+                "     AND artifact_attempts < ? "
+                "   ORDER BY artifact_retry_at LIMIT ?)",
+                (now, ARTIFACT_MAX_ATTEMPTS, limit))
+            n = cur.rowcount
+            # 重试已用尽的判死，避免它们永远停在 failed 被反复扫描
+            dead = conn.execute(
+                "UPDATE shallow_queue SET artifact_state='skipped', "
+                "artifact_note=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE artifact_state='failed' AND artifact_attempts >= ?",
+                (f"重试达上限 {ARTIFACT_MAX_ATTEMPTS} 次", ARTIFACT_MAX_ATTEMPTS)
+            ).rowcount
+            conn.commit()
+        if n:
+            print(f"    [artifacts] failed 行排回队列 {n} 条", flush=True)
+        if dead:
+            print(f"    [artifacts] failed 行判死 {dead} 条", flush=True)
+        return n
+    except Exception as e:
+        print(f"    [artifacts] failed 重排失败: {str(e)[:150]}", flush=True)
+        return 0
+
+
+def _reclaim_stuck_hours(timeout_minutes: int | None = None) -> int:
+    """回收卡死的 claimed 行。
+
+    worker 中途被 kill 时不会回滚，行会永久停在 claimed（CAS 只认 queued，
+    再也捡不起来）。用 artifact_claimed_at（epoch REAL）判断 —— 不用 updated_at，
     后者是 SQLite UTC 字符串，和其他 epoch 列混用容易出错。
     """
     timeout = ARTIFACT_DOWNLOADING_TIMEOUT_MIN if timeout_minutes is None else timeout_minutes
@@ -1354,21 +1411,22 @@ def _reclaim_stuck_hours(timeout_minutes: int | None = None) -> int:
             # 超过重试上限的直接判死，不再排队 —— 否则会陷入
             # 「超时回收→排回 queued→立刻再领取→再超时」的死循环（实测出现过 168 次）。
             dead = conn.execute(
-                "UPDATE task_traj_records SET artifacts_status='skipped', "
-                "error=?, updated_at=CURRENT_TIMESTAMP "
-                "WHERE artifacts_status='downloading' "
-                "AND (artifact_started_at IS NULL OR artifact_started_at < ?) "
-                "AND COALESCE(artifact_attempts,0) >= ?",
+                "UPDATE shallow_queue SET artifact_state='skipped', "
+                "artifact_note=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE artifact_state='claimed' "
+                "AND (artifact_claimed_at IS NULL OR artifact_claimed_at < ?) "
+                "AND artifact_attempts >= ?",
                 (f"放弃：下载超时且已重试 {ARTIFACT_MAX_ATTEMPTS} 次", cutoff,
                  ARTIFACT_MAX_ATTEMPTS)).rowcount
 
             cur = conn.execute(
-                "UPDATE task_traj_records SET artifacts_status='queued', "
-                "error=?, updated_at=CURRENT_TIMESTAMP "
-                "WHERE artifacts_status='downloading' "
-                "AND (artifact_started_at IS NULL OR artifact_started_at < ?) "
-                "AND COALESCE(artifact_attempts,0) < ?",
-                (f"自动回收：downloading 超过 {timeout} 分钟未回写", cutoff,
+                "UPDATE shallow_queue SET artifact_state='queued', "
+                "artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+                "artifact_note=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE artifact_state='claimed' "
+                "AND (artifact_claimed_at IS NULL OR artifact_claimed_at < ?) "
+                "AND artifact_attempts < ?",
+                (f"自动回收：claimed 超过 {timeout} 分钟未回写", cutoff,
                  ARTIFACT_MAX_ATTEMPTS))
             n = cur.rowcount
             conn.commit()
@@ -1383,30 +1441,75 @@ def _reclaim_stuck_hours(timeout_minutes: int | None = None) -> int:
         return 0
 
 
+def _mirror_to_traj(iid: str, cfg: str, leaf: str, status: str,
+                    files=None, total=None, ts=None, error=None) -> None:
+    """把下载结果镜像到 task_traj_records —— 前端 /artifacts/{id}/tasks 读的是这张表。
+
+    这一行可能**不存在**（浅层还没为它建过行）：先 UPDATE，未命中再补一条最小行。
+    不能只 UPDATE —— 那会让「tracker 发现了、浅层还没建行」的 task 下载完却查不到。
+    """
+    with get_connection() as c:
+        cur = c.execute(
+            "UPDATE task_traj_records SET artifacts_status=?, error=?, "
+            "artifact_files=COALESCE(?, artifact_files), "
+            "artifact_bytes=COALESCE(?, artifact_bytes), "
+            "artifact_downloaded_at=COALESCE(?, artifact_downloaded_at), "
+            "artifact_complete=1, updated_at=CURRENT_TIMESTAMP "
+            "WHERE instance_id=? AND config_name=? AND traj_name=?",
+            (status, error, files, total, ts, iid, cfg, leaf))
+        if cur.rowcount == 0:
+            c.execute(
+                "INSERT INTO task_traj_records "
+                "(instance_id, config_name, traj_name, level, status, "
+                " artifacts_status, artifact_complete, artifact_files, "
+                " artifact_bytes, artifact_downloaded_at, error, updated_at) "
+                "VALUES (?,?,?,NULL,'done',?,1,?,?,?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(instance_id, config_name, traj_name) DO UPDATE SET "
+                "  artifacts_status=excluded.artifacts_status, "
+                "  artifact_complete=1, "
+                "  artifact_files=COALESCE(excluded.artifact_files, "
+                "                           task_traj_records.artifact_files), "
+                "  artifact_bytes=COALESCE(excluded.artifact_bytes, "
+                "                           task_traj_records.artifact_bytes), "
+                "  error=excluded.error",
+                (iid, cfg, leaf, status, files, total, ts, error))
+        c.commit()
+
+
 def _persist_artifact_outcome(outcome: str, ok, err) -> None:
     """把单个 task 的下载结果落库。积压/实时两个 worker 共用。
 
+    写**两处**：
+      1. shallow_queue 的 artifact 维 —— 队列的权威状态，决定是否还会被领取；
+      2. task_traj_records —— 镜像，前端和 GET /artifacts/{id}/tasks 读这里。
     原来是「整轮结束后 executemany 批量回写」：一轮要下多个（单个 1~158s），
     整轮几分钟都不回写，页面上 done 一直是 0、downloading 一路涨，
     看起来像「一个都没下载成功」——其实文件早已在磁盘上。
     单行 UPDATE 的成本可以忽略，换来状态实时可见。
     """
+    now = time.time()
     with get_connection() as c:
         if outcome == "ok":
             n, total, ts, iid, cfg, leaf = ok
             c.execute(
-                "UPDATE task_traj_records SET artifacts_status='done', error=NULL, "
-                "artifact_files=?, artifact_bytes=?, artifact_downloaded_at=?, "
+                "UPDATE shallow_queue SET artifact_state='done', "
+                "artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+                "artifact_retry_at=NULL, artifact_note=?, "
                 "updated_at=CURRENT_TIMESTAMP "
-                "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                (n, total, ts, iid, cfg, leaf))
+                "WHERE instance_id=? AND config_name=?",
+                (f"{n} 文件 / {total} 字节", iid, cfg))
+            c.commit()
+            _mirror_to_traj(iid, cfg, leaf, "done", files=n, total=total, ts=ts)
         elif outcome == "oversize":
             msg, iid, cfg, leaf = err
             c.execute(
-                "UPDATE task_traj_records SET artifacts_status='skipped', error=?, "
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                (msg, iid, cfg, leaf))
+                "UPDATE shallow_queue SET artifact_state='skipped', "
+                "artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+                "artifact_note=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE instance_id=? AND config_name=?",
+                (msg[:500], iid, cfg))
+            c.commit()
+            _mirror_to_traj(iid, cfg, leaf, "skipped", error=msg)
         elif outcome == "empty":
             # OBS 前缀确实存在但一个文件都没有 —— 沙箱侧没产出，不是平台故障。
             # 标成独立终态 empty（不是 failed，也不是 done）：
@@ -1414,118 +1517,170 @@ def _persist_artifact_outcome(outcome: str, ok, err) -> None:
             #   - 界面显示「无产出」而不是「下载失败」
             #   - 写 artifact_files=0 让前端能区分「下完了但是空的」
             task_obs, iid, cfg, leaf = err
+            msg = f"OBS 前缀下没有文件（沙箱未产出交付物）: {task_obs}"
             c.execute(
-                "UPDATE task_traj_records SET artifacts_status='empty', "
-                "error=?, artifact_files=0, artifact_bytes=0, "
-                "artifact_downloaded_at=?, updated_at=CURRENT_TIMESTAMP "
-                "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                (f"OBS 前缀下没有文件（沙箱未产出交付物）: {task_obs}",
-                 time.time(), iid, cfg, leaf))
+                "UPDATE shallow_queue SET artifact_state='empty', "
+                "artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+                "artifact_retry_at=NULL, artifact_note=?, "
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE instance_id=? AND config_name=?",
+                (msg[:500], iid, cfg))
+            c.commit()
+            _mirror_to_traj(iid, cfg, leaf, "empty",
+                            files=0, total=0, ts=now, error=msg)
         else:
             msg, iid, cfg, leaf = err
             c.execute(
-                "UPDATE task_traj_records SET artifacts_status='failed', error=?, "
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                (msg, iid, cfg, leaf))
-        c.commit()
+                "UPDATE shallow_queue SET artifact_state='failed', "
+                "artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+                # 退避：failed 的行不能立刻被重新领走，否则会「失败→重领→失败」忙等。
+                # 与 _discover_artifacts 原来的 ARTIFACT_FAIL_RETRY_SECONDS 同语义。
+                "artifact_retry_at=?, artifact_note=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE instance_id=? AND config_name=?",
+                (now + ARTIFACT_FAIL_RETRY_SECONDS, msg[:500], iid, cfg))
+            c.commit()
+            _mirror_to_traj(iid, cfg, leaf, "failed", error=msg)
 
 
 def _claim_and_download(origin: str, obsutil: str, worker_id: str,
                         concurrency: int, instance_id: str | None = None,
                         pri_min: int | None = None,
-                        pri_max: int | None = None) -> tuple[int, int]:
+                        pri_max: int | None = None,
+                        budget_seconds: float = 0) -> tuple[int, int]:
     """领取 [pri_min, pri_max] 区间内的 queued 行并下载，返回 (done, failed)。
 
-    CAS（`WHERE artifacts_status='queued'` + rowcount 校验）保证两个进程
+    队列来源是 `shallow_queue.artifact_state`（task_tracker 在 complete.jsonl
+    增量读时标 queued），不再自己扫 task_traj_records —— 那张表的
+    「发现」是全量 UPSERT，单实例 3.6 万 config，一轮能跑 900s。
+
+    CAS（`WHERE artifact_state='queued'` + rowcount 校验）保证两个进程
     不会重复下载同一行：后到者 rowcount=0 直接跳过。
 
     按区间分流是实时 worker 的核心：积压 worker 只领 priority 低的，
     实时 worker 只领用户点过的高优先级行，互不抢线程也就不会互相拖慢。
-    """
-    where = ["artifacts_status='queued'", "artifact_complete=1"]
-    params: list = []
-    if instance_id:
-        where.append("instance_id=?")
-        params.append(instance_id)
-    if pri_min is not None:
-        where.append("COALESCE(artifact_priority,0) >= ?")
-        params.append(pri_min)
-    if pri_max is not None:
-        where.append("COALESCE(artifact_priority,0) < ?")
-        params.append(pri_max)
-    sql = ("SELECT * FROM task_traj_records WHERE " + " AND ".join(where) +
-           " ORDER BY artifact_priority DESC, updated_at LIMIT ?")
-    params.append(concurrency)
 
+    budget_seconds > 0 时一轮内**连续领取**直到队列空或超时。
+    原来每轮只领 concurrency 条就 sleep，实测「3.5s 干活 + 60s 睡」，
+    93% 的时间在空转；id 游标保证不会每轮都从头扫队列。
+    """
     worker_name = f"{socket.gethostname()}:{os.getpid()}"
-    work: list[tuple[dict, dict]] = []
-    with get_connection() as conn:
-        rows = conn.execute(sql, tuple(params)).fetchall()
-        inst_cache: dict[str, dict] = {}
-        for tr in rows:
-            tr = dict(tr)
-            inst = inst_cache.get(tr["instance_id"])
-            if inst is None:
-                inst = _instance_by_id(conn, tr["instance_id"])
-                if inst:
-                    inst_cache[tr["instance_id"]] = inst
-            if not inst:
-                conn.execute(
-                    "UPDATE task_traj_records SET artifacts_status='skipped', "
-                    "error='实例不存在', updated_at=CURRENT_TIMESTAMP "
-                    "WHERE instance_id=? AND config_name=? AND traj_name=?",
-                    (tr["instance_id"], tr["config_name"], tr["traj_name"]))
-                continue
-            cur = conn.execute(
-                "UPDATE task_traj_records SET artifacts_status='downloading', "
-                "artifact_worker=?, artifact_started_at=?, "
-                "artifact_attempts=COALESCE(artifact_attempts,0)+1, "
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE instance_id=? AND config_name=? AND traj_name=? "
-                "AND artifacts_status='queued'",
-                (worker_name, time.time(), tr["instance_id"],
-                 tr["config_name"], tr["traj_name"]))
-            if cur.rowcount == 0:
-                continue
-            work.append((tr, inst))
-        if work:
+    deadline = time.time() + budget_seconds if budget_seconds > 0 else 0
+    n_done = n_failed = 0
+    last_id = 0
+
+    while True:
+        work: list[tuple[dict, dict]] = []
+        # 每批的 thread 数：实时队列通常很短，别一次领满把线程池撑爆
+        batch = concurrency
+        with get_connection() as conn:
+            where = ["artifact_state='queued'", "id > ?"]
+            params: list = [last_id]
+            if instance_id:
+                where.append("instance_id=?")
+                params.append(instance_id)
+            if pri_min is not None:
+                where.append("artifact_priority >= ?")
+                params.append(pri_min)
+            if pri_max is not None:
+                where.append("artifact_priority < ?")
+                params.append(pri_max)
+            # 游标按 id 前进，所以排序键**必须**也是 id。
+            # 原来用 `ORDER BY priority DESC, id` + `id > 游标`：priority 高的行
+            # id 可能很小，被排到队首取走后游标跳过它后面同 priority 的行，
+            # 于是「priority 高的老行」在同一轮内会被漏掉、永远轮不到。
+            # 车道分流已经由上面的 WHERE 区间完成（积压 <100 / 实时 >=100），
+            # 过滤后的集合里按 id 顺序取就是正确的。
+            sql = ("SELECT id, instance_id, config_name, task_idx, artifact_priority, "
+                   "artifact_attempts FROM shallow_queue WHERE " +
+                   " AND ".join(where) +
+                   " ORDER BY id LIMIT ?")
+            params.append(batch)
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            if not rows:
+                # 本段没有更多行了；若已有产出就结束，否则也结束（队列空）
+                break
+
+            inst_cache: dict[str, dict] = {}
+            for r in rows:
+                r = dict(r)
+                last_id = max(last_id, r["id"])
+                # 退避窗口内的 failed 行不领：否则会「失败→立刻重领→再失败」忙等。
+                if r["artifact_attempts"] >= ARTIFACT_MAX_ATTEMPTS:
+                    conn.execute(
+                        "UPDATE shallow_queue SET artifact_state='skipped', "
+                        "artifact_note=?, updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=? AND artifact_state='queued'",
+                        (f"重试达上限 {ARTIFACT_MAX_ATTEMPTS} 次", r["id"]))
+                    continue
+                inst = inst_cache.get(r["instance_id"])
+                if inst is None:
+                    inst = _instance_by_id(conn, r["instance_id"])
+                    if inst:
+                        inst_cache[r["instance_id"]] = inst
+                if not inst:
+                    conn.execute(
+                        "UPDATE shallow_queue SET artifact_state='skipped', "
+                        "artifact_note='实例不存在', updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=? AND artifact_state='queued'", (r["id"],))
+                    continue
+                cur = conn.execute(
+                    "UPDATE shallow_queue SET artifact_state='claimed', "
+                    "artifact_claimed_by=?, artifact_claimed_at=?, "
+                    "artifact_attempts=artifact_attempts+1, "
+                    "updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=? AND artifact_state='queued'",
+                    (worker_name, time.time(), r["id"]))
+                if cur.rowcount == 0:
+                    continue            # 被别的进程抢走
+                # _download_artifact_task 期望 tr 有 config_name / traj_name
+                r["traj_name"] = _leaf_of(r["config_name"])
+                work.append((r, inst))
             conn.commit()
 
-    if not work:
-        return 0, 0
+        if not work:
+            # 这一批全是还没到重试时间的 / 已被抢走的。若本轮已有产出且
+            # id 已经走到头，就结束；否则继续往前推进游标，避免死循环。
+            if deadline and time.time() < deadline:
+                continue
+            break
 
-    n_done = n_failed = 0
-    with ThreadPoolExecutor(max_workers=concurrency,
-                            thread_name_prefix="art") as pool:
-        futures = {pool.submit(_download_artifact_task, inst, tr, origin, obsutil): tr
-                   for tr, inst in work}
-        for fut in as_completed(futures):
-            # 线程体里任何未捕获异常（makedirs 撞 NFS 满盘、obsutil 被 kill 等）
-            # 都会在 fut.result() 处重新抛出。若不接住，整个消费函数中断，
-            # 这些行会永久停在 downloading，只能等 30 分钟超时回收。
-            try:
-                outcome, ok, err = fut.result()
-            except Exception as e:
-                tr = futures[fut]
-                outcome = "fail"
-                ok = None
-                err = (f"线程异常: {str(e)[:300]}", tr["instance_id"],
-                       tr["config_name"], tr["traj_name"])
-                print(f"    [artifacts] {tr['traj_name']}: 线程异常 {str(e)[:120]}",
-                      flush=True)
-            try:
-                _persist_artifact_outcome(outcome, ok, err)
-            except Exception as e:
-                print(f"    [artifacts] 回写失败: {str(e)[:120]}", flush=True)
-            if outcome == "ok":
-                n_done += 1
-            elif outcome == "empty":
-                # 空产出不是失败：不进 failed 计数，否则心跳的「fail」会虚高，
-                # 运维会去排查一个根本不存在的问题。
-                n_done += 1
-            else:
-                n_failed += 1
+        with ThreadPoolExecutor(max_workers=max(1, len(work)),
+                                thread_name_prefix="art") as pool:
+            futures = {pool.submit(_download_artifact_task, inst, tr, origin, obsutil): tr
+                       for tr, inst in work}
+            for fut in as_completed(futures):
+                # 线程体里任何未捕获异常（makedirs 撞 NFS 满盘、obsutil 被 kill 等）
+                # 都会在 fut.result() 处重新抛出。若不接住，整个消费函数中断，
+                # 这些行会永久停在 claimed，只能等 30 分钟超时回收。
+                try:
+                    outcome, ok, err = fut.result()
+                except Exception as e:
+                    tr = futures[fut]
+                    outcome = "fail"
+                    ok = None
+                    err = (f"线程异常: {str(e)[:300]}", tr["instance_id"],
+                           tr["config_name"], tr["traj_name"])
+                    print(f"    [artifacts] {tr['traj_name']}: 线程异常 {str(e)[:120]}",
+                          flush=True)
+                try:
+                    _persist_artifact_outcome(outcome, ok, err)
+                except Exception as e:
+                    print(f"    [artifacts] 回写失败: {str(e)[:120]}", flush=True)
+                if outcome == "ok":
+                    n_done += 1
+                elif outcome == "empty":
+                    # 空产出不是失败：不进 failed 计数，否则心跳的「fail」会虚高，
+                    # 运维会去排查一个根本不存在的问题。
+                    n_done += 1
+                else:
+                    n_failed += 1
+
+        # 单批模式（budget_seconds=0）：领一批就返回，保持实时 worker 的短轮询语义
+        if budget_seconds <= 0:
+            break
+        if deadline and time.time() >= deadline:
+            break
+
     return n_done, n_failed
 
 
@@ -1538,6 +1693,7 @@ def _consume_artifacts_realtime(origin: str, obsutil: str,
     做到「点完几十秒内看到文件」。
     """
     _reclaim_stuck_hours()
+    _requeue_due_failed()
     n_done, n_failed = _claim_and_download(
         origin, obsutil, "", ARTIFACT_REALTIME_CONCURRENCY,
         instance_id=instance_id,
@@ -1545,9 +1701,8 @@ def _consume_artifacts_realtime(origin: str, obsutil: str,
     try:
         with get_connection() as conn:
             remaining = conn.execute(
-                "SELECT COUNT(*) FROM task_traj_records "
-                "WHERE artifacts_status='queued' AND artifact_complete=1 "
-                "AND COALESCE(artifact_priority,0) >= ?",
+                "SELECT COUNT(*) FROM shallow_queue "
+                "WHERE artifact_state='queued' AND artifact_priority >= ?",
                 (ARTIFACT_REALTIME_PRIORITY,)).fetchone()[0]
     except Exception:
         remaining = 0
@@ -1557,102 +1712,43 @@ def _consume_artifacts_realtime(origin: str, obsutil: str,
 
 def _consume_artifacts(origin: str, obsutil: str, instance_id: str | None = None,
                        realtime_only: bool = False) -> dict:
-    """发现并下载沙箱产物。返回 {n_discovered, n_done, n_failed, n_remaining}。
+    """下载沙箱产物。返回 {n_discovered, n_done, n_failed, n_remaining}。
 
-    分两段：
-      1. 发现：complete.jsonl 里列出的 task（任务结束即写入，running 的不在里面）；
-      2. 下载：pending → downloading（CAS 防重复）→ 线程池 cp → done/failed。
+    队列来源已改为 `shallow_queue.artifact_state`，**本函数不做发现** ——
+    tracker（offline/task_tracker.py）在读 complete.jsonl 增量时就把行标成
+    queued，它每轮 1.7s、带 offset+inode 增量，而原来这里的全量 UPSERT
+    单实例 3.6 万 config、一轮 900s（实测 done 却只有 6~8 个）。
+
+    n_discovered 恒为 0，保留字段是为了心跳/看板兼容。
 
     realtime_only: 只领用户点击过的行（priority >= ARTIFACT_REALTIME_PRIORITY），
-      且**跳过发现阶段** —— 发现是给积压排队的，实时 worker 只负责把用户已经
-      点过的任务尽快下完，不该被几万个 config 的 upsert 拖慢。
+      实时 worker 只负责把用户已经点过的任务尽快下完。
     非 realtime 的进程只领 priority < 阈值 的行，两边互不抢，CAS 也不会重叠。
     """
     if realtime_only:
         return _consume_artifacts_realtime(origin, obsutil, instance_id)
 
     _reclaim_stuck_hours()
-    budget = {"tasks": ARTIFACT_MAX_TASKS_PER_ROUND}
-    n_discovered = 0
+    _requeue_due_failed()
 
-    # ── 阶段 1：发现（只对已结束的实例自动发现）──
-    # 自动发现只覆盖「最近 ARTIFACT_AUTO_DISCOVER_DAYS 天内有活动的实例」：
-    # 全量历史待下载量过大，后台按队列慢慢跑要几天，而用户真正关心的是最近的任务。
-    # 历史实例不自动入队，等用户点开「沙箱交付物」时按需下载
-    # （走 POST /request，置 artifact_priority=100 插队）。
-    with get_connection() as conn:
-        if instance_id:
-            insts = [d for d in (_instance_by_id(conn, instance_id),) if d]
-        else:
-            sql = ("SELECT id, name, config_path, config_snapshot, status "
-                   "FROM task_instances "
-                   "WHERE status IN ('finished', 'stopped', 'completed') ")
-            params: tuple = ()
-            if ARTIFACT_AUTO_DISCOVER_DAYS > 0:
-                # cutoff 必须在 Python 侧用本地时间算好再传参，两条都不能省：
-                #   1) created_at / stopped_at 存的是**本地时间** ISO 串
-                #      （2026-10-26T15:08:48），而 SQLite 的 datetime('now') 是 UTC。
-                #      混用会整体错位 8 小时（实测多放行 26 个实例 = 白下 26 个实例）。
-                #   2) 存储用 'T' 分隔、datetime() 产出空格分隔，字符串比较时
-                #      'T'(84) > ' '(32)，边界当天恒为真，精度退化成按天。
-                cutoff = (datetime.datetime.now()
-                          - datetime.timedelta(days=ARTIFACT_AUTO_DISCOVER_DAYS)).isoformat()
-                # 取「结束时间」而不是创建时间：创建早、刚跑完的实例才是用户此刻
-                # 关心的。实测两者差 51 个实例（138 vs 189）。stopped_at 有 NULL，
-                # 必须 COALESCE 回 created_at。
-                sql += "AND COALESCE(stopped_at, created_at) >= ? "
-                params = (cutoff,)
-            # 按「最近发现过」轮转，而不是固定取最新的 N 个：
-            # 原来 ORDER BY created_at DESC LIMIT 4 会让最新 4 个实例长期占住
-            # 全局预算，窗口内其余上百个实例永远轮不到（机械饥饿）。
-            # last_artifact_discover_at 为空的行优先（从未发现过）。
-            sql += ("ORDER BY COALESCE(last_artifact_discover_at, 0), created_at DESC "
-                    "LIMIT ?")
-            params = params + (ARTIFACT_MAX_INSTANCES_PER_ROUND,)
-            insts = [dict(r) for r in conn.execute(sql, params).fetchall()]
-
-    for inst in insts:
-        if budget["tasks"] <= 0:
-            break
-        try:
-            n = _discover_artifacts(obsutil, inst, budget)
-            if n:
-                n_discovered += n
-                print(f"    [artifacts] {inst['id']}: 新入队 {n} 个 task", flush=True)
-        except Exception as e:
-            print(f"    [artifacts] {inst['id']}: 发现失败 {str(e)[:200]}", flush=True)
-
-    # ── 阶段 2：领取并下载 ──
-    # 队列 = task_traj_records 里 artifacts_status='queued' 且 artifact_complete=1 的行。
-    # **只领 ARTIFACT_CONCURRENCY 条**：把整批都标成 downloading 再丢给线程池，
-    # 排队等线程的那些也成了 downloading —— 页面上看着 20 个在下、实际只 3 个在跑，
-    # 且它们永远等不到回写（实测累积 60 条假 downloading）。
-    # ── 阶段 2：领取并下载 ──
-    # 队列 = task_traj_records 里 artifacts_status='queued' 且 artifact_complete=1 的行。
-    # **只领 [0, ARTIFACT_REALTIME_PRIORITY) 区间**：priority >= 阈值的是用户点击的，
-    # 由独立的实时 worker 负责，两边不抢线程，用户点击也就不必等这一轮跑完。
-    # 只领 ARTIFACT_CONCURRENCY 条：把整批都标成 downloading 再丢给线程池，
-    # 排队等线程的那些也成了 downloading —— 页面上看着 20 个在下、实际只 3 个在跑，
-    # 且它们永远等不到回写（实测累积 60 条假 downloading）。
+    # 一轮内连续领取，直到队列空或超时。原来是「每轮只领 concurrency 条 +
+    # 固定 sleep(interval)」，实测 3.5s 干活 + 60s 睡眠，93% 时间空转。
     n_done, n_failed = _claim_and_download(
         origin, obsutil, "", ARTIFACT_CONCURRENCY,
         instance_id=instance_id,
-        pri_max=ARTIFACT_REALTIME_PRIORITY)
+        pri_max=ARTIFACT_REALTIME_PRIORITY,
+        budget_seconds=ARTIFACT_ROUND_BUDGET_SEC)
 
-    # 本轮结束时队列里还剩多少可领取的行。主循环据此决定立刻续跑还是退避：
-    # 原来无论有无积压都 sleep(interval)，实测队列 3.5 万条时每轮只下 3 条、
-    # 剩下 ~56 秒纯睡 —— 93% 的时间在空转，吞吐被钉死在这里。
     try:
         with get_connection() as conn:
             remaining = conn.execute(
-                "SELECT COUNT(*) FROM task_traj_records "
-                "WHERE artifacts_status='queued' AND artifact_complete=1 "
-                "AND COALESCE(artifact_priority,0) < ?",
+                "SELECT COUNT(*) FROM shallow_queue "
+                "WHERE artifact_state='queued' AND artifact_priority < ?",
                 (ARTIFACT_REALTIME_PRIORITY,)).fetchone()[0]
     except Exception:
         remaining = 0
 
-    return {"n_discovered": n_discovered,
+    return {"n_discovered": 0,
             "n_done": n_done, "n_failed": n_failed,
             "n_remaining": int(remaining or 0)}
 
@@ -1819,11 +1915,13 @@ def main() -> None:
                                        a.artifacts_only, a.realtime_only),
                           os.getpid(), f"started interval={a.interval}s")
 
-    # 轻量自愈：补 task_traj_records 的新增可选列 + 业务索引。
+    # 轻量自愈：补 task_traj_records / shallow_queue 的新增可选列 + 业务索引。
     # worker 是独立进程，不调用 init_db()，只靠 uvicorn 启动时迁移。新增一列
-    # （如 last_artifact_discover_at）后如果只重启 worker，SQL 会直接报
-    # no such column，症状是全轮发现失败、日志只有一句笼统错误。
+    # 后如果只重启 worker，SQL 会直接报 no such column，症状是全轮失败、
+    # 日志只有一句笼统错误。shallow_queue 的 artifact_state 维尤其关键 ——
+    # 没有它整个产物队列都领不出来。
     ensure_traj_extra_columns()
+    ensure_shallow_extra_columns()
 
     while True:
         t0 = time.time()

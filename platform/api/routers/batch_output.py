@@ -80,13 +80,15 @@ async def trigger_shallow(instance_id: str, user: dict = Depends(require_operato
     只消费 running/preparing + 本表登记的 finished/completed 实例。幂等：重复登记只更新
     status/created_by，不动已有的处理进度。处理完成后 worker 删登记出队。
 
-    output_status 门控：任务完成（completed）且 output_status='done' 时说明浅层已完成、
-    结果可直接用 → 不再重复登记，直接返回；output_status IS NULL 才允许提交新浅层。
+    `output_status='done'` 的实例**也照常登记**，只是在返回里说明「本次只扫增量」。
+    原来这里直接 return 不登记，但那个门控挡住了真实的重跑场景：
+    hive 重跑会把 failed.jsonl 原地 truncate 重写（tracker 的 inode + head_hash
+    检测正是为此而存在），此时实例早已是 output_status='done'，用户再点也无法
+    重新登记 → tracker 读不到新增行 → 页面上表现为「点了没反应」。
+    重复登记本身无害：tracker 的 offset 机制保证不会重复投递同一行。
     """
     inst = _get_instance(instance_id)
-    if inst.get("output_status") == "done":
-        return {"instance_id": instance_id, "status": "done",
-                "hint": "该实例浅层已完成(output_status=done)，直接使用，无需重复处理"}
+    already_done = inst.get("output_status") == "done"
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO shallow_requests (instance_id, created_by, status, created_at) "
@@ -95,8 +97,13 @@ async def trigger_shallow(instance_id: str, user: dict = Depends(require_operato
             "status='queued', created_by=excluded.created_by, created_at=CURRENT_TIMESTAMP",
             (instance_id, user.get("username")),
         )
-    return {"instance_id": instance_id, "status": "queued",
-            "hint": "已登记浅层请求，worker 下一轮消费，GET /shallow 观察进度"}
+    return {
+        "instance_id": instance_id,
+        "status": "queued",
+        "hint": ("该实例浅层此前已完成，本次只扫增量（重跑追加的行）"
+                 if already_done else
+                 "已登记浅层请求，worker 下一轮消费，GET /shallow 观察进度"),
+    }
 
 
 @router.get("/{instance_id}/shallow")
@@ -143,6 +150,10 @@ async def get_shallow(instance_id: str, user: dict = Depends(get_current_user)):
     summary["graded"] = graded
     summary["total"] = total
     summary["task_done"] = task_done
+    # failed 必须单独回传：它算「已处理」但不算「已定级」（没有 L0-L3）。
+    # 不回传时前端只知道 approved=0，界面上看起来像一条都没跑，
+    # 实际是 69 条跑完但全被判失败（实测某实例 82 条里 69 条这种）。
+    summary["failed"] = failed
     # 未评估 = traj_level 为 NULL（未被浅层分析覆盖/队列未消费）
     summary["unevaluated"] = unevaluated
 
@@ -298,9 +309,15 @@ async def shallow_tasks(
     total = total_row["n"] if total_row else 0
     offset = (page - 1) * page_size
     tasks = await async_query(
+        # task_done 两个表都有，来源不同、都可能有值：
+        #   task_records.task_done      ← 新架构 shallow-local 扫本地日志写的（权威）
+        #   task_traj_records.task_done ← 旧路径从 OBS tsr / 慢路径写的
+        # 以前只读 ttr，导致新架构处理完的行在这一列上仍是空（全库 119 万 vs 631 万），
+        # 页面上看起来「跑完了但 DONE 一列什么都没有」。
+        # 用 COALESCE 优先取 task_records（本地日志口径最准），回退到 ttr。
         f"SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.status, tr.error_code, "
         f"tr.error_category, tr.eval_score, tr.eval_completion, tr.gate, "
-        f"ttr.task_done, ttr.has_eval "
+        f"COALESCE(tr.task_done, ttr.task_done) AS task_done, ttr.has_eval "
         f"{from_sql} WHERE {where_sql} ORDER BY tr.{col} {direction} LIMIT ? OFFSET ?",
         tuple(params) + (page_size, offset),
     )
@@ -346,6 +363,25 @@ async def trigger_deep(instance_id: str, traj_name: str,
         # artifact_priority=100 必须和 artifacts.py 的 POST /request 口径一致 ——
         # 两条入口都自称「等价」，但这里原来不置优先级，于是从会话详情点
         # 「下载交付物」实际排在数万条积压之后，而工作区里点同名按钮是即时的。
+        #
+        # 队列已迁到 shallow_queue 的 artifact 维（发现由 task_tracker 做），
+        # 所以这里要同时写两处：shallow_queue 是 worker 唯一认的队列，
+        # task_traj_records 是前端 GET /tasks / deep_status 读的镜像。
+        leaf = traj_name.strip("/")
+        config_name = leaf if leaf.endswith(".json") else leaf + ".json"
+        conn.execute(
+            "INSERT INTO shallow_queue "
+            "  (instance_id, config_name, local_state, obs_state, "
+            "   artifact_state, artifact_priority, artifact_attempts, artifact_note) "
+            "VALUES (?,?,'queued','queued','queued',?,0,'用户点击(会话详情)') "
+            "ON CONFLICT(instance_id, config_name) DO UPDATE SET "
+            "  artifact_priority=MAX(shallow_queue.artifact_priority, "
+            "                         excluded.artifact_priority), "
+            "  artifact_state='queued', artifact_attempts=0, artifact_retry_at=NULL, "
+            "  artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+            "  updated_at=CURRENT_TIMESTAMP",
+            (instance_id, config_name, ARTIFACT_PRIORITY_USER),
+        )
         conn.execute(
             "UPDATE task_traj_records SET artifacts_status='queued', "
             "artifact_complete=1, artifact_attempts=0, artifact_priority=?, "

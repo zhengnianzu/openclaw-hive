@@ -46,7 +46,7 @@
           </template>
         </el-table-column>
         <el-table-column label="CPU 请求/限制" min-width="130">
-          <template #default="{row}">{{ row.cpu_request }} / {{ row.cpu_limit }} 核</template>
+          <template #default="{row}">{{ cores(row.cpu_request) }} / {{ cores(row.cpu_limit) }} 核</template>
         </el-table-column>
         <el-table-column label="内存请求/限制" min-width="130">
           <template #default="{row}">{{ row.memory_request }} / {{ row.memory_limit }}</template>
@@ -335,6 +335,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search, Delete, Document, Grid, Setting, Timer, Files, EditPen, ArrowDown } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
+import { toMiB, toCores as cores } from '../utils/quantity'
 
 const authStore = useAuthStore()
 
@@ -470,9 +471,10 @@ function validateForm() {
     ElMessage.warning('资源池只能包含小写字母、数字和连字符，且必须以字母或数字开头结尾（≤63 字符）')
     return false
   }
-  for (const [reqF, limF, label] of [['cpu_request', 'cpu_limit', 'CPU'], ['memory_request', 'memory_limit', '内存']]) {
+  // CPU 按核比、内存按 MiB 比：m 在 CPU 里是毫核，在内存里不是，不能共用一个换算
+  for (const [reqF, limF, label, conv] of [['cpu_request', 'cpu_limit', 'CPU', cores], ['memory_request', 'memory_limit', '内存', toMiB]]) {
     if (!f[reqF] || !f[limF]) { ElMessage.warning(`请填写${label}请求与限制`); return false }
-    if (qty(f[reqF]) > qty(f[limF])) { ElMessage.warning(`${label} 请求不得大于限制`); return false }
+    if (conv(f[reqF]) > conv(f[limF])) { ElMessage.warning(`${label} 请求不得大于限制`); return false }
   }
   for (const k of ['ttl_seconds', 'lease_ttl_seconds', 'wait_timeout_seconds']) {
     if (!(f[k] > 0)) { ElMessage.warning('超时值必须为正整数'); return false }
@@ -480,14 +482,6 @@ function validateForm() {
   return true
 }
 
-function qty(v) {
-  const m = String(v ?? '').trim().match(/^([\d.]+)\s*([A-Za-z]*)$/)
-  if (!m) return 0
-  const num = parseFloat(m[1])
-  const unit = m[2].toLowerCase()
-  const factor = { gi: 1024, mi: 1, g: 1000, m: 1, '': 1 }[unit] ?? 1
-  return num * factor
-}
 
 async function saveConfig() {
   if (!validateForm()) return

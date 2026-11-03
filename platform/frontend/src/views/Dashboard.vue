@@ -226,6 +226,25 @@
             <span class="mono-num" style="color:#059669">{{ row.completed_tasks }}</span>
           </template>
         </el-table-column>
+        <!-- 成功轨迹：task_traj_records 里 task_done=1 的行数。「成功」只看流水线是否抛异常，
+             这个才是 assistant 自己打的【Task_Done】完成标记，两者在生产上差得很远。 -->
+        <el-table-column prop="done_trajs" label="成功轨迹" width="96" align="center" resizable>
+          <template #default="{row}">
+            <el-tooltip placement="top" :content="doneTrajTip(row)">
+              <span class="mono-num" :style="{color: doneTrajColor(row)}">{{ row.done_trajs ?? 0 }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <!-- DONE：worker 直接扫本地 task-N.log 得到的【Task_Done】数（task_records.task_done）。
+             与「成功轨迹」并列：后者依赖 OBS 的 tsr，补全快路径不拉该字段，部分实例恒为 0；
+             这个不依赖 OBS，最接近「任务真的做完了」的真相。 -->
+        <el-table-column prop="done_tasks" label="DONE" width="88" align="center" resizable>
+          <template #default="{row}">
+            <el-tooltip placement="top" :content="doneTaskTip(row)">
+              <span class="mono-num" :style="{color: doneTaskColor(row)}">{{ row.done_tasks ?? 0 }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="failed_tasks" label="失败" width="80" align="center" resizable>
           <template #default="{row}">
             <span class="mono-num" :style="{color: row.failed_tasks > 0 ? '#ef4444' : 'var(--text-muted)'}">{{ row.failed_tasks }}</span>
@@ -331,6 +350,42 @@ const progressColor = [
   { color: '#8b5cf6', percentage: 80 },
   { color: '#10b981', percentage: 100 },
 ]
+
+// 「成功轨迹」列：task_traj_records 里 task_done=1 的行数。
+// 与「成功」列（loop 内没抛异常就算成功）不是一个口径，差得远时标红提醒。
+function doneTrajColor(row) {
+  const done = row.done_trajs ?? 0
+  const ok = row.completed_tasks ?? 0
+  if (!done) return 'var(--text-muted)'
+  return done < ok * 0.9 ? '#d97706' : '#059669'
+}
+function doneTrajTip(row) {
+  const done = row.done_trajs ?? 0
+  const ok = row.completed_tasks ?? 0
+  const gap = ok - done
+  if (gap > 0) {
+    return `成功轨迹 ${done} / 成功 ${ok}（差 ${gap} 个：流水线跑通但 assistant 没打【Task_Done】标记，多为撞最大轮次或 agent 自判失败）`
+  }
+  return `成功轨迹 ${done}：assistant 在会话末尾打出【Task_Done】的任务数`
+}
+
+// DONE 列：本地日志口径（task_records.task_done=1，worker 直接扫 task-N.log）。
+// 与「成功轨迹」的区别是数据源不依赖 OBS，所以不会出现「补全没拉该字段 → 恒为 0」。
+function doneTaskColor(row) {
+  const done = row.done_tasks ?? 0
+  const ok = row.completed_tasks ?? 0
+  if (!done) return ok ? '#d97706' : 'var(--text-muted)'
+  return done < ok * 0.9 ? '#d97706' : '#059669'
+}
+function doneTaskTip(row) {
+  const done = row.done_tasks ?? 0
+  const ok = row.completed_tasks ?? 0
+  const gap = ok - done
+  if (gap > 0) {
+    return `DONE ${done} / 成功 ${ok}（差 ${gap} 个：流水线跑通但 agent 没打出【Task_Done】）`
+  }
+  return `DONE ${done}：本地 task-N.log 里含【Task_Done】的任务数（不依赖 OBS）`
+}
 
 // ===== 资源使用情况 =====
 // 口径与后端 stats.effective_pods 一致：「已用」= running + preparing（preparing
@@ -619,7 +674,15 @@ function harnessColor(t) { return harnessStore.color(t) }
 function harnessTagStyle(t) { return harnessStore.tagStyle(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
 function progress(row) {
-  if (!row.total_tasks) return 0
+  // total=0 有两种含义，不能一律当 0%：
+  //   1) 重跑实例继承了源实例的全部成功任务，本次没有活可干（total 减完为 0）；
+  //   2) 还没统计出任务数（preparing/qeueued，界面另有提示）。
+  // 前者是终态，一条进度都不该显示成 0%。
+  if (!row.total_tasks) {
+    const terminal = ['completed', 'finished', 'stopped'].includes(row.status)
+    const nothingToDo = (row.completed_tasks + row.failed_tasks) === 0
+    return terminal && nothingToDo ? 100 : 0
+  }
   return Math.round(((row.completed_tasks + row.failed_tasks) / row.total_tasks) * 100)
 }
 

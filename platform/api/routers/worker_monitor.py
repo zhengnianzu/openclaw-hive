@@ -27,16 +27,32 @@ router = APIRouter(prefix="/api/worker-monitor", tags=["worker-monitor"])
 
 # pid 文件固定白名单，路径不接受外部输入（避免被当成任意 pid 探测接口）
 WORKER_PID_FILES = {
-    "shallow": "worker.pid",          # --shallow-only
-    "deep": "deep_worker.pid",        # --deep-only（含产物下载）
-    "realtime": "realtime_worker.pid",  # --realtime-only（只下用户点击的）
+    # 目标架构的 4 个常驻进程：按「场景」分车道，不按阶段分。
+    "tracker": "tracker.pid",                      # 发现投递
+    "shallow-realtime": "shallow_realtime.pid",    # 实时分析（用户点击，两阶段）
+    "shallow-auto": "shallow_auto.pid",            # 背景分析（全量，最新优先）
+    "deep-realtime": "realtime_worker.pid",        # 实时下载（点击的交付物）
+    # 旧进程名：保留以便升级期间仍能看到它们的状态与历史心跳。
+    # shallow-local / shallow-obs 已被 shallow-realtime/auto 取代（按阶段拆 → 按场景拆），
+    # shallow（--shallow-only）与 deep（--deep-only）是更早的单体循环。
+    "shallow-local": "shallow_local.pid",
+    "shallow-obs": "shallow_obs.pid",
+    "shallow": "worker.pid",
+    "deep": "deep_worker.pid",
 }
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 WORKER_LABEL = {
-    "shallow": "浅层分级",
-    "deep": "深层下载 / 产物",
-    "realtime": "实时下载（点击优先）",
+    "tracker": "发现投递",
+    "shallow-realtime": "实时分析（点击）",
+    "shallow-auto": "背景分析（全量）",
+    "deep-realtime": "实时下载（点击）",
+    # 旧名
+    "shallow-local": "本地 DONE（旧）",
+    "shallow-obs": "OBS 定级（旧）",
+    "shallow": "浅层分级（旧）",
+    "deep": "深层下载 / 产物（旧）",
+    "realtime": "实时下载（旧名）",
     "artifacts": "产物下载",
     "mixed": "混合",
 }
@@ -301,6 +317,26 @@ def _queue_counts() -> dict:
         not_complete = conn.execute(
             "SELECT COUNT(*) n FROM task_traj_records WHERE artifact_complete=0"
         ).fetchone()["n"]
+        # 按车道拆的浅层待办：上面的 shallow_pending 是全局 traj_level IS NULL，
+        # 看不出「用户刚点的那批还剩多少」—— 而这正是看板最该回答的问题。
+        # 读权威队列 shallow_queue 的两阶段维，按 priority 车道分开。
+        #
+        # 阶段 2 的条件必须和 shallow_obs.claim 一致（_OBS_CLAIMABLE）：
+        # 线上有 2.5 万行 obs_state='queued' 但 traj_level 早已写好，worker 不会领，
+        # 算进待办会让看板显示永远清不完的假积压。
+        lane_row = conn.execute(
+            "SELECT "
+            "  SUM(CASE WHEN priority >= 100 AND local_state='queued' "
+            "           THEN 1 ELSE 0 END) rt_s1, "
+            "  SUM(CASE WHEN priority >= 100 AND obs_state='queued' AND "
+            + _OBS_CLAIMABLE + " THEN 1 ELSE 0 END) rt_s2, "
+            "  SUM(CASE WHEN priority < 100 AND local_state='queued' "
+            "           THEN 1 ELSE 0 END) auto_s1, "
+            "  SUM(CASE WHEN priority < 100 AND obs_state='queued' AND "
+            + _OBS_CLAIMABLE + " THEN 1 ELSE 0 END) auto_s2, "
+            "  SUM(CASE WHEN artifact_state='queued' THEN 1 ELSE 0 END) art_q, "
+            "  SUM(CASE WHEN artifact_state='pending_click' THEN 1 ELSE 0 END) art_pc "
+            "FROM shallow_queue").fetchone()
     return {
         "artifact_pending": art.get("queued", 0),
         "artifact_downloading": art.get("downloading", 0),
@@ -321,6 +357,14 @@ def _queue_counts() -> dict:
                              if shallow_total else None),
         "instances_active": inst_active,
         "instances_queued": inst_queued,
+        # 按车道拆的浅层两阶段待办（权威队列口径）
+        "shallow_realtime_stage1": lane_row["rt_s1"] or 0,
+        "shallow_realtime_stage2": lane_row["rt_s2"] or 0,
+        "shallow_auto_stage1": lane_row["auto_s1"] or 0,
+        "shallow_auto_stage2": lane_row["auto_s2"] or 0,
+        # 产物：queued = 用户点过待下；pending_click = 静默态（点开才下，不占配额）
+        "artifact_queue_pending": lane_row["art_q"] or 0,
+        "artifact_pending_click": lane_row["art_pc"] or 0,
     }
 
 
@@ -472,18 +516,30 @@ async def trend(
     user: dict = Depends(require_operator),
 ):
     """心跳按时间分桶，供负载趋势图。桶宽自适应（最多 ~60 个点）。"""
-    points, bucket = await async_execute(_trend_points, hours)
+    points, bucket, series = await async_execute(_trend_points, hours)
     counts = await async_execute(_queue_counts)
     return {
         "hours": hours,
         "bucket_seconds": bucket,
         "points": points,
+        # 按 worker 拆开的曲线（tracker / shallow-local / shallow-obs / deep / realtime），
+        # 每条与 points 的 ts 一一对齐。前端用它画分线，而不是把所有 worker 加成一条。
+        "series": series,
         "counts": counts,
     }
 
 
 def _trend_points(hours: float) -> tuple[list[dict], float]:
-    """同步实现：读心跳并按时间分桶。调用方放线程池。"""
+    """同步实现：读心跳并按时间分桶。调用方放线程池。
+
+    除了总量，还按 worker 拆出 series —— 不同 worker 的 processed 语义完全不同
+    （浅层一轮几千行、产物下载一轮几个任务），混在一条线上相加没有任何意义：
+      tracker       每轮「新投递到 shallow_queue 的 config 数」
+      shallow-local 每轮「判出 DONE 的数量」
+      shallow-obs   每轮「定级 L0~L3 的数量」
+      deep/realtime 每轮「产物下载完成数」
+    前端按 series 各画一条线，才能看出瓶颈卡在发现、本地判定还是 OBS 定级。
+    """
     since = time.time() - hours * 3600
     bucket = max(60.0, (hours * 3600) / 60)
     with get_connection() as conn:
@@ -493,6 +549,7 @@ def _trend_points(hours: float) -> tuple[list[dict], float]:
             (since,)).fetchall()
 
     buckets: dict[int, dict] = {}
+    by_worker: dict[str, dict[int, int]] = {}
     for r in rows:
         rs = r["round_start"]
         if not rs:
@@ -503,7 +560,18 @@ def _trend_points(hours: float) -> tuple[list[dict], float]:
         cur["failed"] += r["failed"] or 0
         cur["rounds"] += 1
 
-    return [buckets[k] for k in sorted(buckets)], bucket
+        w = r["worker"] or "unknown"
+        wb = by_worker.setdefault(w, {})
+        wb[b] = wb.get(b, 0) + (r["processed"] or 0)
+
+    points = [buckets[k] for k in sorted(buckets)]
+    ts_list = [p["ts"] for p in points]
+    # series 里每个 worker 一条，按 ts_list 对齐（缺失桶补 0），前端直接画
+    series = [
+        {"worker": w, "data": [buckets_ts.get(ts, 0) for ts in ts_list]}
+        for w, buckets_ts in sorted(by_worker.items())
+    ]
+    return points, bucket, series
 
 
 @router.get("/eta")
@@ -511,42 +579,108 @@ async def eta(
     window_minutes: int = Query(default=30, ge=5, le=240),
     user: dict = Depends(require_operator),
 ):
-    """按「最近 window_minutes 的实测吞吐」估算剩余时间。
+    """按「最近 window_minutes 的实测吞吐」估算剩余时间，**按车道分别算**。
 
     吞吐为 0 时明确返回 null（estimated_finish_at / remaining_seconds 都为 null），
     不显示假数字。
+
+    为什么要分车道：原来分子是 `SUM(processed)` 把**全部 worker 混加**
+    （实测 30 分钟 78,424，而真正做产物下载的只有 6,220 → 虚高 12.6 倍），
+    分母又读镜像表 `task_traj_records`（1,931,992 vs 权威队列 973,599 → 虚高 2 倍）。
+    两个误差方向相反但不抵消，算出来的完成时间毫无参考价值。
+    现在每条车道各用自己的 worker 吞吐 ÷ 自己的权威队列积压。
     """
-    processed, pending = await async_execute(_eta_inputs, window_minutes)
+    lanes = await async_execute(_eta_inputs, window_minutes)
 
-    per_min = processed / window_minutes if window_minutes else 0
-    remaining = None
-    finish_at = None
-    if per_min > 0 and pending > 0:
-        remaining = round(pending / per_min * 60, 0)
-        finish_at = (datetime.now() + timedelta(seconds=remaining)).isoformat(timespec="seconds")
+    out = {}
+    for key, (processed, pending) in lanes.items():
+        per_min = processed / window_minutes if window_minutes else 0
+        remaining = None
+        finish_at = None
+        if per_min > 0 and pending > 0:
+            remaining = round(pending / per_min * 60, 0)
+            finish_at = (datetime.now()
+                         + timedelta(seconds=remaining)).isoformat(timespec="seconds")
+        out[key] = {
+            "processed_in_window": processed,
+            "throughput_per_minute": round(per_min, 2),
+            "pending": pending,
+            "remaining_seconds": remaining,
+            "estimated_finish_at": finish_at,
+            "estimable": remaining is not None,
+        }
 
+    # 顶层保留旧字段（取产物车道）兼容现有前端：WorkerMonitor.vue 直接读
+    # eta.throughput_per_minute / eta.pending / eta.estimated_finish_at。
+    top = out.get("artifact", {})
     return {
         "window_minutes": window_minutes,
-        "processed_in_window": processed,
-        "throughput_per_minute": round(per_min, 2),
-        "pending": pending,
-        "remaining_seconds": remaining,
-        "estimated_finish_at": finish_at,
-        "estimable": remaining is not None,
+        "by_lane": out,
+        **{k: top.get(k) for k in
+           ("processed_in_window", "throughput_per_minute", "pending",
+            "remaining_seconds", "estimated_finish_at", "estimable")},
     }
 
 
-def _eta_inputs(window_minutes: int) -> tuple[int, int]:
-    """同步实现：取窗口内吞吐与积压量。调用方放线程池。"""
+# 阶段 2「真的可被领取」的条件，与 shallow_obs.claim 的 EXISTS 子句同源。
+# 抽成常量是为了让这里和 worker 的口径不会各自漂移 —— 一旦不一致，看板的积压数
+# 就会包含 worker 永远不碰的行（实测 2.5 万行已定级但 obs_state 仍 queued）。
+_OBS_CLAIMABLE = (
+    "EXISTS(SELECT 1 FROM task_records tr "
+    "       WHERE tr.instance_id=shallow_queue.instance_id "
+    "         AND tr.config_name=shallow_queue.config_name "
+    "         AND tr.traj_level IS NULL "
+    "         AND tr.task_done IS NOT NULL)"
+)
+
+# 每条车道：(心跳里的 worker 名, 权威队列的积压 WHERE 条件)。
+#
+# 分母一律读 shallow_queue —— 它是 worker 唯一认的队列。
+# task_traj_records 只是给前端看的镜像，两者实测差 2 倍（193 万 vs 97 万）。
+_ETA_LANES = {
+    # 浅层两阶段任一维还在排队就算待办；按场景车道拆开。
+    #
+    # 阶段 2 必须带 EXISTS 子查询，和 shallow_obs.claim 的条件**完全一致** ——
+    # 线上有 2.5 万行 obs_state 还是 'queued' 但 traj_level 其实早已写好
+    # （旧架构遗留：定级成功了但队列那一维没推进）。这些行 worker 根本不会领，
+    # 不带 EXISTS 就会把它们算进积压，ETA 直接报出「181 天」这种假数字。
+    "shallow_realtime": (
+        ("shallow-realtime",),
+        "(local_state='queued' OR (obs_state='queued' AND " + _OBS_CLAIMABLE + ")) "
+        "AND priority >= 100",
+    ),
+    "shallow_auto": (
+        ("shallow-auto",),
+        "(local_state='queued' OR (obs_state='queued' AND " + _OBS_CLAIMABLE + ")) "
+        "AND priority < 100",
+    ),
+    # 产物只有实时车道（不设 deep-auto：全量下载会写爆磁盘）。
+    # 兼容旧进程名 deep/realtime/artifacts，免得改名后看板读不到历史吞吐。
+    "artifact": (
+        ("deep-realtime", "deep", "realtime", "artifacts"),
+        "artifact_state='queued'",
+    ),
+}
+
+
+def _eta_inputs(window_minutes: int) -> dict:
+    """同步实现：每条车道各取「自己 worker 的吞吐」与「自己队列的积压」。
+
+    调用方放线程池。返回 {lane: (processed, pending)}。
+    """
     since = time.time() - window_minutes * 60
+    out: dict = {}
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(processed),0) p FROM worker_heartbeats "
-            "WHERE round_start >= ? AND round_start > 0", (since,)).fetchone()
-        pending = conn.execute(
-            "SELECT COUNT(*) n FROM task_traj_records "
-            "WHERE artifacts_status='queued' AND artifact_complete=1").fetchone()["n"]
-    return row["p"], pending
+        for lane, (workers, where) in _ETA_LANES.items():
+            marks = ",".join("?" * len(workers))
+            row = conn.execute(
+                "SELECT COALESCE(SUM(processed),0) p FROM worker_heartbeats "
+                f"WHERE round_start >= ? AND round_start > 0 AND worker IN ({marks})",
+                (since, *workers)).fetchone()
+            pending = conn.execute(
+                f"SELECT COUNT(*) n FROM shallow_queue WHERE {where}").fetchone()["n"]
+            out[lane] = (row["p"] or 0, pending or 0)
+    return out
 
 
 @router.post("/reclaim")

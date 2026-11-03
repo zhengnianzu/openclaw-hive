@@ -54,6 +54,33 @@ def main():
     )
     print(f"  删除孤儿行: {cur.rowcount}")
 
+    # 2b) 同样清理 task_traj_records —— 实例删除时只 rmtree 目录 + DELETE 实例行，
+    #     没删这两张表的级联行。实测 55.2 万行孤儿，它们永远拿不到浅层分析，
+    #     却一直计进「未分级」的分母里，把看板的进度和成功率全拉低。
+    n_ttr = conn.execute(
+        "SELECT COUNT(*) FROM task_traj_records "
+        "WHERE instance_id NOT IN (SELECT id FROM task_instances)"
+    ).fetchone()[0]
+    if n_ttr:
+        conn.execute(
+            "DELETE FROM task_traj_records "
+            "WHERE instance_id NOT IN (SELECT id FROM task_instances)"
+        )
+    print(f"  删除 task_traj_records 孤儿行: {n_ttr}")
+
+    # 2c) shallow_requests 的孤儿登记：实例没了，登记永远清不掉，
+    #     每轮浅层调度都会为一个不存在的实例做 EXISTS 判断。
+    n_sr = conn.execute(
+        "SELECT COUNT(*) FROM shallow_requests "
+        "WHERE instance_id NOT IN (SELECT id FROM task_instances)"
+    ).fetchone()[0]
+    if n_sr:
+        conn.execute(
+            "DELETE FROM shallow_requests "
+            "WHERE instance_id NOT IN (SELECT id FROM task_instances)"
+        )
+    print(f"  删除 shallow_requests 孤儿登记: {n_sr}")
+
     # 3) 删存量 phantom 行（config= 未解析时用文件名 task-N.log 兜底建的重复行）
     cur = conn.execute(
         "DELETE FROM task_records WHERE config_name LIKE 'task-%.log'"

@@ -61,6 +61,46 @@ def _rate(completed: int, failed: int) -> str:
     return f"{completed / done * 100:.1f}%"
 
 
+# 跨实例汇总只算「叶子实例」：被别人 copy_complete_from 当作重跑源的实例，
+# 它的完成数已经由重跑实例代表，两行都算会让同一批任务计两遍。
+#
+# 生产实测：1881 个实例里有 256 个当过重跑源，其中 229 个会因此从汇总中排除，
+# 涉及 64.6 万条完成记录。这是预期效果（链尾代表整条链），但界面上要说明口径，
+# 否则用户会觉得队列合计突然少了一大截。
+#
+# 用 NOT EXISTS 而不是 NOT IN：NOT IN 遇到 NULL 会让整个条件变成 UNKNOWN，
+# 没被复制过的实例（copied_from IS NULL）会被静默排除掉。
+LEAF_INSTANCE_FILTER = (
+    "NOT EXISTS (SELECT 1 FROM task_instances _c "
+    "WHERE _c.copied_from = task_instances.id)"
+)
+
+
+def _filter_leaf_rows(rows: list[dict], conn) -> list[dict]:
+    """把 rows 里「被当作重跑源」的实例剔掉，只留链尾。
+
+    conn 为 None（单测）时原样返回。查询失败也原样返回 —— 汇总口径退化
+    好过整个导出报错。
+    """
+    ids = [r.get("id") for r in rows if r.get("id") and not r.get("missing")]
+    if not ids or conn is None:
+        return rows
+    try:
+        placeholders = ",".join("?" * len(ids))
+        superseded = {
+            r[0] for r in conn.execute(
+                f"SELECT DISTINCT copied_from FROM task_instances "
+                f"WHERE copied_from IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        }
+    except Exception:
+        return rows
+    if not superseded:
+        return rows
+    return [r for r in rows if r.get("id") not in superseded]
+
+
 def collect_rows(instance_ids: list[str], conn, sync_status=None, with_resources=None) -> list[dict]:
     """按给定顺序收集实例行（含 create_params / 最新计数）。
 
@@ -237,7 +277,12 @@ def _harness_label(params: dict) -> str:
 # Sheet 组装
 # ---------------------------------------------------------------------------
 
-def _sheet_overview(wb, rows, funnel=None, title="任务总览"):
+def _sheet_overview(wb, rows, funnel=None, title="任务总览", leaf_ids=None):
+    """任务总览 sheet。
+
+    leaf_ids 非 None 时，底部「合计」行只累加这些实例（跨实例汇总去重口径）；
+    明细行仍然逐行列出全部实例，用户需要看到被重跑替代的源实例。
+    """
     ws = wb.create_sheet(title)
     funnel = funnel or {}
     funnel_headers = (
@@ -265,11 +310,14 @@ def _sheet_overview(wb, rows, funnel=None, title="任务总览"):
         total = r.get("total_tasks") or 0
         ok = r.get("completed_tasks") or 0
         fail = r.get("failed_tasks") or 0
-        tot_total += total
-        tot_ok += ok
-        tot_fail += fail
-        for k in tot_funnel:
-            tot_funnel[k] += f[k]
+        # 合计行只累加叶子实例；被重跑替代的源实例数值已由重跑实例代表，
+        # 两行都加会把同一批任务算两遍。
+        if leaf_ids is None or r.get("id") in leaf_ids:
+            tot_total += total
+            tot_ok += ok
+            tot_fail += fail
+            for k in tot_funnel:
+                tot_funnel[k] += f[k]
         meta = r.get("_params_meta") or {}
         has_params = bool(r.get("_params"))
         if not has_params:
@@ -501,9 +549,12 @@ def build_workbook(rows, conn=None, queue=None, effective_concurrent=None,
     _write_header(overview, ["项目", "值"])
     valid = [r for r in rows if not r.get("missing")]
     missing = [r for r in rows if r.get("missing")]
-    tot_total = sum(r.get("total_tasks") or 0 for r in valid)
-    tot_ok = sum(r.get("completed_tasks") or 0 for r in valid)
-    tot_fail = sum(r.get("failed_tasks") or 0 for r in valid)
+    # 汇总口径：被重跑过的源实例不计入，只算链尾，否则同一批任务算两遍。
+    # 明细页仍然逐行列出全部有效实例（valid），只有顶部的合计按叶子算。
+    leaf = _filter_leaf_rows(valid, conn)
+    tot_total = sum(r.get("total_tasks") or 0 for r in leaf)
+    tot_ok = sum(r.get("completed_tasks") or 0 for r in leaf)
+    tot_fail = sum(r.get("failed_tasks") or 0 for r in leaf)
     # 会话漏斗计数：一条聚合 SQL 出全部实例；conn 为 None（单元测试）时给空值，列仍在
     funnel = collect_funnel_counts(conn, [r.get("id") for r in valid]) if conn is not None else {}
     from datetime import datetime as _dt
@@ -541,7 +592,8 @@ def build_workbook(rows, conn=None, queue=None, effective_concurrent=None,
     if all_queues:
         _sheet_queue_summary(wb, all_queues[0], all_queues[1])
 
-    _sheet_overview(wb, rows, funnel=funnel)
+    _sheet_overview(wb, rows, funnel=funnel,
+                    leaf_ids={r.get("id") for r in leaf})
     _sheet_key_params(wb, rows)
 
     if include_task_records and conn is not None:
@@ -554,6 +606,11 @@ def collect_queue_stats(conn, queue_ids: list[str]) -> dict:
     """按队列聚合任务状态与成功/失败计数（导出队列列表用）。
 
     一条 SQL 出全部队列的统计，避免逐队列查询。返回 {queue_id: {...}}。
+
+    成功/失败合计只算叶子实例（见 LEAF_INSTANCE_FILTER）：被重跑过的源实例
+    与它的重跑实例同队列，两行都算会让同一批任务计两遍。
+    **但 task_count 必须计全部实例** —— 它用于判断队列能否删除，按叶子算会
+    让队列在还有实例时就被认为可删。
     """
     if not queue_ids:
         return {}
@@ -565,8 +622,10 @@ def collect_queue_stats(conn, queue_ids: list[str]) -> dict:
                    SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued,
                    SUM(CASE WHEN status IN ('completed','finished') THEN 1 ELSE 0 END) AS done,
                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_inst,
-                   SUM(COALESCE(completed_tasks,0)) AS ok,
-                   SUM(COALESCE(failed_tasks,0)) AS fail
+                   SUM(CASE WHEN {LEAF_INSTANCE_FILTER}
+                            THEN COALESCE(completed_tasks,0) ELSE 0 END) AS ok,
+                   SUM(CASE WHEN {LEAF_INSTANCE_FILTER}
+                            THEN COALESCE(failed_tasks,0) ELSE 0 END) AS fail
             FROM task_instances
             WHERE queue_id IN ({placeholders})
             GROUP BY queue_id""",

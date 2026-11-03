@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
 from ..core.config import settings, ARTIFACT_PRIORITY_USER
@@ -125,20 +125,19 @@ async def list_artifact_tasks(instance_id: str, user: dict = Depends(get_current
         "artifact_downloaded_at AS downloaded_at, artifact_complete "
         "FROM task_traj_records WHERE instance_id=? ORDER BY traj_name", (instance_id,))
 
-    # 懒发现条件必须是「没有任何已完成的 task」，不能是「一行都没有」。
+    # 懒发现条件：该实例在浅层队列里还没有任何「已完成」的任务。
     #
-    # 原来的 `if not rows` 漏掉了一整类实例：浅层分析会先建行（_shallow_upsert），
-    # 那条 INSERT 不含 artifact_complete（默认 0），而 running 实例又不参与后台
-    # 自动发现（_consume_artifacts 只扫 finished/stopped/completed）。于是
-    # 「有 888 行、全是 complete=0」的实例兜底不触发，列表永远空 ——
-    # 实测单个实例 7161 个 task 里 1419 个早已跑完，界面上一个都看不到。
-    # 全库曾有 1479 个实例处于这个状态。
+    # 不能只看 rows（旧写法 `if not rows`）：浅层分析会先建 complete=0 的行，
+    # running 实例又从不参与后台自动发现，于是「有 888 行、全是 complete=0」的
+    # 实例兜底不触发，列表永远空 —— 实测单实例 7161 个 task 里 1419 个早已跑完，
+    # 界面上一个都看不到，全库曾有 1479 个实例处于这个状态。
+    #
+    # 也不能只看 task_traj_records.artifact_complete：发现已经迁到 task_tracker，
+    # 它按实例增量投递，一个从没被 tracker 扫过的新实例在 task_traj_records 里
+    # 全是 complete=0，但 shallow_queue 里可能已经有可投递的行。
     if not any(r["artifact_complete"] for r in rows):
-        # 注意：不管 _discover_one_instance 返回几，都要重新查一次。
-        # 它的返回值是「本轮新排进下载队列的条数」（受 20 条预算限制），
-        # 而 artifact_complete 是对**每个** config 都写一遍的（UPSERT 不受预算约束）。
-        # 用 found 判断会漏掉最常见的情况：预算已耗尽 / 行全在队列里 → found=0，
-        # 但 complete 已经标好了，界面却仍然空。
+        # 注意：不管 _discover_one_instance 返回几，都要重新查一次 ——
+        # 它的返回值是「本次新投递的条数」，而前端要的是重新读出来的状态。
         await async_execute(_discover_one_instance, instance_id, inst)
         rows = await async_query(
             "SELECT traj_name, artifacts_status AS status, error, "
@@ -354,45 +353,152 @@ async def request_artifact_download(
     return {"task": task, "status": "queued"}
 
 
-def _discover_one_instance(instance_id: str, inst: dict) -> int:
-    """按需发现单个实例的交付物（仅供 POST /request 用）。
+@router.post("/{instance_id}/request-batch")
+async def request_artifact_download_batch(
+    instance_id: str,
+    tasks: list[str] = Body(..., embed=True),
+    user: dict = Depends(require_operator),
+):
+    """把**一批** task 排进产物下载队列（整实例/当前页批量「下载交付物」）。
 
-    与 _consume_artifacts 的自动发现不同：不受「最近 N 天」限制，也不看实例状态，
-    因为这是用户显式点击触发的。发现出来的行仍是 queued，由 _requeue_artifact
-    单独把被点击的那条提到最高优先级。
+    为什么需要这个：tracker 不再自动把交付物入队（全量下载会写爆磁盘 ——
+    线上实测积压 97.4 万条、磁盘只剩 214G），产物改成纯点击驱动。
+    但用户常常要的是「把这一页看到的任务都下下来」，逐个 POST /request
+    要发几十个请求。这里一次收一个列表。
+
+    与单 task 入口完全同口径：复用 `_requeue_artifact`，置
+    artifact_state='queued' + artifact_priority=100（实时车道），
+    由 deep-realtime worker 2 秒内领走。
+
+    上限 500：再多就该用整实例的背景补全，而不是让一个请求写几万行。
     """
-    from offline import output_worker as w
-    from src import offline_analysis as oa
-    from ..core.database import get_connection
-    budget = {"tasks": w.ARTIFACT_MAX_TASKS_PER_ROUND}
+    insts = await async_query("SELECT 1 FROM task_instances WHERE id=?", (instance_id,))
+    if not insts:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    uniq = list(dict.fromkeys(t.strip("/") for t in tasks if t and t.strip("/")))
+    if not uniq:
+        raise HTTPException(status_code=400, detail="tasks 为空")
+    if len(uniq) > 500:
+        raise HTTPException(status_code=400,
+                            detail=f"一次最多 500 个 task（收到 {len(uniq)}）")
+
+    def _queue_all() -> int:
+        for name in uniq:
+            _requeue_artifact(instance_id, name)
+        return len(uniq)
+
+    n = await async_execute(_queue_all)
+    return {"instance_id": instance_id, "queued": n, "status": "queued"}
+
+
+def _discover_one_instance(instance_id: str, inst: dict) -> int:
+    """按需发现单个实例的交付物（仅供 POST /request 用 / GET /tasks 懒发现）。
+
+    复用 task_tracker 的增量读逻辑（resolve_output_dir / find_records / submit_batch），
+    不再走 output_worker._discover_artifacts 的全量 UPSERT —— 那个按 configs/ 下
+    全部 json 建行，单实例 3.6 万 config，用户点一下就要几十秒到十几分钟。
+    这里只投 complete.jsonl 里真实存在的任务，天然就是「已跑完、可下载」的集合。
+    """
     try:
-        # get_connection 是 contextmanager，必须 with 进去拿连接
+        from offline import task_tracker as tt
+        from ..core.database import get_connection
+
+        out_dir = tt.resolve_output_dir(inst.get("config_path") or "")
+        if not out_dir:
+            return 0
+        path = tt.find_records(out_dir, "complete.jsonl")
+        if not path:
+            return 0
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                names = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            return 0
+        uniq = list(dict.fromkeys(os.path.basename(n) for n in names))
+        if not uniq:
+            return 0
         with get_connection() as conn:
-            full = w._instance_by_id(conn, instance_id) or inst
-        # obsutil 可执行文件在 oa 上（worker 内部也是用 oa.DEFAULT_OBSUTIL），
-        # 不在 output_worker 模块里。
-        return w._discover_artifacts(oa.DEFAULT_OBSUTIL, full, budget)
+            n = tt.submit_batch(conn, instance_id, uniq, artifact_ready=True)
+            # 同时建 task_traj_records 的镜像行 —— 工作区列表（GET /tasks）读的是
+            # **这张表**，而 submit_batch 只写 shallow_queue。
+            #
+            # 以前镜像行由 `--shallow-only` / `--deep-only` 两个 worker 的
+            # _upsert_traj_record 顺手建；产物改成纯点击驱动后那两个进程不再常驻，
+            # 于是没有任何东西建镜像行 → 列表永远空，界面显示
+            # 「暂无可浏览的任务。实例还没产出交付物，或 complete.jsonl 尚未生成」，
+            # 而 shallow_queue 里其实已经有上千行（实测某实例 1429 行 vs 镜像 0 行）。
+            #
+            # 这里只写列表需要的三列（身份 + artifact_complete）：分级、token 数等
+            # 由浅层链路另行回填，不在这里瞎猜。artifact_complete 用 MAX() 语义，
+            # 不能把用户点过下载的 1 覆盖回 0。
+            _mirror_discovered(conn, instance_id, uniq)
+            return n
     except Exception as e:
         # 不能静默返回 0：用户点「沙箱交付物」没反应时，日志里必须留下原因。
         print(f"[artifacts] 按需发现失败 {instance_id}: {str(e)[:200]}", flush=True)
         return 0
 
 
+def _mirror_discovered(conn, instance_id: str, config_names: list[str]) -> None:
+    """为发现到的 config 建/更新 task_traj_records 镜像行（仅列表需要的列）。
+
+    traj_name = config 去掉 .json 后缀，与 _requeue_artifact / trigger_deep 的
+    口径一致（它们按 traj_name 定位行），否则会出现「点下载建了一行、
+    列表又建一行」的重复。
+    """
+    rows = [(instance_id, cn, cn[:-5] if cn.endswith(".json") else cn)
+            for cn in config_names]
+    conn.executemany(
+        "INSERT INTO task_traj_records "
+        "  (instance_id, config_name, traj_name, artifact_complete, "
+        "   artifacts_status, updated_at) "
+        # artifacts_status='pending_click' 与 shallow_queue.artifact_state 同口径：
+        # 没人点过 = 没排队也没下载。写 NULL 的话 GET /tasks 会 `or 'queued'`
+        # 兜成「排队中」，界面上 1426 个任务全显示在排队，而其实一个都没在下。
+        "VALUES (?,?,?,1,'pending_click',CURRENT_TIMESTAMP) "
+        "ON CONFLICT(instance_id, config_name, traj_name) DO UPDATE SET "
+        # MAX 语义：已是 1（用户点过下载）的不回退
+        "  artifact_complete=MAX(task_traj_records.artifact_complete, 1)",
+        rows,
+    )
+
+
 def _requeue_artifact(instance_id: str, task: str) -> None:
+    """把某 task 排进产物下载队列（shallow_queue 的 artifact 维）。
+
+    队列已从 task_traj_records 迁到 shallow_queue.artifact_state：
+    发现由 task_tracker 在 complete.jsonl 增量读时完成，worker 只负责领取下载。
+    这里同时写两处——
+      - shallow_queue：权威队列状态，worker 只认它；
+      - task_traj_records：镜像，前端 GET /tasks 读的是这张表。
+    两处口径必须一致，否则会出现「界面显示已排队、worker 却永远不领」。
+    """
     from ..core.database import get_connection
+    leaf = task.strip("/")
+    config_name = leaf if leaf.endswith(".json") else leaf + ".json"
     with get_connection() as conn:
-        # 必须同时把 artifact_complete 置 1：worker 只领
-        # `artifacts_status='queued' AND artifact_complete=1` 的行
-        # （offline/output_worker.py 的 _consume_artifacts）。只改 status 的话
-        # 用户点了「下载此任务」也永远排不进队列。
-        # artifact_attempts 清零：与 batch_output.trigger_deep 口径一致 ——
-        # 这是用户显式重试，不该被此前的自动重试上限（skipped）永久卡住。
-        # artifact_priority=100：用户点开「沙箱交付物」是最高优先级，
-        # 队列按 artifact_priority DESC, updated_at 领取，能直接插到 1.9 万条积压前面。
+        # 用户显式点击：重置重试计数与退避，突破 max_attempts 的死行。
+        # artifact_priority=100 写的是**产物维自己的**车道号，不是 priority ——
+        # priority 是浅层「整实例插队」的语义，tracker 每 5 秒会把它重写回 100，
+        # 拿它分车道会让整个实例的行都涌进实时车道。
+        conn.execute(
+            "INSERT INTO shallow_queue "
+            "  (instance_id, config_name, local_state, obs_state, "
+            "   artifact_state, artifact_priority, artifact_attempts, artifact_note) "
+            "VALUES (?,?,'queued','queued','queued',?,0,'用户点击') "
+            "ON CONFLICT(instance_id, config_name) DO UPDATE SET "
+            "  artifact_priority=MAX(shallow_queue.artifact_priority, "
+            "                         excluded.artifact_priority), "
+            "  artifact_state='queued', artifact_attempts=0, artifact_retry_at=NULL, "
+            "  artifact_claimed_by=NULL, artifact_claimed_at=NULL, "
+            "  updated_at=CURRENT_TIMESTAMP",
+            (instance_id, config_name, ARTIFACT_PRIORITY_USER))
+        # 镜像：artifact_complete 必须置 1，前端才会把它当「可下载」的任务展示。
         conn.execute(
             "UPDATE task_traj_records SET artifacts_status='queued', "
             "artifact_complete=1, artifact_attempts=0, artifact_priority=?, "
             "error=NULL, updated_at=CURRENT_TIMESTAMP "
             "WHERE instance_id=? AND traj_name=? AND artifacts_status<>'downloading'",
-            (ARTIFACT_PRIORITY_USER, instance_id, task))
+            (ARTIFACT_PRIORITY_USER, instance_id, leaf))
         conn.commit()
