@@ -29,6 +29,7 @@ settings.DB_PATH = os.path.join(_TMP_DB_DIR, "test_platform.db")
 from api.core.database import get_connection, init_db  # noqa: E402
 from offline import shallow_local as sl  # noqa: E402
 from offline import shallow_obs as so  # noqa: E402
+from offline import task_tracker as tt  # noqa: E402
 
 IID = "__sw_test_instance__"
 
@@ -193,6 +194,158 @@ class NoLaneBackCompatTest(LaneTestBase):
         with get_connection() as conn:
             got = {r["config_name"] for r in so.claim(conn, 10)}
         self.assertEqual(got, {"clk.json", "bg.json"})
+
+
+class TrackerOrderTest(unittest.TestCase):
+    """tracker 的实例投递顺序：先未扫过的，再按登记时间倒序（最新点击优先）。
+
+    原来 pick_clicked 没有 ORDER BY，SQLite 按 shallow_requests 主键
+    （instance_id 字符串）返回 —— 实测最老的登记先扫、最新的最后扫，
+    与 shallow-auto 的「最新优先」口径正好相反。
+    """
+
+    IIDS = ("__tk_old__", "__tk_mid__", "__tk_new__", "__tk_fresh__")
+
+    def setUp(self):
+        init_db()
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        with get_connection() as conn:
+            for i in self.IIDS:
+                conn.execute("DELETE FROM shallow_requests WHERE instance_id=?", (i,))
+                conn.execute("DELETE FROM task_instances WHERE id=?", (i,))
+            conn.commit()
+
+    def _seed(self):
+        """造 4 个登记：3 个 tracking（时间递增）+ 1 个 queued（最老时间）。
+
+        queued 那条**故意给最老的登记时间**：它必须靠 status 排到最前，
+        以此区分「按 status 优先」与「单纯按时间倒序」。
+        """
+        rows = [
+            ("__tk_old__",   "tracking", "2026-11-01 00:00:00"),
+            ("__tk_mid__",   "tracking", "2026-11-02 00:00:00"),
+            ("__tk_new__",   "tracking", "2026-11-03 00:00:00"),
+            ("__tk_fresh__", "queued",   "2026-10-01 00:00:00"),
+        ]
+        with get_connection() as conn:
+            for iid, st, ts in rows:
+                conn.execute(
+                    "INSERT INTO task_instances (id, name, config_path, status, created_at) "
+                    "VALUES (?,?,?,'finished',?)", (iid, iid, "/nonexistent.yaml", ts))
+                conn.execute(
+                    "INSERT INTO shallow_requests (instance_id, created_by, status, created_at) "
+                    "VALUES (?,'t',?,?)", (iid, st, ts))
+            conn.commit()
+
+    def test_queued_first_then_newest(self):
+        self._seed()
+        with get_connection() as conn:
+            got = [r["instance_id"] for r in tt.pick_clicked(conn)
+                   if r["instance_id"] in self.IIDS]
+        # queued 的排最前（哪怕它登记时间最老），其余按时间倒序
+        self.assertEqual(got, ["__tk_fresh__", "__tk_new__", "__tk_mid__", "__tk_old__"])
+
+    def test_newest_tracking_before_oldest(self):
+        """只有 tracking 时，最新登记的必须排在最老的前面。"""
+        self._seed()
+        with get_connection() as conn:
+            conn.execute("UPDATE shallow_requests SET status='tracking' "
+                         "WHERE instance_id='__tk_fresh__'")
+            conn.commit()
+            got = [r["instance_id"] for r in tt.pick_clicked(conn)
+                   if r["instance_id"] in self.IIDS]
+        self.assertEqual(got[0], "__tk_new__")
+        self.assertEqual(got[-1], "__tk_fresh__")   # 登记时间最老 → 最后
+
+
+class LanePriorityTest(unittest.TestCase):
+    """tracker 按「实例是否还在跑」分车道(_lane_priority)。
+
+    改前写死 priority=100,而 tracker 只扫点击过的实例 → **所有行都进实时车道**,
+    shallow-auto 永远分不到活(实测 30 分钟 realtime 处理 8986、auto 只有 266,
+    而 auto 的 64 并发全程闲着)。
+    """
+
+    def test_active_goes_realtime(self):
+        for s in ("running", "preparing"):
+            self.assertEqual(tt._lane_priority(s), tt.LANE_REALTIME, s)
+
+    def test_ended_goes_auto(self):
+        for s in ("finished", "stopped", "completed", "queued", "created"):
+            self.assertEqual(tt._lane_priority(s), tt.LANE_AUTO, s)
+
+    def test_unknown_goes_auto(self):
+        """取不到 status 时走背景车道 —— 宁可慢,不要占实时车道。"""
+        self.assertEqual(tt._lane_priority(None), tt.LANE_AUTO)
+        self.assertEqual(tt._lane_priority("某个没见过的态"), tt.LANE_AUTO)
+
+
+class SubmitResetTest(unittest.TestCase):
+    """submit_batch 的 reset 语义。
+
+    判据必须是显式的 `reset` 参数,**不能用 `excluded.priority > 0`** ——
+    priority 现在是车道号:已结束实例的行走背景车道、priority=0,但它们同样是
+    用户点「输出」才投进来的,同样需要从 done/skipped 复活。
+    """
+
+    IID = "__reset_test__"
+
+    def setUp(self):
+        init_db()
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        with get_connection() as conn:
+            conn.execute("DELETE FROM shallow_queue WHERE instance_id=?", (self.IID,))
+            conn.commit()
+
+    def _state(self, conn, cn="a.json"):
+        r = conn.execute(
+            "SELECT local_state, obs_state, priority FROM shallow_queue "
+            "WHERE instance_id=? AND config_name=?", (self.IID, cn)).fetchone()
+        return (r["local_state"], r["obs_state"], r["priority"])
+
+    def test_reset_revives_background_lane_rows(self):
+        """priority=0(背景车道)的行也必须能被 reset 复活 —— 这是改动的要害。"""
+        with get_connection() as conn:
+            tt.submit_batch(conn, self.IID, ["a.json"], priority=0, reset=True)
+            conn.execute("UPDATE shallow_queue SET local_state='done', obs_state='done' "
+                         "WHERE instance_id=?", (self.IID,))
+            conn.commit()
+            tt.submit_batch(conn, self.IID, ["a.json"], priority=0, reset=True)
+            conn.commit()
+            self.assertEqual(self._state(conn)[:2], ("queued", "queued"))
+
+    def test_no_reset_keeps_done(self):
+        """reset=False(懒发现)不得把已分析完的行打回队列。"""
+        with get_connection() as conn:
+            tt.submit_batch(conn, self.IID, ["a.json"], priority=0, reset=True)
+            conn.execute("UPDATE shallow_queue SET local_state='done', obs_state='done' "
+                         "WHERE instance_id=?", (self.IID,))
+            conn.commit()
+            tt.submit_batch(conn, self.IID, ["a.json"], priority=0, reset=False)
+            conn.commit()
+            self.assertEqual(self._state(conn)[:2], ("done", "done"))
+
+    def test_priority_never_downgrades(self):
+        """车道号取 MAX:实例从 running 变 finished 后,老行保持 100 不回退。
+
+        这是可接受的 —— 那些行在 running 期间已经分析完了,留在实时车道不占活。
+        新增的行会按当前 status 走背景车道。
+        """
+        with get_connection() as conn:
+            tt.submit_batch(conn, self.IID, ["a.json"], priority=100, reset=True)
+            tt.submit_batch(conn, self.IID, ["a.json"], priority=0, reset=True)
+            conn.commit()
+            self.assertEqual(self._state(conn)[2], 100)
 
 
 if __name__ == "__main__":

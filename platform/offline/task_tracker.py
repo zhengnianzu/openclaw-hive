@@ -169,15 +169,29 @@ def read_new_lines(conn, instance_id: str, path: str) -> list[str]:
     return lines
 
 
+# submit_batch 的 SQL 片段：reset=True 时把两个浅层维打回 queued。
+# 抽成常量只为让上面那条 f-string 不必内嵌引号转义。
+_LOCAL_RESET = "'queued'"
+_OBS_RESET = "'queued'"
+
+
 def submit_batch(conn, instance_id: str, config_names: list[str],
-                 priority: int = 0, artifact_ready: bool = True) -> int:
+                 priority: int = 0, artifact_ready: bool = True,
+                 reset: bool = True) -> int:
     """把 config 投进 shallow_queue，返回新插入的行数。
 
     task_idx 从 task_records 带过来（在线同步时已写入）：shallow-local 要用它拼
     task-<idx>.log 的路径。取不到时留 NULL，由 shallow-local 回退到输入目录下标。
 
-    priority=100 表示用户点击触发的插队（领取按车道分流 + id 排序），
-    保证「点完很快就能看到结果」而不是排在几十万条积压后面。
+    priority 是**浅层车道号**（不是「是否用户点击」）：
+      100 = 实时车道，实例还在跑（running/preparing），用户在等新完成的任务冒出来
+        0 = 背景车道，实例已结束，剩下的是批量补全，交给 64 并发吃满
+    由 `_lane_priority(实例status)` 决定，领取端见 shallow_worker 的 claim 过滤。
+
+    reset: 冲突时是否把两个浅层维打回 queued（复活已 done/skipped 的行）。
+      tracker 投递要 True —— 用户点「输出」就是要重新看这个实例的结果。
+      artifacts.py 的懒发现要 False —— 它只为把列表显示出来而补建行，
+      打回 queued 会让两个 worker 白跑几千行已分析完的任务。
 
     artifact_ready: 该 config 是不是「任务成功」（来自 complete.jsonl）。
       **只用于备注文案**：产物维现在恒为 'pending_click'（见下），不再按成功/失败
@@ -217,10 +231,13 @@ def submit_batch(conn, instance_id: str, config_names: list[str],
         # 点击触发时把各维都重置回 queued —— 否则用户点了「立即分析」，
         # 但这条早已是 done/skipped（历史遗留或上次失败），worker 不会再处理，
         # 界面看起来「点了没反应」。
-        "  local_state=CASE WHEN excluded.priority > 0 THEN 'queued' "
-        "                   ELSE shallow_queue.local_state END, "
-        "  obs_state=CASE WHEN excluded.priority > 0 THEN 'queued' "
-        "                 ELSE shallow_queue.obs_state END, "
+        #
+        # 判据是 `reset`（调用方显式传入），**不能用 `excluded.priority > 0`** ——
+        # priority 现在是「车道号」而不是「是否用户点击」：已结束实例的行走背景
+        # 车道、priority=0，但它们同样是用户点「输出」才投进来的，同样需要复活。
+        # 用 priority>0 判断会让这些行永远停在 done/skipped，表现为「点了没反应」。
+        f"  local_state={_LOCAL_RESET if reset else 'shallow_queue.local_state'}, "
+        f"  obs_state={_OBS_RESET if reset else 'shallow_queue.obs_state'}, "
         # 产物维**完全不看 priority**，且本函数永不把它推进到 queued。
         #
         # priority 是浅层「用户点了输出，整个实例插队」的语义：一个实例被点过一次，
@@ -255,13 +272,76 @@ def pick_clicked(conn) -> list[dict]:
     status 两态：
       'queued'   —— 刚点，还没扫过。首轮要从头(offset=0)整扫一遍，之后转 'tracking'
       'tracking' —— 已在增量跟踪。运行中实例每轮只读新增行，结束后自然安静
+
+    **顺序：先未扫过的(queued)，再按登记时间倒序(最新点击优先)**。
+
+    两层排序各有原因：
+      1. `req_status='queued'` 排最前 —— 这是「用户刚点、一行都还没投」的实例，
+         它在界面上是完全空白的。已 tracking 的实例每轮只增量读几行、早就有结果可看，
+         让它们排在后面不影响体感。
+      2. 同组内按 `created_at DESC` —— 用户最后点的那个通常就是他正盯着的。
+         原来没有 ORDER BY，SQLite 按 shallow_requests 的主键(instance_id 字符串)
+         返回，实测结果是**最老的登记(10-31)先扫、最新的(11-03 08:09)最后扫**，
+         与 shallow-auto 的「最新优先」(ORDER BY id DESC)口径正好相反。
+
+    注意这只影响「同一轮内先读哪个实例的 jsonl」。tracker 一轮通常 0.2~0.3s
+    就把全部实例扫完（增量读只有几行），所以顺序在实例数少时无感；
+    但实例数多、或某实例首轮要整扫几十万行时，顺序就决定了谁先拿到结果。
     """
     rows = conn.execute(
         "SELECT sr.instance_id, sr.status AS req_status, ti.config_path, ti.status "
         "FROM shallow_requests sr "
-        "JOIN task_instances ti ON ti.id = sr.instance_id",
+        "JOIN task_instances ti ON ti.id = sr.instance_id "
+        "ORDER BY CASE WHEN sr.status='queued' THEN 0 ELSE 1 END, "
+        "         sr.created_at DESC",
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# 「实例还在跑」的状态。与 output_worker._pick_running_instances、
+# queue_scheduler.OCCUPYING_STATUSES 同口径，别各写一套。
+ACTIVE_STATUSES = ("running", "preparing")
+# 浅层车道号：实时 = 用户正盯着结果的，背景 = 批量补全。
+# 与 shallow_worker 的 claim 过滤（priority >= / < 100）对齐。
+LANE_REALTIME = 100
+LANE_AUTO = 0
+
+
+def _short_iid(instance_id: str) -> str:
+    """instance_id 缩写，用于日志。
+
+    id 的形状是 `<MMDDHHmm>-<用户><时间戳>-<4位后缀>`，例如
+    `2611031754-wanyi26110317530533-70b2`。中段的用户名+时间戳最长且信息重复
+    （前段已有时间），所以只留**首段时间 + 末段后缀**：`2611031754-70b2`。
+    这两段合起来足够在日志里唯一定位一个实例，且长度固定 15 字符。
+
+    不用 `name`：实测同一批次的 name 只差末尾几个字（「…lego」/「…lego-copy」/
+    「…lego-copy-copy」），截断后完全分不出谁是谁；而且 name 最长 50+ 字符、
+    含中文，对齐很难看。
+    """
+    parts = instance_id.split("-")
+    if len(parts) >= 3:
+        return f"{parts[0]}-{parts[-1]}"
+    return instance_id[:16]
+
+
+def _lane_priority(inst_status: str | None) -> int:
+    """按实例是否还在跑决定浅层车道。
+
+    **running/preparing → 实时车道（100）**：实例还在产出，用户点开输出页就是在
+    等新完成的任务逐个冒出来，要秒级增量。这类实例每轮只新增几行，队列天然很短，
+    shallow-realtime 的 16/8 并发足够。
+
+    **finished/stopped/completed/queued/created → 背景车道（0）**：实例已经不动了，
+    剩下的是「把几万行历史一次性补全」，属于吞吐活而非响应活，交给
+    shallow-auto 的 64/16 并发吃满，顺带按 id DESC 最新优先。
+
+    改前这里写死 priority=100：而 tracker 只扫点击过的实例，于是**所有行都进实时
+    车道**，shallow-auto 永远分不到活（实测近 30 分钟 realtime 处理 8986、
+    auto 只有 266，而 auto 的 64 并发全程闲着）。一个 3.4 万 config 的已结束实例
+    本该用 64 并发快速清完，却挤在 16 并发里跑。
+    """
+    return LANE_REALTIME if inst_status in ACTIVE_STATUSES else LANE_AUTO
 
 
 def _reset_offsets(conn, instance_id: str) -> None:
@@ -323,7 +403,10 @@ def run_once(limit: int) -> dict:
       · 之后（status='tracking'）：只读新增行，运行中实例新完成的 config 逐轮带进来
     `limit` 参数保留仅为兼容 CLI，不再用于发现范围。
     """
-    stats = {"instances": 0, "lines": 0, "submitted": 0, "clicked": 0}
+    stats = {"instances": 0, "lines": 0, "submitted": 0, "clicked": 0,
+             # 本轮真正投出行的实例（(短ID, 行数, 车道) 三元组），供日志打明细。
+             # 只记有产出的：24 个实例里通常只有 1~2 个有新行，全列出来反而看不清。
+             "detail": []}
     with get_connection() as conn:
         for inst in pick_clicked(conn):
             iid = inst["instance_id"]
@@ -340,10 +423,15 @@ def run_once(limit: int) -> dict:
                     "UPDATE shallow_requests SET status='tracking' WHERE instance_id=?",
                     (iid,))
 
-            n_lines, n_sub = _submit_incremental(conn, iid, out_dir, priority=100)
+            pri = _lane_priority(inst.get("status"))
+            n_lines, n_sub = _submit_incremental(conn, iid, out_dir, priority=pri)
             stats["lines"] += n_lines
             stats["submitted"] += n_sub
             stats["clicked"] += n_sub
+            if n_lines:
+                stats["detail"].append(
+                    (_short_iid(iid), n_lines,
+                     "rt" if pri >= LANE_REALTIME else "auto"))
         conn.commit()
     return stats
 
@@ -369,8 +457,16 @@ def main() -> None:
         try:
             st = run_once(a.limit)
             if st["submitted"] or st["lines"]:
-                print(f"[tracker] 实例={st['instances']} 新行={st['lines']} "
-                      f"投递={st['submitted']} {time.time()-t0:.2f}s", flush=True)
+                # 列出**真正投出行的实例**（短ID + 行数 + 车道），而不是只报一个
+                # 「实例=24」的总数 —— 24 是「在跟踪的实例数」，每轮通常只有 1~2 个
+                # 有新行，报总数看不出是谁在动、进了哪条车道。
+                # 超过 4 个就省略尾部，避免单行过长。
+                det = st.get("detail") or []
+                shown = "  ".join(f"{iid}({n},{lane})" for iid, n, lane in det[:4])
+                more = f" +{len(det)-4}个" if len(det) > 4 else ""
+                print(f"[tracker] 跟踪={st['instances']} 新行={st['lines']} "
+                      f"投递={st['submitted']} {time.time()-t0:.2f}s | {shown}{more}",
+                      flush=True)
             # 每轮都写心跳（哪怕本轮没有新行）：监控页靠最后心跳时间判断进程存活。
             # processed 记「新投递数」，这才是 tracker 的产出；scanned 放 note 里。
             write_heartbeat(

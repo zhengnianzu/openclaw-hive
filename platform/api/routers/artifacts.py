@@ -419,7 +419,12 @@ def _discover_one_instance(instance_id: str, inst: dict) -> int:
         if not uniq:
             return 0
         with get_connection() as conn:
-            n = tt.submit_batch(conn, instance_id, uniq, artifact_ready=True)
+            # reset=False：本函数只是「为了把列表显示出来」补建队列行，
+            # 不是用户要求重跑浅层分析。默认的 reset=True 会把已 done 的
+            # local_state/obs_state 打回 queued，让两个 shallow worker 白跑一遍
+            # 几千行已经分析完的任务（纯浪费 OBS 配额）。
+            n = tt.submit_batch(conn, instance_id, uniq, artifact_ready=True,
+                                reset=False)
             # 同时建 task_traj_records 的镜像行 —— 工作区列表（GET /tasks）读的是
             # **这张表**，而 submit_batch 只写 shallow_queue。
             #
