@@ -46,6 +46,45 @@ def ps_command(script: str, remote: str) -> list[str]:
     return ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
 
 
+def ps_copy_skill_command(source: str, target_dir: str) -> list[str]:
+    """复制沙箱内单个技能到目标目录；不依赖任何 harness 的配置或 gateway。"""
+    source = str(PureWindowsPath(source)).replace("'", "''")
+    target_dir = str(PureWindowsPath(target_dir)).replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop'; try { "
+        f"[System.IO.Directory]::CreateDirectory('{target_dir}') | Out-Null; "
+        f"Copy-Item -LiteralPath '{source}' -Destination '{target_dir}' -Recurse -Force; "
+        "exit 0 } catch { Write-Error $_ -ErrorAction Continue; exit 1 }"
+    )
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+
+
+def ps_script_command(remote_script: str) -> list[str]:
+    """用 -File 执行沙箱内的 .ps1, 命令行长度只有路径那么长。
+
+    -EncodedCommand 走的是 cmd.exe 命令行, 上限 8191 字符, 而 utf-16le+base64
+    会把脚本放大约 2.67 倍 —— 稍长一点的启动脚本就会撞「命令行太长。」。
+    脚本内容改为上传成文件, 这里只留调用命令。
+    """
+    return [
+        "powershell.exe", "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass", "-File", remote_script,
+    ]
+
+
+def write_ps1_file(script: str, local_dir: str, name: str) -> str:
+    """把 PowerShell 脚本落到本地临时文件, 返回路径。
+
+    用 utf-8-sig 写: Windows PowerShell 5.1 读无 BOM 文件时按系统 ANSI 代码页
+    解码, 脚本里的中文 (就绪 marker 的「服务已启动」) 会变成乱码匹配不上。
+    """
+    path = Path(local_dir) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(script, encoding="utf-8-sig")
+    return str(path)
+
+
 # ---- Windows 远程文件读取: base64 通道 -------------------------------------
 # PowerShell 把字符串写回 stdout 时按控制台/OEM 代码页重新编码, 中文必然乱码;
 # 且 UTF-8 字节一旦被替换成 U+FFFD 就不可逆。改成让 PS 输出文件**原始字节**的
@@ -96,11 +135,18 @@ def decode_remote_b64(stdout: str) -> str:
 
 # Windows 沙箱辅助目录: (本地源目录, 相对 home 的 tar arcname)。
 # 打包后统一解压到 sandbox home, 三个目录即落到各自目标位置。
+# 注意: 这些目录只对下面白名单里的镜像有意义 —— 只有那个镜像缺内置依赖,
+# 需要从宿主机补进去; 其余镜像自带, 传过去反而可能覆盖掉镜像里的新版。
 _WINDOWS_AUX_DIRS = [
     ("/root/sandbox-log/windows/skills/serper", ".openclaw/skills/serper"),
     ("/root/sandbox-log/windows/xiaoyi-device-env", "xiaoyi-device-env"),
     ("/root/sandbox-log/windows/claude_code_image_reading_tool", "claude_code_image_reading_tool"),
 ]
+
+# 仅这些镜像执行 _setup_windows_obsutil(上传辅助目录)。其余镜像跳过。
+_WINDOWS_AUX_IMAGE_ALLOWLIST = {
+    "swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:windows-openclaw-2026.6.6-harness-20261010-2177eeb0-defaultpy-noagentd-v2",
+}
 
 
 def _read_obs_credentials() -> tuple[str, str, str]:
@@ -182,12 +228,14 @@ async def _setup_windows_obsutil(self) -> None:
     """配置 Windows 沙箱内 obsutil 的 OBS 凭据, 并上传三个辅助目录到 home。
 
     1. obsutil config 的 -i/-k/-e 从 <project>/platform/.env 读 (IK/KK/EK),
-        .env 不存在时回落 .env.example, 不再硬编码。
+        .env 不存在时回落 .env.example, 不再硬编码。每个镜像都配置一遍。
     2. 三个辅助目录 (tar 打包 + 沙箱内 tar -xf, 与 _upload_and_extract_code 同
         套路 —— ExtendUploadFile 传目录只会把 zip 字节写成一个文件, 不解压):
             /root/sandbox-log/windows/skills/serper/            -> ~/.openclaw/skills/serper/
             /root/sandbox-log/windows/xiaoyi-device-env/        -> ~/xiaoyi-device-env/
             /root/sandbox-log/windows/claude_code_image_reading_tool/ -> ~/claude_code_image_reading_tool/
+       这一步只在镜像命中 _WINDOWS_AUX_IMAGE_ALLOWLIST 时执行; 其他镜像自带这些
+       目录, 覆盖会顶掉镜像内更新的版本。
     """
     s3 = self.client_config.s3
     obsutil_exe = s3.s3_download_script
@@ -206,6 +254,11 @@ async def _setup_windows_obsutil(self) -> None:
     self.logger.info(f"obsutil configured successfully: {obsutil_exe}")
 
     # ---- 2. 上传三个辅助目录 ----
+    # 只有白名单镜像需要这部分: 它们缺内置依赖, 靠宿主机补进去。
+    # 其余镜像自带, 传过去会覆盖镜像里更新的版本。
+    image = (getattr(self.config.sandbox_config, "image", "") or "").strip()
+    if image not in _WINDOWS_AUX_IMAGE_ALLOWLIST:
+        return
     if not any(os.path.isdir(src) for src, _ in _WINDOWS_AUX_DIRS):
         self.logger.warning("no windows aux dirs found, skip upload")
         return
@@ -309,6 +362,248 @@ async def _start_openclaw_gateway_windows(self, config_file: str) -> None:
             raise HiveError("S003", detail=f"port={port}", sandbox_result=result)
 
     self.logger.info(f"Gateway started on port {port}")
+
+
+# ---- JiuwenSwarm 网关 (TUI, 固定 19001) -------------------------------------
+# Windows 镜像把 jiuwenswarm 装在独立 venv (C:\Users\<user>\.jiuwenswarm-runtime),
+# 没有 Linux 侧的 ~/.local/bin/jiuwenswarm-start, 所以不能用 Linux 分支的启动方式:
+# 用该 venv 的 python 跑 `-u -m jiuwenswarm.start_services app`。端口固定 19001
+# (TUI 客户端默认 ws://127.0.0.1:19001/tui), 不随机; 就绪判定 = 端口可连 且
+# 日志出现 "[App] Gateway server started" / "[App] started: Web"。
+_JIUWENSWARM_WIN_PORT = 19001
+_JIUWENSWARM_WIN_READY_REGEX = "Gateway server started|started: Web|服务已启动"
+
+
+def _jiuwenswarm_win_paths(sandbox_cfg) -> dict:
+    """Windows 下 JiuwenSwarm 启动/停止共用的前向斜杠路径集合。"""
+    home = str(PureWindowsPath(sandbox_cfg.home)).replace("\\", "/")
+    workdir = sandbox_cfg.result_workdir.replace("\\", "/")
+    return {
+        "home": home,
+        "workdir": workdir,
+        "gateway_log": f"{workdir}/{sandbox_cfg.gateway_log}",
+        "pid_path": f"{workdir}/jiuwenswarm-gateway.pid",
+        "run_cmd": f"{workdir}/jiuwenswarm.cmd",
+        "config_dir": str(
+            PureWindowsPath(sandbox_cfg.harness_sandbox_config_file).parent
+        ).replace("\\", "/"),
+        "runtime_py": f"{home}/.jiuwenswarm-runtime/Scripts/python.exe",
+    }
+
+
+def _jiuwenswarm_kill_script() -> str:
+    """PowerShell 片段: 按命令行特征结束 JiuwenSwarm 服务进程树。
+
+    pid 文件是首选, 但固定端口 19001 意味着上一轮残留会直接占位, 所以每轮启动
+    前都按命令行兜底扫一遍 —— 只匹配 python.exe 且命令行含
+    jiuwenswarm.start_services, 不会误伤宿主 agent 或其它 python 进程。
+    """
+    return (
+        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Name -eq 'python.exe' -and "
+        "$_.CommandLine -match 'jiuwenswarm[.]start_services' } | "
+        "ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>&1 | Out-Null }; "
+    )
+
+
+async def _start_jiuwenswarm_gateway_windows(self, config_file: str) -> None:
+    """在 Windows 沙箱里启动 JiuwenSwarm 网关 (gateway + agent server)。
+
+    与 Linux 分支的差异:
+      - 可执行入口是 venv 的 python (`-m jiuwenswarm.start_services app`),
+        不是 ~/.local/bin/jiuwenswarm-start;
+      - 端口固定 19001, 不需要 (也不能) 把随机端口写进配置;
+      - 就绪靠「端口可连 + 日志 marker」双条件, 避免端口被残留进程占着就误判;
+      - 进程经 cmd.exe 拉起, 用 jiuwenswarm.cmd 承载重定向 (PS 的
+        Start-Process 不能用同一个文件同时重定向 stdout 和 stderr)。
+    """
+    sandbox_cfg = self.config.sandbox_config
+    paths = _jiuwenswarm_win_paths(sandbox_cfg)
+    port = _JIUWENSWARM_WIN_PORT
+    # 单次 extend 内的轮询时长 (秒): 探到 marker 即提前退出, 不会耗满。
+    poll_seconds = max(10, sandbox_cfg.openclaw_start_timeout)
+    ready_marker = "__HIVE_JIUWENSWARM_READY__"
+    not_ready_marker = "__HIVE_JIUWENSWARM_NOT_READY__"
+
+    start_time = asyncio.get_running_loop().time()
+    max_wait = self.config.openclaw_gateway_timeout
+
+    while True:
+        elapsed = asyncio.get_running_loop().time() - start_time
+        if elapsed > max_wait:
+            self.logger.error(f"[S002] jiuwenswarm gateway startup timeout ({max_wait}s)")
+            raise HiveError("S002", detail=f"{max_wait}s / config={os.path.basename(config_file)}")
+
+        # 上传 jw_config.yaml → <home>\.jiuwenswarm\config\config.yaml (含注入的模型)
+        await self._copy_agent_config(config_file)
+
+        # 脚本内容走 .ps1 文件 + -File 调用: -EncodedCommand 会把脚本放大 ~2.67 倍
+        # 塞进 cmd.exe 命令行, 超过 8191 字符就直接「命令行太长。」(实测 exit_code=1)。
+        launch_script = (
+            "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
+            + _windows_env_assign(self) + " "
+            f"New-Item -ItemType Directory -Force '{paths['workdir']}' | Out-Null; "
+            # 固定端口: 先清掉上一轮残留, 否则重试永远撞在同一个端口上。
+            + _jiuwenswarm_kill_script()
+            # 运行入口: venv python 优先, 缺失时回落到 PATH 上的 python.exe
+            + f"$py='{paths['runtime_py']}'; "
+            "if(!(Test-Path $py)) { "
+            "$c=Get-Command python.exe -ErrorAction SilentlyContinue; "
+            "if(!$c) { throw 'jiuwenswarm runtime python not found' }; $py=$c.Source }; "
+            # jiuwenswarm 的数据目录由 env 决定, 必须显式注入:
+            # guest agent 派生的子进程不重读注册表/机器级 env。
+            f"$env:JIUWENSWARM_HOME='{paths['home']}'; "
+            f"$env:JIUWENSWARM_DATA_DIR='{paths['home']}/.jiuwenswarm'; "
+            f"$env:JIUWENSWARM_HARNESS_WORKSPACE='{paths['home']}/.jiuwenswarm/harness-workspaces'; "
+            "$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; "
+            # run.cmd 承载重定向, 避开 Start-Process 双重重定向到同一文件的限制
+            "$q=[char]34; "
+            f"$bat='@echo off'+[Environment]::NewLine"
+            f"+'cd /d \"{paths['home']}\"'+[Environment]::NewLine"
+            f"+'set PYTHONUTF8=1'+[Environment]::NewLine"
+            f"+'set PYTHONIOENCODING=utf-8'+[Environment]::NewLine"
+            f"+$q+$py+$q+' -u -m jiuwenswarm.start_services app 1> \"{paths['gateway_log']}\" 2>&1'"
+            f"+[Environment]::NewLine; "
+            f"Set-Content -Path '{paths['run_cmd']}' -Value $bat -Encoding ASCII; "
+            f"Start-Process cmd.exe -ArgumentList '/d /c {paths['run_cmd']}' -PassThru -WindowStyle Hidden "
+            f"| ForEach-Object {{ $_.Id | Set-Content '{paths['pid_path']}' }}; "
+            # 轮询就绪: 端口可连 且 日志出现 marker。
+            # 用 TcpClient 而非 Test-NetConnection: 后者单次约 1-2s, 几十轮下来
+            # 会超出 extend 的 timeout, 让命令在沙箱侧还在跑就被判超时。
+            # 期限用绝对时间算, 不按次数算, 免得每轮探测耗时不同导致漂移。
+            "$ready=$false; $text=''; "
+            f"$deadline=(Get-Date).AddSeconds({poll_seconds}); "
+            "while ((Get-Date) -lt $deadline) { "
+            f"$open=$false; $tcp=New-Object Net.Sockets.TcpClient; "
+            "try { $iar=$tcp.BeginConnect('127.0.0.1',"
+            f"{port}"
+            ",$null,$null); "
+            "if ($iar.AsyncWaitHandle.WaitOne(1000) -and $tcp.Connected) { $open=$true } "
+            "} catch { $open=$false } finally { $tcp.Close() }; "
+            f"if ($open) {{ try {{ $text=Get-Content '{paths['gateway_log']}' -Raw -ErrorAction Stop }} catch {{ $text='' }}; "
+            f"if ($text -and $text -match '{_JIUWENSWARM_WIN_READY_REGEX}') {{ $ready=$true; break }} }}; "
+            f"Start-Sleep -Milliseconds 500 }}; "
+            # 哨兵必须先于日志输出, 失败时也拿得到日志
+            f"if($ready) {{Write-Output '{ready_marker}'}} else {{Write-Output '{not_ready_marker}'}}; "
+            + ps_read_file_b64(paths["gateway_log"]) + "; "
+            f"if(!$ready) {{throw 'jiuwenswarm gateway not ready'}}"
+        )
+        script_local = write_ps1_file(
+            launch_script,
+            str(Path(self.config.task_output_path) / "sandbox_scripts" /
+                str(self.client_config.env_make.env_id)),
+            "jiuwenswarm_launch.ps1",
+        )
+        # 落点选 config 目录: 它在 _copy_agent_config 之后必然已存在,
+        # workdir 则要等脚本自己 New-Item 出来, 上传时可能还不存在。
+        # 这里用反斜杠原生路径: -File 的参数不走 shell 解析, 正斜杠虽多数情况
+        # 也能用, 但盘符路径保持 Windows 原生形态最稳。
+        script_remote = str(PureWindowsPath(
+            sandbox_cfg.harness_sandbox_config_file
+        ).parent / "jiuwenswarm_launch.ps1")
+        await self._upload_file("jiuwenswarm launch script", script_local, script_remote)
+
+        exec_request = ExtendExecCommand(
+            command=ps_script_command(script_remote),
+            timeout=poll_seconds + 60,
+        )
+        result = await self.execution_client.extend(args=exec_request.to_dict())
+
+        result_data = result.data or {}
+        stdout = result_data.get("stdout", "") or ""
+        exit_code = result_data.get("exit_code")
+        gateway_content = decode_remote_b64(stdout)
+
+        if result.code != ErrorCode.SUCCESS[0] or exit_code != 0:
+            # 未就绪 = 在 openclaw_start_timeout 内没等到 marker, 归 S002;
+            # 其它失败 (入口缺失 / 起不来) 归 S001。
+            if not_ready_marker in stdout:
+                self.logger.error(
+                    f"[S002] jiuwenswarm gateway startup timeout "
+                    f"({sandbox_cfg.openclaw_start_timeout}s)"
+                )
+                _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup timeout",
+                                    result, level=logging.ERROR,
+                                    extra_stdout=gateway_content,
+                                    extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+                raise HiveError(
+                    "S002",
+                    detail=(f"{sandbox_cfg.openclaw_start_timeout}s / "
+                            f"config={os.path.basename(config_file)}"),
+                    sandbox_result=result,
+                )
+            self.logger.error("[S001] jiuwenswarm gateway start failed")
+            _log_sandbox_detail(self.logger, "jiuwenswarm gateway start failed",
+                                result, level=logging.ERROR,
+                                extra_stdout=gateway_content,
+                                extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+            raise HiveError("S001", detail=os.path.basename(config_file), sandbox_result=result)
+
+        if ready_marker in stdout:
+            _log_sandbox_detail(self.logger, "jiuwenswarm gateway startup OK", result,
+                                extra_stdout=gateway_content,
+                                extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+            break
+
+        self.logger.error("[S003] jiuwenswarm gateway unexpected output")
+        _log_sandbox_detail(self.logger, "jiuwenswarm gateway unexpected output",
+                            result, level=logging.ERROR,
+                            extra_stdout=gateway_content,
+                            extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+        raise HiveError("S003", detail=os.path.basename(config_file), sandbox_result=result)
+
+    self.logger.info(f"JiuwenSwarm gateway started (TUI on {port})")
+
+
+async def _stop_jiuwenswarm_gateway_windows(self) -> None:
+    """停止 Windows 沙箱里的 JiuwenSwarm 服务树, 让会话文件落盘后再上传 OBS。
+
+    两阶段 (对齐 Linux 的 TERM → 等 → KILL): 先 taskkill 不带 /F 让进程有机会
+    正常退出, 等 5s, 再 /F 强制清场并按命令行特征兜底。
+    """
+    paths = _jiuwenswarm_win_paths(self.config.sandbox_config)
+
+    term_script = (
+        f"$pidPath='{paths['pid_path']}'; "
+        "if(Test-Path $pidPath) { "
+        "$procId=((Get-Content $pidPath -ErrorAction SilentlyContinue) | Select-Object -First 1); "
+        "if($procId) { $procId=$procId.Trim(); "
+        "taskkill /PID $procId /T 2>&1 | Out-Null; "
+        "Write-Output ('HIVE_JIUWENSWARM_TERM_PID='+$procId) } } "
+        "else { Write-Output 'HIVE_JIUWENSWARM_TERM_FALLBACK' }"
+    )
+    term_result = await self._exec_sandbox(
+        ps_command(term_script, paths["config_dir"]), self.config.simple_bash_timeout
+    )
+    _log_sandbox_detail(self.logger, "jiuwenswarm gateway stop TERM", term_result)
+
+    await asyncio.sleep(5)
+
+    kill_script = (
+        f"$pidPath='{paths['pid_path']}'; "
+        "if(Test-Path $pidPath) { "
+        "$procId=((Get-Content $pidPath -ErrorAction SilentlyContinue) | Select-Object -First 1); "
+        "if($procId) { $procId=$procId.Trim(); "
+        "taskkill /PID $procId /T /F 2>&1 | Out-Null } }; "
+        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Name -eq 'python.exe' -and "
+        "$_.CommandLine -match 'jiuwenswarm[.]start_services' } | "
+        "ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>&1 | Out-Null }; "
+        f"Remove-Item '{paths['pid_path']}' -ErrorAction SilentlyContinue; "
+        "Write-Output 'HIVE_JIUWENSWARM_STOPPED'"
+    )
+    kill_result = await self._exec_sandbox(
+        ps_command(kill_script, paths["config_dir"]), self.config.simple_bash_timeout
+    )
+    _log_sandbox_detail(self.logger, "jiuwenswarm gateway stopped", kill_result)
+    kill_data = kill_result.data or {}
+    if (kill_result.code != ErrorCode.SUCCESS[0]
+            or kill_data.get("exit_code") not in (None, 0)):
+        raise RuntimeError(
+            f"stop jiuwenswarm gateway failed: "
+            f"exit_code={kill_data.get('exit_code')} stderr={kill_data.get('stderr', '')}"
+        )
+    self.logger.info("JiuwenSwarm gateway stopped before OBS upload")
 
 
 async def _run_main_script_windows(self, config_file: str, task_idx: int) -> None:

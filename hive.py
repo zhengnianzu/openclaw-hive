@@ -53,9 +53,12 @@ from prepare_config import (
 )
 from utils.win_util import (
     ps_command,
+    ps_copy_skill_command,
     _setup_windows_obsutil,
     _windows_env_assign,
     _start_openclaw_gateway_windows,
+    _start_jiuwenswarm_gateway_windows,
+    _stop_jiuwenswarm_gateway_windows,
     _run_main_script_windows,
 )
 # Module-level logger
@@ -211,6 +214,8 @@ class SandboxConfig:
     default_skill_path: str = ""
     harness_sandbox_config_file: str = field(default_factory=lambda: _FW["harness_sandbox_config"])
     harness_local_config_file: str = field(default_factory=lambda: _FW["harness_local_config"])
+    # 沙箱镜像全名。仅用于按镜像决定是否执行镜像专属的辅助步骤
+    image: str = ""
     # openclaw用于启动gateway
     openclaw_bash: str = "/usr/local/node24/bin/openclaw"
     gateway_log: str = "gateway.log"
@@ -353,6 +358,8 @@ class OpenClawDistillationTask:
     _setup_windows_obsutil = _setup_windows_obsutil
     _windows_env_assign = _windows_env_assign
     _start_openclaw_gateway_windows = _start_openclaw_gateway_windows
+    _start_jiuwenswarm_gateway_windows = _start_jiuwenswarm_gateway_windows
+    _stop_jiuwenswarm_gateway_windows = _stop_jiuwenswarm_gateway_windows
     _run_main_script_windows = _run_main_script_windows
 
     def __init__(self, config: TaskConfig):
@@ -903,7 +910,8 @@ class OpenClawDistillationTask:
     async def _download_s3_skills(self, data_config_file: str, sandbox_type: str) -> None:
         """Fetch task/default skills into the sandbox.
 
-        skill_download_path 以 "/" 开头 → 视为沙箱本地路径, 否则视为 OBS bucket 前缀
+        skill_download_path 以 "/" 开头或为 Windows 绝对路径 → 沙箱本地路径,
+        否则视为 OBS bucket 前缀。
         """
         data_cfg = parse_data_config(data_config_file)
 
@@ -934,17 +942,22 @@ class OpenClawDistillationTask:
         if not skill_src:
             self.logger.warning("skill_download_path is empty, skipping skill download")
             return
-        is_local = skill_src.startswith("/")
+        is_local = skill_src.startswith("/") or (
+            sandbox_type == "windows" and PureWindowsPath(skill_src).is_absolute()
+        )
 
         async def download_skill(skill_path: str, target_path: str) -> None:
             if is_local:
                 # 只 cp 需要的单个 skill。目标目录本身已是新沙箱, 且 openclaw-task
                 # 里一般没有 skills 目录, 不需要先删 —— 两个 workspace 并发复制同一个
                 # skill 时, 多余的 rm -rf 会让另一条链撞上 "Directory not empty" 而失败。
-                src = os.path.join(skill_src.rstrip("/"), skill_path)
-                inner = (f"mkdir -p {target_path} && cp -r {src} {target_path}/")
+                if sandbox_type == "windows":
+                    src = str(PureWindowsPath(skill_src, skill_path))
+                    inner = ps_copy_skill_command(src, target_path)
+                else:
+                    src = os.path.join(skill_src.rstrip("/"), skill_path)
+                    inner = (f"mkdir -p {target_path} && cp -r {src} {target_path}/")
             else:
-                # windows 只支持obs桶下载的方式
                 bucket_path = os.path.join(skill_src, skill_path) + "/"
                 obs_cmd = get_obsutil_downloader_command(
                     self.client_config.s3,
@@ -952,7 +965,7 @@ class OpenClawDistillationTask:
                     bucket_path=bucket_path,
                 )
                 if sandbox_type == "windows":
-                    inner = f"mkdir {target_path} & {obs_cmd}"
+                    inner = ["cmd.exe", "/c", f'mkdir "{target_path}" & {obs_cmd}']
                 else:
                     inner = f"mkdir -p {target_path} && {obs_cmd}"
             await self._run_skill_cmd(inner, detail=skill_path)
@@ -967,10 +980,10 @@ class OpenClawDistillationTask:
             f"default={len(set(default_skills))}) in {time.time() - start_time:.1f}s"
         )
 
-    async def _run_skill_cmd(self, bash: str, *, detail: str) -> None:
+    async def _run_skill_cmd(self, command: str | list[str], *, detail: str) -> None:
         """在沙箱里执行 skill 相关命令, 统一 [S005] 错误处理。"""
         exec_request = ExtendExecCommand(
-            command=["/bin/bash", "-c", bash],
+            command=["/bin/bash", "-c", command] if isinstance(command, str) else command,
             timeout=self.config.obs_config.download_timeout,
             mode="stream",
         )
@@ -1393,7 +1406,10 @@ class OpenClawDistillationTask:
                     await self._start_openclaw_gateway(config_file)
             elif stop_jiuwenswarm:
                 # 先启动 jiuwenswarm 网关, 再跑主程序 (内部会先上传 jw_config.yaml)
-                await self._start_jiuwenswarm_gateway(config_file)
+                if sandbox_type == "windows":
+                    await self._start_jiuwenswarm_gateway_windows(config_file)
+                else:
+                    await self._start_jiuwenswarm_gateway(config_file)
             else:
                 # 就地改写 → 上传 agent config + user_proxy_model → 还原
                 await self._copy_agent_config(config_file)
@@ -1404,7 +1420,10 @@ class OpenClawDistillationTask:
         finally:
             if stop_jiuwenswarm:
                 try:
-                    await self._stop_jiuwenswarm_gateway()
+                    if sandbox_type == "windows":
+                        await self._stop_jiuwenswarm_gateway_windows()
+                    else:
+                        await self._stop_jiuwenswarm_gateway()
                 except Exception as e:
                     # 停止失败不覆盖主任务的原始异常；OBS 上传仍会执行并记录结果。
                     self.logger.error(
@@ -1866,6 +1885,7 @@ def main() -> None:
             **_compat_sandbox(run_cfg.sandbox),
             sandbox_type=sandbox_type,
             harness_type=harness_type,
+            image=str(config_obj.sandbox[sandbox_type].get("sandbox", {}).get("image") or ""),
         ),
         model_api_key=args.model_api_key,
         harness_md=list(run_cfg.get("harness_md") or []),
