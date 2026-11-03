@@ -467,12 +467,12 @@ def update_sandbox_config(
     if "sandbox_namespace" in data:
         data["sandbox_namespace"] = _validate_namespace(data["sandbox_namespace"])
 
-    # 请求 ≤ 限制（前端已拦，后端兜底）
-    for req_f, lim_f, label in [("cpu_request", "cpu_limit", "CPU"),
-                                ("memory_request", "memory_limit", "内存")]:
+    # 请求 ≤ 限制（前端已拦，后端兜底）。CPU 按核比、内存按 MiB 比，单位口径不同
+    for req_f, lim_f, label, conv in [("cpu_request", "cpu_limit", "CPU", to_cores),
+                                      ("memory_request", "memory_limit", "内存", _to_quantity)]:
         r = data.get(req_f, row.get(req_f))
         l = data.get(lim_f, row.get(lim_f))
-        if r is not None and l is not None and _to_quantity(r) > _to_quantity(l):
+        if r is not None and l is not None and conv(r) > conv(l):
             raise HTTPException(status_code=400, detail=f"{label} 请求不得大于限制")
 
     # 业务字段写进派生文件
@@ -494,6 +494,7 @@ def update_sandbox_config(
 
 
 def _to_quantity(v) -> float:
+    """K8s 内存量 → MiB。注意只用于内存：CPU 的 m 是毫核，见 to_cores。"""
     s = str(v or "").strip()
     m = re.match(r"^([\d.]+)\s*([A-Za-z]*)$", s)
     if not m:
@@ -501,6 +502,22 @@ def _to_quantity(v) -> float:
     num = float(m.group(1))
     unit = m.group(2).lower()
     return num * {"gi": 1024, "mi": 1, "g": 1000, "m": 1, "": 1}.get(unit, 1)
+
+
+def to_cores(v, default: float = 0.0) -> float:
+    """K8s CPU 量 → 核数。`500m` = 0.5 核（m 是毫核，和内存的 Mi 不是一回事）。
+
+    裸数字按核处理（`2` → 2.0）；解析不出来返回 default，让调用方决定兜底值。
+    """
+    s = str(v if v is not None else "").strip()
+    m = re.match(r"^([\d.]+)\s*([A-Za-z]*)$", s)
+    if not m:
+        return default
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return default
+    return num / 1000 if m.group(2).lower() == "m" else num
 
 
 @router.delete("/{config_id}")

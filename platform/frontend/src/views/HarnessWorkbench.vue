@@ -6,8 +6,7 @@
           <el-icon><ArrowLeft /></el-icon> 返回列表
         </el-button>
         <div class="wb-title">
-          <el-tag v-if="currentType" :color="harnessStore.color(currentType)" effect="dark"
-            :style="{ border: 'none' }">{{ harnessStore.label(currentType) }}</el-tag>
+          <el-tag v-if="currentType" :style="harnessStore.tagStyle(currentType)">{{ harnessStore.label(currentType) }}</el-tag>
           <span class="wb-title-text">{{ currentScheme ? currentScheme.name : '选择配置方案' }}</span>
           <el-tag v-if="currentScheme?.is_default" size="small" type="success" effect="plain">默认方案</el-tag>
           <el-tag v-if="viewingVersion" size="small" :type="statusType(viewingVersion.status)" effect="plain">

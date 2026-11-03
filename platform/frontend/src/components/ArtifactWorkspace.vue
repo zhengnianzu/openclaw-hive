@@ -457,6 +457,10 @@ const treeProps = { label: 'label', children: 'children', isLeaf: 'leaf' }
 // oversize 在后端归为 skipped，这里保留 oversize 映射以兼容旧响应。
 function statusLabel(t) {
   return { queued: '排队中', pending: '排队中', downloading: '下载中',
+           // pending_click = 产物纯点击驱动下的静默态：没人点过，所以没排队、
+           // 也没下载。不能显示「排队中」—— 那会让用户以为在等 worker，
+           // 实际上要他点一下才会开始下。
+           pending_click: '未下载',
            failed: '下载失败', skipped: '已跳过', oversize: '体积超限',
            // empty = 沙箱没产出，OBS 前缀本身是空的。用中性文案，别让用户以为平台出错。
            empty: '无产出',
@@ -483,6 +487,8 @@ function downloadHint(t) {
   if (t.status === 'skipped') return `已跳过，点击重试${t.error ? '：' + t.error : ''}`
   if (t.status === 'downloading') return '正在下载…'
   if (t.status === 'queued' || t.status === 'pending') return '已排队，点击重新排队'
+  // pending_click：产物不再自动下载（全量下载会写爆磁盘），点一下才开始
+  if (t.status === 'pending_click') return '点击下载该任务的交付物'
   return '下载此任务'
 }
 
@@ -672,10 +678,13 @@ function startPoll() {
       if (before === task.value) await loadTree()
       return
     }
-    // 全部到达终态（完成 / 空产出 / 失败 / 跳过）就停止轮询，避免空转。
+    // 全部到达终态（完成 / 空产出 / 失败 / 跳过 / 未下载）就停止轮询，避免空转。
     // empty 也是终态：OBS 前缀确实没有文件，再等也不会变。
+    // pending_click 同样是终态：产物纯点击驱动，没人点就永远不会变 ——
+    // 不列进来的话，一个有上千个未下载任务的实例会一直 3s 轮询到标签页关闭。
     const pending = tasks.value.some(
-      x => !x.downloaded && !['done', 'empty', 'failed', 'skipped'].includes(x.status))
+      x => !x.downloaded
+        && !['done', 'empty', 'failed', 'skipped', 'pending_click'].includes(x.status))
     if (!pending) stopPoll()
   }, POLL_MS)
 }

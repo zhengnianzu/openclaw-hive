@@ -77,7 +77,7 @@
         </el-table-column>
         <el-table-column prop="harness_type" label="类型" width="140">
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" effect="dark" size="default" :style="{ border: 'none' }">{{ typeLabel(row.harness_type) }}</el-tag>
+            <el-tag :style="harnessTagStyle(row.harness_type)" size="default">{{ typeLabel(row.harness_type) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="当前版本" width="150">
@@ -285,6 +285,7 @@ function statusType(s) {
 // ---- 格式化辅助 ----
 function harnessFileLabel(t) { return harnessStore.fileLabel(t) }
 function harnessColor(t) { return harnessStore.color(t) }
+function harnessTagStyle(t) { return harnessStore.tagStyle(t) }
 function typeLabel(t) { return harnessStore.label(t) }
 
 function openWorkbench(row) {

@@ -12,7 +12,7 @@
         <el-table-column prop="name" label="模板名称" min-width="160" />
         <el-table-column prop="harness_type" label="Harness类型" width="120">
           <template #default="{row}">
-            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
+            <el-tag :style="harnessTagStyle(row.harness_type)" size="small">{{ harnessLabel(row.harness_type) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="默认" width="80" align="center">
@@ -208,6 +208,7 @@ const defaultForm = () => ({
 const form = ref(defaultForm())
 const agents = ref([{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }])
 function harnessColor(type) { return harnessStore.color(type) }
+function harnessTagStyle(type) { return harnessStore.tagStyle(type) }
 function harnessLabel(type) { return harnessStore.label(type) }
 
 function addAgent() {

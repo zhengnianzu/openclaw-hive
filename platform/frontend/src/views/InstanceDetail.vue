@@ -122,7 +122,7 @@
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="Harness类型">
-                  <el-tag size="small" :color="harnessColor(createParams.harness_type)" :style="{borderColor: harnessColor(createParams.harness_type)}" effect="dark">
+                  <el-tag size="small" :style="harnessTagStyle(createParams.harness_type)">
                     {{ harnessLabel(createParams.harness_type) }}
                   </el-tag>
                 </el-descriptions-item>
@@ -315,7 +315,15 @@
               :color="shallowProgressColor" :format="shallowProgressText" />
             <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:var(--text-muted)">
               <span>浅层分析{{ shallowProgressStateLabel }}</span>
-              <span>已定级 {{ shallowProgress.approved }} / {{ shallowProgress.total }} 个会话</span>
+              <span>
+                已定级 {{ shallowProgress.approved }} / {{ shallowProgress.total }} 个会话
+                <span v-if="shallowProgress.failed > 0" style="color:#f56c6c;margin-left:8px">
+                  · 失败 {{ shallowProgress.failed }}
+                </span>
+                <span v-if="shallowProgress.undone > 0" style="margin-left:8px">
+                  · 未分析 {{ shallowProgress.undone }}
+                </span>
+              </span>
             </div>
           </div>
           <div v-if="shallowSummary.total > 0">
@@ -336,6 +344,16 @@
                     :style="{ height: unevaluatedPct + '%' }" />
                 </div>
                 <span class="funnel-bar-label">未评估</span>
+              </div>
+              <!-- 已处理但判失败：不算 L0-L3，以前完全不出现在漏斗里，
+                   导致「跑了但全失败」的实例看起来像一条都没跑 -->
+              <div class="funnel-bar-col">
+                <span class="funnel-bar-count">{{ shallowSummary.failed || '' }}</span>
+                <div class="funnel-bar-track">
+                  <div class="funnel-bar failed-bar"
+                    :style="{ height: failedPct + '%' }" />
+                </div>
+                <span class="funnel-bar-label">失败</span>
               </div>
             </div>
           </div>
@@ -467,22 +485,38 @@
                 <div :style="{ fontSize: '14px', fontWeight: '600', color: artifactActive ? 'var(--el-color-primary)' : 'var(--text-muted)' }">{{ artifactStepLabel }}</div>
               </div>
             </div>
-            <div style="flex:1;min-width:200px;font-size:12px;color:var(--text-muted)">
-              {{ stageMeta.desc }}
-              <div v-if="shallowProgress && shallowProgress.total > 0" style="margin-top:4px">
-                已定级 <b>{{ shallowProgress.approved }}</b> / {{ shallowProgress.total }} 个会话
-                <span v-if="shallowProgress.undone > 0">，剩余 <b>{{ shallowProgress.undone }}</b> 未分析</span>
+            <div style="flex:1;min-width:220px;font-size:12px;color:var(--text-muted)">
+              <!-- 浅层分级进度条：以「已处理 / 总会话」反映完成度，undone→0 即 100%。
+                   原来那段 stageMeta.desc 文字说明（running/preparing…无需手动提交）已去掉，
+                   进度条本身更直观，也能看出还要多久跑完。 -->
+              <div v-if="shallowProgress && shallowProgress.total > 0">
+                <el-progress :percentage="shallowProgressPct" :stroke-width="8"
+                  :color="shallowProgressColor" :format="shallowProgressText" />
+                <div style="margin-top:4px">
+                  正在分析：已定级 <b>{{ shallowProgress.approved }}</b> / {{ shallowProgress.total }}
+                  <span v-if="shallowProgress.failed > 0">· 失败 <b>{{ shallowProgress.failed }}</b></span>
+                  <span v-if="shallowProgress.undone > 0">· 剩余 <b>{{ shallowProgress.undone }}</b> 未分析</span>
+                </div>
               </div>
-              <div v-if="artifactProgress.total > 0" style="margin-top:4px">
-                交付物已下载 <b>{{ artifactProgress.done }}</b> / {{ artifactProgress.total }}
-                <span v-if="artifactProgress.downloading > 0">，下载中 <b>{{ artifactProgress.downloading }}</b></span>
-                <span v-if="artifactProgress.queued > 0">，待下载 <b>{{ artifactProgress.queued }}</b></span>
-                <span v-if="artifactProgress.failed > 0" style="color:#f56c6c">，失败 <b>{{ artifactProgress.failed }}</b></span>
+              <!-- 交付物下载进度条 -->
+              <div v-if="artifactProgress.total > 0" style="margin-top:8px">
+                <el-progress :percentage="artifactProgressPct" :stroke-width="8"
+                  :color="artifactProgressColor" :format="artifactProgressText" />
+                <div style="margin-top:4px">
+                  交付物已下载 <b>{{ artifactProgress.done }}</b> / {{ artifactProgress.total }}
+                  <span v-if="artifactProgress.downloading > 0">· 下载中 <b>{{ artifactProgress.downloading }}</b></span>
+                  <span v-if="artifactProgress.queued > 0">· 待下载 <b>{{ artifactProgress.queued }}</b></span>
+                  <span v-if="artifactProgress.failed > 0" style="color:#f56c6c">· 失败 <b>{{ artifactProgress.failed }}</b></span>
+                </div>
               </div>
             </div>
             <!-- 手动提交浅层：ended 实例且仍有缺口时显示 -->
             <el-button v-if="authStore.isOperator && pipelineStage === 'ungraded'" type="primary" size="small"
               :loading="submittingShallow" @click="submitShallow">提交浅层分析</el-button>
+            <!-- running 实例：自动会由 tracker 增量发现，但用户主动点「输出」时
+                 也应该能立刻插队（priority=100），不必等下一轮增量 -->
+            <el-button v-else-if="authStore.isOperator && pipelineStage === 'grading' && shallowProgress && shallowProgress.undone > 0"
+              size="small" :loading="submittingShallow" @click="submitShallow">立即分析未定级会话</el-button>
             <el-button v-else-if="pipelineStage === 'queued' || pipelineStage === 'grading'" size="small" disabled>浅层分析处理中…</el-button>
           </div>
         </el-card>
@@ -523,7 +557,12 @@
                   v-if="row.traj_level && row.traj_level !== 'failed'">
                   {{ row.traj_level }}
                 </el-tag>
-                <el-tag v-else-if="row.traj_level === 'failed'" size="small" type="info" effect="plain">未分级</el-tag>
+                <!-- failed = 浅层已处理但判不出等级（无 tsr / 任务异常）。
+                     以前和「未评估」都渲染成灰色 info 标签，看不出「已跑过」，
+                     用户会以为一条都没分析。用 danger 色区分。 -->
+                <el-tag v-else-if="row.traj_level === 'failed'" size="small" type="danger" effect="plain">
+                  失败
+                </el-tag>
                 <el-tag v-else size="small" type="info" effect="plain">未评估</el-tag>
               </template>
             </el-table-column>
@@ -659,7 +698,7 @@
       <template v-else-if="detailData">
         <el-descriptions :column="3" border size="small" style="margin-bottom:16px">
           <el-descriptions-item label="Harness">
-            <el-tag size="small" :color="harnessColor(detailData.harness)" :style="{borderColor: harnessColor(detailData.harness)}" effect="dark">{{ harnessLabel(detailData.harness) }}</el-tag>
+            <el-tag size="small" :style="harnessTagStyle(detailData.harness)">{{ harnessLabel(detailData.harness) }}</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="状态">
             <el-tag size="small" :type="detailData.verdict?.has_eval ? 'success' : 'info'">
@@ -988,6 +1027,7 @@ async function loadQueueInfo() {
   } finally { loadingQueueTasks.value = false }
 }
 function harnessColor(t) { return harnessStore.color(t) }
+function harnessTagStyle(t) { return harnessStore.tagStyle(t) }
 function harnessLabel(t) { return harnessStore.label(t) }
 function formatDuration(seconds) {
   if (seconds == null) return ''
@@ -1225,7 +1265,7 @@ async function loadTaskStatusMap() {
 // 统计: GET /instances/{id}/shallow（summary/progress，全量语义，10s 轮询）。
 // 表格: GET /instances/{id}/shallow/tasks（分页 + tag/keyword 过滤 + 排序，后端下沉）。
 const shallowLoading = ref(false)
-const shallowSummary = ref({ L0: 0, L1: 0, 'L1.5': 0, L2: 0, L3: 0, graded: 0, total: 0, task_done: 0, unevaluated: 0 })
+const shallowSummary = ref({ L0: 0, L1: 0, 'L1.5': 0, L2: 0, L3: 0, graded: 0, total: 0, task_done: 0, unevaluated: 0, failed: 0 })
 const shallowTasks = ref([])
 const shallowTaskTotal = ref(0)
 const instanceStatus = ref('')
@@ -1285,6 +1325,20 @@ const shallowProgressStateLabel = computed(() => {
   if (!p) return ''
   if (p.queued) return '处理中…'
   return '待处理'
+})
+
+// 交付物下载进度条：已下载 / 总数，全部下完 → 100% 变绿。
+const artifactProgressPct = computed(() => {
+  const p = artifactProgress.value
+  if (!p || !p.total) return 0
+  return Math.round((p.done / p.total) * 100)
+})
+const artifactProgressText = computed(() => `${artifactProgressPct.value}%`)
+const artifactProgressColor = computed(() => {
+  const p = artifactProgress.value
+  if (!p) return '#409eff'
+  if (p.failed > 0 && p.done + p.downloading + p.queued === 0) return '#f56c6c'
+  return (p.queued > 0 || p.downloading > 0) ? '#e6a23c' : '#10b981'
 })
 
 // ---- 状态分析：浅层→深层 流水线当前所处阶段（供顶部状态卡展示） ----
@@ -1364,6 +1418,13 @@ const unevaluatedPct = computed(() => {
   const total = shallowSummary.value.total
   if (!total) return 0
   return (((shallowSummary.value.unevaluated || 0) / total) * 100)
+})
+// 失败柱的高度口径与「未评估」一致（都按总数），否则两者不可比。
+// L0-L3 那几柱按 graded 归一，是漏斗语义（一层层筛选）；失败/未评估是并列状态，按 total。
+const failedPct = computed(() => {
+  const total = shallowSummary.value.total
+  if (!total) return 0
+  return (((shallowSummary.value.failed || 0) / total) * 100)
 })
 
 // 导出漏斗各层级计数为 Excel（后端 openpyxl 生成 .xlsx，同 proxy-config/export 模式）
@@ -1750,8 +1811,8 @@ onMounted(async () => {
   loading.value = true
   try { inst.value = await api.get(`/instances/${id}`) } catch {}
   loading.value = false
-  // 点击驱动：打开详情页即登记浅层请求（仅 ended 实例；running 由 worker 持续分级，无需登记）。
-  // 幂等登记，worker 处理完删登记出队；flag 防止同一会话重复 POST。漏斗进度由 10s 轮询反映。
+  // 点击驱动：打开详情页即登记浅层请求（任何状态，含 running；由 undone 缺口门控）。
+  // 幂等登记，tracker 按 offset 增量投递；flag 防止同一会话重复 POST。漏斗进度由 10s 轮询反映。
   maybeTriggerShallow()
   // 顶部状态条 10s 轮询；overview 只在「配置信息」tab 需要（汇总/错误树都在那），
   // 其它 tab 只刷新实例本身，避免每个周期多打一次带目录扫描的 /overview。
@@ -1768,14 +1829,12 @@ onMounted(async () => {
 
 async function maybeTriggerShallow() {
   if (shallowTriggered) return
-  const status = inst.value?.status
-  // finished/completed/stopped：worker 的 _pick_running_instances 消费这类登记 + running/preparing。
-  // stopped 实例轨迹可能仍在 OBS（中止已上传的部分 task 目录），同样可分级查看会话详情；
-  // worker 处理完（无缺口）删登记出队，不会永久残留。
-  if (status !== 'finished' && status !== 'completed' && status !== 'stopped') return
+  // 任何状态都允许自动登记（含 running）：浅层已改为纯点击/打开驱动，tracker 按
+  // offset 增量投递，运行中实例新完成的 config 会逐轮带进来。只要打开输出 tab 且
+  // 还有未定级缺口就登记一次，不必再去找「立即分析未定级会话」那个手动按钮。
+  // 唯一的门控是下面的 undone 缺口判定：全部定级就不登记。
   // 用 progress.undone（剩余未分级会话数）判定缺口，而不是依赖表格行已填充：
   //   loadShallow 在 mount 时可能尚未返回，progress 为空会导致永远跳过（既不登记也无提示）。
-  //   只要 ended 实例还有未分级会话就应登记；0 或全部完成则无需登记。
   const p = shallowProgress.value
   const undone = p ? p.undone : undefined
   if (undone === undefined) return      // progress 未加载，等 loadShallow 返回后再触发
@@ -1926,6 +1985,9 @@ onUnmounted(() => {
 }
 .uneval-bar {
   background: repeating-linear-gradient(135deg, #d8d8dc 0 6px, #c2c2c8 6px 12px);
+}
+.failed-bar {
+  background: #f56c6c;
 }
 .funnel-bar-label {
   font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;

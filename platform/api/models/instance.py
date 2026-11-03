@@ -135,6 +135,15 @@ class InstanceInfo(BaseModel):
     total_tasks: int = 0
     completed_tasks: int = 0
     failed_tasks: int = 0
+    # 成功轨迹数：task_traj_records 里 task_done=1 的行数。
+    # completed_tasks 是 complete.jsonl 的行数（流水线没抛异常就算成功），
+    # 这个是 assistant 自己打的【Task_Done】标记，代表任务真的做完了。
+    # 两个口径在生产上差得很远，首页并列展示。
+    done_trajs: int = 0
+    # DONE 数：worker 直接扫本地 task-N.log 得到的【Task_Done】数（task_records.task_done）。
+    # 与 done_trajs 并列：后者依赖 OBS 的 tsr，补全快路径不拉该字段导致部分实例恒为 0；
+    # 这个是本地日志口径，最接近真相。实例若还没被扫过，后端回退填 done_trajs 的值。
+    done_tasks: int = 0
     concurrent_num: int = 100
     harness_type: str = "openclaw"
     suffix_api_keys: bool = False       # 创建时是否开启 key 沙箱后缀（列表标识用）
@@ -144,6 +153,9 @@ class InstanceInfo(BaseModel):
     error_summary: Optional[str] = None
     queue_id: Optional[str] = None      # 所属队列ID
     queue_position: int = 0              # 在队列中的位置（入队序号，只增不减，会有空洞）
+    # 重跑来源：本实例是「重跑失败」新建出来的，指向源实例 id；普通实例为 None。
+    # 前端据此给「已被重跑替代」的源实例打标签，避免用户看到汇总变少时困惑。
+    copied_from: Optional[str] = None
     # 插队优先级：>0 表示已插队。前端算「队列位置」名次时必须按
     # (queue_priority DESC, queue_position ASC) 排，否则插队任务的名次会反过来。
     queue_priority: int = 0
@@ -181,6 +193,11 @@ class InstanceOverview(BaseModel):
     running: int
     pending: int
     success_rate: float
+    # 成功轨迹数（task_done=1）。与 completed 是两个口径：completed 只看流水线是否
+    # 抛异常，done_trajs 是 assistant 自己打的完成标记。前者含「跑完但没做完」的任务。
+    done_trajs: int = 0
+    # 本地日志口径的 DONE（task_records.task_done=1），见 InstanceInfo.done_tasks
+    done_tasks: int = 0
     error_breakdown: dict = {}
     error_tree: list = []
     elapsed_seconds: Optional[float] = None

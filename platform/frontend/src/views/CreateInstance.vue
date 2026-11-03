@@ -200,7 +200,7 @@
                 :label="`${sb.name}${sb.is_default ? ' (默认)' : ''}`" :value="sb.id">
                 <span>{{ sb.name }}<el-tag v-if="sb.is_default" size="small" type="info" style="margin-left:6px">默认</el-tag></span>
                 <span style="float:right;color:#999;font-size:12px">
-                  {{ sb.sandbox_type === 'windows' ? 'Windows' : 'Linux' }} · {{ sb.cpu_request }}/{{ sb.cpu_limit }} 核
+                  {{ sb.sandbox_type === 'windows' ? 'Windows' : 'Linux' }} · {{ cores(sb.cpu_request) }}/{{ cores(sb.cpu_limit) }} 核
                   <template v-if="sb.sandbox_namespace"> · {{ sb.sandbox_namespace }}</template>
                 </span>
               </el-option>
@@ -305,6 +305,7 @@ import QueuePicker from '../components/QueuePicker.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 import { obsBucket, stripBucket, joinBucket } from '../api/obsConfig'
+import { toCores as cores } from '../utils/quantity'
 
 const router = useRouter()
 const route = useRoute()

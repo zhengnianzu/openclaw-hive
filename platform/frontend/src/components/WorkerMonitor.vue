@@ -242,6 +242,9 @@ const eta = ref(null)
 const queueItems = ref([])
 const queueTab = ref('active')
 const trendPoints = ref([])
+// 按 worker 拆开的曲线（后端 /worker-monitor/trend 的 series 字段）。
+// 每条与 trendPoints 的 ts 一一对齐，缺失桶已由后端补 0。
+const trendSeries = ref([])
 const trendHours = ref(1)
 const generatedAt = ref('')
 
@@ -325,30 +328,80 @@ const statusPieOption = computed(() => ({
   }],
 }))
 
-const trendOption = computed(() => ({
-  grid: { left: 44, right: 16, top: 30, bottom: 26 },
-  tooltip: { trigger: 'axis' },
-  legend: { data: ['处理条数', '失败'], right: 0, top: 0, itemWidth: 9, itemHeight: 9 },
-  xAxis: {
-    type: 'category',
-    data: trendPoints.value.map(p =>
-      new Date(p.ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })),
-    axisLabel: { fontSize: 10 },
-  },
-  yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
-  series: [
-    {
-      name: '处理条数', type: 'line', smooth: true, showSymbol: false,
-      data: trendPoints.value.map(p => p.processed),
-      areaStyle: { opacity: 0.15 }, itemStyle: { color: '#2a78d6' },
-    },
-    {
-      name: '失败', type: 'line', smooth: true, showSymbol: false,
-      data: trendPoints.value.map(p => p.failed),
-      itemStyle: { color: '#d03b3b' },
-    },
-  ],
-}))
+// 每个 worker 一条曲线。不同 worker 的 processed 语义完全不同：
+//   tracker          = 新投递到队列的 config 数
+//   shallow-realtime = 用户点击那批的两阶段产出（DONE + 定级）
+//   shallow-auto     = 背景全量的两阶段产出
+//   deep-realtime    = 产物下载完成数
+// 混成一条线相加没有意义（浅层一轮几千、下载一轮几个）。
+const WORKER_COLOR = {
+  'tracker': '#8b5cf6',
+  'shallow-realtime': '#dc2626',
+  'shallow-auto': '#2a78d6',
+  'deep-realtime': '#d97706',
+  // 旧进程名（升级期间仍能看到历史心跳曲线）
+  'shallow-local': '#60a5fa',
+  'shallow-obs': '#0d9488',
+  'shallow': '#64748b',
+  'deep': '#f59e0b',
+  'realtime': '#f87171',
+}
+const WORKER_LABEL = {
+  'tracker': '发现投递',
+  'shallow-realtime': '实时分析（点击）',
+  'shallow-auto': '背景分析（全量）',
+  'deep-realtime': '实时下载（点击）',
+  // 旧名
+  'shallow-local': '本地 DONE(旧)',
+  'shallow-obs': 'OBS 定级(旧)',
+  'shallow': '浅层(旧)',
+  'deep': '产物下载(旧)',
+  'realtime': '实时下载(旧)',
+}
+
+const trendOption = computed(() => {
+  const series = trendSeries.value
+  const x = trendPoints.value.map(p =>
+    new Date(p.ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }))
+  // 有分 worker 数据就画分线；没有（老数据只有合并心跳）时退回单条总量线
+  if (series.length) {
+    return {
+      grid: { left: 44, right: 16, top: 30, bottom: 26 },
+      tooltip: { trigger: 'axis' },
+      legend: {
+        data: series.map(s => WORKER_LABEL[s.worker] || s.worker),
+        right: 0, top: 0, itemWidth: 9, itemHeight: 9, textStyle: { fontSize: 11 },
+      },
+      xAxis: { type: 'category', data: x, axisLabel: { fontSize: 10 } },
+      yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
+      series: series.map(s => ({
+        name: WORKER_LABEL[s.worker] || s.worker,
+        type: 'line', smooth: true, showSymbol: false,
+        data: s.data,
+        itemStyle: { color: WORKER_COLOR[s.worker] || '#94a3b8' },
+      })),
+    }
+  }
+  return {
+    grid: { left: 44, right: 16, top: 30, bottom: 26 },
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['处理条数', '失败'], right: 0, top: 0, itemWidth: 9, itemHeight: 9 },
+    xAxis: { type: 'category', data: x, axisLabel: { fontSize: 10 } },
+    yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
+    series: [
+      {
+        name: '处理条数', type: 'line', smooth: true, showSymbol: false,
+        data: trendPoints.value.map(p => p.processed),
+        areaStyle: { opacity: 0.15 }, itemStyle: { color: '#2a78d6' },
+      },
+      {
+        name: '失败', type: 'line', smooth: true, showSymbol: false,
+        data: trendPoints.value.map(p => p.failed),
+        itemStyle: { color: '#d03b3b' },
+      },
+    ],
+  }
+})
 
 // ── 数据加载 ──────────────────────────────────────────────────────────────
 
@@ -377,7 +430,11 @@ async function loadTrend() {
   try {
     const tr = await api.get(`/worker-monitor/trend?hours=${trendHours.value}`, { silent: true })
     trendPoints.value = tr.points || []
-  } catch { trendPoints.value = [] }
+    trendSeries.value = tr.series || []
+  } catch {
+    trendPoints.value = []
+    trendSeries.value = []
+  }
 }
 
 async function loadQueue() { loadAll() }

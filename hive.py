@@ -246,6 +246,10 @@ class TaskConfig:
     task_output_path: str = "outputs"
     task_complete_record: str = "complete.jsonl"
     task_failed_record: str = "failed.jsonl"
+    # 「重跑失败」从源实例继承来的成功名单。单独成文件，不进 complete.jsonl ——
+    # 平台按 complete.jsonl 行数算 completed_tasks，混在一起会让新实例一开始
+    # 就顶着源实例的成功数。这里只作为跳过名单读取。
+    task_inherited_record: str = "complete.inherited.jsonl"
     task_download_path: str = "downloads"
     main_code_tar: str = "uploads/openclaw-task.tar"
     main_code_dir: str = ""
@@ -261,6 +265,12 @@ class TaskConfig:
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
     run_output_complete_record: set = field(default_factory=set)
+    # 上一轮遗留的 failed.jsonl 内容（累计语义）。运行结束时与本轮结果合并重写。
+    run_previous_failed: set = field(default_factory=set)
+    # 本轮真正跑出来的结果，供 _rewrite_failed_record 合并用。
+    # 不能复用 run_output_complete_record —— 它初始化时已含历史成功记录。
+    run_round_success: set = field(default_factory=set)
+    run_round_failed: set = field(default_factory=set)
 
 
 @dataclass
@@ -396,12 +406,24 @@ class OpenClawDistillationTask:
         return config
 
     async def _save_record(self, file_path: str, config: str) -> None:
-        """Append a config filename to a record file."""
+        """Append a config filename to a record file, and track this round's result.
+
+        累加到 run_round_success / run_round_failed 是给 _rewrite_failed_record 用的：
+        它要在运行结束时算出「累计失败 ∪ 本轮失败 − 本轮成功」。
+        不能事后重读 complete.jsonl 来判断本轮成功 —— 那里面还有历史成功记录。
+        """
         if not config:
             self.logger.error(f"save_record error: config={config}, file_path={file_path}")
             return
 
         config_basename = os.path.basename(config)
+        is_success = file_path == self.complete_record_file
+        bucket = (
+            self.config.run_round_success if is_success
+            else self.config.run_round_failed
+        )
+        bucket.add(config_basename)
+
         async with _file_lock:
             async with aiofiles.open(file_path, "a", encoding="utf-8") as f:
                 await f.write(config_basename + "\n")
@@ -720,7 +742,11 @@ class OpenClawDistillationTask:
             )
             gateway_cmd = [
                 "/bin/bash", "-c",
-                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
+                # mkdir 必须独占一条语句、以 ';' 收尾。原写法 `mkdir -p X && nohup ... &`
+                # 中 '&' 的优先级低于 '&&'，整个 `mkdir && nohup` 被丢到后台，紧接着的
+                # 前台 `echo $! > X/pid` 在目录尚未创建时执行，报
+                # "cannot create .../jiuwenswarm-gateway.pid: Directory nonexistent"。
+                f"mkdir -p {self.config.sandbox_config.result_workdir}; "
                 # 独立进程组 + PID 文件，任务结束后可先停止整个 JiuwenSwarm 服务树。
                 f"nohup setsid {jiuwenswarm_bin} > {gateway_log_path} 2>&1 & "
                 f"echo $! > {gateway_pid_path}; "
@@ -1220,7 +1246,11 @@ class OpenClawDistillationTask:
         code_stem = Path(self.config.main_code_tar).stem
         task_logs = str(PathCls(sandbox_cfg.workspace, code_stem, "logs"))
         per_agent_workspaces = self._derive_per_agent_workspaces(config_file)
-        # 按 _FRAMEWORK_LAYOUTS 中定义的 skill_subdir 清理旧 skills（各 harness 的 skills 目录不同）
+        # 按 _FRAMEWORK_LAYOUTS 中定义的 skill_subdir 清理旧 skills（各 harness 的 skills 目录不同）。
+        # 必须在上传前整个删掉：skill 目录里常带 node_modules（image-search 就有 415 个文件），
+        # 这部分是确定性的依赖副本，传上去只会拖慢上传、撑大 OBS，且 obsutil 对它
+        # 恒返回 rc=8（实测每个任务都是 Failed count=415，导致整批 S009 失败）。
+        # 每个 agent workspace 的 skill_subdir 都要清，不只是 main。
         skill_subdir = _FW.get("skill_subdir", "skills")
         # 清理目标 (每条单独执行, 失败只告警 —— 清理不成功不该让整个 traj 上传失败)
         if sandbox_type == "windows":
@@ -1257,6 +1287,9 @@ class OpenClawDistillationTask:
             sandbox_cfg.harness_sandbox_config_file).parent).replace("\\", "/")
 
         # ---- 清理旧 skills: 逐条执行, 失败只告警 ----
+        # 注意: _exec_sandbox 只在「命令没发出去」时抛异常, 命令本身跑失败(退出码非 0)
+        # 不会抛。原先只 try/except 而不看返回码, 清理失败是完全静默的 —— 这正是
+        # skills/ 里的 node_modules 一直能混进上传、把整批拖成 S009 的原因。
         for target in purge_targets:
             if sandbox_type == "windows":
                 # cmd.exe 不认单引号: `if exist 'x'` 会把引号当字面字符, 永远判不中
@@ -1266,7 +1299,16 @@ class OpenClawDistillationTask:
                 purge_cmd = f"rm -rf '{target}'"
                 exec_command = ["/bin/bash", "-c", purge_cmd]
             try:
-                await self._exec_sandbox(exec_command, self.config.simple_bash_timeout)
+                purge_result = await self._exec_sandbox(
+                    exec_command, self.config.simple_bash_timeout
+                )
+                purge_code = (purge_result.data or {}).get("exit_code")
+                if purge_result.code != ErrorCode.SUCCESS[0] or purge_code != 0:
+                    purge_err = (purge_result.data or {}).get("stderr", "") or ""
+                    self.logger.warning(
+                        f"[upload_traj] purge non-zero {target}: "
+                        f"code={purge_result.code} exit={purge_code} {purge_err[:200]}"
+                    )
             except Exception as e:
                 self.logger.warning(f"[upload_traj] purge failed {target}: {e}")
 
@@ -1318,12 +1360,18 @@ class OpenClawDistillationTask:
             f"uploaded={len(uploaded_srcs)} "
             f"missing={len(missing_srcs)} failed={len(failures)}"
         )
-        if failures:
-            raise HiveError("S009", detail=f"bucket={bucket_path} " + "; ".join(failures))
         if not uploaded_srcs:
-            # 一个源都没传上去: 不能算成功
+            # 一个源都没传上去: 轨迹完全缺失, 必须让任务失败以便重跑
             self.logger.error(f"[upload_traj] FAILED bucket={bucket_path} no source existed")
-            return False
+            raise HiveError("S009", detail=f"bucket={bucket_path} " + "; ".join(failures))
+        if failures:
+            # 部分源上传失败: 轨迹已基本落盘, 不再让整个任务失败。
+            # 否则任务进 failed.jsonl, 下一级重跑会把 agent 从头再跑一遍
+            self.logger.error(
+                f"[upload_traj] partial failure bucket={bucket_path}: "
+                f"uploaded={len(uploaded_srcs)} failed={len(failures)}, 视为成功; "
+                f"明细: " + "; ".join(failures)
+            )
         return True
 
 
@@ -1501,6 +1549,43 @@ class OpenClawDistillationTask:
 # Task Orchestration
 # ============================================================================
 
+async def _rewrite_failed_record(config: TaskConfig) -> None:
+    """把 failed.jsonl 合并重写为「累计失败 ∪ 本轮失败 − 本轮成功」。
+
+    failed.jsonl 的语义是**累计失败清单**，不是本轮失败清单。曾经每次启动都
+    os.remove 掉它，导致「停止后再启动」时历史失败数凭空归零、成功率虚高。
+    现在改为：启动时读入 run_previous_failed，结束时合并重写。
+
+    两条约束：
+
+    1. **必须原地 truncate 写，不能用「临时文件 + os.replace」。**
+       实例的 outputs 目录在 /mnt/sfs_turbo（NFSv3），不支持 rename，
+       os.replace 会抛 Operation not permitted。见 sfs_turbo 迁移记录。
+
+    2. 重写窗口内平台可能读到半截文件。文件只有文件名列表（几百 KB 级），
+       写入是毫秒级；平台侧 _status_cache 有 5s TTL、后台 8s 一轮刷新，
+       读到瞬时中间态的概率极低且下一轮自愈。不要为这点去引入锁文件。
+    """
+    failed_file = os.path.join(config.task_output_path, config.task_failed_record)
+    final = (config.run_previous_failed | config.run_round_failed) - config.run_round_success
+
+    # 本轮成功但历史上失败过的，从失败清单里剔除；本轮没跑到的历史失败保留。
+    try:
+        async with _file_lock:
+            with open(failed_file, "w", encoding="utf-8") as f:
+                if final:
+                    f.write("\n".join(sorted(final)) + "\n")
+    except OSError as e:
+        logger.error(f"[rewrite_failed] {failed_file} 重写失败: {e}")
+        return
+
+    logger.info(
+        f"[rewrite_failed] {failed_file}: 历史 {len(config.run_previous_failed)} "
+        f"+ 本轮失败 {len(config.run_round_failed)} "
+        f"- 本轮成功 {len(config.run_round_success)} = {len(final)}"
+    )
+
+
 async def _upload_records_to_obs(config: TaskConfig) -> None:
     """把本次运行的 complete.jsonl / failed.jsonl 上传到 OBS traj_save_path 下。"""
     traj_path = config.obs_config.traj_save_path
@@ -1580,27 +1665,50 @@ async def run_tasks(
     config = task_config
 
     # Load completed records
+    #
+    # 两份文件都要读：complete.jsonl 是本实例自己跑出来的，complete.inherited.jsonl
+    # 是「重跑失败」从源实例继承来的（平台建实例时写入，见 instances.py）。
+    # 后者不进 complete.jsonl 是因为平台按 complete.jsonl 的**行数**算 completed_tasks，
+    # 混在一起会让新实例一开始就顶着源实例的成功数（进度 212% 那种）。
+    # 这里只是跳过名单，两份来源等价。
     complete_file = os.path.join(config.task_output_path, config.task_complete_record)
-    if os.path.exists(complete_file):
-        with open(complete_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    config.run_output_complete_record.add(line)
+    inherited_file = os.path.join(
+        config.task_output_path, config.task_inherited_record
+    )
+    for record_file in (complete_file, inherited_file):
+        if not os.path.exists(record_file):
+            continue
+        try:
+            with open(record_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        config.run_output_complete_record.add(line)
+        except OSError as e:
+            logger.warning(f"read {record_file} failed: {e}")
     logger.info(f"Completed records: {config.run_output_complete_record}")
 
     # Load or discover task files
+    #
+    # failed.jsonl 是「累计失败清单」，不是「本次失败清单」：每次运行开始读旧内容，
+    # 运行结束再合并重写（见 _rewrite_failed_record）。曾经在这里直接 os.remove，
+    # 结果停止后再启动时历史失败数凭空归零、成功率虚高。
     failed_file = os.path.join(config.task_output_path, config.task_failed_record)
+    if os.path.exists(failed_file):
+        try:
+            with open(failed_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        config.run_previous_failed.add(line)
+        except OSError as e:
+            logger.warning(f"read {failed_file} failed: {e}")
+
     if run_failed:
-        if not os.path.exists(failed_file):
+        if not config.run_previous_failed:
             logger.info(f"No failed record file found ({failed_file}), exiting")
             return
-        with open(failed_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    config.run_input_config_files.add(line)
-        os.remove(failed_file)
+        config.run_input_config_files.update(config.run_previous_failed)
         logger.info(f"Loaded {len(config.run_input_config_files)} failed tasks")
     else:
         # Download config from OBS if needed
@@ -1692,6 +1800,9 @@ async def run_tasks(
     ]
     if workers:
         await asyncio.gather(*workers)
+
+    # 合并重写 failed.jsonl（累计语义），必须在上传前完成，否则传上去的还是旧内容
+    await _rewrite_failed_record(config)
 
     # Upload this run's complete/failed records to OBS
     await _upload_records_to_obs(config)

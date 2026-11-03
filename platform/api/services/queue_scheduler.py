@@ -13,6 +13,8 @@ concurrent_num 仅作为实例参数透传，不再参与放行判断。
 """
 import asyncio
 import logging
+import random
+import sqlite3
 
 from ..core.config import settings
 from ..core.database import (
@@ -24,6 +26,12 @@ logger = logging.getLogger(__name__)
 # 占用队列槽位的状态：preparing 也算占用，因为任务在 _prepare_instance（OBS 下载、
 # 打包、统计任务数）期间还没变成 running，若此刻放行下一个任务，队列就不再串行了。
 OCCUPYING_STATUSES = ("preparing", "running")
+
+# 抢占队首时遇到 `database is locked` 的重试次数与基础退避。
+# 退避是指数的（0.5s / 1s / 2s）并加 30% 抖动 —— 4 个 uvicorn worker 各跑一份
+# 调度器，固定退避会让它们同步重试、再次撞在一起。
+_CLAIM_RETRIES = 3
+_CLAIM_BACKOFF_SEC = 0.5
 
 
 def global_max_concurrent() -> int:
@@ -205,7 +213,35 @@ async def schedule_queue(queue_id: str):
     logger.info(f"Scheduling queue: {queue_id}")
 
     # 原子抢占队首排队任务（内含「队列无占用者」判断，多 worker 安全）
-    queued_task = await async_execute(_try_claim_next, queue_id)
+    #
+    # 必须兜住 `database is locked`：_try_claim_next 是 UPDATE...RETURNING（写事务），
+    # 而 SQLite 的 WAL 只允许一个写者。platform.db 近 10GB，WAL checkpoint 期间
+    # 独占写锁可能超过 busy_timeout(15s)；加上 4 个 uvicorn worker 各跑一份调度器、
+    # 4 个离线 worker 也在写，撞锁是常态而不是异常。
+    #
+    # 不兜的后果（线上实测）：异常从 schedule_queue 逃逸，而调用方用的是
+    # asyncio.create_task 且没取结果 → 满屏 "Task exception was never retrieved"，
+    # **且这一次调度被整个丢掉**，队首任务要等下一次状态变化才会被重新调度。
+    queued_task = None
+    for attempt in range(_CLAIM_RETRIES):
+        try:
+            queued_task = await async_execute(_try_claim_next, queue_id)
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                raise
+            if attempt == _CLAIM_RETRIES - 1:
+                # 放弃本次调度：不改任何状态，队首任务仍是 queued，
+                # 下一次 schedule_queue（任务结束/新入队/定时巡检）会再试。
+                logger.warning(
+                    f"Queue {queue_id}: 抢占队首时数据库持续被锁（{_CLAIM_RETRIES} 次重试均失败），"
+                    f"本次调度跳过，任务仍在队列中: {e}")
+                return
+            # 退避后重试。加抖动避免 4 个 uvicorn worker 同步重试再次撞在一起。
+            delay = _CLAIM_BACKOFF_SEC * (2 ** attempt) * (1 + random.random() * 0.3)
+            logger.info(f"Queue {queue_id}: 数据库被锁，{delay:.1f}s 后重试 "
+                        f"({attempt + 1}/{_CLAIM_RETRIES})")
+            await asyncio.sleep(delay)
 
     if not queued_task:
         logger.info(f"Queue {queue_id}: no claimable task (occupied or empty)")

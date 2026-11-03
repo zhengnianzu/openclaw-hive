@@ -236,6 +236,22 @@ def _get_output_dir(config_path: str) -> str:
     return os.path.join(instance_dir, "outputs", config_basename)
 
 
+# 「重跑失败」时从源实例继承来的成功记录清单。
+#
+# 为什么不直接写进 complete.jsonl：平台数的是 complete.jsonl 的**行数**
+# （见 _count_lines / _sync_instance_status），而重跑实例会继承源实例的成功名单。
+# 两者放同一个文件时，新实例还没跑任何东西，completed_tasks 就已经等于源实例的成功数
+# （生产实测出现过 total=32 / completed=68，进度 212%）。分成两个文件后，
+# complete.jsonl 天然只含「本次运行真正跑出来的」，所有下游计数不用改。
+#
+# hive.py 侧把两份都读进跳过集合（run_output_complete_record），行为不变。
+INHERITED_COMPLETE_RECORD = "complete.inherited.jsonl"
+
+
+def _inherited_complete_path(output_dir: str) -> str:
+    return os.path.join(output_dir, INHERITED_COMPLETE_RECORD)
+
+
 def _count_lines(file_path: str) -> int:
     if not os.path.exists(file_path):
         return 0
@@ -244,6 +260,67 @@ def _count_lines(file_path: str) -> int:
         for chunk in iter(lambda: f.read(65536), b""):
             count += chunk.count(b"\n")
     return count
+
+
+def _done_counts(instance_ids: list[str], conn) -> dict:
+    """批量取每个实例的「DONE 数」= task_records 里 task_done=1 的行数。
+
+    与 _task_done_counts 的区别是数据来源：
+      - _task_done_counts：task_traj_records.task_done，来自 OBS 的 tsr / 慢路径。
+        但补全快路径刻意不拉这个字段，导致 254 个实例该列恒为 0。
+      - _done_counts（本函数）：task_records.task_done，由 worker 直接扫本地
+        task-N.log 得到，不依赖 OBS —— 也就是「本地日志口径」，最接近真相。
+
+    **回退规则**：某实例若还没被扫过（task_done 全为 NULL），返回的字典里不会有它，
+    调用方据此回退到 OBS 口径，避免新列因为「还没轮到」而显示 0。
+
+    性能：走 idx_task_records_done 部分索引。
+    """
+    ids = [i for i in instance_ids if i]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT instance_id, COUNT(*) AS n FROM task_records "
+        f"WHERE task_done=1 AND instance_id IN ({placeholders}) "
+        f"GROUP BY instance_id",
+        tuple(ids),
+    ).fetchall()
+    out = {r["instance_id"]: r["n"] for r in rows}
+    # 再查一次「扫过但没有 done」的实例，用来区分「扫过且为 0」与「压根没扫」：
+    # 前者要显示真实的 0，后者要回退 OBS 口径。不区分的话两者都会漏掉，看起来一样。
+    scanned = conn.execute(
+        f"SELECT DISTINCT instance_id FROM task_records "
+        f"WHERE task_done IS NOT NULL AND instance_id IN ({placeholders})",
+        tuple(ids),
+    ).fetchall()
+    for r in scanned:
+        out.setdefault(r["instance_id"], 0)
+    return out
+
+
+def _task_done_counts(instance_ids: list[str], conn) -> dict:
+    """批量取每个实例的「成功轨迹数」= task_traj_records 里 task_done=1 的行数。
+
+    为什么单独一个口径：task_done 是 assistant 自己在对话末尾打的【Task_Done】标记，
+    代表「任务真的做完了」；而 completed_tasks 只是 complete.jsonl 的行数，
+    只要流水线没抛异常就算成功——哪怕 agent 根本没做完（比如撞到最大轮次 T002、
+    或 agent 自己判了失败）。两者在生产上差得很远，首页要同时给出。
+
+    性能：走 idx_traj_task_done_inst 部分索引（只收 task_done=1 的行），
+    COUNT 走 covering index。全表 GROUP BY 是 1.97s，加索引后 0.10s。
+    """
+    ids = [i for i in instance_ids if i]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT instance_id, COUNT(*) AS n FROM task_traj_records "
+        f"WHERE task_done=1 AND instance_id IN ({placeholders}) "
+        f"GROUP BY instance_id",
+        tuple(ids),
+    ).fetchall()
+    return {r["instance_id"]: r["n"] for r in rows}
 
 
 def _is_pid_running(pid: int) -> bool:
@@ -489,11 +566,9 @@ def _gib(v) -> float:
     return round(sandbox_configs._to_quantity(v) / 1024, 4)
 
 
-def _num(v, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+def _cores(v, default: float) -> float:
+    """K8s CPU 量 → 核数。复用沙箱配置的 to_cores（500m → 0.5 核）。"""
+    return sandbox_configs.to_cores(v, default)
 
 
 def _parse_resources(cfg: dict) -> dict:
@@ -506,15 +581,15 @@ def _parse_resources(cfg: dict) -> dict:
             # Windows 沙箱写法
             req, lim = res.get("requests") or {}, res.get("limits") or {}
             return {
-                "cpu_request": _num(req.get("cpu"), 2),
-                "cpu_limit": _num(lim.get("cpu"), 3),
+                "cpu_request": _cores(req.get("cpu"), 2),
+                "cpu_limit": _cores(lim.get("cpu"), 3),
                 "memory_request": _gib(req.get("memory") or "6Gi"),
                 "memory_limit": _gib(lim.get("memory") or "8Gi"),
             }
         # Linux 沙箱写法
         return {
-            "cpu_request": _num(res.get("cpu_request"), 2),
-            "cpu_limit": _num(res.get("cpu_limit"), 3),
+            "cpu_request": _cores(res.get("cpu_request"), 2),
+            "cpu_limit": _cores(res.get("cpu_limit"), 3),
             "memory_request": _gib(res.get("memory_request") or "6Gi"),
             "memory_limit": _gib(res.get("memory_limit") or "8Gi"),
         }
@@ -524,8 +599,8 @@ def _parse_resources(cfg: dict) -> dict:
     res = (env_make.get("args") or {}).get("resources") or {}
     if res:
         return {
-            "cpu_request": _num(res.get("cpu_request"), 2),
-            "cpu_limit": _num(res.get("cpu_limit"), 3),
+            "cpu_request": _cores(res.get("cpu_request"), 2),
+            "cpu_limit": _cores(res.get("cpu_limit"), 3),
             "memory_request": _gib(res.get("memory_request") or "6Gi"),
             "memory_limit": _gib(res.get("memory_limit") or "8Gi"),
         }
@@ -599,8 +674,8 @@ def _sandbox_resources(row: dict) -> dict:
                         sb_row["sandbox_key"],
                     )
                     out = {
-                        "cpu_request": _num(summary.get("cpu_request"), 2),
-                        "cpu_limit": _num(summary.get("cpu_limit"), 3),
+                        "cpu_request": _cores(summary.get("cpu_request"), 2),
+                        "cpu_limit": _cores(summary.get("cpu_limit"), 3),
                         "memory_request": _gib(summary.get("memory_request") or "6Gi"),
                         "memory_limit": _gib(summary.get("memory_limit") or "8Gi"),
                         "sandbox_namespace": summary.get("sandbox_namespace") or "",
@@ -646,16 +721,31 @@ def _describe_error(e: Exception) -> str:
 def list_instances(user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM task_instances ORDER BY created_at DESC").fetchall()
-    return [InstanceInfo(**_with_resources(_with_harness_type(_sync_instance_status(dict(r))))) for r in rows]
+        ids = [r["id"] for r in rows]
+        # 一次聚合出全部实例的成功轨迹数，避免每个实例单独 COUNT（单次 5ms × 1882 个 = 9s）
+        done_counts = _task_done_counts(ids, conn)
+        # DONE：本地日志口径。字典里没有 = 还没扫过 → 回退 OBS 口径
+        local_done = _done_counts(ids, conn)
+    out = []
+    for r in rows:
+        inst = _sync_instance_status(dict(r))
+        inst["done_trajs"] = done_counts.get(inst["id"], 0)
+        inst["done_tasks"] = local_done.get(inst["id"], inst["done_trajs"])
+        out.append(InstanceInfo(**_with_resources(_with_harness_type(inst))))
+    return out
 
 
 @router.get("/{instance_id}", response_model=InstanceInfo)
 def get_instance(instance_id: str, user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="实例不存在")
-    return InstanceInfo(**_with_resources(_with_harness_type(_sync_instance_status(dict(row)))))
+        if not row:
+            raise HTTPException(status_code=404, detail="实例不存在")
+        inst = _sync_instance_status(dict(row))
+        inst["done_trajs"] = _task_done_counts([instance_id], conn).get(instance_id, 0)
+        inst["done_tasks"] = _done_counts([instance_id], conn).get(
+            instance_id, inst["done_trajs"])
+    return InstanceInfo(**_with_resources(_with_harness_type(inst)))
 
 
 async def _async_subprocess_run(cmd, *, cwd=None, timeout=600):
@@ -1321,17 +1411,25 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             """INSERT INTO task_instances
                (id, name, config_path, status, created_by, total_tasks, concurrent_num,
                 config_snapshot, create_params, created_at, queue_id, queue_position,
-                suffix_api_keys)
-               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                suffix_api_keys, copied_from)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], 0,
              req.concurrent_num, OmegaConf.to_yaml(base),
              json.dumps(_create_params, ensure_ascii=False),
              datetime.now().isoformat(), req.queue_id, queue_position,
-             1 if req.suffix_api_keys else 0),
+             1 if req.suffix_api_keys else 0, req.copy_complete_from or None),
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 
-    # --- 6. 重跑失败: 搬源实例 complete.jsonl 到新实例 output 目录 ---
+    # --- 6. 重跑失败: 搬源实例 complete.jsonl 到新实例的「继承」清单 ---
+    #
+    # 拷成 complete.inherited.jsonl 而不是 complete.jsonl：源实例的成功记录是
+    # 「本次不用再跑」的跳过名单，不是新实例自己的战绩。混进 complete.jsonl 会让
+    # completed_tasks 从一开始就继承源实例的数字（用户报告：原来 10 条，新跑 5 条
+    # 变成 15 条，进度和成功率全是错的）。分成两个文件后平台只数 complete.jsonl。
+    #
+    # 源实例若本身也是重跑出来的，它自己的 complete.inherited.jsonl 一并并进来，
+    # 否则链式重跑（A→B→C）到 C 时会把 A 的成功任务再跑一遍。
     if req.copy_complete_from:
         with get_connection() as conn:
             src_row = conn.execute(
@@ -1339,11 +1437,28 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             ).fetchone()
         if src_row:
             src_output_dir = _get_output_dir(src_row["config_path"])
-            src_complete = os.path.join(src_output_dir, "complete.jsonl")
-            if os.path.exists(src_complete):
-                new_output_dir = _get_output_dir(config_path)
-                os.makedirs(new_output_dir, exist_ok=True)
-                shutil.copy2(src_complete, os.path.join(new_output_dir, "complete.jsonl"))
+            new_output_dir = _get_output_dir(config_path)
+            os.makedirs(new_output_dir, exist_ok=True)
+            inherited = _inherited_complete_path(new_output_dir)
+            seen: set[str] = set()
+            lines: list[str] = []
+            for src_name in ("complete.jsonl", INHERITED_COMPLETE_RECORD):
+                src_file = os.path.join(src_output_dir, src_name)
+                if not os.path.exists(src_file):
+                    continue
+                try:
+                    with open(src_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and line not in seen:
+                                seen.add(line)
+                                lines.append(line)
+                except OSError as e:
+                    print(f"[create] 读取源实例 {src_name} 失败: {e}")
+            if lines:
+                # 原地写（NFSv3 不支持 rename，见 sfs_turbo 迁移记录）
+                with open(inherited, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
 
     return InstanceInfo(**dict(row))
 
@@ -1523,6 +1638,12 @@ async def _prepare_instance(instance_id: str, inst: dict):
         actual_start = min(start_index, file_count)
         available = file_count - actual_start
         total_tasks = min(total_num, available) if total_num > 0 else available
+
+    # 重跑实例：从源实例继承来的成功任务本次不会再跑，分母里要扣掉，
+    # 否则 total 与 completed 不同源，进度永远到不了 100%、all_done 判据也会错。
+    inherited_count = _count_lines(_inherited_complete_path(_get_output_dir(config_path)))
+    if inherited_count:
+        total_tasks = max(0, total_tasks - inherited_count)
 
     with get_connection() as conn:
         conn.execute(
@@ -1807,8 +1928,10 @@ async def stop_instance(instance_id: str, user: dict = Depends(require_operator)
 def get_instance_overview(instance_id: str, user: dict = Depends(get_current_user)):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="实例不存在")
+        if not row:
+            raise HTTPException(status_code=404, detail="实例不存在")
+        done_trajs = _task_done_counts([instance_id], conn).get(instance_id, 0)
+        done_tasks = _done_counts([instance_id], conn).get(instance_id, done_trajs)
 
     inst = _sync_instance_status(dict(row))
     completed = inst["completed_tasks"]
@@ -1841,6 +1964,8 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
         running=running_pods, pending=pending,
         success_rate=round(rate, 1), error_breakdown=error_breakdown,
         error_tree=error_tree,
+        done_trajs=done_trajs,
+        done_tasks=done_tasks,
         elapsed_seconds=elapsed_seconds,
         **time_est,
     )
@@ -1891,6 +2016,10 @@ def get_overview_batch(payload: OverviewBatchRequest, user: dict = Depends(get_c
         rows = conn.execute(
             f"SELECT * FROM task_instances WHERE id IN ({placeholders})", tuple(ids)
         ).fetchall()
+        # 一次聚合出全部实例的成功轨迹数（走 idx_traj_task_done_inst 部分索引）
+        done_counts = _task_done_counts(ids, conn)
+        # DONE：本地日志口径（走 idx_task_records_done）
+        local_done = _done_counts(ids, conn)
     by_id = {dict(r)["id"]: dict(r) for r in rows}
 
     for iid in ids:
@@ -1913,6 +2042,8 @@ def get_overview_batch(payload: OverviewBatchRequest, user: dict = Depends(get_c
             "running": running_pods,
             "pending": max(0, total - finished - running_pods),
             "success_rate": round(inst["completed_tasks"] / finished * 100, 1) if finished else 0.0,
+            "done_trajs": done_counts.get(iid, 0),
+            "done_tasks": local_done.get(iid, done_counts.get(iid, 0)),
             "error_breakdown": _analyze_cache.get(inst["config_path"], ({}, 0))[0],
             "error_tree": error_tree,
             **_estimate_remaining_time(total, finished, inst.get("started_at"), inst["status"]),

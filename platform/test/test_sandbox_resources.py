@@ -69,6 +69,43 @@ class ParseResourcesTest(unittest.TestCase):
         self.assertEqual(instances._gib("1Gi"), 1.0)
         self.assertAlmostEqual(instances._gib("2G"), 1.9531, places=4)
 
+    def test_cpu_millicores(self):
+        # 后缀 m 是毫核：500m = 0.5 核。曾经 float("500m") 抛错后静默兜底成 2 核，
+        # 把 0.5 核的实例按 4 倍算进看板「已用 CPU」。
+        self.assertEqual(sandbox_configs.to_cores("500m"), 0.5)
+        self.assertEqual(sandbox_configs.to_cores("1500m"), 1.5)
+        self.assertEqual(sandbox_configs.to_cores("2"), 2.0)
+        self.assertEqual(sandbox_configs.to_cores("0.5"), 0.5)
+        # 解析不出来才用 default，不要和合法的 0 混淆
+        self.assertEqual(sandbox_configs.to_cores("abc", 2), 2)
+        self.assertEqual(sandbox_configs.to_cores(None, 2), 2)
+        self.assertEqual(sandbox_configs.to_cores("0"), 0.0)
+
+    def test_millicore_cpu_parsed_in_both_config_shapes(self):
+        flat = {
+            "sandbox_active_key": "x86_cpu",
+            "sandbox": {"x86_cpu": {"sandbox": {"resources": {
+                "cpu_request": "500m", "cpu_limit": "3",
+                "memory_request": "2Gi", "memory_limit": "6Gi",
+            }}}},
+        }
+        self.assertEqual(instances._parse_resources(flat), {
+            "cpu_request": 0.5, "cpu_limit": 3.0,
+            "memory_request": 2.0, "memory_limit": 6.0,
+        })
+        nested = {
+            "sandbox_active_key": "windows",
+            "sandbox": {"windows": {"sandbox": {"resources": {
+                "requests": {"cpu": "500m", "memory": "2Gi"},
+                "limits": {"cpu": "2", "memory": "4Gi"},
+            }}}},
+        }
+        self.assertEqual(instances._parse_resources(nested)["cpu_request"], 0.5)
+
+    def test_millicore_request_not_over_limit(self):
+        # CPU 要按核比：按内存那套换算（m→1）会把 500m 读成 500，误判「请求 > 限制」
+        self.assertLess(sandbox_configs.to_cores("500m"), sandbox_configs.to_cores("3"))
+
 
 class DefaultNamespaceTest(unittest.TestCase):
     """default_namespace() 的降级顺序：default → 第一个池 → 常量。"""

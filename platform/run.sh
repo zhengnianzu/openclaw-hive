@@ -6,6 +6,17 @@ cd "$SCRIPT_DIR"
 
 
 ACTION="${1:-help}"
+
+# 两词写法 `shallow logs [tracker|local|obs] [-f]` → 归一到 shallow-logs。
+# 用户习惯敲 `./run.sh shallow logs -f`（对标 docker/journalctl 的风格），
+# 这里把子命令左移一位，让下面的 case 只认 shallow-logs 一个入口。
+if [ "$ACTION" = "shallow" ] && [ "${2:-}" = "logs" ]; then
+    ACTION="shallow-logs"
+    # 丢掉 "shallow logs" 两个词，余下的（tracker/local/obs、-f）前移给 $2 起
+    shift 2 2>/dev/null || shift $#
+    set -- "shallow-logs" "$@"
+fi
+
 HOST="${2:-0.0.0.0}"
 PORT="${3:-8087}"
 NGINX_PORT="${4:-80}"
@@ -205,8 +216,92 @@ stop_deep_worker() {
     _stop_pidfile deep_worker.pid "产物下载 worker"
 }
 
-# 实时下载 worker：只处理用户点击过（artifact_priority=100）的任务。
-# 与 deep worker 分开进程、分开线程池，点击不必等几万条积压。
+# ── 浅层分析架构（tracker + shallow-realtime + shallow-auto 三进程）──
+# 浅层有两个**阶段**（都要做、顺序固定）：
+#   阶段1 local：读本地 logs/task-N.log 判 DONE（写 task_records.task_done）
+#   阶段2 obs  ：拉 OBS tsr 定级（写 task_records.traj_level），依赖阶段1 的 task_done
+# 需要进程级隔离的不是阶段，而是**场景**：
+#   shallow-realtime 只领用户点过的行（priority>=100），2s 一轮，秒级响应
+#   shallow-auto     只领背景行（priority<100），按 id DESC 最新优先，全量同步
+# 旧架构按阶段拆成 shallow-local/shallow-obs 两进程，两种场景混在一条队列里抢并发，
+# 实测用户点的那批有 2.3 万行卡在阶段2（阶段2 只有 16 并发、要和 92 万背景行抢）。
+# 合并成「一个进程内跑完两阶段」后，同一轮里阶段1 刚写出的 task_done 阶段2 立刻可用。
+start_tracker() {
+    if [ -f tracker.pid ] && kill -0 "$(cat tracker.pid)" 2>/dev/null; then
+        echo "task_tracker 已在运行 (PID: $(cat tracker.pid))"
+        return
+    fi
+    rm -f tracker.pid
+    nohup $PYTHON offline/task_tracker.py > tracker.log 2>&1 &
+    echo $! > tracker.pid
+    echo "task_tracker 已启动 (PID: $(cat tracker.pid))"
+}
+stop_tracker() {
+    _stop_pidfile tracker.pid "task_tracker"
+}
+
+start_shallow_realtime() {
+    if [ -f shallow_realtime.pid ] && kill -0 "$(cat shallow_realtime.pid)" 2>/dev/null; then
+        echo "shallow-realtime 已在运行 (PID: $(cat shallow_realtime.pid))"
+        return
+    fi
+    rm -f shallow_realtime.pid
+    nohup $PYTHON offline/shallow_worker.py --mode realtime > shallow_realtime.log 2>&1 &
+    echo $! > shallow_realtime.pid
+    echo "shallow-realtime 已启动 (PID: $(cat shallow_realtime.pid))"
+}
+stop_shallow_realtime() {
+    _stop_pidfile shallow_realtime.pid "shallow-realtime"
+}
+
+start_shallow_auto() {
+    if [ -f shallow_auto.pid ] && kill -0 "$(cat shallow_auto.pid)" 2>/dev/null; then
+        echo "shallow-auto 已在运行 (PID: $(cat shallow_auto.pid))"
+        return
+    fi
+    rm -f shallow_auto.pid
+    nohup $PYTHON offline/shallow_worker.py --mode auto > shallow_auto.log 2>&1 &
+    echo $! > shallow_auto.pid
+    echo "shallow-auto 已启动 (PID: $(cat shallow_auto.pid))"
+}
+stop_shallow_auto() {
+    _stop_pidfile shallow_auto.pid "shallow-auto"
+}
+
+# ── 旧的按阶段拆分的两个进程（已被 shallow-realtime/auto 取代）──
+# 保留启停函数仅为回滚方便；正常不要和新进程同时跑 —— 它们的 claim 不带车道过滤，
+# 会和新进程抢同一批行（CAS 不会重复处理，但会互相拖慢并打乱车道隔离）。
+start_shallow_local() {
+    if [ -f shallow_local.pid ] && kill -0 "$(cat shallow_local.pid)" 2>/dev/null; then
+        echo "shallow-local 已在运行 (PID: $(cat shallow_local.pid))"
+        return
+    fi
+    rm -f shallow_local.pid
+    nohup $PYTHON offline/shallow_local.py > shallow_local.log 2>&1 &
+    echo $! > shallow_local.pid
+    echo "shallow-local 已启动 (PID: $(cat shallow_local.pid))"
+}
+stop_shallow_local() {
+    _stop_pidfile shallow_local.pid "shallow-local"
+}
+
+start_shallow_obs() {
+    if [ -f shallow_obs.pid ] && kill -0 "$(cat shallow_obs.pid)" 2>/dev/null; then
+        echo "shallow-obs 已在运行 (PID: $(cat shallow_obs.pid))"
+        return
+    fi
+    rm -f shallow_obs.pid
+    nohup $PYTHON offline/shallow_obs.py > shallow_obs.log 2>&1 &
+    echo $! > shallow_obs.pid
+    echo "shallow-obs 已启动 (PID: $(cat shallow_obs.pid))"
+}
+stop_shallow_obs() {
+    _stop_pidfile shallow_obs.pid "shallow-obs"
+}
+
+# 实时下载 worker（deep-realtime）：只处理用户点击过（artifact_priority=100）的任务。
+# **没有 deep-auto**：交付物全量自动下载会写爆磁盘（实测积压 97 万条、盘只剩 214G），
+# 所以产物是纯点击驱动 —— tracker 投递时置 pending_click，点开详情才入队。
 start_realtime_worker() {
     if [ -f realtime_worker.pid ] && kill -0 "$(cat realtime_worker.pid)" 2>/dev/null; then
         echo "实时下载 worker 已在运行 (PID: $(cat realtime_worker.pid))"
@@ -306,8 +401,10 @@ case "$ACTION" in
         nohup $UVICORN main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
-        start_worker
-        start_deep_worker
+        # 目标架构 4 进程（不含旧单体循环与 deep-auto 背景全量下载）
+        start_tracker
+        start_shallow_realtime
+        start_shallow_auto
         start_realtime_worker
 
         # 启动 Nginx（如果已安装）
@@ -341,9 +438,16 @@ case "$ACTION" in
         else
             echo "Uvicorn 未运行"
         fi
+        # 停全部：目标架构 4 进程 + 旧进程（单体循环 / deep-auto），
+        # 两边都停才不会在升级期间留下孤儿进程继续抢队列。
+        stop_tracker
+        stop_shallow_realtime
+        stop_shallow_auto
+        stop_realtime_worker
+        stop_shallow_local
+        stop_shallow_obs
         stop_worker
         stop_deep_worker
-        stop_realtime_worker
         # uvicorn --workers N 是「父进程 + N 个 spawn 出来的子进程」。
         # 只 kill pid 文件里那个 master，子进程会被 reparent 到 PID 1 变成孤儿，
         # **继续占着端口**——表现就是「进程列表里看不到 uvicorn，但 8087 仍在监听」，
@@ -362,9 +466,16 @@ case "$ACTION" in
             rm -f platform.pid
             echo "已停止旧进程"
         fi
+        # 停全部：目标架构 4 进程 + 旧进程（单体循环 / deep-auto），
+        # 两边都停才不会在升级期间留下孤儿进程继续抢队列。
+        stop_tracker
+        stop_shallow_realtime
+        stop_shallow_auto
+        stop_realtime_worker
+        stop_shallow_local
+        stop_shallow_obs
         stop_worker
         stop_deep_worker
-        stop_realtime_worker
         if command -v nginx &> /dev/null; then
             nginx -s stop 2>/dev/null
         fi
@@ -379,8 +490,10 @@ case "$ACTION" in
         nohup $UVICORN main:app --host "$HOST" --port "$PORT" --workers 4 --limit-concurrency 100 > platform.log 2>&1 &
         echo $! > platform.pid
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
-        start_worker
-        start_deep_worker
+        # 目标架构 4 进程（不含旧单体循环与 deep-auto 背景全量下载）
+        start_tracker
+        start_shallow_realtime
+        start_shallow_auto
         start_realtime_worker
 
         if command -v nginx &> /dev/null; then
@@ -404,73 +517,141 @@ case "$ACTION" in
         fi
         ;;
 
+    # 单个 worker 的实时日志。这 4 个就是当前架构的全部常驻进程。
+    #   ./run.sh logs-tracker | logs-rt | logs-auto | logs-dl
+    logs-tracker|logs-rt|logs-auto|logs-dl)
+        case "$ACTION" in
+            logs-tracker) _f=tracker.log;          _n="tracker（发现投递）" ;;
+            logs-rt)      _f=shallow_realtime.log; _n="shallow-realtime（实时分析/点击）" ;;
+            logs-auto)    _f=shallow_auto.log;     _n="shallow-auto（背景分析/全量）" ;;
+            logs-dl)      _f=realtime_worker.log;  _n="deep-realtime（实时下载/交付物）" ;;
+        esac
+        if [ -f "$_f" ]; then
+            echo "=== $_n → $_f ==="
+            tail -n 30 -f "$_f"
+        else
+            echo "$_f 不存在 —— $_n 可能未启动，先跑 ./run.sh worker-start"
+        fi
+        ;;
+
+    # 旧进程的日志（已被 rt/auto 取代，保留仅为排查历史问题）。
+    # worker.log = --shallow-only 单体循环；deep_worker.log = --deep-only 背景全量下载。
     worker-logs)
         if [ -f worker.log ]; then
-            echo "=== 浅层 worker.log ==="
+            echo "=== [旧] 单体浅层循环 worker.log（已被 rt/auto 取代）==="
+            echo "    看当前架构请用: ./run.sh logs-rt / logs-auto / shallow-logs"
             tail -f worker.log
         else
-            echo "worker.log 不存在，浅层 worker 可能未启动"
+            echo "worker.log 不存在（旧的 --shallow-only 进程，当前架构已不使用）"
+            echo "看当前 4 个 worker: ./run.sh shallow-logs"
         fi
         ;;
 
     deep-worker-logs)
         if [ -f deep_worker.log ]; then
-            echo "=== 产物下载 deep_worker.log ==="
+            echo "=== [旧] 背景全量下载 deep_worker.log（当前架构已不启用）==="
+            echo "    实时下载日志请用: ./run.sh logs-dl"
             tail -f deep_worker.log
         else
-            echo "deep_worker.log 不存在，产物下载 worker 可能未启动"
+            echo "deep_worker.log 不存在（旧的 --deep-only 进程，当前架构已不使用）"
+            echo "看实时下载: ./run.sh logs-dl"
+        fi
+        ;;
+
+    # 浅层进程的实时日志。支持两种写法：
+    #   ./run.sh shallow-logs            （tail -f 全部）
+    #   ./run.sh shallow logs            （等价，$2=logs 时转发到这里）
+    #   ./run.sh shallow-logs rt         （只看 shallow-realtime；auto / tracker 同理）
+    # tail -f 跟多个文件时会自动打 ==> 文件名 <== 分隔，不必自己拼前缀。
+    shallow-logs)
+        # $2 可能是子目标（tracker/rt/auto/...），也可能是 start 时的 host，这里只认前者
+        case "$2" in
+            tracker) _logs=(tracker.log) ;;
+            rt|realtime) _logs=(shallow_realtime.log) ;;
+            auto)    _logs=(shallow_auto.log) ;;
+            dl|download) _logs=(realtime_worker.log) ;;
+            local)   _logs=(shallow_local.log) ;;      # 旧进程
+            obs)     _logs=(shallow_obs.log) ;;        # 旧进程
+            *)       _logs=(tracker.log shallow_realtime.log shallow_auto.log
+                            realtime_worker.log) ;;
+        esac
+        _present=()
+        for f in "${_logs[@]}"; do
+            [ -f "$f" ] && _present+=("$f")
+        done
+        if [ ${#_present[@]} -eq 0 ]; then
+            echo "浅层日志不存在（${_logs[*]}）—— 进程可能未启动，先跑 ./run.sh shallow-all-start"
+        else
+            echo "=== tail -f ${_present[*]} ==="
+            tail -n 20 -f "${_present[@]}"
         fi
         ;;
 
     worker-status)
-        if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null; then
-            echo "浅层 worker 运行中 (PID: $(cat worker.pid))"
-        else
-            echo "浅层 worker 未运行"
-        fi
-        if [ -f deep_worker.pid ] && kill -0 "$(cat deep_worker.pid)" 2>/dev/null; then
-            echo "产物下载 worker 运行中 (PID: $(cat deep_worker.pid))"
-        else
-            echo "产物下载 worker 未运行"
-        fi
-        if [ -f realtime_worker.pid ] && kill -0 "$(cat realtime_worker.pid)" 2>/dev/null; then
-            echo "实时下载 worker 运行中 (PID: $(cat realtime_worker.pid))"
-        else
-            echo "实时下载 worker 未运行"
-        fi
-        echo "--- 浅层 worker.log 尾部 20 行 ---"
-        if [ -f worker.log ]; then
-            tail -n 20 worker.log
-        else
-            echo "(worker.log 不存在)"
-        fi
-        echo "--- 产物下载 deep_worker.log 尾部 20 行 ---"
-        if [ -f deep_worker.log ]; then
-            tail -n 20 deep_worker.log
-        else
-            echo "(deep_worker.log 不存在)"
-        fi
+        # 当前架构的 4 个常驻进程（按场景分车道，不按阶段）
+        echo "=== Worker 状态 ==="
+        _ws() {   # $1=pid文件 $2=显示名 $3=日志
+            if [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; then
+                _p=$(cat "$1")
+                _e=$(ps -o etime= -p "$_p" 2>/dev/null | tr -d ' ')
+                printf "  %-34s 运行中  PID=%-8s 已跑 %s\n" "$2" "$_p" "$_e"
+            else
+                printf "  %-34s 未运行\n" "$2"
+            fi
+        }
+        _ws tracker.pid          "tracker（发现投递）"              tracker.log
+        _ws shallow_realtime.pid "shallow-realtime（实时分析/点击）" shallow_realtime.log
+        _ws shallow_auto.pid     "shallow-auto（背景分析/全量）"      shallow_auto.log
+        _ws realtime_worker.pid  "deep-realtime（实时下载）"         realtime_worker.log
+
+        # 旧进程：正常应全部「未运行」。还在跑说明升级时漏停，会和新进程抢队列。
+        for _pf in worker.pid deep_worker.pid shallow_local.pid shallow_obs.pid; do
+            if [ -f "$_pf" ] && kill -0 "$(cat "$_pf")" 2>/dev/null; then
+                echo "  ⚠ 旧进程仍在运行: $_pf (PID $(cat "$_pf")) —— 会和新架构抢队列，建议停掉"
+            fi
+        done
+
+        echo ""
+        echo "=== 各 worker 日志尾部 5 行 ==="
+        for _pair in "tracker.log:tracker" \
+                     "shallow_realtime.log:shallow-realtime" \
+                     "shallow_auto.log:shallow-auto" \
+                     "realtime_worker.log:deep-realtime"; do
+            _f="${_pair%%:*}"; _n="${_pair##*:}"
+            echo "--- $_n ($_f) ---"
+            if [ -f "$_f" ]; then tail -n 5 "$_f"; else echo "($_f 不存在)"; fi
+        done
         ;;
 
+    # worker-start/stop/restart = 目标架构的 4 个常驻进程。
+    #   tracker（发现投递）+ shallow-realtime（点击，两阶段）
+    #   + shallow-auto（背景全量，最新优先）+ deep-realtime（点击的交付物）
+    # 刻意**不启** start_worker（旧 --shallow-only 单体循环，已被 rt/auto 取代）
+    # 与 start_deep_worker（背景全量下载 = deep-auto，会写爆磁盘，产物改纯点击驱动）。
+    # 要跑旧进程用 ./run.sh shallow-start / deep-start 单独起。
     worker-start)
-        start_worker
-        start_deep_worker
+        start_tracker
+        start_shallow_realtime
+        start_shallow_auto
         start_realtime_worker
         ;;
 
     worker-stop)
-        stop_worker
-        stop_deep_worker
+        stop_tracker
+        stop_shallow_realtime
+        stop_shallow_auto
         stop_realtime_worker
         ;;
 
     worker-restart)
-        stop_worker
-        stop_deep_worker
+        stop_tracker
+        stop_shallow_realtime
+        stop_shallow_auto
         stop_realtime_worker
         sleep 1
-        start_worker
-        start_deep_worker
+        start_tracker
+        start_shallow_realtime
+        start_shallow_auto
         start_realtime_worker
         ;;
 
@@ -479,6 +660,61 @@ case "$ACTION" in
             shallow-start) start_worker ;;
             shallow-stop)  stop_worker ;;
             shallow-restart) stop_worker; sleep 1; start_worker ;;
+        esac
+        ;;
+
+    # 浅层新架构三件套：一起启停，避免只起一半导致队列停滞
+    tracker-start|tracker-stop|tracker-restart)
+        case "$ACTION" in
+            tracker-start) start_tracker ;;
+            tracker-stop)  stop_tracker ;;
+            tracker-restart) stop_tracker; sleep 1; start_tracker ;;
+        esac
+        ;;
+    rt-start|rt-stop|rt-restart)
+        case "$ACTION" in
+            rt-start) start_shallow_realtime ;;
+            rt-stop)  stop_shallow_realtime ;;
+            rt-restart) stop_shallow_realtime; sleep 1; start_shallow_realtime ;;
+        esac
+        ;;
+    auto-start|auto-stop|auto-restart)
+        case "$ACTION" in
+            auto-start) start_shallow_auto ;;
+            auto-stop)  stop_shallow_auto ;;
+            auto-restart) stop_shallow_auto; sleep 1; start_shallow_auto ;;
+        esac
+        ;;
+    # 旧的按阶段拆分的两个进程（已被 rt/auto 取代，保留仅为回滚）
+    local-start|local-stop|local-restart)
+        case "$ACTION" in
+            local-start) start_shallow_local ;;
+            local-stop)  stop_shallow_local ;;
+            local-restart) stop_shallow_local; sleep 1; start_shallow_local ;;
+        esac
+        ;;
+    obs-start|obs-stop|obs-restart)
+        case "$ACTION" in
+            obs-start) start_shallow_obs ;;
+            obs-stop)  stop_shallow_obs ;;
+            obs-restart) stop_shallow_obs; sleep 1; start_shallow_obs ;;
+        esac
+        ;;
+    shallow-all-start|shallow-all-stop|shallow-all-restart)
+        # 目标架构的 4 个常驻进程：tracker + shallow-realtime + shallow-auto + deep-realtime。
+        # 不含 deep-auto（产物纯点击驱动，全量下载会写爆磁盘）。
+        case "$ACTION" in
+            shallow-all-start)
+                start_tracker; start_shallow_realtime; start_shallow_auto
+                start_realtime_worker ;;
+            shallow-all-stop)
+                stop_tracker; stop_shallow_realtime; stop_shallow_auto
+                stop_realtime_worker ;;
+            shallow-all-restart)
+                stop_tracker; stop_shallow_realtime; stop_shallow_auto
+                stop_realtime_worker; sleep 1
+                start_tracker; start_shallow_realtime; start_shallow_auto
+                start_realtime_worker ;;
         esac
         ;;
 
@@ -508,19 +744,35 @@ case "$ACTION" in
         echo "  start            生产模式启动（uvicorn + nginx + 浅层/产物下载 worker）"
         echo "  stop             停止服务（含 worker）"
         echo "  restart          重启服务（含 worker）"
-        echo "  logs             查看主服务日志（实时）"
-        echo "  worker-logs      查看浅层 worker 日志（实时）"
-        echo "  deep-worker-logs 查看产物下载 worker 日志（实时）"
-        echo "  worker-status    查看浅层/产物下载 worker 状态 + 日志尾部"
+        echo "  logs             查看主服务日志（uvicorn，实时）"
+        echo ""
+        echo "  —— 四个 worker 的日志（当前架构）——"
+        echo "  logs-tracker     tracker 发现投递        → tracker.log"
+        echo "  logs-rt          shallow-realtime 实时分析 → shallow_realtime.log"
+        echo "  logs-auto        shallow-auto 背景分析     → shallow_auto.log"
+        echo "  logs-dl          deep-realtime 实时下载    → realtime_worker.log"
+        echo "  shallow-logs     四个一起看（tail -f 全部，自动打文件名分隔）"
+        echo "                   也可写 ./run.sh shallow logs [tracker|rt|auto|dl]"
+        echo "  worker-status    四个 worker 的 PID/运行时长 + 各自日志尾部"
+        echo ""
+        echo "  —— 旧进程日志（已被 rt/auto 取代，仅排查历史问题用）——"
+        echo "  worker-logs      [旧] --shallow-only 单体循环 → worker.log"
+        echo "  deep-worker-logs [旧] --deep-only 背景全量下载 → deep_worker.log"
         echo ""
         echo "  —— Worker 独立控制（不影响 uvicorn / nginx）——"
         echo "  worker-start     启动浅层 + 产物下载"
         echo "  worker-stop      停止浅层 + 产物下载"
         echo "  worker-restart   重启浅层 + 产物下载"
-        echo "  shallow-start|stop|restart   只动浅层（分级/补全）"
+        echo "  shallow-all-start|stop|restart  目标架构 4 进程一起启停"
+        echo "                   （tracker + shallow-realtime + shallow-auto + deep-realtime）"
+        echo "  tracker-start|stop|restart   只动发现投递"
+        echo "  rt-start|stop|restart        只动实时分析（用户点击，两阶段，2s）"
+        echo "  auto-start|stop|restart      只动背景分析（全量，最新优先）"
+        echo "  realtime-start|stop|restart  只动实时下载（点击的交付物，2s 轮询）"
+        echo "  local-start|obs-start ...    旧的按阶段拆分进程（已被 rt/auto 取代，仅回滚用）"
+        echo "  shallow-start|stop|restart   只动浅层（旧的 --shallow-only 单体循环）"
         echo "  deep-start|stop|restart      只动产物下载（deep/artifacts 两个名字等价）"
         echo "  artifacts-start|stop|restart 同 deep（产物下载跑在 deep_worker 进程里）"
-        echo "  realtime-start|stop|restart  只动实时下载（仅处理用户点击的任务，2s 轮询）"
         echo ""
         echo "默认端口: uvicorn=${PORT}, nginx=${NGINX_PORT}"
         ;;

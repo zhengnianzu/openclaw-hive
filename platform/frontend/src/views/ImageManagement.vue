@@ -21,7 +21,7 @@
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
         <el-table-column prop="harness_type" label="Harness 类型" width="130" align="center">
           <template #default="{ row }">
-            <el-tag :color="harnessColor(row.harness_type)" :style="{borderColor: harnessColor(row.harness_type)}" effect="dark" size="small">
+            <el-tag :style="harnessTagStyle(row.harness_type)" size="small">
               {{ harnessLabel(row.harness_type) }}
             </el-tag>
           </template>
@@ -77,6 +77,7 @@ const images = ref([])
 const form = ref({ name: '', address: '', harness_type: 'openclaw' })
 
 function harnessColor(type) { return harnessStore.color(type) }
+function harnessTagStyle(type) { return harnessStore.tagStyle(type) }
 function harnessLabel(type) { return harnessStore.label(type) }
 
 const filteredImages = computed(() => {
