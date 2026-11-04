@@ -52,6 +52,19 @@ from offline.heartbeat import write_heartbeat, write_worker_started  # noqa: E40
 
 WORKER_NAME = "tracker"
 DEFAULT_INTERVAL = 5
+# 实时车道水位上限：待办超过这个行数就**暂停投递自动跟踪的实例**（点击的照投）。
+#
+# 为什么需要：一个 running 实例可能 10 分钟产出近万个任务（实测某实例
+# total=10000，10 分钟跑完 9,924 个），而 tracker 每 5 秒投一批、
+# shallow-realtime 实测 727 行/分 —— 产出快过消化，队列无界堆积
+# （实测积压 26,650 条 ≈ 37 分钟延迟，新点的实例全被挤在后面）。
+#
+# 有水位后：队列深则本轮只投点击的（用户在等），自动跟踪的下轮再说。
+# 实例的 jsonl 不会丢数据 —— offset 没推进，下次照旧从那里接着读。
+#
+# 取 30000 的依据：shallow-realtime 提到 48 并发后约 2000+ 行/分，
+# 3 万行约 15 分钟消化完；再小会让大实例迟迟投不进去。
+DEFAULT_MAX_PENDING = int(os.environ.get("TRACKER_MAX_PENDING", "30000"))
 DEFAULT_LIMIT = 100          # 只盯最近 N 个有任务的实例
 RECORDS = ("complete.jsonl", "failed.jsonl")
 
@@ -342,8 +355,15 @@ def pick_clicked(conn) -> list[dict]:
 ACTIVE_STATUSES = ("running", "preparing")
 # 浅层车道号：实时 = 用户正盯着结果的，背景 = 批量补全。
 # 与 shallow_worker 的 claim 过滤（priority >= / < 100）对齐。
-LANE_REALTIME = 100
-LANE_AUTO = 0
+LANE_CLICK = 100      # 用户点了「输出」—— 他正盯着这个实例，最高优先
+LANE_TRACK = 90       # running/preparing 自动跟踪 —— 实时车道，但让位于点击
+LANE_AUTO = 0         # 已结束实例的历史补全 —— 背景车道
+# 实时车道的下界：>= 这个值走 shallow-realtime，< 走 shallow-auto。
+# 取 90 而不是 100，是为了让「自动跟踪」也享受实时车道的低延迟，
+# 同时点击（100）在同一车道内仍能插到它前面（claim 按 priority DESC 排序）。
+LANE_REALTIME_MIN = LANE_TRACK
+# 兼容旧名（外部可能 import）
+LANE_REALTIME = LANE_CLICK
 
 
 def _short_iid(instance_id: str) -> str:
@@ -364,23 +384,47 @@ def _short_iid(instance_id: str) -> str:
     return instance_id[:16]
 
 
-def _lane_priority(inst_status: str | None) -> int:
-    """按实例是否还在跑决定浅层车道。
+def realtime_lane_pending(conn) -> int:
+    """实时车道当前待办行数（两阶段任一维还在排队）。
 
-    **running/preparing → 实时车道（100）**：实例还在产出，用户点开输出页就是在
-    等新完成的任务逐个冒出来，要秒级增量。这类实例每轮只新增几行，队列天然很短，
-    shallow-realtime 的 16/8 并发足够。
-
-    **finished/stopped/completed/queued/created → 背景车道（0）**：实例已经不动了，
-    剩下的是「把几万行历史一次性补全」，属于吞吐活而非响应活，交给
-    shallow-auto 的 64/16 并发吃满，顺带按 id DESC 最新优先。
-
-    改前这里写死 priority=100：而 tracker 只扫点击过的实例，于是**所有行都进实时
-    车道**，shallow-auto 永远分不到活（实测近 30 分钟 realtime 处理 8986、
-    auto 只有 266，而 auto 的 64 并发全程闲着）。一个 3.4 万 config 的已结束实例
-    本该用 64 并发快速清完，却挤在 16 并发里跑。
+    阶段 2 必须带 EXISTS 子查询，与 shallow_obs.claim 的条件完全一致 ——
+    线上有大量 `obs_state='queued'` 但 `traj_level` 早已写好的遗留行，
+    worker 根本不会领，算进水位会让 tracker 误以为队列很满、永远不投新行。
     """
-    return LANE_REALTIME if inst_status in ACTIVE_STATUSES else LANE_AUTO
+    return conn.execute(
+        "SELECT COUNT(*) FROM shallow_queue sq "
+        " WHERE sq.priority >= ? AND ("
+        "   sq.local_state='queued' OR ("
+        "     sq.obs_state='queued' AND EXISTS("
+        "       SELECT 1 FROM task_records tr "
+        "        WHERE tr.instance_id=sq.instance_id "
+        "          AND tr.config_name=sq.config_name "
+        "          AND tr.traj_level IS NULL AND tr.task_done IS NOT NULL)))",
+        (LANE_REALTIME_MIN,),
+    ).fetchone()[0]
+
+
+def _lane_priority(inst_status: str | None, clicked: bool = False) -> int:
+    """决定浅层车道号。三档：
+
+    | 来源 | priority | 车道 | 理由 |
+    |------|----------|------|------|
+    | 用户点了「输出」 | 100 (LANE_CLICK) | 实时 | 他正盯着这个实例,最高优先 |
+    | running/preparing 自动跟踪 | 90 (LANE_TRACK) | 实时 | 实例还在产出,要秒级增量;但让位于点击 |
+    | 已结束实例的历史补全 | 0 (LANE_AUTO) | 背景 | 吞吐活,交给 64 并发吃满 |
+
+    **点击优先于自动跟踪**是关键：两者都在实时车道（claim 条件
+    `priority >= LANE_REALTIME_MIN`），而 claim 内部按 `priority DESC` 排序，
+    所以用户随时点一下就能插到自动跟踪的几万行前面。
+    改前两者都是 100，无法区分，用户点击只能和自动跟踪的行一起排队
+    （实测实时车道积压 26,650 条，新点的实例要等 37 分钟）。
+
+    **点击的已结束实例也走 100**：用户显式要求看结果，不该因为实例已结束就被
+    降到背景车道去排几十万条历史的队。所以 clicked=True 时不看 status。
+    """
+    if clicked:
+        return LANE_CLICK
+    return LANE_TRACK if inst_status in ACTIVE_STATUSES else LANE_AUTO
 
 
 def _reset_offsets(conn, instance_id: str) -> None:
@@ -433,7 +477,7 @@ def _submit_incremental(conn, instance_id: str, out_dir: str, priority: int) -> 
     return n_lines, n_sub
 
 
-def run_once(limit: int) -> dict:
+def run_once(limit: int, max_pending: int = DEFAULT_MAX_PENDING) -> dict:
     """投递「点击过的」+「正在跑的」实例，且**只投新增 config**。
 
     点击驱动 + running 自动跟踪：已结束且没点过的实例不在这里处理
@@ -443,10 +487,21 @@ def run_once(limit: int) -> dict:
       · 之后（status='tracking'）：只读新增行，运行中实例新完成的 config 逐轮带进来
     `limit` 参数保留仅为兼容 CLI，不再用于发现范围。
     """
-    stats = {"instances": 0, "lines": 0, "submitted": 0, "clicked": 0}
+    stats = {"instances": 0, "lines": 0, "submitted": 0, "clicked": 0,
+             "pending": 0, "throttled": 0}
     with get_connection() as conn:
+        # 水位：实时车道积压过深时，本轮**只投点击的实例**（用户在等），
+        # 自动跟踪的跳过、下轮再说。offset 不推进，数据不会丢。
+        pending = realtime_lane_pending(conn)
+        stats["pending"] = pending
+        throttle = max_pending > 0 and pending >= max_pending
+
         for inst in pick_clicked(conn):
             iid = inst["instance_id"]
+            clicked = inst.get("src") == 0
+            if throttle and not clicked:
+                stats["throttled"] += 1
+                continue
             out_dir = resolve_output_dir(inst["config_path"])
             if not out_dir:
                 continue
@@ -460,8 +515,11 @@ def run_once(limit: int) -> dict:
                     "UPDATE shallow_requests SET status='tracking' WHERE instance_id=?",
                     (iid,))
 
+            # src=0 是点击登记的（pick_clicked 的 UNION 第一段），src=1 是自动跟踪。
+            # 点击走 100、自动跟踪走 90，两者同在实时车道但点击能插队。
             n_lines, n_sub = _submit_incremental(
-                conn, iid, out_dir, priority=_lane_priority(inst.get("status")))
+                conn, iid, out_dir,
+                priority=_lane_priority(inst.get("status"), clicked=clicked))
             stats["lines"] += n_lines
             stats["submitted"] += n_sub
             stats["clicked"] += n_sub
@@ -474,6 +532,9 @@ def main() -> None:
     ap.add_argument("--once", action="store_true", help="跑一轮即退出")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
                     help=f"轮询间隔秒（默认 {DEFAULT_INTERVAL}）")
+    ap.add_argument("--max-pending", type=int, default=DEFAULT_MAX_PENDING,
+                    help=f"实时车道水位上限，超过就暂停投递自动跟踪的实例"
+                         f"（默认 {DEFAULT_MAX_PENDING}，0=不限）")
     ap.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                     help="已废弃：纯点击驱动不再按范围发现，保留仅为兼容")
     a = ap.parse_args()
@@ -488,10 +549,15 @@ def main() -> None:
         t0 = time.time()
         st: dict = {}
         try:
-            st = run_once(a.limit)
+            st = run_once(a.limit, a.max_pending)
             if st["submitted"] or st["lines"]:
                 print(f"[tracker] 跟踪={st['instances']} 新行={st['lines']} "
-                      f"投递={st['submitted']} {time.time()-t0:.2f}s", flush=True)
+                      f"投递={st['submitted']} 水位={st['pending']:,} "
+                      f"{time.time()-t0:.2f}s", flush=True)
+            elif st.get("throttled"):
+                # 水位满时每轮打一行，否则看起来像 tracker 挂了
+                print(f"[tracker] 水位={st['pending']:,} ≥ {a.max_pending:,}，"
+                      f"暂停 {st['throttled']} 个自动跟踪实例（点击的不受限）", flush=True)
             # 每轮都写心跳（哪怕本轮没有新行）：监控页靠最后心跳时间判断进程存活。
             # processed 记「新投递数」，这才是 tracker 的产出；scanned 放 note 里。
             write_heartbeat(

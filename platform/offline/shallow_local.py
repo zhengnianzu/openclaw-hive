@@ -51,6 +51,7 @@ if PLATFORM_DIR not in sys.path:
 from api.core.database import (                        # noqa: E402
     get_connection, ensure_shallow_extra_columns)
 from src import offline_analysis as oa                # noqa: E402
+from offline.task_tracker import LANE_REALTIME_MIN    # noqa: E402
 from offline.output_worker import _FINAL_STATUS_RE, _logs_dir  # noqa: E402
 from offline.heartbeat import write_heartbeat, write_worker_started  # noqa: E402
 
@@ -125,14 +126,17 @@ def claim(conn, limit: int, lane: str | None = None) -> list[dict]:
     而不是排在历史行后面等几天。注意**不能再带 `priority DESC`** —— 车道已由
     WHERE 分流，再按 priority 排序只会让同优先级内的顺序失去意义。
     """
-    where = ["local_state='queued'", "(priority >= 100 OR attempts < ?)"]
+    where = ["local_state='queued'", f"(priority >= {LANE_REALTIME_MIN} OR attempts < ?)"]
     params: list = [MAX_ATTEMPTS]
     order = "priority DESC, id"
     if lane == "realtime":
-        where.append("priority >= 100")
-        order = "id"
+        where.append(f"priority >= {LANE_REALTIME_MIN}")
+        # 实时车道内按 priority 降序优先：点击(100) 插到自动跟踪(90) 前面。
+        # 只按 id 的话，用户新点的实例要排在自动跟踪的几万行后面
+        # （实测实时车道曾积压 26,650 条 ≈ 37 分钟）。
+        order = "priority DESC, id"
     elif lane == "auto":
-        where.append("priority < 100")
+        where.append(f"priority < {LANE_REALTIME_MIN}")
         order = "id DESC"
     params.append(limit)
     rows = conn.execute(

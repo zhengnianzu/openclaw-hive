@@ -322,18 +322,130 @@ class LanePriorityTest(unittest.TestCase):
     而 auto 的 64 并发全程闲着)。
     """
 
-    def test_active_goes_realtime(self):
+    def test_active_goes_track_lane(self):
+        """running/preparing 自动跟踪 → 90（实时车道，但让位于点击）。"""
         for s in ("running", "preparing"):
-            self.assertEqual(tt._lane_priority(s), tt.LANE_REALTIME, s)
+            self.assertEqual(tt._lane_priority(s), tt.LANE_TRACK, s)
+            self.assertGreaterEqual(tt.LANE_TRACK, tt.LANE_REALTIME_MIN,
+                                    "自动跟踪必须落在实时车道内")
+
+    def test_clicked_outranks_tracking(self):
+        """点击 → 100，严格高于自动跟踪的 90，这样随时能插队。"""
+        self.assertEqual(tt._lane_priority("running", clicked=True), tt.LANE_CLICK)
+        self.assertGreater(tt.LANE_CLICK, tt.LANE_TRACK)
+
+    def test_clicked_ended_instance_still_realtime(self):
+        """点击已结束的实例也走 100 —— 用户显式要求看结果,
+        不该因为实例已结束就被降到背景车道去排几十万条历史的队。"""
+        for s in ("finished", "stopped", "completed"):
+            self.assertEqual(tt._lane_priority(s, clicked=True), tt.LANE_CLICK, s)
 
     def test_ended_goes_auto(self):
         for s in ("finished", "stopped", "completed", "queued", "created"):
             self.assertEqual(tt._lane_priority(s), tt.LANE_AUTO, s)
+            self.assertLess(tt.LANE_AUTO, tt.LANE_REALTIME_MIN)
 
     def test_unknown_goes_auto(self):
         """取不到 status 时走背景车道 —— 宁可慢,不要占实时车道。"""
         self.assertEqual(tt._lane_priority(None), tt.LANE_AUTO)
         self.assertEqual(tt._lane_priority("某个没见过的态"), tt.LANE_AUTO)
+
+
+class ClickJumpsQueueTest(LaneTestBase):
+    """实时车道内点击(100)必须插到自动跟踪(90)前面。
+
+    claim 的 ORDER BY 原来只有 `id`,于是用户新点的实例要排在自动跟踪的几万行
+    后面（实测实时车道积压 26,650 条 ≈ 37 分钟）。现在是 `priority DESC, id`。
+    """
+
+    def _seed_mixed(self):
+        """先插 3 条自动跟踪(90)，再插 1 条点击(100) —— 点击的 id 最大。"""
+        with get_connection() as conn:
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                    " local_state, obs_state, artifact_state) "
+                    "VALUES (?,?,?,'queued','queued','pending_click')",
+                    (IID, f"track{i}.json", tt.LANE_TRACK))
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,?,?,'queued','queued','pending_click')",
+                (IID, "click.json", tt.LANE_CLICK))
+            conn.commit()
+
+    def test_click_claimed_first(self):
+        self._seed_mixed()
+        with get_connection() as conn:
+            got = sl.claim(conn, 10, lane="realtime")
+        self.assertEqual(got[0]["config_name"], "click.json",
+                         "点击的行必须先被领取，哪怕它的 id 最大")
+
+    def test_track_lane_not_leaked_to_auto(self):
+        """90 属于实时车道，不能被 auto 领走。"""
+        self._seed_mixed()
+        with get_connection() as conn:
+            got = sl.claim(conn, 10, lane="auto")
+        self.assertEqual(got, [], "auto 不该领到 priority=90 的行")
+
+
+class TrackerWaterLevelTest(unittest.TestCase):
+    """tracker 的实时车道水位：积压过深时只投点击的实例。
+
+    一个 running 实例可能 10 分钟产出近万个任务（实测 total=10000、
+    10 分钟跑完 9,924 个），而 tracker 每 5 秒投一批、shallow-realtime
+    实测 727 行/分 —— 产出快过消化，队列无界堆积。
+    """
+
+    IID = "__wl_tracker__"
+
+    def setUp(self):
+        init_db()
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        with get_connection() as conn:
+            conn.execute("DELETE FROM shallow_queue WHERE instance_id=?", (self.IID,))
+            conn.execute("DELETE FROM task_records WHERE instance_id=?", (self.IID,))
+            conn.commit()
+
+    def test_counts_realtime_lane_only(self):
+        with get_connection() as conn:
+            before = tt.realtime_lane_pending(conn)
+            # 实时车道的行要计入
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,?,?,'queued','done','pending_click')",
+                (self.IID, "a.json", tt.LANE_TRACK))
+            # 背景车道的不计入
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,?,?,'queued','done','pending_click')",
+                (self.IID, "b.json", tt.LANE_AUTO))
+            conn.commit()
+            self.assertEqual(tt.realtime_lane_pending(conn), before + 1)
+
+    def test_ignores_already_graded_obs_rows(self):
+        """obs_state='queued' 但 traj_level 已写好的遗留行不算水位 ——
+        worker 根本不会领，算进去会让 tracker 永远以为队列满。"""
+        with get_connection() as conn:
+            before = tt.realtime_lane_pending(conn)
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, priority, "
+                " local_state, obs_state, artifact_state) "
+                "VALUES (?,?,?,'done','queued','pending_click')",
+                (self.IID, "c.json", tt.LANE_TRACK))
+            conn.execute(
+                "INSERT INTO task_records (instance_id, config_name, task_idx, "
+                " status, task_done, traj_level) "
+                "VALUES (?,'c.json',0,'任务成功',1,'L2')", (self.IID,))
+            conn.commit()
+            self.assertEqual(tt.realtime_lane_pending(conn), before)
 
 
 class SubmitResetTest(unittest.TestCase):

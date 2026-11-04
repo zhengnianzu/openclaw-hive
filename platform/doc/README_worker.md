@@ -24,10 +24,18 @@
 
 `tracker` 投递时按实例 `status` 决定 `priority`(`_lane_priority()`):
 
-| 实例 status | 车道 | `priority` | 为什么 |
-|------------|------|-----------|--------|
-| `running` / `preparing` | 实时 | 100 | 实例还在产出,用户点开输出页就是在等新完成的任务逐个冒出来。每轮只新增几行,队列天然很短,16/8 并发够用 |
-| `finished` / `stopped` / `completed` / `queued` / `created` | 背景 | 0 | 实例已不动,剩下的是「把几万行历史一次性补全」—— 吞吐活而非响应活,交给 64/16 并发吃满 |
+| 来源 | 车道 | `priority` | 为什么 |
+|------|------|-----------|--------|
+| **用户点了「输出」** | 实时 | **100** (`LANE_CLICK`) | 他正盯着这个实例,最高优先。点击已结束的实例也走 100 —— 显式要求不该被降到背景车道排几十万条历史的队 |
+| **running/preparing 自动跟踪** | 实时 | **90** (`LANE_TRACK`) | 实例还在产出,要秒级增量;但**让位于点击** |
+| 已结束且没点过 | 背景 | **0** (`LANE_AUTO`) | 吞吐活而非响应活,交给 64 并发吃满(由 auto_tracker 投递) |
+
+车道分界线是 `LANE_REALTIME_MIN = 90`(= `LANE_TRACK`):`priority >= 90` 走
+shallow-realtime,`< 90` 走 shallow-auto。两档同在实时车道,靠 claim 的
+**`ORDER BY priority DESC, id`** 让点击插到自动跟踪前面。
+
+> 原来点击和自动跟踪都是 100、无法区分,claim 又只按 `id` 排序 ——
+> 用户新点的实例要排在自动跟踪的几万行后面(实测实时车道积压 26,650 条 ≈ 37 分钟)。
 
 > **踩过的坑**:改前 `priority=100` 是写死的,而 tracker 只扫点击过的实例,
 > 于是**所有行都进实时车道**,shallow-auto 永远分不到活 ——
@@ -92,6 +100,17 @@
 期间用户点下载全部 500),还会把新点击的实例挤在几百万条历史后面。
 每轮一个、投完等 shallow-auto 消化,历史缺口以「实例」为粒度稳步推进,
 任何时刻队列里的背景行都是有界的。实测单实例投 10,000 行耗时 0.48s。
+
+**两个 tracker 都有水位控制**(超过上限就暂停投递,等 worker 消化):
+
+| 进程 | 上限 | 环境变量 | 水位满时的行为 |
+|------|------|---------|--------------|
+| `task_tracker` | 30000 | `TRACKER_MAX_PENDING` | 只投**点击**的实例,自动跟踪的跳过(offset 不推进,数据不丢) |
+| `auto_tracker` | 20000 | `AUTO_TRACKER_MAX_PENDING` | 本轮完全不投 |
+
+没有水位时队列会无界堆积:一个 running 实例可能 10 分钟产出近万个任务
+(实测 total=10000、10 分钟跑完 9,924 个),而 tracker 每 5 秒投一批、
+shallow-realtime 实测 727 行/分 —— 产出快过消化。
 
 `auto_tracker_state` 表记录投过哪些实例。必须记 —— 投完后缺口要等 shallow-auto
 慢慢消化,期间 `traj_level` 仍是 NULL,不记状态下一轮又会选中它、又整扫一遍 jsonl。
@@ -283,8 +302,8 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 
 | 模式 | claim 过滤 | 排序 | 阶段1并发 | 阶段2并发 | 间隔 | 单轮预算 |
 |------|-----------|------|----------|----------|------|---------|
-| `realtime` | `priority >= 100` | `id` 升序 | 16 | 8 | 2s | 10s |
-| `auto` | `priority < 100` | **`id DESC`** | 64 | 16 | 5s | 30s |
+| `realtime` | `priority >= 90` | **`priority DESC, id`** | 48 | 16 | 2s | 10s |
+| `auto` | `priority < 90` | **`id DESC`** | 64 | 16 | 5s | 30s |
 
 命令行可覆盖:`--local-concurrency` / `--obs-concurrency` / `--interval` / `--max-seconds`。
 
@@ -564,6 +583,6 @@ python offline/shallow_worker.py --mode auto --once
 | `api/routers/worker_monitor.py` | 监控接口(overview/queue/trend/eta/reclaim) |
 | `api/routers/artifacts.py` | 交付物工作区(列表/树/内容/入队) |
 | `api/routers/batch_output.py` | 浅层登记、会话详情(deep) |
-| `test/test_shallow_worker.py` | 车道隔离、阶段串联、投递顺序、车道分配、reset 语义、auto-tracker 挑选、水位、tsr 降噪(40 项) |
+| `test/test_shallow_worker.py` | 车道三档(点击/跟踪/背景)、插队、阶段串联、投递顺序、reset 语义、auto-tracker 挑选、两处水位、tsr 降噪(50 项) |
 | `test/test_artifact_queue.py` | 产物状态机(20 项) |
 | `test/test_worker_monitor.py` | 心跳、ETA、回收(11 项) |

@@ -41,6 +41,7 @@ if PLATFORM_DIR not in sys.path:
 from api.core.database import (                        # noqa: E402
     get_connection, ensure_shallow_extra_columns)
 from src import offline_analysis as oa                # noqa: E402
+from offline.task_tracker import LANE_REALTIME_MIN    # noqa: E402
 from offline.output_worker import (                    # noqa: E402
     _fetch_tsr_entries_fast,
     _instance_harness_type,
@@ -114,14 +115,17 @@ def claim(conn, limit: int, lane: str | None = None) -> list[dict]:
       'auto'     → priority<100，id DESC（最新投递优先）
       None       → 不分车道（单独作为调试 CLI 跑时的旧行为）
     """
-    where = ["q.obs_state='queued'", "(q.priority >= 100 OR q.obs_attempts < ?)"]
+    where = ["q.obs_state='queued'", f"(q.priority >= {LANE_REALTIME_MIN} OR q.obs_attempts < ?)"]
     params: list = [MAX_ATTEMPTS]
     order = "q.priority DESC, q.id"
     if lane == "realtime":
-        where.append("q.priority >= 100")
-        order = "q.id"
+        where.append(f"q.priority >= {LANE_REALTIME_MIN}")
+        # 实时车道内按 priority 降序优先：点击(100) 插到自动跟踪(90) 前面。
+        # 只按 id 的话，用户新点的实例要排在自动跟踪的几万行后面
+        # （实测实时车道曾积压 26,650 条 ≈ 37 分钟）。
+        order = "q.priority DESC, q.id"
     elif lane == "auto":
-        where.append("q.priority < 100")
+        where.append(f"q.priority < {LANE_REALTIME_MIN}")
         order = "q.id DESC"
     params.append(limit)
     rows = conn.execute(

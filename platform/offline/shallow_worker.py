@@ -68,7 +68,11 @@ from offline import output_worker as ow                # noqa: E402
 # 每种模式的默认参数。realtime 要的是响应快（短间隔、队列短所以并发不用大），
 # auto 要的是吞吐（并发拉满到各自的饱和点）。
 MODE_DEFAULTS = {
-    "realtime": {"local": 16, "obs": 8,  "interval": 2, "max_seconds": 10},
+    # realtime 的职责从「只处理点击」扩成「点击 + 所有 running 实例的自动跟踪」后,
+    # 16/8 明显偏小：实测一轮只领 160 条、积压 26,650 条要 37 分钟。
+    # 阶段1 是读本地 NFS（约 900 个/秒、无配额），提到 48 没问题。
+    # 阶段2 保持 16 —— OBS 并发超 32 会返回 exit 8，而 auto 那边也占 16，加起来已到 32。
+    "realtime": {"local": 48, "obs": 16, "interval": 2, "max_seconds": 10},
     "auto":     {"local": 64, "obs": 16, "interval": 5, "max_seconds": 30},
 }
 
