@@ -442,6 +442,26 @@ class MirrorBackfillGateTest(unittest.TestCase):
         from api.routers.artifacts import _complete_jsonl_count
         self.assertEqual(_complete_jsonl_count({"config_path": "/nonexistent.yaml"}), 0)
 
+    def test_counts_both_jsonl_files(self):
+        """计数必须 complete + failed 两个文件都算。
+
+        _discover_one_instance 两个文件都投（失败任务 OBS 上同样有 workspace/），
+        这里只数 complete 的话，镜像追平 complete 行数后就不再触发补发现，
+        failed 那几千行永远补不进来 —— 实测单实例 complete 1,060 / failed 8,939。
+        """
+        import tempfile, os as _os
+        from api.routers.artifacts import _complete_jsonl_count
+        d = tempfile.mkdtemp()
+        _os.makedirs(_os.path.join(d, "outputs"), exist_ok=True)
+        out = _os.path.join(d, "outputs")
+        with open(_os.path.join(out, "complete.jsonl"), "w") as f:
+            f.write("a.json\nb.json\n")
+        with open(_os.path.join(out, "failed.jsonl"), "w") as f:
+            f.write("c.json\nd.json\ne.json\n")
+        # resolve_output_dir 回退到 <inst_dir>/outputs，所以 config_path 放在 d 下
+        n = _complete_jsonl_count({"config_path": _os.path.join(d, "config.yaml")})
+        self.assertEqual(n, 5, "应为 complete 2 + failed 3")
+
 
 if __name__ == "__main__":
     unittest.main()

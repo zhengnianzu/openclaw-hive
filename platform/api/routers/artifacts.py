@@ -398,11 +398,15 @@ async def request_artifact_download_batch(
 
 
 def _complete_jsonl_count(inst: dict) -> int:
-    """complete.jsonl 的行数（= 该实例真正跑完、可下载交付物的任务数）。
+    """complete.jsonl + failed.jsonl 的总行数（= 该实例跑过的、OBS 上有前缀的任务数）。
 
-    用来判断镜像表是否落后于实际进度。只数行、不解析内容:
-    单实例实测 922 行约 1 万字节,读一遍是毫秒级;而 running 实例每次打开
-    工作区都会调一次,不能在这里做重活。
+    用来判断镜像表是否落后于实际进度，**必须和 _discover_one_instance 投递的
+    集合同口径** —— 它两个文件都投，这里只数 complete 的话，
+    `n_mirror < count` 会在镜像追平 complete 行数时就不再触发，
+    failed 的那几千行永远补不进来。
+
+    只数行、不解析内容：单实例实测两文件合计约 1 万行、几百 KB，读一遍毫秒级;
+    而 running 实例每次打开工作区都会调一次，不能在这里做重活。
 
     取不到文件（实例目录被清理/还没产出）返回 0 —— 此时镜像有多少就显示多少,
     不触发无意义的补发现。
@@ -412,11 +416,14 @@ def _complete_jsonl_count(inst: dict) -> int:
         out_dir = tt.resolve_output_dir(inst.get("config_path") or "")
         if not out_dir:
             return 0
-        path = tt.find_records(out_dir, "complete.jsonl")
-        if not path:
-            return 0
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return sum(1 for ln in f if ln.strip())
+        total = 0
+        for rec in ("complete.jsonl", "failed.jsonl"):
+            path = tt.find_records(out_dir, rec)
+            if not path:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                total += sum(1 for ln in f if ln.strip())
+        return total
     except OSError:
         return 0
 
@@ -427,7 +434,15 @@ def _discover_one_instance(instance_id: str, inst: dict) -> int:
     复用 task_tracker 的增量读逻辑（resolve_output_dir / find_records / submit_batch），
     不再走 output_worker._discover_artifacts 的全量 UPSERT —— 那个按 configs/ 下
     全部 json 建行，单实例 3.6 万 config，用户点一下就要几十秒到十几分钟。
-    这里只投 complete.jsonl 里真实存在的任务，天然就是「已跑完、可下载」的集合。
+
+    **complete.jsonl 和 failed.jsonl 都投**：失败的任务 OBS 上同样有交付物 ——
+    实测某 failed.jsonl 里的任务，OBS 前缀下有 `workspace/ workdir/ sessions/
+    logs/ .logs/`，和成功任务的结构一样。只投 complete.jsonl 会让工作区
+    看不到这些（实测单实例 complete 1,060 行、failed 8,939 行，89% 被藏起来），
+    而失败任务的 workspace/日志往往正是要排查的对象。
+
+    真的没产出时不会误导：worker 下载后发现 OBS 前缀为空会把状态置 `empty`，
+    前端显示「无产出」（见 ArtifactWorkspace.vue 的 statusLabel）。
     """
     try:
         from offline import task_tracker as tt
@@ -436,14 +451,16 @@ def _discover_one_instance(instance_id: str, inst: dict) -> int:
         out_dir = tt.resolve_output_dir(inst.get("config_path") or "")
         if not out_dir:
             return 0
-        path = tt.find_records(out_dir, "complete.jsonl")
-        if not path:
-            return 0
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                names = [ln.strip() for ln in f if ln.strip()]
-        except OSError:
-            return 0
+        names: list[str] = []
+        for rec in ("complete.jsonl", "failed.jsonl"):
+            path = tt.find_records(out_dir, rec)
+            if not path:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    names.extend(ln.strip() for ln in f if ln.strip())
+            except OSError:
+                continue
         uniq = list(dict.fromkeys(os.path.basename(n) for n in names))
         if not uniq:
             return 0

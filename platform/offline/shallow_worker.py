@@ -191,6 +191,17 @@ def run_once(lane: str, local_conc: int, obs_conc: int, obsutil: str, origin: st
             total["s1_done"] += st1.get("done", 0) + st1.get("done_failed", 0)
             total["s1_skipped"] += st1.get("skipped", 0)
 
+            # 阶段 1 还领满说明本地日志有大量积压；此时**先把阶段 1 连续跑完**，
+            # 不要每轮只跑一批就被阶段 2 的 OBS 往返拖住。
+            #
+            # 实测 realtime：阶段1 积压 12,250 条、阶段2 只有 592 条，而一轮
+            # `阶段1(领=48) 阶段2(领=16) 10.5s` —— 10s 预算几乎全被阶段 2 的
+            # 16 次 OBS 调用吃掉，阶段 1 每 10s 只能推进 48 条（约 264 行/分）。
+            # 阶段 1 是读本地 NFS（约 900 个/秒、无配额），本该快得多。
+            if st1.get("claimed", 0) >= local_conc and \
+                    (max_seconds <= 0 or (time.time() - t_start) < max_seconds):
+                continue
+
             st2 = run_stage2(lane, obs_conc, cache2, obsutil, origin, pool)
             total["s2_claimed"] += st2.get("claimed", 0)
             total["s2_done"] += st2.get("done", 0)

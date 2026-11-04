@@ -14,9 +14,15 @@
           ? (totalSubtasks - counts.artifact_not_complete) : '—' }} · 未跑 {{ counts.artifact_not_complete }}</div>
       </div>
       <div class="wm-kpi">
-        <div class="wm-kpi-label">下载队列</div>
-        <div class="wm-kpi-value warn">{{ counts.artifact_pending }}</div>
-        <div class="wm-kpi-sub">下载中 {{ counts.artifact_downloading }} · 失败 {{ counts.artifact_failed }}</div>
+        <!-- 产物已改纯点击驱动：artifact_pending/downloading 结构上恒为 0
+             （没人点就不入队），盯这两个数永远是 0，没有信息量。
+             改成看「待点开」与「已下载」—— 前者是可下载但没人要的量。 -->
+        <div class="wm-kpi-label">交付物待点开</div>
+        <div class="wm-kpi-value">{{ fmtNum(counts.artifact_pending_click) }}</div>
+        <div class="wm-kpi-sub">
+          排队中 {{ counts.artifact_pending ?? 0 }} · 下载中 {{ counts.artifact_downloading ?? 0 }}
+          · 失败 {{ counts.artifact_failed ?? 0 }}
+        </div>
       </div>
       <div class="wm-kpi">
         <div class="wm-kpi-label">已下载</div>
@@ -78,46 +84,46 @@
       <el-col :xs="24" :lg="8">
         <div class="glass-card panel">
           <div class="panel-head">
-            <span class="panel-title">浅层分级进度</span>
-            <span class="panel-hint">
-              {{ counts.shallow_progress != null ? counts.shallow_progress + '%' : '—' }}
+            <span class="panel-title">车道负载</span>
+            <span class="panel-hint" :class="{ bad: anyOverloaded }">
+              {{ anyOverloaded ? '有车道过载' : '正常' }}
             </span>
           </div>
-          <div class="wm-eta-grid" style="margin-top:4px">
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ fmtNum(counts.shallow_graded) }}</span>
-              <span class="wm-eta-label">已分级</span>
+          <!-- 原来这里是「浅层分级进度」：只给全库累计的已分级/待分级（1000 万量级
+               的静态数字），看不出此刻堵不堵。改成按车道看实际负载 ——
+               排队多少 / 吞吐多少 / 多久清完 / 新增会不会压过消化。 -->
+          <div v-if="!lanes.length" class="wm-dim" style="margin-top:8px">加载中…</div>
+          <div v-for="L in lanes" :key="L.lane" class="wm-lane">
+            <div class="wm-lane-head">
+              <span class="wm-lane-name">{{ L.label }}</span>
+              <el-tag v-if="L.overloaded" type="danger" size="small" effect="plain">
+                {{ L.throughput_per_min > 0 ? '积压中' : '无吞吐' }}
+              </el-tag>
+              <span v-else-if="!L.pending" class="wm-lane-ok">空闲</span>
             </div>
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ fmtNum(counts.shallow_pending) }}</span>
-              <span class="wm-eta-label">待分级</span>
-            </div>
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ fmtNum(counts.shallow_failed) }}</span>
-              <span class="wm-eta-label">失败</span>
-            </div>
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ fmtNum(counts.shallow_total) }}</span>
-              <span class="wm-eta-label">总数</span>
+            <div class="wm-lane-nums">
+              <span><b>{{ fmtNum(L.pending) }}</b> 待办</span>
+              <span>消化 <b>{{ L.throughput_per_min }}</b>/分</span>
+              <span :class="{ bad: L.overloaded && L.inflow_per_min > L.throughput_per_min }">
+                新增 <b>{{ L.inflow_per_min }}</b>/分
+              </span>
+              <span>预计 <b>{{ fmtEta(L.eta_seconds) }}</b></span>
             </div>
           </div>
-          <el-progress
-            :percentage="counts.shallow_progress || 0"
-            :stroke-width="10"
-            :show-text="false"
-            color="#2a78d6"
-            style="margin-top:12px"
-          />
           <div class="wm-dim" style="margin-top:8px">
-            进度 = 已分级 / 总数（数据源 task_records.traj_level）
+            「新增 &gt; 消化」且有待办 = 会持续积压；吞吐为 0 但有待办 = worker 可能卡住
           </div>
         </div>
       </el-col>
     </el-row>
 
-    <!-- ===== 负载趋势 + 预计完成 ===== -->
+    <!-- ===== 负载趋势 ===== -->
+    <!-- 原来这一行右侧是「执行时间估计」面板：它的三个数（预计总耗时/任务每分钟/
+         待下载）全部取自产物车道，而产物已改纯点击驱动、队列恒为 0，算出来永远是
+         「—」。而且「车道负载」面板已经按车道给出了同样的信息且更全（含新增速率
+         与过载判定），所以删掉，趋势图占满整行。 -->
     <el-row :gutter="16">
-      <el-col :xs="24" :lg="16">
+      <el-col :span="24">
         <div class="glass-card panel">
           <div class="panel-head">
             <span class="panel-title">下载趋势（近 {{ trendHours }} 小时）</span>
@@ -129,31 +135,6 @@
           </div>
           <EChart v-if="trendPoints.length" :option="trendOption" height="220px" />
           <el-empty v-else description="暂无心跳数据（worker 跑过一轮后出现）" :image-size="50" />
-        </div>
-      </el-col>
-
-      <el-col :xs="24" :lg="8">
-        <div class="glass-card panel">
-          <div class="panel-head"><span class="panel-title">执行时间估计</span></div>
-          <div class="wm-eta-grid">
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ eta?.remaining_seconds ? fmtDuration(eta.remaining_seconds) : '—' }}</span>
-              <span class="wm-eta-label">预计总耗时</span>
-            </div>
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ eta?.throughput_per_minute ?? '—' }}</span>
-              <span class="wm-eta-label">任务/分钟</span>
-            </div>
-            <div class="wm-eta-item">
-              <span class="wm-eta-num">{{ eta?.pending ?? '—' }}</span>
-              <span class="wm-eta-label">待下载</span>
-            </div>
-          </div>
-          <div class="wm-dim" style="margin-top:10px">
-            预计完成：
-            <b v-if="eta?.estimated_finish_at">{{ eta.estimated_finish_at.replace('T', ' ') }}</b>
-            <span v-else>无法估算（近期无下载产出）</span>
-          </div>
         </div>
       </el-col>
     </el-row>
@@ -238,7 +219,6 @@ const reclaiming = ref(false)
 const workers = ref([])
 const counts = ref({})
 const disk = ref(null)
-const eta = ref(null)
 const queueItems = ref([])
 const queueTab = ref('active')
 const trendPoints = ref([])
@@ -265,6 +245,19 @@ const statusTagType = s => ({
 }[s] || 'info')
 
 // 千分位格式化；null/undefined 显示「—」而不是 0，避免把「还没数据」误显示成 0
+// 车道负载（/worker-monitor/load）：排队 / 吞吐 / 新增 / 预计清完
+const lanes = ref([])
+const anyOverloaded = computed(() => lanes.value.some(l => l.overloaded))
+
+// 预计清完时间：秒 → 人话。null 表示吞吐为 0 算不出来（不编假数字）。
+function fmtEta(sec) {
+  if (sec == null) return '—'
+  if (sec < 60) return `${Math.round(sec)} 秒`
+  if (sec < 3600) return `${Math.round(sec / 60)} 分钟`
+  if (sec < 86400) return `${(sec / 3600).toFixed(1)} 小时`
+  return `${(sec / 86400).toFixed(1)} 天`
+}
+
 function fmtNum(n) {
   if (n == null) return '—'
   return Number(n).toLocaleString('en-US')
@@ -410,17 +403,20 @@ async function loadAll() {
   try {
     // 注意：这里用 Promise.all，任何一支超时都会让整块面板空白。
     // 所以每个请求都必须足够快（/queue 曾经 50s 超时，就是因为这个整片空白）。
-    const [ov, et, q] = await Promise.all([
+    // 不再请求 /eta：它的消费方「执行时间估计」面板已删除（那三个数全取自
+    // 产物车道，而产物纯点击驱动、队列恒为 0）。少一个请求也少一次 2.4s 的
+    // _queue_counts 全表聚合（已加 5s 缓存，但能不发就不发）。
+    const [ov, q, ld] = await Promise.all([
       api.get('/worker-monitor/overview', { silent: true }),
-      api.get('/worker-monitor/eta', { silent: true }),
       api.get(`/worker-monitor/queue?status=${queueTab.value}&limit=50`, { silent: true }),
+      api.get('/worker-monitor/load?window_minutes=10', { silent: true }),
     ])
     workers.value = ov.workers || []
     counts.value = ov.queue || {}
     disk.value = ov.disk || null
     generatedAt.value = (ov.generated_at || '').replace('T', ' ')
-    eta.value = et
     queueItems.value = q.items || []
+    lanes.value = ld.lanes || []
   } catch { /* 单块失败不影响其他块 */ }
   finally { loading.value = false }
   loadTrend()
@@ -488,6 +484,16 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .wm-dot.offline { background: #c0c4cc; }
 
 .wm-eta-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+/* 车道负载面板 */
+.wm-lane { padding: 8px 0; border-bottom: 1px solid var(--border-color, #ebeef5); }
+.wm-lane:last-of-type { border-bottom: none; }
+.wm-lane-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.wm-lane-name { font-size: 13px; font-weight: 500; }
+.wm-lane-ok { font-size: 11px; color: var(--text-muted, #909399); }
+.wm-lane-nums { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px;
+  color: var(--text-muted, #909399); }
+.wm-lane-nums b { color: var(--text-primary, #303133); font-variant-numeric: tabular-nums; }
+.wm-lane-nums .bad b, .panel-hint.bad { color: #ef4444; }
 .wm-eta-item {
   background: #fafbfd; border-radius: 8px; padding: 12px 10px; text-align: center;
 }

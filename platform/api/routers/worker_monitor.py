@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
@@ -285,7 +286,37 @@ def _artifact_bytes_total() -> int:
     return (row["s"] if row else 0) or 0
 
 
+# _queue_counts 的短 TTL 缓存：被 4 个接口共用，看板一次加载并发调 3 个。
+# 用锁保护 —— uvicorn 的 async_execute 把它丢进线程池，多请求会并发进来。
+_QC_TTL = 5.0
+_QC_LOCK = threading.Lock()
+_QC_CACHE: list = []
+
+
 def _queue_counts() -> dict:
+    """看板的队列/进度汇总。**带 5s TTL 缓存** —— 它被 4 个接口共用
+    （overview / queue / trend / stats），而看板一次加载会并发调 3 个，
+    不缓存就要把同样的全表扫描跑 3 遍。
+
+    为什么慢：里面有几条对 1000 万行表的全表聚合 —— 实测
+      · task_traj_records 按 artifacts_status 分组   0.81s
+      · task_records 的 L0~L3 / NULL / failed 五项聚合 0.94s
+      · shallow_queue 的车道计数（含两个 EXISTS 子查询） 0.44s
+    合计约 2.4s。三个接口各跑一遍 = 每次打开看板 7s+，30s 轮询又来一轮。
+    5s TTL 足够让「同一次页面加载的 3 个并发请求」只算一次，
+    又不会让看板数据看起来停滞（轮询间隔是 30s）。
+    """
+    now = time.time()
+    with _QC_LOCK:
+        if _QC_CACHE and now - _QC_CACHE[1] < _QC_TTL:
+            return _QC_CACHE[0]
+    data = _queue_counts_uncached()
+    with _QC_LOCK:
+        _QC_CACHE[:] = [data, now]
+    return data
+
+
+def _queue_counts_uncached() -> dict:
     with get_connection() as conn:
         # 唯一的状态机就是产物下载（artifacts_status）。原 traj_status/status 驱动的
         # 「深层下载」已取消：那两列恒为 'done'，按它统计永远返回 0，只会误导看板。
@@ -326,13 +357,13 @@ def _queue_counts() -> dict:
         # 算进待办会让看板显示永远清不完的假积压。
         lane_row = conn.execute(
             "SELECT "
-            "  SUM(CASE WHEN priority >= 100 AND local_state='queued' "
+            "  SUM(CASE WHEN priority >= 90 AND local_state='queued' "
             "           THEN 1 ELSE 0 END) rt_s1, "
-            "  SUM(CASE WHEN priority >= 100 AND obs_state='queued' AND "
+            "  SUM(CASE WHEN priority >= 90 AND obs_state='queued' AND "
             + _OBS_CLAIMABLE + " THEN 1 ELSE 0 END) rt_s2, "
-            "  SUM(CASE WHEN priority < 100 AND local_state='queued' "
+            "  SUM(CASE WHEN priority < 90 AND local_state='queued' "
             "           THEN 1 ELSE 0 END) auto_s1, "
-            "  SUM(CASE WHEN priority < 100 AND obs_state='queued' AND "
+            "  SUM(CASE WHEN priority < 90 AND obs_state='queued' AND "
             + _OBS_CLAIMABLE + " THEN 1 ELSE 0 END) auto_s2, "
             "  SUM(CASE WHEN artifact_state='queued' THEN 1 ELSE 0 END) art_q, "
             "  SUM(CASE WHEN artifact_state='pending_click' THEN 1 ELSE 0 END) art_pc "
@@ -647,12 +678,12 @@ _ETA_LANES = {
     "shallow_realtime": (
         ("shallow-realtime",),
         "(local_state='queued' OR (obs_state='queued' AND " + _OBS_CLAIMABLE + ")) "
-        "AND priority >= 100",
+        "AND priority >= 90",      # LANE_REALTIME_MIN（点击 100 + 自动跟踪 90）
     ),
     "shallow_auto": (
         ("shallow-auto",),
         "(local_state='queued' OR (obs_state='queued' AND " + _OBS_CLAIMABLE + ")) "
-        "AND priority < 100",
+        "AND priority < 90",
     ),
     # 产物只有实时车道（不设 deep-auto：全量下载会写爆磁盘）。
     # 兼容旧进程名 deep/realtime/artifacts，免得改名后看板读不到历史吞吐。
@@ -681,6 +712,80 @@ def _eta_inputs(window_minutes: int) -> dict:
                 f"SELECT COUNT(*) n FROM shallow_queue WHERE {where}").fetchone()["n"]
             out[lane] = (row["p"] or 0, pending or 0)
     return out
+
+
+@router.get("/load")
+async def load(
+    window_minutes: int = Query(default=10, ge=2, le=120),
+    user: dict = Depends(require_operator),
+):
+    """按车道的**实际负载**：排队多少 / 吞吐多少 / 多久清完 / 会不会积压。
+
+    这是看板最该回答的四个问题，原来的「浅层分级进度」只给全库累计的
+    已分级/待分级（1000 万量级的静态数字），看不出此刻堵不堵。
+
+    每条车道返回：
+      pending      当前待办行数（与 worker 的 claim 条件同口径）
+      throughput   实测吞吐（行/分，取自 worker_heartbeats.processed）
+      inflow       新增投递速率（行/分，取 tracker / auto-tracker 的 processed）
+      eta_seconds  按当前吞吐清空 pending 需要多久（吞吐为 0 时 null）
+      overloaded   inflow > throughput 且 pending 在涨 → 会持续积压
+    """
+    data = await async_execute(_load_inputs, window_minutes)
+    return {"window_minutes": window_minutes, **data}
+
+
+# 投递方 → 它喂的车道。tracker 投点击(100)和自动跟踪(90)，都进实时车道；
+# auto-tracker 只投背景车道(0)。
+_INFLOW_WORKERS = {
+    "shallow_realtime": ("tracker",),
+    "shallow_auto": ("auto-tracker",),
+    # 产物没有自动投递方（纯点击驱动），inflow 恒 0
+    "artifact": (),
+}
+_LANE_LABEL = {
+    "shallow_realtime": "实时分析（点击 + 运行中实例）",
+    "shallow_auto": "背景分析（历史补全）",
+    "artifact": "交付物下载（点击触发）",
+}
+
+
+def _load_inputs(window_minutes: int) -> dict:
+    """每条车道的 pending / 吞吐 / 新增速率 / ETA / 过载判定。"""
+    since = time.time() - window_minutes * 60
+    lanes = []
+    with get_connection() as conn:
+        def _sum(workers: tuple) -> int:
+            if not workers:
+                return 0
+            marks = ",".join("?" * len(workers))
+            row = conn.execute(
+                "SELECT COALESCE(SUM(processed),0) p FROM worker_heartbeats "
+                f"WHERE round_start >= ? AND round_start > 0 AND worker IN ({marks})",
+                (since, *workers)).fetchone()
+            return row["p"] or 0
+
+        for key, (workers, where) in _ETA_LANES.items():
+            pending = conn.execute(
+                f"SELECT COUNT(*) n FROM shallow_queue WHERE {where}").fetchone()["n"]
+            done = _sum(workers)
+            inflow = _sum(_INFLOW_WORKERS.get(key, ()))
+            tp = done / window_minutes
+            inf = inflow / window_minutes
+            eta = round(pending / tp * 60) if tp > 0 and pending > 0 else None
+            lanes.append({
+                "lane": key,
+                "label": _LANE_LABEL.get(key, key),
+                "pending": pending,
+                "throughput_per_min": round(tp, 1),
+                "inflow_per_min": round(inf, 1),
+                "eta_seconds": eta,
+                # 过载：进得比出得快，且已经有积压 —— 再等下去只会更堵。
+                # 吞吐为 0 但有积压也算过载（worker 挂了/被锁住）。
+                "overloaded": bool(pending > 0 and (inf > tp or tp == 0)),
+                "workers": list(workers),
+            })
+    return {"lanes": lanes}
 
 
 @router.post("/reclaim")
