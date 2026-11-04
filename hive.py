@@ -87,6 +87,11 @@ _FW: dict = _FRAMEWORK_LAYOUTS["openclaw"]
 _JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
 
 
+def _sandbox_home(sandbox_type: str) -> str:
+    """Return the fixed home directory for the selected sandbox platform."""
+    return r"C:\Users\win11admin" if sandbox_type == "windows" else "/home/ma-user"
+
+
 def set_agent_framework(name: str, sandbox_type: str = "x86_cpu", home: str = "/home/ma-user") -> str:
     """Set the module-level framework layout switch. Called from ``main()`` exactly once.
 
@@ -106,8 +111,14 @@ def set_agent_framework(name: str, sandbox_type: str = "x86_cpu", home: str = "/
     return name
 
 
-def get_obsutil_downloader_command(s3_config, objects_storage_path, bucket_path):
+def get_obsutil_downloader_command(
+    s3_config, objects_storage_path, bucket_path, *, incremental=False, jobs=None
+):
     command = f"{s3_config.s3_download_script} cp {s3_config.bucket_name}/{bucket_path} {objects_storage_path} -r -f"
+    if incremental:
+        command += " -u"
+    if jobs is not None:
+        command += f" -j={jobs}"
     return command
 
 
@@ -205,7 +216,7 @@ class SandboxConfig:
     """Sandbox environment configuration."""
     sandbox_type: str = "x86_cpu"   # "x86_cpu"(Linux) | "windows" — 决定路径/命令形态
     harness_type: str = "openclaw"  # 框架名(openclaw/hermes/opencode/...), 注入自 run_cfg.harness_type
-    home: str = "/home/ma-user"
+    home: str = ""
     workspace: str = ""
     result_workdir: str = ""
     result_log: str = "run.log"
@@ -225,6 +236,8 @@ class SandboxConfig:
 
     def __post_init__(self):
         # 路径按 sandbox_type 选 Pure*Path 派生; Linux 结果与旧类体默认值逐字节一致。
+        if not self.home:
+            self.home = _sandbox_home(self.sandbox_type)
         cls = PureWindowsPath if self.sandbox_type == "windows" else PurePosixPath
         if not self.workspace:
             self.workspace = str(cls(self.home, "workspace"))
@@ -233,7 +246,10 @@ class SandboxConfig:
         if not self.data_config_path:
             self.data_config_path = str(cls(self.workspace, "config"))
         if not self.default_skill_path:
-            self.default_skill_path = str(cls(self.harness_dir, "skills"))
+            if self.harness_type in _JIUWENSWARM_TYPES:
+                self.default_skill_path = str(cls(_FW["workspace_base"], "skills"))
+            else:
+                self.default_skill_path = str(cls(self.harness_dir, "skills"))
         if self.sandbox_type == "windows":
             self.openclaw_bash = "openclaw"
 
@@ -254,7 +270,7 @@ class TaskConfig:
     main_code_tar: str = "uploads/openclaw-task.tar"
     main_code_dir: str = ""
     main_python_file: str = "harness_automation.py"
-    main_python_timeout: int = 7200
+    main_python_timeout: int = 36000
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
@@ -906,7 +922,6 @@ class OpenClawDistillationTask:
             raise HiveError("S008", detail=python_file, sandbox_result=result)
         self.logger.info(f"Script completed: {python_file}")
 
-
     async def _download_s3_skills(self, data_config_file: str, sandbox_type: str) -> None:
         """Fetch task/default skills into the sandbox.
 
@@ -963,6 +978,8 @@ class OpenClawDistillationTask:
                     self.client_config.s3,
                     objects_storage_path=target_path,
                     bucket_path=bucket_path,
+                    incremental=True,
+                    jobs=2,
                 )
                 if sandbox_type == "windows":
                     inner = ["cmd.exe", "/c", f'mkdir "{target_path}" & {obs_cmd}']
@@ -971,28 +988,69 @@ class OpenClawDistillationTask:
             await self._run_skill_cmd(inner, detail=skill_path)
 
         start_time = time.time()
-        tasks = [download_skill(s, task_target_path) for s in set(task_skills)]
-        tasks += [download_skill(s, default_target_path) for s in set(default_skills)]
-        await asyncio.gather(*tasks)
+        unique_task_skills = list(dict.fromkeys(task_skills))
+        unique_default_skills = list(dict.fromkeys(default_skills))
+        downloads = [
+            ("task", skill, task_target_path) for skill in unique_task_skills
+        ] + [
+            ("default", skill, default_target_path) for skill in unique_default_skills
+        ]
+        for index, (kind, skill, target_path) in enumerate(downloads, 1):
+            self.logger.info(
+                f"Downloading skill sequentially ({index}/{len(downloads)}): "
+                f"kind={kind} skill={skill}"
+            )
+            await download_skill(skill, target_path)
         mode = "local-cp" if is_local else "obsutil"
         self.logger.info(
-            f"Downloaded skills ({mode}: task={len(set(task_skills))}, "
-            f"default={len(set(default_skills))}) in {time.time() - start_time:.1f}s"
+            f"Downloaded skills ({mode}: task={len(unique_task_skills)}, "
+            f"default={len(unique_default_skills)}) in {time.time() - start_time:.1f}s"
         )
 
     async def _run_skill_cmd(self, command: str | list[str], *, detail: str) -> None:
-        """在沙箱里执行 skill 相关命令, 统一 [S005] 错误处理。"""
-        exec_request = ExtendExecCommand(
-            command=["/bin/bash", "-c", command] if isinstance(command, str) else command,
-            timeout=self.config.obs_config.download_timeout,
-            mode="stream",
-        )
-        result = await self.execution_client.extend(args=exec_request.to_dict())
-        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            self.logger.error(f"[S005] skill fetch failed: {detail}")
-            _log_sandbox_detail(self.logger, f"skill fetch failed — {detail}",
-                                result, level=logging.ERROR)
-            raise HiveError("S005", detail=detail, sandbox_result=result)
+        """在沙箱里执行 skill 命令；瞬时失败重试，耗尽后抛出 S005。"""
+        skill_download_retries = 3
+        attempts = skill_download_retries + 1
+
+        for attempt in range(1, attempts + 1):
+            exec_request = ExtendExecCommand(
+                command=["/bin/bash", "-c", command]
+                if isinstance(command, str) else command,
+                timeout=self.config.obs_config.download_timeout,
+                mode="stream",
+            )
+            try:
+                result = await self.execution_client.extend(args=exec_request.to_dict())
+                data = (result.data or {}) if result else {}
+                exit_code = data.get("exit_code")
+                if result and result.code == ErrorCode.SUCCESS[0] and exit_code == 0:
+                    if attempt > 1:
+                        self.logger.info(
+                            f"Skill fetch recovered: {detail}, attempt={attempt}/{attempts}"
+                        )
+                    return
+                if attempt == attempts:
+                    _log_sandbox_detail(
+                        self.logger,
+                        f"skill fetch failed after {attempts} attempts — {detail}",
+                        result,
+                        level=logging.ERROR,
+                    )
+            except Exception as exc:
+                if attempt == attempts:
+                    self.logger.error(
+                        f"Skill fetch failed after {attempts} attempts: "
+                        f"{detail}: {type(exc).__name__}: {exc}"
+                    )
+
+            if attempt < attempts:
+                # 与上传重试保持一致：随机错开并发任务，削弱 OBS 流量高峰。
+                delay = random.uniform(0, 60)
+                await asyncio.sleep(delay)
+
+        failure_detail = f"{detail}; attempts={attempts}"
+        self.logger.error(f"[S005] skill fetch failed: {failure_detail}")
+        raise HiveError("S005", detail=failure_detail)
 
     async def _download_s3_user_profile(self, data_config_file: str, sandbox_type: str) -> None:
         """Download user profile from S3 to sandbox."""
@@ -1854,7 +1912,7 @@ def main() -> None:
     run_cfg = config_obj.run_config
     sandbox_keys = list(config_obj.sandbox.keys())
     sandbox_type = sandbox_keys[0] if sandbox_keys else "x86_cpu"
-    sandbox_home = run_cfg.sandbox.get("home") or "/home/ma-user"
+    sandbox_home = run_cfg.sandbox.get("home") or _sandbox_home(sandbox_type)
     harness_type = set_agent_framework(run_cfg.harness_type, sandbox_type, sandbox_home)
     print(f"  Framework: {harness_type}")
 
@@ -1877,12 +1935,15 @@ def main() -> None:
     print(f"  Output dir: {task_dict['task_output_path']}")
     print("=" * 60)
 
+    sandbox_dict = _compat_sandbox(run_cfg.sandbox)
+    sandbox_dict["home"] = sandbox_home
+
     task_config = TaskConfig(
         run_config_file=args.config,
         **task_dict,
         obs_config=ObsBucketConfig(**run_cfg.obs),
         sandbox_config=SandboxConfig(
-            **_compat_sandbox(run_cfg.sandbox),
+            **sandbox_dict,
             sandbox_type=sandbox_type,
             harness_type=harness_type,
             image=str(config_obj.sandbox[sandbox_type].get("sandbox", {}).get("image") or ""),
