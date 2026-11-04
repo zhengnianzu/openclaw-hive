@@ -426,6 +426,9 @@ def _queue_page(limit: int, status: str) -> list[dict]:
     where = {
         # empty 是终态（OBS 前缀确实为空、沙箱没产出），不该出现在「活跃队列」里 ——
         # 它不是待处理的积压，混进去会让运维以为还有活没干完。
+        # 前端标签叫「下载失败」。仍保留 queued/downloading：产物纯点击驱动下
+        # 它们结构上恒为 0，但用户点了「下载交付物」的那几秒里确实会短暂出现，
+        # 一并列出才不会让人以为点击没生效。
         "active": "a.artifacts_status IN ('queued','downloading','failed','skipped')",
         "done": "a.artifacts_status='done'",
         "empty": "a.artifacts_status='empty'",

@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -190,6 +191,23 @@ def _task_idx_map(inst: dict) -> dict:
     return {name: i for i, name in enumerate(names)}
 
 
+# 每实例一把锁，用于 inst_cache 的填充（防缓存击穿，见 judge_one 里的说明）。
+# 自身用一把全局锁保护创建；锁对象很小，不清理也不会涨（实例数量级是千）。
+_INST_LOCKS: dict[str, threading.Lock] = {}
+_INST_LOCKS_GUARD = threading.Lock()
+
+
+def _inst_lock(iid: str) -> threading.Lock:
+    lk = _INST_LOCKS.get(iid)
+    if lk is None:
+        with _INST_LOCKS_GUARD:
+            lk = _INST_LOCKS.get(iid)
+            if lk is None:
+                lk = threading.Lock()
+                _INST_LOCKS[iid] = lk
+    return lk
+
+
 def judge_one(item: dict, inst_cache: dict) -> tuple[str, int | None, str]:
     """判一条。返回 (state, task_done, note)。
 
@@ -204,14 +222,26 @@ def judge_one(item: dict, inst_cache: dict) -> tuple[str, int | None, str]:
     iid = item["instance_id"]
     cached = inst_cache.get(iid)
     if cached is None:
-        with get_connection() as c:
-            row = c.execute("SELECT id, config_path FROM task_instances WHERE id=?",
-                            (iid,)).fetchone()
-        inst = dict(row) if row else None
-        # 实例不存在时也缓存 (None, None, {})，避免每条都去查一次库
-        cached = (inst, _logs_dir(inst) if inst else None,
-                  _task_idx_map(inst) if inst else {})
-        inst_cache[iid] = cached
+        # **按实例加锁**：一轮领的 48~64 条往往全来自同一个实例（实测 48/48），
+        # 冷 cache 时所有线程都看到 None、各自跑一遍昂贵的填充 ——
+        #   _logs_dir      → OmegaConf.load 解析 config.yaml   0.037s
+        #   _task_idx_map  → listdir 一个 5,591 文件的 NFS 目录 0.048s
+        # 48 个线程同时做 = 典型的缓存击穿（thundering herd）。
+        # 实测 48 条并发 judge_one 要 5.61s，而暖 cache 后单条只要 0.002s
+        # （48 条串行仅 0.1s）—— 56 倍的差距全在这。
+        lock = _inst_lock(iid)
+        with lock:
+            cached = inst_cache.get(iid)          # 双重检查：可能已被别的线程填好
+            if cached is None:
+                with get_connection() as c:
+                    row = c.execute(
+                        "SELECT id, config_path FROM task_instances WHERE id=?",
+                        (iid,)).fetchone()
+                inst = dict(row) if row else None
+                # 实例不存在时也缓存 (None, None, {})，避免每条都去查一次库
+                cached = (inst, _logs_dir(inst) if inst else None,
+                          _task_idx_map(inst) if inst else {})
+                inst_cache[iid] = cached
     inst, logs_dir, idx_map = cached
     if not inst:
         return "skipped", 0, "实例已不存在"

@@ -139,14 +139,21 @@
       </el-col>
     </el-row>
 
-    <!-- ===== 队列明细 ===== -->
+    <!-- ===== 交付物下载明细 ===== -->
+    <!-- 原来叫「下载队列」、默认标签叫「活跃」—— 但产物已改纯点击驱动：
+         queued/downloading 结构上恒为 0（没人点就不入队），而 'active' 的筛选
+         条件里混了 failed/skipped 两个**终态**，于是这个「队列」里永远只有死行
+         （实测全库 active = failed 166 + skipped 6，queued/downloading 都是 0）。
+         改名为「交付物下载明细」，默认看「下载失败」—— 那才是这张表真正的用处
+         （带错误原因 + 「回收卡住任务」按钮，是排查入口）。 -->
     <div class="glass-card panel">
       <div class="panel-head">
-        <span class="panel-title">下载队列 <span class="wm-count">{{ queueItems.length }}</span></span>
+        <span class="panel-title">交付物下载明细 <span class="wm-count">{{ queueItems.length }}</span></span>
         <div style="display:flex;gap:8px;align-items:center">
           <el-radio-group v-model="queueTab" size="small" @change="loadQueue">
-            <el-radio-button value="active">活跃</el-radio-button>
-            <el-radio-button value="done">已完成</el-radio-button>
+            <el-radio-button value="active">下载失败</el-radio-button>
+            <el-radio-button value="done">已下载</el-radio-button>
+            <el-radio-button value="empty">无产出</el-radio-button>
           </el-radio-group>
           <el-button v-if="isOperator" size="small" :loading="reclaiming" @click="reclaim">
             回收卡住任务

@@ -784,6 +784,126 @@ ERROR_CATALOG: dict = {
 }
 
 
+# ============================================================================
+# Error policy — 「这个错该怎么办」
+# ============================================================================
+# ERROR_CATALOG 按**来源**分类(C/S/T), 但来源相同的错处置方式可能完全相反:
+# S005(下载抖动)该重试, S003(镜像配错)重试一万次也没用。所以另立一张按**处置**
+# 分类的表, 供重试逻辑与 ThrottleController 查询。
+#
+#   retry      瞬时故障, 重试即可挽回 → 按 max_retries 退避重试
+#   throttle   容量压力, 重试只会加剧 → 不重试, 喂给 ThrottleController 降并发/熔断
+#   fail_fast  配置/环境错误, 重试无意义 → 不重试, 尽早让用户去改配置
+#   task_side  任务侧正常损耗, 不是基础设施问题 → 不重试, 也不该触发降并发
+#
+# 实测依据(近 7 天 147 万条 task_records): C003 随并发单调上升(并发<100 时 1.28%,
+# 1000+ 时 6.12%), 且呈「整实例全军覆没」形态(最坏 1688/1688 全损); 而 S008 的
+# 失败平铺在各实例, 是逐任务方差。两者形状相反, 故分属 throttle 与 task_side。
+POLICY_RETRY = "retry"
+POLICY_THROTTLE = "throttle"
+POLICY_FAIL_FAST = "fail_fast"
+POLICY_TASK_SIDE = "task_side"
+
+ERROR_POLICY: dict = {
+    # -- 可重试: 瞬时故障 --
+    # C003 是特例: 一个码三种原因, 处置相反, 必须按 detail 二次分类(见 classify_c003)
+    "C003": {"policy": POLICY_THROTTLE, "max_retries": 3, "detail_classified": True},
+    "C002": {"policy": POLICY_RETRY, "max_retries": 3},
+    "S004": {"policy": POLICY_RETRY, "max_retries": 3},
+    # 下载类: 单次抖动该重试, 但整实例全失败就是路径配错了(实测有 10000/10000
+    # 全 S005 的实例, 所有 skill 一个都没下来)。config_error_ratio 是转 fail_fast
+    # 的阈值, 由调用方按实例累计失败率判定。
+    "S005": {"policy": POLICY_RETRY, "max_retries": 3, "config_error_ratio": 0.8},
+    "S006": {"policy": POLICY_RETRY, "max_retries": 3, "config_error_ratio": 0.8},
+    "S007": {"policy": POLICY_RETRY, "max_retries": 3, "config_error_ratio": 0.8},
+    "S009": {"policy": POLICY_RETRY, "max_retries": 3},
+    # T007 超时重试一次就够: agent 已经跑了很久, 重试成本高、收益低
+    "T007": {"policy": POLICY_RETRY, "max_retries": 1},
+
+    # -- 应降并发/熔断: 容量压力 --
+    "S001": {"policy": POLICY_THROTTLE},
+    "S002": {"policy": POLICY_THROTTLE},
+
+    # -- 应快速失败: 配置/环境错误 --
+    "C001": {"policy": POLICY_FAIL_FAST},
+    "C004": {"policy": POLICY_FAIL_FAST},
+    "S003": {"policy": POLICY_FAIL_FAST},
+
+    # -- 任务侧正常损耗 --
+    # S008 虽是 S 前缀, 但语义是「非零退出且 stdout 无可识别业务线索」
+    # (见 _run_main_script 的分类优先级: 具体T码 > T010 > S008), 实际是任务侧兜底。
+    "S008": {"policy": POLICY_TASK_SIDE},
+    "T001": {"policy": POLICY_TASK_SIDE},
+    "T002": {"policy": POLICY_TASK_SIDE},
+    "T003": {"policy": POLICY_TASK_SIDE},
+    "T004": {"policy": POLICY_TASK_SIDE},
+    "T005": {"policy": POLICY_TASK_SIDE},
+    "T006": {"policy": POLICY_TASK_SIDE},
+    "T008": {"policy": POLICY_TASK_SIDE},
+    "T009": {"policy": POLICY_TASK_SIDE},
+    "T010": {"policy": POLICY_TASK_SIDE},
+    "X999": {"policy": POLICY_TASK_SIDE},
+}
+
+
+# C003 的 detail 里表示「集群没有可调度资源」的特征串。
+# 这类失败 6.4s 就返回(实测), 几乎不消耗配额, 退避等待是安全的; 重试只会加剧拥塞。
+_C003_THROTTLE_MARKERS = (
+    "no_cluster_matches_request",
+)
+
+# C003 的 detail 里表示「瞬时故障」的特征串 —— 控制面/DNS 不可达、沙箱还在初始化。
+# 实测有单实例 7617 次全是 DNS 解析失败, 这类重试就能救回来, 误判成容量不足
+# 而去降并发反而会白降。
+_C003_RETRY_MARKERS = (
+    "Temporary failure in name resolution",
+    "PodInitializing",
+    "Sandbox is running",
+)
+
+
+def classify_c003(detail: str) -> str:
+    """把 C003 的 detail 文本二次分类成 throttle / retry。
+
+    C003(environment creation failed) 一个码底下藏着三种原因, 处置相反:
+      - no_cluster_matches_request           集群无可调度资源 → throttle(降并发)
+      - Temporary failure in name resolution DNS/控制面不可达  → retry
+      - PodInitializing / Sandbox is running 沙箱瞬时态        → retry
+
+    这是降并发信号准确性的前提: 不分类就会把 DNS 抖动当成容量不足, 白降并发。
+    认不出来时保守返回 throttle —— C003 的压倒性多数是容量不足, 且降并发的代价
+    (跑得慢些)远小于误重试的代价(把已经过载的集群继续打满)。
+    """
+    text = detail or ""
+    for marker in _C003_RETRY_MARKERS:
+        if marker in text:
+            return POLICY_RETRY
+    for marker in _C003_THROTTLE_MARKERS:
+        if marker in text:
+            return POLICY_THROTTLE
+    return POLICY_THROTTLE
+
+
+def error_policy(code: str, detail: str = "") -> str:
+    """查某个错误码此刻该走哪种处置策略。
+
+    detail_classified 的码(目前只有 C003)需要结合 detail 文本二次判定,
+    其余直接查表。未登记的码按 task_side 处理(不重试、不降并发), 保持保守。
+    """
+    spec = ERROR_POLICY.get(code)
+    if not spec:
+        return POLICY_TASK_SIDE
+    if spec.get("detail_classified"):
+        return classify_c003(detail)
+    return spec["policy"]
+
+
+def error_max_retries(code: str) -> int:
+    """该错误码允许的重试次数(不含首次尝试); 不可重试的码返回 0。"""
+    spec = ERROR_POLICY.get(code) or {}
+    return int(spec.get("max_retries") or 0)
+
+
 def _strip_api_use_lines(text: str) -> str:
     """去掉日志里的 'INFO:api_use:' 行 (api 用量记录, 与任务成败无关, 干扰判定/查看)。"""
     if not text:
