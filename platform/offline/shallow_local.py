@@ -229,6 +229,12 @@ def judge_one(item: dict, inst_cache: dict) -> tuple[str, int | None, str]:
         idx = idx_map.get(item["config_name"])
     if idx is None:
         return "skipped", 0, "task_idx 缺失，无法定位日志"
+
+    # 把解出来的 idx 写回 item，供 apply_results 落库 ——
+    # 否则「队列里 task_idx 为 NULL、靠回退 2 才解出来」的行永远不落这个值，
+    # 页面「任务编号」一列只能显示 —，排查时还得手工去输入目录数下标。
+    # 实测全库 23,526 行（0.22%）是这种情况。
+    item["task_idx"] = idx
     path = os.path.join(logs_dir, f"task-{idx}.log")
     if not os.path.isfile(path):
         return "skipped", 0, "本地日志不存在"
@@ -296,7 +302,9 @@ def apply_results(results: list[tuple[dict, str, int | None, str]]) -> dict:
         if state in ("done", "done_failed") and done_val is not None:
             tr_rows.append((done_val, item["instance_id"], item["config_name"]))
         if state == "done_failed":
-            failed_rows.append((item["instance_id"], item["config_name"]))
+            # 带上 task_idx 供 UPSERT 建行用（可能是 None，见下面的说明）
+            failed_rows.append((item["instance_id"], item["config_name"],
+                                item.get("task_idx")))
             q_rows.append(("done", (note or "")[:200] or None, item["id"]))
         else:
             q_rows.append((state, (note or "")[:200] or None, item["id"]))
@@ -314,6 +322,18 @@ def apply_results(results: list[tuple[dict, str, int | None, str]]) -> dict:
                 "WHERE instance_id=? AND config_name=?",
                 tr_rows,
             )
+            # 顺手补 task_idx：judge_one 已经按三级回退解出来了（见它末尾写回 item），
+            # 不补的话页面「任务编号」一列对这些行只能显示 —。
+            # 只在原值为 NULL 时写，不覆盖在线同步写入的权威值。
+            idx_rows = [(it.get("task_idx"), it["instance_id"], it["config_name"])
+                        for it, st, _, _ in results
+                        if st in ("done", "done_failed") and it.get("task_idx") is not None]
+            if idx_rows:
+                conn.executemany(
+                    "UPDATE task_records SET task_idx=? "
+                    "WHERE instance_id=? AND config_name=? AND task_idx IS NULL",
+                    idx_rows,
+                )
             # 同步到 task_traj_records —— 两表实际上是 1:1（实测 traj_name 与
             # config stem 不一致的行为 0），但历史上 task_done 各写一份：
             #   task_records     ← 新架构 shallow-local 扫本地日志（权威）
@@ -327,15 +347,31 @@ def apply_results(results: list[tuple[dict, str, int | None, str]]) -> dict:
             )
         # 任务异常/失败：直接定 failed，同时把 obs_state 也收掉，不让它再进 OBS 队列
         if failed_rows:
+            # **UPSERT 而不是纯 UPDATE**：task_records 的行平时由在线
+            # _sync_task_records 写，但实例跑太快结束 / 在线同步漏掉的 config
+            # 在这里是**没有行**的 —— 纯 UPDATE 命中 0 行却把队列置成 done，
+            # 这个任务就永久消失：页面上既不算已定级、也不算未评估，
+            # 连 total 都不包含它。
+            #
+            # 实测全库 23,516 行是这种「队列有行、task_records 没行」的孤儿；
+            # 某实例 4,161 个任务里 1,739 个因此丢失，页面显示成「未执行 1739」
+            # （而其实它们全部跑过且失败了）。
+            #
+            # task_idx 可能为 NULL（tracker 投递时 task_records 还没建行、
+            # 拿不到 idx），不影响：定级与 DONE 判定都不依赖它。
             conn.executemany(
-                "UPDATE task_records SET traj_level='failed' "
-                "WHERE instance_id=? AND config_name=? AND traj_level IS NULL",
+                "INSERT INTO task_records "
+                "  (instance_id, config_name, task_idx, status, traj_level, updated_at) "
+                "VALUES (?,?,?,'任务异常','failed',CURRENT_TIMESTAMP) "
+                "ON CONFLICT(instance_id, config_name) DO UPDATE SET "
+                # 已定级的不覆盖（可能是别的路径判出的真实等级）
+                "  traj_level=COALESCE(task_records.traj_level, 'failed')",
                 failed_rows,
             )
             conn.executemany(
                 "UPDATE shallow_queue SET obs_state='done' "
                 "WHERE instance_id=? AND config_name=? AND obs_state='queued'",
-                failed_rows,
+                [(iid, cn) for iid, cn, _ in failed_rows],
             )
         if q_rows:
             conn.executemany(

@@ -125,17 +125,22 @@ async def list_artifact_tasks(instance_id: str, user: dict = Depends(get_current
         "artifact_downloaded_at AS downloaded_at, artifact_complete "
         "FROM task_traj_records WHERE instance_id=? ORDER BY traj_name", (instance_id,))
 
-    # 懒发现条件：该实例在浅层队列里还没有任何「已完成」的任务。
+    # 懒发现条件：镜像表里「可下载」的行数**少于** complete.jsonl 的实际完成数。
     #
-    # 不能只看 rows（旧写法 `if not rows`）：浅层分析会先建 complete=0 的行，
+    # 不能只看 rows（最早的写法 `if not rows`）：浅层分析会先建 complete=0 的行，
     # running 实例又从不参与后台自动发现，于是「有 888 行、全是 complete=0」的
     # 实例兜底不触发，列表永远空 —— 实测单实例 7161 个 task 里 1419 个早已跑完，
     # 界面上一个都看不到，全库曾有 1479 个实例处于这个状态。
     #
-    # 也不能只看 task_traj_records.artifact_complete：发现已经迁到 task_tracker，
-    # 它按实例增量投递，一个从没被 tracker 扫过的新实例在 task_traj_records 里
-    # 全是 complete=0，但 shallow_queue 里可能已经有可投递的行。
-    if not any(r["artifact_complete"] for r in rows):
+    # 也不能用 `not any(artifact_complete)`（上一版）：那是「**全部**为 0 才补」，
+    # 对 running 实例是错的 —— 它边跑边产出，只要曾经补过一次（哪怕只补出 16 行），
+    # 条件就永久为假，之后新完成的几百个任务再也不会建镜像行。
+    # 实测本实例 complete.jsonl 已有 922 行，工作区却只显示 16 个。
+    #
+    # 现在按**数量**比：镜像里 complete=1 的行数 < complete.jsonl 行数就补。
+    # _discover_one_instance 内部是 UPSERT（ON CONFLICT），重复补是幂等的。
+    n_mirror = sum(1 for r in rows if r["artifact_complete"])
+    if n_mirror < await async_execute(_complete_jsonl_count, inst):
         # 注意：不管 _discover_one_instance 返回几，都要重新查一次 ——
         # 它的返回值是「本次新投递的条数」，而前端要的是重新读出来的状态。
         await async_execute(_discover_one_instance, instance_id, inst)
@@ -390,6 +395,30 @@ async def request_artifact_download_batch(
 
     n = await async_execute(_queue_all)
     return {"instance_id": instance_id, "queued": n, "status": "queued"}
+
+
+def _complete_jsonl_count(inst: dict) -> int:
+    """complete.jsonl 的行数（= 该实例真正跑完、可下载交付物的任务数）。
+
+    用来判断镜像表是否落后于实际进度。只数行、不解析内容:
+    单实例实测 922 行约 1 万字节,读一遍是毫秒级;而 running 实例每次打开
+    工作区都会调一次,不能在这里做重活。
+
+    取不到文件（实例目录被清理/还没产出）返回 0 —— 此时镜像有多少就显示多少,
+    不触发无意义的补发现。
+    """
+    try:
+        from offline import task_tracker as tt
+        out_dir = tt.resolve_output_dir(inst.get("config_path") or "")
+        if not out_dir:
+            return 0
+        path = tt.find_records(out_dir, "complete.jsonl")
+        if not path:
+            return 0
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return sum(1 for ln in f if ln.strip())
+    except OSError:
+        return 0
 
 
 def _discover_one_instance(instance_id: str, inst: dict) -> int:

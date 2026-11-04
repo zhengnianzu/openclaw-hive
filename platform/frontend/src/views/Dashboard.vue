@@ -212,13 +212,13 @@
             <el-tag :type="statusColor(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="任务队列" width="110" resizable>
-          <template #default="{row}">
-            <el-tag v-if="row.queue_id" size="small" effect="plain">{{ row.queue_id }}</el-tag>
-            <span v-else style="color:var(--text-muted)">-</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="队列位置" width="130" align="center" resizable>
+        <!-- 队列位置：只在**按队列筛选后**出现（与上面「镜像」列同款条件显示）。
+             原来「任务队列」+「队列位置」两列常驻,占 240px 让表格一屏装不下,
+             而它们只在排队场景有意义 —— 非 queued 实例恒显示 "-"。
+             「任务队列」列也不再需要:筛选条件本身就说明了是哪个队列,
+             列里再重复一遍每行都一样的队列名是冗余。 -->
+        <el-table-column v-if="queueFilter && queueFilter !== '__none__'"
+          label="队列位置" width="130" align="center" resizable>
           <template #default="{row}">
             <span v-if="row.status === 'queued'" class="mono-num" style="color:#e6a23c">
               {{ queuePositionLabel(row) }}
@@ -230,44 +230,44 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="进度" width="160" resizable>
+        <!-- 进度：原来拆成「进度」(进度条) + 「数字进度」(4655/10000) 两列，
+             信息重复且占 290px。合成一列，数字放进度条下方一行。 -->
+        <el-table-column label="进度" width="170" resizable>
           <template #default="{row}">
             <el-progress :percentage="progress(row)" :stroke-width="8" :show-text="false"
               :color="progressColor" />
-            <div v-if="timeEstimates[row.id]" style="font-size:11px;color:var(--text-muted);margin-top:2px">
-              {{ formatDuration(timeEstimates[row.id].estimated_remaining_seconds) }}
+            <div style="font-size:11px;color:var(--text-muted);margin-top:2px;display:flex;justify-content:space-between">
+              <span v-if="row.status === 'preparing'" class="mono-num" style="color:#e6a23c">
+                下载 {{ prepareProgress[row.id]?.downloaded_configs ?? 0 }} 个
+              </span>
+              <span v-else class="mono-num">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
+              <span v-if="timeEstimates[row.id]">
+                {{ formatDuration(timeEstimates[row.id].estimated_remaining_seconds) }}
+              </span>
             </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="数字进度" width="130" align="center" resizable>
-          <template #default="{row}">
-            <span v-if="row.status === 'preparing'" class="mono-num" style="color:#e6a23c">
-              下载 {{ prepareProgress[row.id]?.downloaded_configs ?? 0 }} 个
-            </span>
-            <span v-else class="mono-num">{{ row.completed_tasks + row.failed_tasks }}/{{ row.total_tasks }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="completed_tasks" label="成功" width="80" align="center" resizable>
           <template #default="{row}">
-            <span class="mono-num" style="color:#059669">{{ row.completed_tasks }}</span>
-          </template>
-        </el-table-column>
-        <!-- 成功轨迹：task_traj_records 里 task_done=1 的行数。「成功」只看流水线是否抛异常，
-             这个才是 assistant 自己打的【Task_Done】完成标记，两者在生产上差得很远。 -->
-        <el-table-column prop="done_trajs" label="成功轨迹" width="96" align="center" resizable>
-          <template #default="{row}">
-            <el-tooltip placement="top" :content="doneTrajTip(row)">
-              <span class="mono-num" :style="{color: doneTrajColor(row)}">{{ row.done_trajs ?? 0 }}</span>
+            <el-tooltip placement="top"
+              content="流水线跑完且没抛异常的任务数（沙箱起来了、模型调通了、轨迹已上传）。注意它不代表任务真的做完 —— 那看 DONE 列。">
+              <span class="mono-num" style="color:#059669">{{ row.completed_tasks }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
-        <!-- DONE：worker 直接扫本地 task-N.log 得到的【Task_Done】数（task_records.task_done）。
-             与「成功轨迹」并列：后者依赖 OBS 的 tsr，补全快路径不拉该字段，部分实例恒为 0；
-             这个不依赖 OBS，最接近「任务真的做完了」的真相。 -->
-        <el-table-column prop="done_tasks" label="DONE" width="88" align="center" resizable>
+        <!-- DONE：assistant 自己在回复末尾打【Task_Done】的任务数 = 「任务真的做完了」。
+             原来拆成「成功轨迹」(task_traj_records，来自 OBS 的 tsr) 和「DONE」
+             (task_records，worker 扫本地 task-N.log) 两列 —— **判据完全相同**，
+             只是两条数据链路，属历史双写。两者各有盲区：
+               · 老实例 shallow-local 没扫过本地日志 → DONE=0（实测 1056 个实例）
+               · 老批次 OBS 上没有 tsr            → 成功轨迹=0（实测 324 个实例）
+             所以取 max()：含义是「两条链路里至少有一条确认了」，而不是凭空编的口径。
+             hover 里仍给出两个来源的原始值，便于排查链路本身的问题。 -->
+        <el-table-column label="DONE" width="92" align="center" resizable
+          :sort-by="doneMerged" sortable="custom">
           <template #default="{row}">
-            <el-tooltip placement="top" :content="doneTaskTip(row)">
-              <span class="mono-num" :style="{color: doneTaskColor(row)}">{{ row.done_tasks ?? 0 }}</span>
+            <el-tooltip placement="top" :content="doneMergedTip(row)">
+              <span class="mono-num" :style="{color: doneTaskColor(row)}">{{ doneMerged(row) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
@@ -381,26 +381,13 @@ const progressColor = [
 
 // 「成功轨迹」列：task_traj_records 里 task_done=1 的行数。
 // 与「成功」列（loop 内没抛异常就算成功）不是一个口径，差得远时标红提醒。
-function doneTrajColor(row) {
-  const done = row.done_trajs ?? 0
-  const ok = row.completed_tasks ?? 0
-  if (!done) return 'var(--text-muted)'
-  return done < ok * 0.9 ? '#d97706' : '#059669'
-}
-function doneTrajTip(row) {
-  const done = row.done_trajs ?? 0
-  const ok = row.completed_tasks ?? 0
-  const gap = ok - done
-  if (gap > 0) {
-    return `成功轨迹 ${done} / 成功 ${ok}（差 ${gap} 个：流水线跑通但 assistant 没打【Task_Done】标记，多为撞最大轮次或 agent 自判失败）`
-  }
-  return `成功轨迹 ${done}：assistant 在会话末尾打出【Task_Done】的任务数`
-}
 
 // DONE 列：本地日志口径（task_records.task_done=1，worker 直接扫 task-N.log）。
 // 与「成功轨迹」的区别是数据源不依赖 OBS，所以不会出现「补全没拉该字段 → 恒为 0」。
 function doneTaskColor(row) {
-  const done = row.done_tasks ?? 0
+  // 用合并后的值判色：否则「OBS 口径有值、本地口径为 0」的老实例会被标成橙色告警，
+  // 而它其实是有 DONE 的（只是 shallow-local 没扫过本地日志）。
+  const done = Math.max(row.done_trajs ?? 0, row.done_tasks ?? 0)
   const ok = row.completed_tasks ?? 0
   if (!done) return ok ? '#d97706' : 'var(--text-muted)'
   return done < ok * 0.9 ? '#d97706' : '#059669'
@@ -413,6 +400,27 @@ function doneTaskTip(row) {
     return `DONE ${done} / 成功 ${ok}（差 ${gap} 个：流水线跑通但 agent 没打出【Task_Done】）`
   }
   return `DONE ${done}：本地 task-N.log 里含【Task_Done】的任务数（不依赖 OBS）`
+}
+
+// ── 合并后的 DONE 列 ──
+// 「成功轨迹」(done_trajs，OBS tsr 口径) 与「DONE」(done_tasks，本地日志口径)
+// 判据完全相同（都是 assistant 打的【Task_Done】），属历史双写。取 max 的含义是
+// 「两条链路里至少有一条确认了这个任务做完了」—— 两者各有盲区，见模板里的说明。
+function doneMerged(row) {
+  return Math.max(row.done_trajs ?? 0, row.done_tasks ?? 0)
+}
+function doneMergedTip(row) {
+  const traj = row.done_trajs ?? 0
+  const recs = row.done_tasks ?? 0
+  const done = Math.max(traj, recs)
+  const ok = row.completed_tasks ?? 0
+  const gap = ok - done
+  const src = `来源：本地日志 ${recs} / OBS 统计 ${traj}`
+  if (gap > 0) {
+    return `DONE ${done} / 成功 ${ok}（差 ${gap} 个：流水线跑通但 agent 没打出【Task_Done】，`
+      + `多为撞最大轮次或 agent 自判失败）\n${src}`
+  }
+  return `DONE ${done}：assistant 在回复末尾打出【Task_Done】的任务数\n${src}`
 }
 
 // ===== 资源使用情况 =====

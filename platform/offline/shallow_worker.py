@@ -62,6 +62,8 @@ from src import offline_analysis as oa                 # noqa: E402
 from offline.heartbeat import write_heartbeat, write_worker_started  # noqa: E402
 from offline import shallow_local as sl                # noqa: E402
 from offline import shallow_obs as so                  # noqa: E402
+# 只为取 tsr 轮内统计（tsr_round_summary）；定级本身在 shallow_obs.grade_one 里
+from offline import output_worker as ow                # noqa: E402
 
 # 每种模式的默认参数。realtime 要的是响应快（短间隔、队列短所以并发不用大），
 # auto 要的是吞吐（并发拉满到各自的饱和点）。
@@ -243,9 +245,14 @@ def main() -> None:
             st = run_once(a.mode, local_conc, obs_conc, a.obsutil, origin, max_seconds)
             busy = st.get("s1_claimed", 0) + st.get("s2_claimed", 0)
             if busy:
+                # tsr 统计汇总成一行（替代原来每任务 2 行的 per-task print）。
+                # 「无tsr(走日志兜底)」占多数是正常的 —— 2026-08 及更早的批次
+                # harness 不写 traj_stats_result.json，定级靠本地日志兜底。
+                tsr = ow.tsr_round_summary()
                 print(f"[{a.mode}] 阶段1(领={st['s1_claimed']} done={st['s1_done']}) "
                       f"阶段2(领={st['s2_claimed']} done={st['s2_done']}) "
-                      f"{time.time()-t0:.2f}s", flush=True)
+                      f"{time.time()-t0:.2f}s"
+                      + (f" | tsr: {tsr}" if tsr else ""), flush=True)
             # 每轮都写心跳（哪怕 0 条）：监控页靠「最后心跳时间」判断进程是否还活着，
             # 只在有产出时写会让空闲的 worker 看起来已经死了。
             # processed 取两阶段 done 之和 —— 这是本 worker 真正的产出。

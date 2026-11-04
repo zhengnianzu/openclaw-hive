@@ -8,7 +8,7 @@
 
 ---
 
-## 一、四个 Worker
+## 一、五个 Worker
 
 当前架构共 **5 个常驻进程**。切分维度是**场景**(是不是用户在等),不是阶段(读本地还是读 OBS)。
 
@@ -101,7 +101,43 @@
 同时跑安全:某实例既被点过又被 auto_tracker 选中时,`priority=MAX()` 保证它
 留在实时车道(用户在等,优先级更高)。
 
-### 1.3 两个 tracker 的日志怎么读
+### 1.3 `无tsr(走日志兜底)` 不是故障
+
+shallow worker 的轮末日志长这样:
+
+```
+[auto] 阶段1(领=0 done=0) 阶段2(领=512 done=512) 30.29s | tsr: 无tsr(走日志兜底)=512
+```
+
+**`无tsr` 占多数是正常的**:`traj_stats_result.json`(tsr)是 harness 跑完任务时
+预先算好的统计摘要,但 **2026-08 及更早的批次根本不写它** ——
+OBS 上那些 task 目录里只有:
+
+```
+logs/<task>.log      logs/api_use.log
+logs/gateway.log     logs/evaluator_use.log     ← 没有 traj_stats_result.json
+```
+
+拉不到 tsr 时 `shallow_obs.grade_one` 自动退到 `oa.log_fallback_grade`,
+读本地日志里的「`【Task_Done】`」或旧版「`所有任务执行完成!`」判等级
+(实测某 8 月实例据此判出 7,610 行 L1.5)。**定级成功了,只是走了另一条路。**
+
+> 原来这里是每个任务打一行 `OBS 拉 tsr 失败 rc=6`,补历史时**一轮几千行**,
+> 把真正的异常彻底淹没,看着像"大量失败"。现在按返回码分流:
+>
+> | 情况 | 处理 |
+> |------|------|
+> | `rc=6`(对象不存在) | 只计数,轮末汇总一行 |
+> | 其它返回码(配额 exit 8、网络错误) | 逐条打 `[warn]` |
+> | subprocess 异常(超时、obsutil 不可执行) | 逐条打 `[error]` |
+> | 拿到 tsr 但解析出 0 条 | 计入 `解析0条` |
+>
+> 计数用锁 —— 这段跑在 16~64 线程的池子里,`dict` 的 `+=` 不是原子操作。
+
+`rc=6` 的辨识特征:耗时极短(实测 0.14~0.22s,OBS 立刻答"没有")。
+如果是配额超限,obsutil 返回的是 **exit 8** 且耗时明显更长。
+
+### 1.4 两个 tracker 的日志怎么读
 
 ```
 [tracker] 跟踪=26 新行=5 投递=5 0.41s
@@ -528,6 +564,6 @@ python offline/shallow_worker.py --mode auto --once
 | `api/routers/worker_monitor.py` | 监控接口(overview/queue/trend/eta/reclaim) |
 | `api/routers/artifacts.py` | 交付物工作区(列表/树/内容/入队) |
 | `api/routers/batch_output.py` | 浅层登记、会话详情(deep) |
-| `test/test_shallow_worker.py` | 车道隔离、最新优先、阶段串联、投递顺序、车道分配、reset 语义、auto-tracker 挑选(28 项) |
+| `test/test_shallow_worker.py` | 车道隔离、阶段串联、投递顺序、车道分配、reset 语义、auto-tracker 挑选、水位、tsr 降噪(40 项) |
 | `test/test_artifact_queue.py` | 产物状态机(20 项) |
 | `test/test_worker_monitor.py` | 心跳、ETA、回收(11 项) |

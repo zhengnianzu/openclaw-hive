@@ -406,5 +406,42 @@ class ClearShallowRequestTest(unittest.TestCase):
             conn.commit()
 
 
+class MirrorBackfillGateTest(unittest.TestCase):
+    """工作区列表的「懒发现」触发条件:镜像行数 < complete.jsonl 行数。
+
+    这个判据错过两次:
+      1. `if not rows` —— 浅层会先建 complete=0 的行,于是永不触发,列表永远空
+         (实测单实例 7161 个 task 里 1419 个早已跑完却一个都看不到)
+      2. `if not any(artifact_complete)` —— 「全部为 0 才补」,对 running 实例是错的:
+         它边跑边产出,只要曾经补过一次(哪怕只补出 16 行),条件就永久为假,
+         之后新完成的几百个任务再也不会建镜像行
+         (实测某实例 complete.jsonl 922 行,工作区只显示 16 个)
+
+    现在按**数量**比,所以 running 实例每次打开工作区都会把新完成的补齐。
+    """
+
+    def test_gate_triggers_when_mirror_lags(self):
+        """镜像 16 行 < 实际 922 行 → 必须补。"""
+        self.assertTrue(16 < 922)
+
+    def test_gate_skips_when_caught_up(self):
+        """镜像已追平 → 不再补（避免每次打开都重扫 jsonl）。"""
+        self.assertFalse(922 < 922)
+
+    def test_old_any_gate_would_miss(self):
+        """回归:旧判据 `not any(complete)` 在「有 1 行 complete=1」时为假,
+        于是剩下 906 个永远不补 —— 这正是 bug 的形状。"""
+        rows = [{"artifact_complete": 1}] + [{"artifact_complete": 0}] * 15
+        old_gate = not any(r["artifact_complete"] for r in rows)
+        self.assertFalse(old_gate, "旧判据不触发（bug）")
+        n_mirror = sum(1 for r in rows if r["artifact_complete"])
+        self.assertTrue(n_mirror < 922, "新判据按数量比，仍会触发")
+
+    def test_complete_count_missing_file_is_zero(self):
+        """complete.jsonl 取不到时返回 0 —— 镜像有多少显示多少,不触发无意义补发现。"""
+        from api.routers.artifacts import _complete_jsonl_count
+        self.assertEqual(_complete_jsonl_count({"config_path": "/nonexistent.yaml"}), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

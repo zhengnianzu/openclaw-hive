@@ -16,36 +16,12 @@ from io import BytesIO
 from urllib.parse import quote
 
 from .create_params import build_create_params
+# 掩码口径统一在 services/secrets.py（实例详情的 /create-params、/configs 也用同一份）。
+# 这里重新导出，保持 task_export.mask_secret / MASK_PLACEHOLDER 的既有调用不变。
+from .secrets import MASK_PLACEHOLDER, mask_secret  # noqa: F401
 
 # 任务明细行数上限：超过就只给提示行，避免内存与文件体积失控
 _TASK_RECORD_ROW_LIMIT = 20000
-
-MASK_PLACEHOLDER = "****"
-
-# 命中即视为敏感值。按小写比较，用子串匹配（api_key / apiKey / ANTHROPIC_AUTH_TOKEN 都能覆盖）
-_SECRET_KEY_WORDS = (
-    "api_key", "apikey", "api-key",
-    "secret", "access_key", "access-key",
-    "password", "passwd", "private_key",
-    "token", "auth_token", "access_token",
-)
-
-def mask_secret(value) -> str:
-    """API Key 等敏感值的统一掩码。
-
-    与前端 maskKey（InstanceDetail.vue）的展示效果一致，但更严格：
-    前端对长度 <= 8 的值原样返回，这里一律整体打码，不泄漏短 key。
-    """
-    if value is None:
-        return ""
-    s = str(value).strip()
-    if not s:
-        return ""
-    if s == MASK_PLACEHOLDER:
-        return s
-    if len(s) <= 8:
-        return MASK_PLACEHOLDER
-    return s[:4] + "***" + s[-4:]
 
 
 def _fmt_time(v) -> str:

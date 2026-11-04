@@ -563,6 +563,19 @@
                   @click="openTaskDetail(row)">{{ row.task_title || row.traj_name }}</span>
               </template>
             </el-table-column>
+            <!-- 任务编号：traj_name(workspace_builder_xxx) ↔ task-N 的对应关系。
+                 排查时要去 logs/task-N.log 看日志，而列表里只有哈希名，
+                 之前得手工到 DB 里查 task_idx。task_idx 后端早就返回了（_SORTABLE
+                 白名单里也有），这里直接展示并支持排序。 -->
+            <el-table-column prop="task_idx" label="任务编号" min-width="110"
+              align="center" sortable="custom">
+              <template #default="{ row }">
+                <span v-if="row.task_idx !== null && row.task_idx !== undefined"
+                  style="font-family:monospace;font-size:12px"
+                  :title="`日志文件: logs/task-${row.task_idx}.log`">task-{{ row.task_idx }}</span>
+                <span v-else style="color:var(--text-muted)">—</span>
+              </template>
+            </el-table-column>
             <el-table-column label="等级" min-width="90" align="center">
               <template #default="{ row }">
                 <el-tag size="small" :color="levelTagBg(row.traj_level)" style="color:#fff;border:none"
@@ -1049,8 +1062,12 @@ function formatDuration(seconds) {
   if (h > 0) return `${h}h${m}m`
   return `${m}min`
 }
+// 兜底遮罩：后端 /create-params 下发的 key 已经是掩码（mask_secret 幂等，
+// 再遮一次不变形）。这里只防「某个字段漏了后端脱敏」的情况，故短值也整体打码，
+// 与后端 services/secrets.py 的规则对齐，不留短 key 泄漏口。
 function maskKey(key) {
-  if (!key || key.length <= 8) return key || '-'
+  if (!key) return '-'
+  if (key.length <= 8) return '****'
   return key.slice(0, 4) + '***' + key.slice(-4)
 }
 

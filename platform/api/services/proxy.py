@@ -28,6 +28,10 @@ from . import export_meta
 
 _PROXY_NAME_FILE = os.path.join(settings.SETTINGS_DIR, "proxy_name.json")
 
+# 自部署模型网关的默认端口：实测历史数据里 99.5%(6311/6342) 都是 8082。
+# 只用于「代理已登记但没人用过」时拼一条候选，用户可自由改写。
+_DEFAULT_PROXY_PORT = 8082
+
 # 只认 IPv4 字面量：内网网关都是 IP；不是 IP 时退回 URL 里的 host 段
 _IP_RE = re.compile(r"https?://([0-9]{1,3}(?:\.[0-9]{1,3}){3})")
 _HOST_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/:]+)")
@@ -113,3 +117,49 @@ def proxy_identity(url: Optional[str], proxy_map: Optional[dict] = None) -> dict
         "proxy_name": proxy_map.get(host, "") if host else "",
         "baseurl": normalized,
     }
+
+
+def build_base_url_options(
+    raw_urls, proxy_map: Optional[dict] = None, proxy_ips: Optional[dict] = None
+) -> list[dict]:
+    """历史用过的 base_url → 新建任务页「模型 Base URL」下拉选项。
+
+    为什么以历史用量为主、而不是直接列 /export/proxy_list 的代理：远端只登记了
+    7 个代理，而实际在用的端点有 20 个——其中 115.120.87.159:8082 用过 400+ 次却
+    两边都没登记。只列有名字的代理会把常用端点从界面上抹掉。
+
+    归一化后聚合（normalize_base_url 会把 `.../`、`.../v1` 并到同一台），所以
+    「同一个代理四种写法」在下拉里只出现一次；次数相同按地址排序，保证顺序稳定。
+
+    proxy_ips: {ip: 代理名} 中尚未在历史里出现过的，也补进选项尾部（次数 0），
+    这样新上线的代理不必等有人手填过一次才出现在下拉里。
+    """
+    proxy_map = proxy_map or {}
+    counts: dict[str, int] = {}
+    for u in raw_urls or []:
+        normalized = normalize_base_url(u)
+        if not normalized:
+            continue
+        counts[normalized] = counts.get(normalized, 0) + 1
+
+    # 已登记但历史没用过的代理：按默认端口补一条。8082 是实测 99.5% 的端口
+    # （6311/6342），没有更好的依据时用它，用户仍可自由改写。
+    for ip, name in (proxy_ips or {}).items():
+        if not ip or not name:
+            continue
+        guess = f"http://{ip}:{_DEFAULT_PROXY_PORT}"
+        if not any(_host_of(u) == ip for u in counts):
+            counts.setdefault(guess, 0)
+
+    options = []
+    for url, used in counts.items():
+        host = _host_of(url)
+        options.append({
+            "value": url,
+            "proxy_name": proxy_map.get(host, "") if host else "",
+            "host": host,
+            "used": used,
+        })
+    # 用得多的排前面；次数相同按地址字典序，避免同次数条目每次刷新乱跳
+    options.sort(key=lambda o: (-o["used"], o["value"]))
+    return options

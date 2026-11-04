@@ -44,6 +44,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -680,6 +681,47 @@ def _read_task_log_for(inst: dict, task_idx: int) -> dict:
             "status": status or "任务异常", "code": code, "task_done": task_done}
 
 
+# ── tsr 拉取的轮内计数（替代 per-task print）──
+#
+# 原来每个任务拉 tsr 都打 2 行（拉取结果 + 解析结果），一轮几千个任务就是上万行日志，
+# 真正的异常被彻底淹没。改成轮内累计、由调用方在轮末打一行汇总。
+# 用锁：本函数跑在 16~64 线程的池子里，dict 的 += 不是原子操作。
+_TSR_LOCK = threading.Lock()
+_TSR_STATS: dict[str, int] = {}
+
+
+def _tsr_count(key: str) -> None:
+    """累加一类 tsr 结果（fetched/cached/missing/empty）。线程安全。"""
+    with _TSR_LOCK:
+        _TSR_STATS[key] = _TSR_STATS.get(key, 0) + 1
+
+
+def _tsr_log(level: str, msg: str) -> None:
+    """打一条 tsr 相关日志。只用于**真正需要排查**的情况（异常/非 rc=6 失败/解析错）。
+
+    rc=6（对象不存在）走 _tsr_count("missing") 不打印 —— 老批次没有 tsr 是数据常态。
+    """
+    print(f"    [tsr-cache][{level}] {msg}", flush=True)
+
+
+def tsr_round_summary(reset: bool = True) -> str:
+    """取本轮 tsr 统计的一行摘要；reset=True 时清零供下一轮使用。
+
+    返回空字符串表示本轮没碰过 tsr（调用方可据此不打这一行）。
+    """
+    with _TSR_LOCK:
+        if not _TSR_STATS:
+            return ""
+        parts = []
+        for k, label in (("fetched", "拉取"), ("cached", "缓存命中"),
+                         ("missing", "无tsr(走日志兜底)"), ("empty", "解析0条")):
+            if _TSR_STATS.get(k):
+                parts.append(f"{label}={_TSR_STATS[k]}")
+        if reset:
+            _TSR_STATS.clear()
+        return " ".join(parts)
+
+
 def _fetch_tsr_entries_fast(obsutil: str, task_obs: str, origin: str,
                             instance_harness_type: str | None = None) -> list[dict]:
     """补全专用快路径：拉单个 task 的 logs/traj_stats_result.json（约 1KB）→ tsr entries。
@@ -704,29 +746,45 @@ def _fetch_tsr_entries_fast(obsutil: str, task_obs: str, origin: str,
         try:
             res = subprocess.run(cmd, capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=60)
-        except Exception:
-            print(f"    [tsr-cache] {leaf}: OBS cp 异常返回", flush=True)
+        except Exception as e:
+            # 真异常（超时/obsutil 不可执行）：必须打，这是要排查的
+            _tsr_log("error", f"{leaf}: OBS cp 异常 {str(e)[:80]}")
             return []
         if res.returncode != 0 or not os.path.isfile(dest):
-            print(f"    [tsr-cache] {leaf}: OBS 拉 tsr 失败 rc={res.returncode} "
-                  f"{time.time()-_t0:.2f}s", flush=True)
+            # **rc=6 = 对象不存在**，不是故障：老批次（2026-08 及更早）的 harness
+            # 根本不写 traj_stats_result.json，只有 logs/<task>.log + gateway.log。
+            # 调用方拉不到 tsr 会自动走 log_fallback_grade 读本地日志判等级
+            # （实测某 8 月实例 7,610 行据此判出 L1.5），**分析并没有失败**。
+            #
+            # 这类"失败"在补历史时是常态：实测 auto 啃 8 月批次时满屏 rc=6，
+            # 每个任务一行，一轮几千行，把真正的异常彻底淹没。所以降级为计数,
+            # 只在轮末汇总一行；其它返回码（配额 exit 8、网络错误）仍逐条打。
+            if res.returncode == 6:
+                _tsr_count("missing")
+            else:
+                _tsr_log("warn", f"{leaf}: OBS 拉 tsr 失败 rc={res.returncode} "
+                                 f"{time.time()-_t0:.2f}s")
             return []
-        print(f"    [tsr-cache] {leaf}: OBS 拉 tsr 成功 {time.time()-_t0:.2f}s", flush=True)
+        _tsr_count("fetched")
     else:
-        print(f"    [tsr-cache] {leaf}: 本地 tsr 缓存命中 {time.time()-_t0:.2f}s", flush=True)
+        _tsr_count("cached")
     try:
         with open(dest, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as e:
+        _tsr_log("warn", f"{leaf}: tsr 解析失败 {str(e)[:60]}")
         return []
     if not isinstance(data, dict):
+        _tsr_log("warn", f"{leaf}: tsr 不是 dict")
         return []
     # tsr 自身无 harness_type 字段时（存量实例），用实例级 instance_harness_type 补填，
     # 避免 harness_tsr_to_entries 回退到 harness_home 路径猜测（openjiuwen 写 ~/.openclaw 导致误判）。
     if instance_harness_type and not data.get("harness_type"):
         data = dict(data, harness_type=instance_harness_type)
     entries = oa.harness_tsr_to_entries(data, task_obs=task_obs)
-    print(f"    [tsr-cache] {leaf}: 解析出 {len(entries)} 条 entry", flush=True)
+    if not entries:
+        # 拿到了 tsr 但解析出 0 条：这个要知道（tsr 格式变了/内容为空）
+        _tsr_count("empty")
     return entries
 
 

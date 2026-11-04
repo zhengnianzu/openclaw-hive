@@ -89,13 +89,28 @@
         </el-tab-pane>
 
         <el-tab-pane label="Harness配置" name="model">
+          <!-- 候选来自历史用量 + 已登记代理（见 /export-meta/base-urls）。
+               用 autocomplete 而不是 select：它渲染的是真正的 <input>，地址可以选中复制，
+               且天然允许填候选以外的值（新代理/外部网关）。select 的显示区不是输入框，
+               改成 select 后就复制不了地址了。 -->
           <el-form-item label="模型 Base URL">
-            <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
+            <el-autocomplete v-model="form.model_base_url" :fetch-suggestions="queryBaseUrls"
+              :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '选择或输入，例如：http://192.168.30.95:8084（自动补 /v1）' : '选择或输入，例如：http://192.168.30.95:8084'"
+              style="width:100%" clearable :trigger-on-focus="true" fit-input-width>
+              <template #default="{ item }">
+                <span>{{ item.value }}</span>
+                <span style="float:right;color:#999;font-size:12px">
+                  {{ item.proxy_name || '未登记' }}{{ item.used ? ` · ${item.used} 次` : '' }}
+                </span>
+              </template>
+            </el-autocomplete>
           </el-form-item>
 
           <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">
             <div style="display:flex;gap:8px;width:100%">
-              <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" />
+              <!-- show-password：新建KEY 后完整 key 会填进这个框，不隐藏就等于明文摊在页面上
+                   （下面那行掩码预览本就是配合隐藏输入框用的）。与其余 key 输入框口径一致。 -->
+              <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" show-password />
               <el-button type="primary" @click="openKeyDialog('harness')">新建KEY</el-button>
             </div>
             <div v-if="form.model_api_key" style="font-size:12px;color:#999;margin-top:4px">
@@ -139,8 +154,19 @@
                 <el-input v-model="ag.name" placeholder="例如：user_simulator" />
               </el-form-item>
 
+              <!-- 候选带 /v1：后端对 agents[].base_url 是原样写入 user_proxy_model.json，
+                   不像主 Agent 那样按 harness 自动补 /v1，所以这里必须给带后缀的值。 -->
               <el-form-item label="模型 Base URL">
-                <el-input v-model="ag.base_url" placeholder="例如：http://192.168.30.95:8084/v1（user_simulator 需带 /v1）" />
+                <el-autocomplete v-model="ag.base_url" :fetch-suggestions="queryAgentBaseUrls"
+                  placeholder="选择或输入，例如：http://192.168.30.95:8084/v1（需带 /v1）"
+                  style="width:100%" clearable :trigger-on-focus="true" fit-input-width>
+                  <template #default="{ item }">
+                    <span>{{ item.value }}</span>
+                    <span style="float:right;color:#999;font-size:12px">
+                      {{ item.proxy_name || '未登记' }}{{ item.used ? ` · ${item.used} 次` : '' }}
+                    </span>
+                  </template>
+                </el-autocomplete>
                 <div style="font-size:12px;color:#999;margin-top:4px">user_simulator 的 Base URL 需带 /v1 后缀</div>
               </el-form-item>
 
@@ -415,6 +441,7 @@ function removeAgentTab(tabName) {
 }
 
 const imageList = ref([])
+const baseUrlOptions = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
 const versionList = ref([])
@@ -548,6 +575,38 @@ async function loadCodeRepos() {
   } catch { codeRepoList.value = [] }
 }
 
+// Base URL 候选：后端按归一化地址聚合历史用量并补上代理名（/export-meta/base-urls）。
+// 取不到就留空数组——下拉是 allow-create 的，没候选也能照常手填。
+async function loadBaseUrls() {
+  try {
+    const res = await api.get('/export-meta/base-urls')
+    baseUrlOptions.value = res.options || []
+  } catch { baseUrlOptions.value = [] }
+}
+
+// 用户模拟 agent 的 base_url 要带 /v1，而后端聚合时已把 /v1 归一化掉了
+// （否则同一台代理会在候选里重复出现）。这里按需补回后缀。
+const agentBaseUrlOptions = computed(() => baseUrlOptions.value.map(o => ({
+  ...o,
+  value: /\/v\d+$/.test(o.value) ? o.value : `${o.value.replace(/\/$/, '')}/v1`,
+})))
+
+// el-autocomplete 的候选过滤：已输入内容按子串匹配，空输入给全部（trigger-on-focus）。
+// 候选只是建议，输入框里填什么都不拦——新代理、外部网关照旧手填。
+function filterBaseUrls(list, queryString) {
+  const q = (queryString || '').trim().toLowerCase()
+  if (!q) return list
+  return list.filter(o =>
+    o.value.toLowerCase().includes(q) ||
+    (o.proxy_name || '').toLowerCase().includes(q))
+}
+function queryBaseUrls(queryString, cb) {
+  cb(filterBaseUrls(baseUrlOptions.value, queryString))
+}
+function queryAgentBaseUrls(queryString, cb) {
+  cb(filterBaseUrls(agentBaseUrlOptions.value, queryString))
+}
+
 function onHarnessChange() {
   form.value.image_name = ''
   form.value.harness_config_id = null
@@ -629,7 +688,9 @@ onMounted(async () => {
   const fromRegistration = route.query.from_registration
   if (copyFrom) {
     try {
-      const params = await api.get(`/instances/${copyFrom}/create-params`)
+      // 走 /full（operator 限定）而非 /create-params：后者 key 已脱敏，
+      // 直接回填会让复制出的任务带着掩码当 key 去跑。
+      const params = await api.get(`/instances/${copyFrom}/create-params/full`)
       Object.assign(form.value, params)
       // 历史实例的 suffix_api_keys 统一是 false（迁移默认值），直接继承会让
       // 「复制」出来的新任务默认关闭后缀。复制时回到当前默认值，用户仍可手动改。
@@ -702,6 +763,7 @@ onMounted(async () => {
     }
   }
   loadImages()
+  loadBaseUrls()
   loadCodeRepos()
   loadHarnessConfigs()
   loadQueues()

@@ -29,6 +29,7 @@ from ..services.queue_scheduler import (
     slot_condition_params as _slot_condition_params,
 )
 from ..services.create_params import build_create_params
+from ..services.secrets import mask_create_params, redact_text
 from . import harness_meta
 from . import harness_configs
 from . import sandbox_configs
@@ -87,6 +88,36 @@ _analyze_changed = {}
 # 后台预热开关：为 True 时请求线程只读缓存（哪怕已过期），扫描交给后台任务，
 # 避免同步端点在请求线程里做重扫把 anyio 线程池打满
 _bg_refresh_active = False
+
+
+class UpstreamKeyError(Exception):
+    """申请 key 时上游明确拒绝（HTTP 200 但 success:false / 无 key）。
+
+    与网络异常区分开：这类错误带着上游给的可读原因（名字太长、邀请码不存在…），
+    应该原样透给用户，让用户自己照提示改（比如把 key 名字改短），而不是包成
+    一句笼统的「申请失败」。
+    """
+
+
+# 上游返回体里承载失败原因的字段，按优先级取第一个非空的。
+# 不同网关叫法不一：tokenfly 用 message，也见过 msg / error / detail。
+_UPSTREAM_MSG_FIELDS = ("message", "msg", "error", "detail", "error_msg")
+
+
+def _upstream_message(data) -> str:
+    """从上游响应体里取可读的失败原因；取不到返回空串。"""
+    if not isinstance(data, dict):
+        return ""
+    for field in _UPSTREAM_MSG_FIELDS:
+        val = data.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        # 有些网关把原因嵌在 error 对象里（{"error": {"message": "..."}}）
+        if isinstance(val, dict):
+            nested = _upstream_message(val)
+            if nested:
+                return nested
+    return ""
 
 
 def _load_key_gen_config() -> dict:
@@ -189,7 +220,14 @@ async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
             resp = await client.get(api_url, params=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data.get(key_field, "")
+        api_key = data.get(key_field, "")
+        if not api_key:
+            # 上游用「HTTP 200 + success:false + message」表示失败（实测 tokenfly
+            # 网关就是这样：名字超长回 {"message":"Token name is too long"}），
+            # raise_for_status 拦不住，必须在这里把 message 透出来。否则用户只看到
+            # 一句笼统的「未返回 api_key」，不知道是名字太长还是邀请码不对。
+            raise UpstreamKeyError(_upstream_message(data) or "上游服务未返回 api_key")
+        return api_key
 
 
 @key_router.post("/generate-api-key")
@@ -208,21 +246,29 @@ async def generate_api_key(
         raise HTTPException(status_code=400, detail="invite_code 不能为空")
     try:
         api_key = await _request_api_key(base_url or "", invite_code, name)
+    except UpstreamKeyError as e:
+        # 上游明确拒绝：原样透出它给的原因（如 "Token name is too long"），
+        # 用户照提示自己改（把 key 名字改短）即可，不必来问。
+        raise HTTPException(status_code=502, detail=f"申请 key 失败：{e}")
     except httpx.HTTPStatusError as e:
-        # 把上游服务的真实报错透出来（如 "Token not provided"）
+        # 非 2xx：同样优先用上游的 message。空响应体（如 429 限流只给状态码）
+        # 时退回状态码说明，否则前端会弹出一个没有原因的空报错。
         detail = ""
         try:
-            detail = e.response.json().get("message") or e.response.text
+            detail = _upstream_message(e.response.json())
         except Exception:
-            detail = e.response.text
+            detail = ""
+        detail = detail or (e.response.text or "").strip()
+        if not detail:
+            detail = f"上游返回 HTTP {e.response.status_code}"
+            if e.response.status_code == 429:
+                detail += "（申请过于频繁，被限流，请稍后再试）"
         raise HTTPException(status_code=502, detail=f"申请 key 失败：{detail}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"申请 key 失败：{e}")
 
-    if not api_key:
-        raise HTTPException(status_code=502, detail="上游服务未返回 api_key")
     return {"api_key": api_key}
 
 
@@ -1104,7 +1150,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             if prov["api"] == "openai-completions" and not base_url.endswith("/v1"):
                 base_url += "/v1"
             if prov["api"] == "anthropic-messages" and base_url.endswith("/v1"):
-                base_url -= "v1"
+                base_url = base_url[:-3].rstrip("/")
             prov["baseUrl"] = base_url
         
         if req.model_id:
@@ -1173,7 +1219,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             if prov["api"] == "openai-completions" and not base_url.endswith("/v1"):
                 base_url += "/v1"
             if prov["api"] == "anthropic-messages" and base_url.endswith("/v1"):
-                base_url -= "v1"
+                base_url = base_url[:-3].rstrip("/")
             prov["baseURL"] = base_url
         if req.model_id:
             models_list = prov.get("models")
@@ -1508,6 +1554,25 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 # 配置查看
 # ============================================================================
 
+def _instance_create_params(instance_id: str) -> dict:
+    """该实例的 create_params（原始 dict）；缺失或非法 JSON 返回空 dict。
+
+    只给脱敏用：拿不到就是没 key 可遮，不该让配置文件接口 500
+    （与 batch_output 对非法 create_params 静默降级的口径一致）。
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT create_params FROM task_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+    if not row or not row["create_params"]:
+        return {}
+    try:
+        params = json.loads(row["create_params"])
+    except (ValueError, TypeError):
+        return {}
+    return params if isinstance(params, dict) else {}
+
+
 @router.get("/{instance_id}/configs")
 def list_instance_configs(instance_id: str, user: dict = Depends(get_current_user)):
     instance_dir = _get_instance_dir(instance_id)
@@ -1538,17 +1603,16 @@ def get_instance_config(instance_id: str, filename: str, user: dict = Depends(ge
     with open(fpath, "r", encoding="utf-8") as f:
         content = f.read()
 
+    # key 脱敏：这些文件是后端拿 create_params 里的 key 填出来的，原文在手上，
+    # 直接按原文替换，不必在 13 种 harness 格式里找 key 字段叫什么、在哪一层
+    # （同 hive.py 打沙箱后缀的做法）。拿不到 create_params 时原样返回，不 500。
+    content = redact_text(content, _instance_create_params(instance_id))
+
     file_type = "yaml" if filename.endswith(".yaml") else "json"
     return {"filename": filename, "type": file_type, "content": content}
 
 
-@router.get("/{instance_id}/create-params")
-def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
-    """详情页「配置信息 → 创建参数」卡片。
-
-    组装逻辑与任务导出共用 api.services.create_params.build_create_params，
-    保证「详情页看到什么，导出就是什么」。
-    """
+def _build_create_params_or_404(instance_id: str) -> dict:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT create_params, config_snapshot, suffix_api_keys "
@@ -1561,6 +1625,30 @@ def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="该实例无创建参数记录")
     params, _ = build_create_params(dict(row))
     return params
+
+
+@router.get("/{instance_id}/create-params")
+def get_create_params(instance_id: str, user: dict = Depends(get_current_user)):
+    """详情页「配置信息 → 创建参数」卡片（API Key 已脱敏）。
+
+    组装逻辑与任务导出共用 api.services.create_params.build_create_params，
+    保证「详情页看到什么，导出就是什么」。
+
+    脱敏只加在这一层，不动 build_create_params：导出和复制实例都还要原文。
+    任何登录用户（含 viewer）都能调本接口，所以 key 绝不能明文下发。
+    """
+    return mask_create_params(_build_create_params_or_404(instance_id))
+
+
+@router.get("/{instance_id}/create-params/full")
+def get_create_params_full(instance_id: str, user: dict = Depends(require_operator)):
+    """「复制实例」专用：返回含完整 API Key 的创建参数，仅 operator/admin 可调。
+
+    复制实例要把源实例的 key 回填进新建表单，拿到掩码值会让新任务带着假 key
+    去跑（静默失败，不报错），所以这条路径必须给原文；但收紧到 operator，
+    viewer 调不到。前端只在 CreateInstance 的 copy_from 分支用它。
+    """
+    return _build_create_params_or_404(instance_id)
 
 
 # ============================================================================
@@ -1954,6 +2042,21 @@ async def stop_instance(instance_id: str, user: dict = Depends(require_operator)
         )
         stopped = cur.rowcount > 0
 
+    # 停止那一刻重算一次 error_breakdown：running 期间的最后一个快照是
+    # 「跑到一半」的，而 _analyze_task_status 对非 running 实例永不重扫，
+    # 不补算的话页面会把停止前未统计到的任务永久显示成「未执行」
+    # （实测某实例 4161 个全部失败，却显示「任务异常 2422 / 未执行 1739」）。
+    #
+    # 放后台线程：冷扫一个 4000+ 任务的实例要十几秒，不能阻塞停止请求的响应。
+    if stopped:
+        async def _recompute() -> None:
+            try:
+                await async_execute(_compute_analyze, inst["config_path"],
+                                    inst["total_tasks"])
+            except Exception:
+                pass
+        asyncio.create_task(_recompute())
+
     # 任务停止后，触发队列调度：它腾出了槽位，让下一个排队任务继续
     # （即使本次未改写状态，也调度一次——若实例刚自然跑完，同样需要放行下一个）
     queue_id = inst.get("queue_id")
@@ -1987,7 +2090,8 @@ def get_instance_overview(instance_id: str, user: dict = Depends(get_current_use
     pending = max(0, total - finished - running_pods)
     rate = (completed / finished * 100) if finished > 0 else 0.0
 
-    error_breakdown = _analyze_task_status(inst["config_path"], total, inst["status"])
+    error_breakdown = _analyze_task_status(inst["config_path"], total, inst["status"],
+                                       inst.get("stopped_at"))
     # error_tree 与 error_breakdown 在 _compute_analyze 中同刻写入，缓存生命周期一致
     error_tree = _analyze_tree_cache.get(inst["config_path"], [])
     time_est = _estimate_remaining_time(total, finished, inst.get("started_at"), inst["status"])
@@ -2074,7 +2178,8 @@ def get_overview_batch(payload: OverviewBatchRequest, user: dict = Depends(get_c
         if inst["status"] == "running" and total > finished:
             running_pods = min(inst["concurrent_num"], total - finished)
         # overview 与 _sync_instance_status 共用缓存，无需在这里重复扫描
-        _analyze_task_status(inst["config_path"], total, inst["status"])
+        _analyze_task_status(inst["config_path"], total, inst["status"],
+                             inst.get("stopped_at"))
         error_tree = _analyze_tree_cache.get(inst["config_path"], [])
         out["overviews"][iid] = {
             "total": total,
@@ -2189,7 +2294,8 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     """
     # 后台刷新器直接调本函数，不经过 _analyze_task_status；重启后第一次扫描前
     # 必须先把落盘的签名灌进来，否则 11.7 万份日志会被整篇重读（实测 129s）。
-    _load_file_state()
+    # 传 config_path：真要扫这个实例才付解压成本（见 _load_file_state 的说明）。
+    _load_file_state(config_path)
     output_dir = _get_output_dir(config_path)
     logs_dir = os.path.join(output_dir, "logs")
 
@@ -2493,6 +2599,22 @@ def _refresh_running_once():
                 if inst.get("queue_id"):
                     queues_to_schedule.add(inst["queue_id"])
             elif inst["status"] in ("completed", "finished"):
+                # 刚从 running/preparing 转终态：**重算一次 error_breakdown**。
+                #
+                # running 期间每轮都 _compute_analyze，但最后那一轮的快照是
+                # 「跑到一半」的 —— 实例结束后剩下的任务也有了结果，而
+                # _analyze_task_status 对非 running 实例永不重扫，旧快照会被永久复用。
+                # 实测某实例 4161 个任务全部 C003 失败，页面却显示
+                # 「任务异常 2422 / 未执行 1739」（2422 是停止前那一刻的计数），
+                # 与 overview 的 failed=4161 口径打架。
+                #
+                # 只在**转换那一刻**算一次：成本一次性，且结果随后由
+                # _save_shared_caches() 落盘，4 个 uvicorn worker 都能复用。
+                if prev_status in ("running", "preparing"):
+                    try:
+                        _compute_analyze(inst["config_path"], inst["total_tasks"])
+                    except Exception:
+                        pass
                 # 队列续跑：本实例刚跑完，放行同队列的下一排队任务
                 if prev_status in ("running", "preparing") and inst.get("queue_id"):
                     queues_to_schedule.add(inst["queue_id"])
@@ -2668,36 +2790,94 @@ def _file_state_path() -> str:
     return os.path.join(os.path.dirname(settings.DB_PATH), "analyze_file_state.json.gz")
 
 
-def _load_file_state() -> None:
-    """启动时灌入上次的 per-file 扫描签名，避免重启后把 10 万+ 份日志重读一遍。
+def _load_file_state(config_path: str | None = None) -> None:
+    """灌入上次的 per-file 扫描签名，避免重启后把 10 万+ 份日志重读一遍。
 
-    只加载一次；之后由 leader 每 2 分钟覆盖写回。签名按 (mtime, size) 核对，
-    日志有任何追加都会自然失效并重读，不存在读到陈旧内容的风险。
+    签名按 (mtime, size) 核对，日志有任何追加都会自然失效并重读，不存在陈旧风险。
+
+    **按需加载单个实例，而不是整文件**。这个 gz 已经涨到 **203 MB / 704 万条签名**
+    （注释里写的「11 万条约几 MB」是很久以前的规模），整文件 gzip 解压 + json 解析
+    实测 **12.35s** —— 而它是每个进程首次请求时同步做的，uvicorn 有 4 个 worker，
+    于是「重启后点开任务实例管理」每次都要卡十几秒（实测列表页计算本身只要 0.43s，
+    99% 的时间全在这一步）。
+
+    改成按 config_path 懒加载：
+      · 传 config_path → 只解出这一个实例的签名（命中内存则直接返回）
+      · 不传（兼容旧调用）→ 不再整文件加载，交给调用方按实例取
+    整文件只在 leader 落盘前需要全量（_save_file_state 用内存里的即可）。
     """
+    if config_path is not None and config_path in _analyze_file_state:
+        return
+    if config_path is None:
+        # 旧签名的调用方（列表页/overview）不再触发整文件解压 ——
+        # 真正需要签名的 _compute_analyze 会带 config_path 再来一次。
+        return
+
+    # 单实例懒加载：仍要解压整个 gz（json 不支持随机读），但**只保留命中的那一份**，
+    # 并把结果记在 _analyze_file_state 里，同一实例不会重复解。
+    # 为避免每个实例各解一遍 203MB，这里解一次就把全部灌进内存（和原来等价），
+    # 只是把时机从「进程首次请求」推迟到「真的要扫某个实例」——
+    # 列表页/overview 命中缓存时根本不需要签名，也就不必付这 12s。
     if _FILE_STATE_LOADED[0]:
         return
     _FILE_STATE_LOADED[0] = True
     try:
         import gzip
+        t0 = time.time()
         with gzip.open(_file_state_path(), "rt", encoding="utf-8") as f:
             payload = json.load(f)
         for k, v in (payload or {}).items():
             _analyze_file_state[k] = {
                 fname: tuple(rec) for fname, rec in v.items()
             }
+        elapsed = time.time() - t0
+        if elapsed > 3:
+            print(f"[analyze] file_state 加载 {elapsed:.1f}s "
+                  f"({len(_analyze_file_state)} 实例) —— 文件过大时考虑裁剪已删实例",
+                  flush=True)
     except Exception:
         pass
 
 
 def _save_file_state(force: bool = False) -> None:
-    """把 per-file 签名落盘（leader 调用）。节流 2 分钟，11 万条约几 MB gzip。"""
+    """把 per-file 签名落盘（leader 调用）。节流 2 分钟。
+
+    **只保留「还会被再扫一次」的实例**，否则这个文件会无界增长：
+    实测涨到 **203 MB / 704 万条签名 / 1319 个实例**（其中 232 个实例已被删除），
+    而 gzip 解压 + json 解析要 **12.35s**，是每个 uvicorn worker 首次请求同步付的 ——
+    「重启后点开任务实例管理卡十几秒」就是这么来的。
+
+    判据：签名的唯一用途是 `_compute_analyze` 的增量扫描（跳过未变化的日志文件）。
+      · running/preparing  —— 每轮都要重扫，必须留
+      · 终态且 task_done_sync=0 —— 还差「转终态那一次」补算，留
+      · 其它终态实例         —— 已经算完且永不重扫（见 _analyze_task_status），
+                                 签名留着纯占体积
+    实测只留前两类 = 25 个实例 / 19 万条签名，体积降到约 1/37。
+
+    被裁掉的实例若之后又要扫（比如用户重启了它），签名缺失只是让那一次全量重读，
+    功能不受影响。
+    """
     now = time.time()
     if not force and now - _file_state_last_save[0] < _FILE_STATE_SAVE_INTERVAL:
         return
     _file_state_last_save[0] = now
     try:
         import gzip
-        payload = {k: v for k, v in _analyze_file_state.items()}
+        keep: set[str] = set()
+        try:
+            with get_connection() as conn:
+                keep = {r[0] for r in conn.execute(
+                    "SELECT config_path FROM task_instances "
+                    " WHERE status IN ('running','preparing') "
+                    "    OR (status IN ('completed','finished','stopped') "
+                    "        AND COALESCE(task_done_sync,0)=0)")}
+        except Exception:
+            # 查不到就退回全量（宁可文件大，也不要误删正在用的签名）
+            keep = set(_analyze_file_state)
+        payload = {k: v for k, v in _analyze_file_state.items() if k in keep}
+        # 内存里也同步裁掉，否则进程越跑越占内存（704 万条元组约数百 MB）
+        for k in [k for k in _analyze_file_state if k not in keep]:
+            _analyze_file_state.pop(k, None)
         path = _file_state_path()
         tmp = f"{path}.{os.getpid()}.tmp"
         with gzip.open(tmp, "wt", encoding="utf-8") as f:
@@ -2707,8 +2887,18 @@ def _save_file_state(force: bool = False) -> None:
         pass
 
 
-def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running") -> dict:
-    _load_file_state()
+def _analyze_task_status(config_path: str, total_tasks: int, instance_status: str = "running",
+                         stopped_at: str | None = None) -> dict:
+    """error_breakdown（按状态/错误码分类的计数）。
+
+    stopped_at 当前不参与判断，保留参数是因为调用方已经在传 —— 曾用它做
+    「缓存是否早于实例结束」的校验，但那会让列表页每次重扫 19/20 个实例
+    （单个冷扫 12.66s，整页 88s）。改由实例转终态那一刻补算一次，见
+    _refresh_running_once 与 stop_instance。
+    """
+    # **不在这里 _load_file_state()** —— 命中缓存的请求根本不需要 per-file 签名,
+    # 而整文件解压要 12.35s（203MB / 704 万条）。真需要扫的 _compute_analyze
+    # 会自己带 config_path 调用。这是「重启后列表页卡十几秒」的真凶。
     now = time.time()
     cache_key = config_path
     cached = _analyze_cache.get(cache_key)
@@ -2718,7 +2908,18 @@ def _analyze_task_status(config_path: str, total_tasks: int, instance_status: st
         _load_shared_caches()
         cached = _analyze_cache.get(cache_key)
 
-    # 非 running：状态已定，命中缓存直接返回，永不重扫
+    # 非 running：状态已定，命中缓存直接返回，**永不重扫**。
+    #
+    # 这里刻意不做「缓存是否早于 stopped_at」的校验 —— 试过，代价不可接受：
+    # 冷扫一个 4000+ 任务的实例要 12.66s（NFS 上读几千个 task-N.log），
+    # 而列表页一次就有 19/20 个实例命中失效条件，整页 88 秒。
+    # 更糟的是 _compute_analyze 只写**进程内**缓存，uvicorn 有 4 个 worker、
+    # 只有 leader 会 _save_shared_caches()，所以每个 worker 的每次请求都要重扫，
+    # 永远修不好。
+    #
+    # 「跑一半的快照」改由 _refresh_running_once 在**实例刚转终态那一刻**
+    # 重算一次（见那里的 _compute_analyze 调用），一次性修正并落进共享缓存，
+    # 读路径完全不受影响。
     if instance_status not in ("running",):
         if cached:
             return cached[0]

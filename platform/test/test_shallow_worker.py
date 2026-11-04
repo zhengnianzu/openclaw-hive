@@ -31,6 +31,7 @@ from offline import shallow_local as sl  # noqa: E402
 from offline import shallow_obs as so  # noqa: E402
 from offline import task_tracker as tt  # noqa: E402
 from offline import auto_tracker as at  # noqa: E402
+from offline import output_worker as ow  # noqa: E402
 
 IID = "__sw_test_instance__"
 
@@ -581,6 +582,147 @@ class AutoLanePendingTest(unittest.TestCase):
         st = at.run_once(min_gap=1, max_pending=1)
         self.assertIsNone(st["instance"])
         self.assertEqual(st["submitted"], 0)
+
+
+class TsrLoggingTest(unittest.TestCase):
+    """tsr 拉取的日志降噪:rc=6(对象不存在)只计数,真异常仍逐条打。
+
+    为什么:2026-08 及更早的批次 harness 不写 traj_stats_result.json
+    (OBS 上只有 logs/<task>.log + gateway.log),拉不到会自动走
+    log_fallback_grade 读本地日志判等级 —— **分析并没有失败**。
+    而原来每个任务打一行「OBS 拉 tsr 失败 rc=6」,补历史时一轮几千行,
+    把真正的异常彻底淹没。
+    """
+
+    def setUp(self):
+        ow.tsr_round_summary()      # 清零
+
+    def tearDown(self):
+        ow.tsr_round_summary()
+
+    def test_counts_are_summarised(self):
+        ow._tsr_count("missing")
+        ow._tsr_count("missing")
+        ow._tsr_count("fetched")
+        s = ow.tsr_round_summary()
+        self.assertIn("无tsr", s)
+        self.assertIn("=2", s)
+        self.assertIn("拉取=1", s)
+
+    def test_summary_resets(self):
+        ow._tsr_count("missing")
+        self.assertTrue(ow.tsr_round_summary())
+        self.assertEqual(ow.tsr_round_summary(), "", "取过一次就该清零")
+
+    def test_summary_empty_when_untouched(self):
+        """本轮没碰 tsr 时返回空串 —— 调用方据此不打这一行。"""
+        self.assertEqual(ow.tsr_round_summary(), "")
+
+    def test_thread_safe(self):
+        """跑在 16~64 线程池里,dict 的 += 不是原子操作,必须加锁。"""
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            for _ in range(2000):
+                pool.submit(ow._tsr_count, "missing")
+        self.assertIn("=2000", ow.tsr_round_summary())
+
+
+class DoneFailedUpsertTest(unittest.TestCase):
+    """「任务异常」的行必须 UPSERT task_records,不能只 UPDATE。
+
+    task_records 的行平时由在线 _sync_task_records 写,但实例跑太快结束 /
+    在线同步漏掉的 config 在 apply_results 里是**没有行**的 —— 纯 UPDATE
+    命中 0 行却把队列置成 done,这个任务就永久消失:页面上既不算已定级、
+    也不算未评估,连 total 都不包含它。
+
+    实测全库 23,516 行是这种孤儿;某实例 4,161 个任务里 1,739 个因此丢失,
+    页面显示成「未执行 1739」(而其实它们全部跑过且失败了)。
+    """
+
+    IID = "__df_test__"
+
+    def setUp(self):
+        init_db()
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        with get_connection() as conn:
+            conn.execute("DELETE FROM shallow_queue WHERE instance_id=?", (self.IID,))
+            conn.execute("DELETE FROM task_records WHERE instance_id=?", (self.IID,))
+            conn.commit()
+
+    def _queue_row(self, cn, idx=None):
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO shallow_queue (instance_id, config_name, task_idx, "
+                " priority, local_state, obs_state, artifact_state) "
+                "VALUES (?,?,?,0,'claimed','queued','pending_click')",
+                (self.IID, cn, idx))
+            conn.commit()
+            return conn.execute(
+                "SELECT id FROM shallow_queue WHERE instance_id=? AND config_name=?",
+                (self.IID, cn)).fetchone()["id"]
+
+    def test_creates_row_when_missing(self):
+        qid = self._queue_row("a.json", 7)
+        sl.apply_results([({"id": qid, "instance_id": self.IID,
+                            "config_name": "a.json", "task_idx": 7},
+                           "done_failed", 0, "status=任务异常")])
+        with get_connection() as conn:
+            tr = conn.execute(
+                "SELECT task_idx, status, traj_level FROM task_records "
+                "WHERE instance_id=? AND config_name='a.json'", (self.IID,)).fetchone()
+        self.assertIsNotNone(tr, "task_records 没行时必须建出来")
+        self.assertEqual(tr["traj_level"], "failed")
+        self.assertEqual(tr["status"], "任务异常")
+        self.assertEqual(tr["task_idx"], 7)
+
+    def test_does_not_overwrite_existing_grade(self):
+        """已定级的行不被覆盖 —— 那可能是别的路径判出的真实等级。"""
+        qid = self._queue_row("b.json", 3)
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO task_records (instance_id, config_name, task_idx, "
+                " status, traj_level) VALUES (?,?,3,'任务成功','L2')",
+                (self.IID, "b.json"))
+            conn.commit()
+        sl.apply_results([({"id": qid, "instance_id": self.IID,
+                            "config_name": "b.json", "task_idx": 3},
+                           "done_failed", 0, "x")])
+        with get_connection() as conn:
+            tr = conn.execute(
+                "SELECT status, traj_level FROM task_records "
+                "WHERE instance_id=? AND config_name='b.json'", (self.IID,)).fetchone()
+        self.assertEqual(tr["traj_level"], "L2")
+        self.assertEqual(tr["status"], "任务成功")
+
+    def test_queue_advanced(self):
+        """建行的同时两个浅层维都要收掉,不留在队列里空转。"""
+        qid = self._queue_row("c.json")
+        sl.apply_results([({"id": qid, "instance_id": self.IID,
+                            "config_name": "c.json", "task_idx": None},
+                           "done_failed", 0, "x")])
+        with get_connection() as conn:
+            q = conn.execute(
+                "SELECT local_state, obs_state FROM shallow_queue WHERE id=?",
+                (qid,)).fetchone()
+        self.assertEqual(q["local_state"], "done")
+        self.assertEqual(q["obs_state"], "done")
+
+    def test_null_task_idx_ok(self):
+        """task_idx 为 NULL 也要能建行（tracker 投递时 task_records 还没建行）。"""
+        qid = self._queue_row("d.json")
+        sl.apply_results([({"id": qid, "instance_id": self.IID,
+                            "config_name": "d.json", "task_idx": None},
+                           "done_failed", 0, "x")])
+        with get_connection() as conn:
+            tr = conn.execute(
+                "SELECT traj_level FROM task_records "
+                "WHERE instance_id=? AND config_name='d.json'", (self.IID,)).fetchone()
+        self.assertEqual(tr["traj_level"], "failed")
 
 
 if __name__ == "__main__":
