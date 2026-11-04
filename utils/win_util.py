@@ -144,11 +144,11 @@ _WINDOWS_AUX_DIRS_BY_IMAGE: dict[str, list[tuple[str, str]]] = {
         ("/root/sandbox-log/windows/xiaoyi-device-env", "xiaoyi-device-env"),
         ("/root/sandbox-log/windows/claude_code_image_reading_tool", "claude_code_image_reading_tool"),
     ],
-    # fix1: 缺 serper 技能。jiuwenswarm 按 <home>/.jiuwenswarm/agent/workspace 找项目技能
-    "swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:windows-jiuwenswarm-xiaoyi-0.2.4.beta3-toc-stable-20261103-fix1": [
-        ("/root/sandbox-log/windows/skills/serper",
-         ".jiuwenswarm/agent/workspace/skills/serper"),
-    ],
+    # # fix1: 缺 serper 技能。jiuwenswarm 按 <home>/.jiuwenswarm/agent/workspace 找项目技能
+    # "swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:windows-jiuwenswarm-xiaoyi-0.2.4.beta3-toc-stable-20261103-fix1": [
+    #     ("/root/sandbox-log/windows/skills/serper",
+    #      ".jiuwenswarm/agent/workspace/skills/serper"),
+    # ],
 }
 
 
