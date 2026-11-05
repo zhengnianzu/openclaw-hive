@@ -50,7 +50,7 @@
           <el-option label="空闲" value="idle" />
           <el-option label="已满" value="full" />
         </el-select>
-        <el-button size="default" @click="resetFilters">重置</el-button>
+        <el-button size="default" @click="resetFilters">重置筛选</el-button>
       </div>
 
       <el-table :data="pagedQueues" v-loading="loading" stripe style="width:100%">
@@ -169,7 +169,7 @@
         <el-date-picker v-model="taskDateRange" type="daterange" range-separator="~"
           start-placeholder="开始" end-placeholder="结束" value-format="YYYY-MM-DD"
           size="default" style="width:220px" clearable />
-        <el-button size="default" @click="resetTaskFilters">重置</el-button>
+        <el-button size="default" @click="resetTaskFilters">重置筛选</el-button>
       </div>
 
       <el-table ref="taskTableRef" :data="pagedTasks" v-loading="loadingTasks" stripe

@@ -253,5 +253,108 @@ class PoolUsageTest(unittest.TestCase):
         self.assertEqual(out["pool-a"]["used_cpu"], 2)
 
 
+class TestValidateS3Script(unittest.TestCase):
+    """s3_uploader_script / s3_download_script 只能是可执行文件路径。
+
+    hive.py 把该值当命令名拼接（f"{s3_download_script} cp ..."），
+    写入 shell 脚本内容会在沙箱里执行失败，故保存时就拦住。
+    """
+
+    def _ok(self, value):
+        self.assertEqual(sandbox_configs._validate_s3_script(value, "f"), value.strip())
+
+    def _rejected(self, value):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as cm:
+            sandbox_configs._validate_s3_script(value, "f")
+        self.assertEqual(cm.exception.status_code, 400)
+
+    def test_accepts_linux_path(self):
+        self._ok("/home/ma-user/obsutil/obsutil")
+
+    def test_accepts_windows_path_with_spaces(self):
+        """Windows 路径带反斜杠、冒号、空格，都不该被当成 shell 元字符。"""
+        self._ok(r"C:\Program Files\obsutil\obsutil.exe")
+
+    def test_accepts_bare_and_relative(self):
+        self._ok("obsutil")
+        self._ok("./obsutil")
+
+    def test_accepts_empty(self):
+        """download 留空 = 沿用 uploader，见 _apply_summary。"""
+        self.assertEqual(sandbox_configs._validate_s3_script("", "f"), "")
+        self.assertEqual(sandbox_configs._validate_s3_script(None, "f"), "")
+
+    def test_strips_surrounding_space(self):
+        self.assertEqual(
+            sandbox_configs._validate_s3_script("  /a/obsutil  ", "f"), "/a/obsutil"
+        )
+
+    def test_rejects_shebang(self):
+        self._rejected("#!/bin/bash\necho upload")
+        self._rejected("#!/bin/sh")
+
+    def test_rejects_shell_metachars(self):
+        for v in ("obsutil cp a b && rm -rf /", "echo x | obsutil", "obsutil; ls",
+                  "$(whoami)", "`id`", "obsutil > /tmp/x", "a<b", "(x)"):
+            with self.subTest(v=v):
+                self._rejected(v)
+
+    def test_rejects_newline_and_tab(self):
+        self._rejected("line1\nline2")
+        self._rejected("line1\r\nline2")
+        self._rejected("a\tb")
+
+    def test_existing_configs_still_valid(self):
+        """线上既有配置必须全部通过，否则改配置时会突然保存失败。"""
+        import glob
+        import yaml
+        checked = 0
+        for path in glob.glob(os.path.join(PLATFORM_DIR, "settings", "sandbox", "*.yaml")):
+            with open(path, encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            for key in ("s3_uploader_script", "s3_download_script"):
+                val = (cfg.get("s3") or {}).get(key)
+                if val is None:
+                    continue
+                checked += 1
+                with self.subTest(file=os.path.basename(path), key=key):
+                    self._ok(val)
+        self.assertGreater(checked, 0, "没检查到任何现有取值，用例失去意义")
+
+
+class TestApplySummaryS3Validation(unittest.TestCase):
+    """校验挂在 _apply_summary 上，创建与更新两条路径都要覆盖。"""
+
+    def test_uploader_rejected(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
+            sandbox_configs._apply_summary(
+                {}, "x86_cpu", {"s3_uploader_script": "#!/bin/bash\nfoo"}
+            )
+
+    def test_download_only_still_validated(self):
+        """只填 download 时外层 if 不成立 —— 这条路径曾会绕过校验。"""
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
+            sandbox_configs._apply_summary(
+                {}, "x86_cpu", {"s3_download_script": "#!/bin/sh\nfoo"}
+            )
+
+    def test_download_defaults_to_uploader(self):
+        cfg = sandbox_configs._apply_summary(
+            {}, "x86_cpu", {"s3_uploader_script": "/a/obsutil"}
+        )
+        self.assertEqual(cfg["s3"]["s3_uploader_script"], "/a/obsutil")
+        self.assertEqual(cfg["s3"]["s3_download_script"], "/a/obsutil")
+
+    def test_both_kept_when_given(self):
+        cfg = sandbox_configs._apply_summary(
+            {}, "x86_cpu",
+            {"s3_uploader_script": "/a/up", "s3_download_script": "/a/down"},
+        )
+        self.assertEqual(cfg["s3"]["s3_download_script"], "/a/down")
+
+
 if __name__ == "__main__":
     unittest.main()

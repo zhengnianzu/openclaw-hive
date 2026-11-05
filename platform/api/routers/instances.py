@@ -1599,6 +1599,55 @@ def get_instance_config(instance_id: str, filename: str, user: dict = Depends(ge
     return {"filename": filename, "type": file_type, "content": content}
 
 
+@router.get("/{instance_id}/task-config")
+def get_task_config(instance_id: str, config_name: str = Query(..., description="config 文件名"),
+                    user: dict = Depends(get_current_user)):
+    """单个 task 的输入配置原文（会话列表「任务配置」列的弹窗）。
+
+    与 `/configs/{filename}` 的区别：那个只放实例级的白名单文件
+    （config.yaml 等），这里读的是 `task_input_path` 下**每任务一个**的 json
+    （`hive` 建队列时 `enumerate(sorted(files))` 的那批，数量上万）。
+
+    **路径安全**：config_name 必须是纯文件名 —— 用 os.path.basename 削掉任何
+    目录成分，再校验结果与入参一致。否则 `?config_name=../../../etc/passwd`
+    就能越过 task_input_path 读任意文件（这个接口对所有登录用户开放，含 viewer）。
+
+    **key 脱敏**：与 /configs/{filename} 同款 —— 任务配置里可能带模型 key
+    （agents[].config 里嵌 api_key），而 viewer 也能调本接口。
+    """
+    safe = os.path.basename(config_name or "")
+    if not safe or safe != config_name:
+        raise HTTPException(status_code=400, detail="非法的 config 文件名")
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT config_path FROM task_instances WHERE id=?", (instance_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    # 复用 shallow_local 的解析：它读 config.yaml 的 run_config.task.task_input_path，
+    # 并在目录不可用时返回 None（实例被搬迁/清理后）。
+    from offline.shallow_local import _task_input_path
+    d = _task_input_path({"config_path": row["config_path"]})
+    if not d:
+        raise HTTPException(status_code=404,
+                            detail="取不到任务输入目录（实例可能已被清理或搬迁）")
+
+    fpath = os.path.join(d, safe)
+    if not os.path.isfile(fpath):
+        raise HTTPException(status_code=404, detail=f"配置文件不存在: {safe}")
+
+    try:
+        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"读取失败: {str(e)[:120]}")
+
+    content = redact_text(content, _instance_create_params(instance_id))
+    return {"config_name": safe, "type": "json", "content": content,
+            "size": len(content), "path": fpath}
+
+
 def _build_create_params_or_404(instance_id: str) -> dict:
     with get_connection() as conn:
         row = conn.execute(

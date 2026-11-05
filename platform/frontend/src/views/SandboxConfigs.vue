@@ -273,15 +273,19 @@
           <!-- S3 -->
           <div v-show="activePanel === 's3'">
             <h3>S3 上传配置</h3>
-            <p class="panel-sub">配置用于上传文件到 S3 的脚本或脚本引用。</p>
+            <p class="panel-sub">obsutil 可执行文件在沙箱内的路径，用于上传/下载产物。</p>
             <el-form-item label="s3_uploader_script" required>
-              <el-input v-model="form.s3_uploader_script" type="textarea" :autosize="{minRows:4}"
-                placeholder="# 这里填写脚本内容或脚本引用路径&#10;#!/bin/bash&#10;echo &quot;upload to s3...&quot;" />
+              <el-input v-model="form.s3_uploader_script"
+                placeholder="/home/ma-user/obsutil/obsutil" />
             </el-form-item>
             <el-form-item label="s3_download_script">
               <el-input v-model="form.s3_download_script" placeholder="留空则与上传脚本相同" />
             </el-form-item>
-            <div class="hint">建议采用脚本引用或版本 ID，避免在模板中直接保存敏感凭据。</div>
+            <div class="hint">
+              只能填可执行文件路径，不能写 shell 脚本内容 —— 任务侧是把它当命令名拼接执行的
+              （<code>&lt;路径&gt; cp &lt;源&gt; &lt;目标&gt; -r -f</code>）。
+              Windows 形如 <code>C:\ProgramData\OmniEnv\tools\obsutil\obsutil.exe</code>。
+            </div>
           </div>
 
           <!-- 源文件（文件权威：直接编辑 settings/sandbox/<file>） -->

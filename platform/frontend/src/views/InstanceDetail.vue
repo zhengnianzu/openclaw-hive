@@ -576,6 +576,14 @@
                 <span v-else style="color:var(--text-muted)">—</span>
               </template>
             </el-table-column>
+            <!-- 任务配置：点开看该 task 的输入 json 原文（task_input_path 下每任务一个）。
+                 列表里只有哈希名，想知道这个任务具体在跑什么，以前得登机器翻目录。 -->
+            <el-table-column label="任务配置" min-width="90" align="center">
+              <template #default="{ row }">
+                <el-button link type="primary" size="small"
+                  @click="openTaskConfig(row)">查看</el-button>
+              </template>
+            </el-table-column>
             <el-table-column label="等级" min-width="90" align="center">
               <template #default="{ row }">
                 <el-tag size="small" :color="levelTagBg(row.traj_level)" style="color:#fff;border:none"
@@ -849,6 +857,26 @@
         <el-button type="primary" @click="openArtifacts({ traj_name: detailTrajName })">
           查看交付物
         </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 任务配置查看：该 task 的输入 json 原文（key 已由后端脱敏） -->
+    <el-dialog v-model="taskCfgVisible"
+      :title="`任务配置 · ${taskCfgName || ''}`" width="820px" append-to-body>
+      <div v-if="taskCfgLoading" style="padding:24px;text-align:center;color:var(--text-muted)">
+        加载中…
+      </div>
+      <div v-else-if="taskCfgError" style="padding:16px">
+        <el-alert :title="taskCfgError" type="error" :closable="false" show-icon />
+      </div>
+      <template v-else>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-size:12px;color:var(--text-muted);word-break:break-all">
+            {{ taskCfgPath }}
+          </span>
+          <el-button link type="primary" size="small" @click="copyTaskCfg">复制</el-button>
+        </div>
+        <pre class="task-cfg-pre">{{ taskCfgText }}</pre>
       </template>
     </el-dialog>
   </div>
@@ -1760,6 +1788,53 @@ watch(detailVisible, (v) => {
 const assistantBlocks = computed(() => detailData.value?.assistant_trajectory || [])
 const evaluatorBlocks = computed(() => detailData.value?.evaluator_trajectory || [])
 
+// ---- 任务配置查看（会话列表「任务配置」列）----
+const taskCfgVisible = ref(false)
+const taskCfgName = ref('')
+const taskCfgText = ref('')
+const taskCfgPath = ref('')
+const taskCfgLoading = ref(false)
+const taskCfgError = ref('')
+
+async function openTaskConfig(row) {
+  // config_name 优先（后端按它在 task_input_path 下找文件）；
+  // 只有 traj_name 时补回 .json —— 两者只差扩展名（traj_name = config stem）。
+  const cn = row.config_name
+    || (row.traj_name ? `${row.traj_name}.json` : '')
+  if (!cn) { ElMessage.warning('该行没有 config 名，无法定位配置'); return }
+  taskCfgName.value = cn
+  taskCfgText.value = ''
+  taskCfgPath.value = ''
+  taskCfgError.value = ''
+  taskCfgVisible.value = true
+  taskCfgLoading.value = true
+  try {
+    const r = await api.get(`/instances/${id}/task-config`,
+      { params: { config_name: cn }, silent: true })
+    // 后端返回原文字符串；能解析成 JSON 就缩进美化，不能就原样显示
+    // （配置可能被脱敏替换过，或本身不是严格 JSON）。
+    try {
+      taskCfgText.value = JSON.stringify(JSON.parse(r.content), null, 2)
+    } catch {
+      taskCfgText.value = r.content
+    }
+    taskCfgPath.value = r.path || ''
+  } catch (e) {
+    taskCfgError.value = e?.response?.data?.detail || e?.message || '读取失败'
+  } finally {
+    taskCfgLoading.value = false
+  }
+}
+
+async function copyTaskCfg() {
+  try {
+    await navigator.clipboard.writeText(taskCfgText.value)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('浏览器拒绝了剪贴板访问')
+  }
+}
+
 async function openTaskDetail(row) {
   const name = row.traj_name
   detailTrajName.value = name
@@ -1918,6 +1993,20 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.task-cfg-pre {
+  margin: 0;
+  padding: 12px;
+  max-height: 520px;
+  overflow: auto;
+  background: var(--bg-secondary, #f5f7fa);
+  border: 1px solid var(--border-color, #ebeef5);
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .detail-tabs { margin-top: 4px; }
 

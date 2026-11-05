@@ -81,6 +81,43 @@ def _validate_namespace(ns: str) -> str:
     return ns
 
 
+# s3_uploader_script / s3_download_script 只能是 obsutil 可执行文件的路径：
+# hive.py 把它当命令名用（f"{s3_download_script} cp ..."，见 hive.py:117/126），
+# 写入 shell 内容会被当成命令名执行，必然失败。实际取值形如
+# /home/ma-user/obsutil/obsutil 或 C:\ProgramData\...\obsutil.exe。
+#
+# 拦 shell 元字符不是为了防注入（能改沙箱配置的人本就是 operator+），
+# 而是因为这些字符出现在这里一定是误填 —— 宁可保存时报错，
+# 也不要等任务跑起来才在沙箱里以一句看不懂的报错失败。
+_SHELL_METACHARS = ("|", "&", ";", "$", "`", ">", "<", "\n", "\r", "(", ")", "\t")
+
+
+def _validate_s3_script(value: str, field: str) -> str:
+    """校验 s3 脚本字段是可执行文件路径，而非 shell 脚本内容。
+
+    允许空串：s3_download_script 留空表示沿用上传脚本（见 _apply_summary）。
+    允许空格与反斜杠、冒号：Windows 路径形如 C:\\Program Files\\obsutil.exe。
+    """
+    value = (value or "").strip()
+    if not value:
+        return value
+    if value.startswith("#!"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} 只能填 obsutil 可执行文件的路径，不能是脚本内容"
+                   "（检测到 shebang #!）。例如 /home/ma-user/obsutil/obsutil",
+        )
+    hit = next((ch for ch in _SHELL_METACHARS if ch in value), None)
+    if hit:
+        shown = {"\n": "换行", "\r": "回车", "\t": "制表符"}.get(hit, hit)
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} 只能填 obsutil 可执行文件的路径，不能是脚本内容或命令"
+                   f"（检测到 {shown}）。例如 /home/ma-user/obsutil/obsutil",
+        )
+    return value
+
+
 def _template_path(sandbox_type: str) -> str:
     if sandbox_type not in _TEMPLATES:
         raise HTTPException(status_code=400, detail=f"沙箱类型必须是 {sorted(_ALLOWED_TYPES)} 之一")
@@ -211,8 +248,19 @@ def _apply_summary(cfg: dict, sandbox_key: str, data: dict) -> dict:
         cfg["sandbox_namespace"] = data["sandbox_namespace"]
     if "s3_uploader_script" in data and data["s3_uploader_script"]:
         s3 = cfg.setdefault("s3", {})
-        s3["s3_uploader_script"] = data["s3_uploader_script"]
-        s3["s3_download_script"] = data.get("s3_download_script") or data["s3_uploader_script"]
+        uploader = _validate_s3_script(data["s3_uploader_script"], "s3_uploader_script")
+        downloader = _validate_s3_script(
+            data.get("s3_download_script") or "", "s3_download_script"
+        )
+        s3["s3_uploader_script"] = uploader
+        s3["s3_download_script"] = downloader or uploader
+    elif data.get("s3_download_script"):
+        # 只改下载脚本、不碰上传脚本：上面的分支不成立，这里单独校验并写入，
+        # 否则这条路径会绕过校验。
+        s3 = cfg.setdefault("s3", {})
+        s3["s3_download_script"] = _validate_s3_script(
+            data["s3_download_script"], "s3_download_script"
+        )
     return cfg
 
 

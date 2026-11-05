@@ -31,14 +31,8 @@
       </div>
       <div class="ov-card ov-card-wide">
         <div class="ov-label" style="margin-bottom:6px">各 Harness 方案 / 版本</div>
-        <div class="ov-types">
-          <div v-for="t in overview.byType" :key="t.type" class="ov-type"
-            :class="{ 'ov-type-empty': !t.schemes }">
-            <span class="ov-type-dot" :style="{ background: harnessColor(t.type) }"></span>
-            <span class="ov-type-name">{{ typeLabel(t.type) }}</span>
-            <span class="ov-type-num">{{ t.schemes }} / {{ t.versions }}</span>
-          </div>
-        </div>
+        <EChart v-if="typeChartOption" :option="typeChartOption" :height="typeChartHeight" />
+        <div v-else class="muted" style="font-size:12px">暂无数据</div>
       </div>
     </div>
 
@@ -57,7 +51,7 @@
           <el-option label="普通配置" value="normal" />
         </el-select>
       </div>
-      <el-button @click="resetFilters">重置</el-button>
+      <el-button @click="resetFilters">重置筛选</el-button>
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
@@ -94,11 +88,21 @@
         <el-table-column label="版本数" width="80" align="center">
           <template #default="{row}">
             <span class="file-count">{{ row.version_count }}</span>
-            <span class="muted" style="font-size:11px"> ({{ row.published_count }} 发布)</span>
           </template>
         </el-table-column>
-        <el-table-column prop="description" label="描述" min-width="180" show-overflow-tooltip>
+        <el-table-column label="已发布" width="80" align="center">
+          <template #default="{row}">
+            <span class="file-count">{{ row.published_count }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="description" label="描述" min-width="160" show-overflow-tooltip>
           <template #default="{row}"><span class="muted">{{ row.description || '—' }}</span></template>
+        </el-table-column>
+        <el-table-column prop="latest_change" label="最新变更" min-width="160" show-overflow-tooltip>
+          <template #default="{row}">
+            <span v-if="row.latest_change" class="muted">{{ row.latest_change }}</span>
+            <span v-else class="muted">—</span>
+          </template>
         </el-table-column>
         <el-table-column label="文件" width="90" align="center">
           <template #default="{row}">
@@ -183,6 +187,7 @@ import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 import { joinBucket } from '../api/obsConfig'
+import EChart from '../components/EChart.vue'
 
 const authStore = useAuthStore()
 const harnessStore = useHarnessStore()
@@ -220,6 +225,80 @@ const overview = computed(() => {
     return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib)
   })
   return { schemeCount, versionCount, publishedCount, byType }
+})
+
+// 「各 Harness 方案 / 版本」横向双系列条形图。
+// 横向而非纵向：13 个类型名是中文 + 连字符（jiuwenswarm-xiaoyi），
+// 竖排 x 轴标签会挤成一团或被迫斜排。
+// 只画有方案的类型：byType 会把 harnessStore.types 里没方案的也补成 0/0，
+// 画进去就是一排空白条，占掉本就紧张的垂直空间。
+const typeChartRows = computed(() =>
+  overview.value.byType
+    .filter(t => t.schemes || t.versions)
+    .sort((a, b) => b.versions - a.versions || b.schemes - a.schemes)
+)
+
+// 每行约 22px，上下留白 36px；至少 140px，避免只有一两个类型时图表过扁。
+const typeChartHeight = computed(
+  () => `${Math.max(140, typeChartRows.value.length * 22 + 36)}px`
+)
+
+const typeChartOption = computed(() => {
+  const rows = typeChartRows.value
+  if (!rows.length) return null
+  return {
+    grid: { left: 4, right: 36, top: 28, bottom: 4, containLabel: true },
+    legend: {
+      data: ['方案', '版本'], top: 0, right: 0,
+      itemWidth: 10, itemHeight: 10,
+      textStyle: { color: '#64748b', fontSize: 11 },
+    },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (ps) => {
+        const r = rows[ps[0].dataIndex]
+        const avg = r.schemes ? (r.versions / r.schemes).toFixed(1) : '0'
+        return `<b>${typeLabel(r.type)}</b><br/>`
+          + `方案 ${r.schemes} 个 · 版本 ${r.versions} 个<br/>`
+          + `平均每方案 ${avg} 个版本`
+      },
+    },
+    xAxis: {
+      type: 'value',
+      axisLabel: { color: '#64748b', fontSize: 11 },
+      splitLine: { lineStyle: { color: '#f1f5f9' } },
+    },
+    yAxis: {
+      type: 'category',
+      // 降序排在数组前面的要显示在最上方，而 category 轴默认自下而上
+      inverse: true,
+      data: rows.map(r => typeLabel(r.type)),
+      axisLabel: { color: '#334155', fontSize: 11, width: 110, overflow: 'truncate' },
+      axisLine: { lineStyle: { color: '#e5e7eb' } },
+      axisTick: { show: false },
+    },
+    series: [
+      {
+        name: '方案', type: 'bar',
+        // 两个系列的量级差得多（方案 33 / 版本 52，尾部都是 1），
+        // 用各 harness 自己的主题色区分类型、方案系列浅一档，
+        // 比默认调色盘更贴合页面里其它地方的类型配色。
+        data: rows.map(r => ({ value: r.schemes, itemStyle: { color: harnessColor(r.type), opacity: 0.45 } })),
+        barMaxWidth: 9,
+        itemStyle: { borderRadius: [0, 3, 3, 0] },
+      },
+      {
+        name: '版本', type: 'bar',
+        data: rows.map(r => ({ value: r.versions, itemStyle: { color: harnessColor(r.type) } })),
+        barMaxWidth: 9,
+        itemStyle: { borderRadius: [0, 3, 3, 0] },
+        label: {
+          show: true, position: 'right', color: '#64748b', fontSize: 11,
+        },
+      },
+    ],
+  }
 })
 
 const filteredConfigs = computed(() => {
@@ -460,20 +539,16 @@ onMounted(() => { harnessStore.load(); loadList() })
 
 .overview-row {
   display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;
+  /* 图表卡比四个数字卡高得多；默认 stretch 会把数字卡拉成等高空心长条 */
+  align-items: flex-start;
 }
 .ov-card {
   background: var(--bg-card); border: 1px solid var(--border-color);
   border-radius: 10px; padding: 12px 18px; min-width: 110px;
 }
-.ov-card-wide { flex: 1; min-width: 320px; }
+.ov-card-wide { flex: 1; min-width: 420px; }
 .ov-num { font-size: 22px; font-weight: 700; color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .ov-label { font-size: 12px; color: var(--text-muted); }
-.ov-types { display: flex; flex-wrap: wrap; gap: 4px 18px; }
-.ov-type { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
-.ov-type-dot { width: 8px; height: 8px; border-radius: 2px; }
-.ov-type-name { color: var(--text-secondary); }
-.ov-type-num { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
-.ov-type-empty { opacity: .45; }
 
 .filter-bar {
   display: flex;

@@ -257,17 +257,21 @@ def _md_file_list(root_dir: str, harness_type: str) -> list[dict]:
 
 def _version_rollup(conn, config_id: int) -> dict:
     rows = conn.execute(
-        "SELECT version, status, created_at FROM harness_config_versions "
+        "SELECT version, status, description, created_at FROM harness_config_versions "
         "WHERE config_id = ? ORDER BY created_at DESC, id DESC",
         (config_id,),
     ).fetchall()
     if not rows:
-        return {"version_count": 0, "latest_version": "", "latest_status": "", "published_count": 0}
+        return {"version_count": 0, "latest_version": "", "latest_status": "",
+                "published_count": 0, "latest_change": ""}
     return {
         "version_count": len(rows),
         "latest_version": rows[0]["version"],
         "latest_status": rows[0]["status"],
         "published_count": sum(1 for r in rows if r["status"] == "published"),
+        # 最新版本的变更说明：列表页「最新变更」列用它，免得为看一句改动
+        # 就要点进工作台。版本表自带 description，这里只是把它带出来。
+        "latest_change": (rows[0]["description"] or "").strip(),
     }
 
 

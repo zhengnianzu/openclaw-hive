@@ -50,6 +50,8 @@ class HarnessConfigInfo(BaseModel):
     latest_version: str = ""
     latest_status: str = ""
     published_count: int = 0
+    # 最新版本的变更说明（取版本表的 description），列表页「最新变更」列用
+    latest_change: str = ""
 
 
 # ============================================================================
