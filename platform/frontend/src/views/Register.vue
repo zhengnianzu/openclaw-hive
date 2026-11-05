@@ -1,6 +1,11 @@
 <template>
   <div class="login-container">
-    <div class="login-card">
+    <div class="login-card" v-if="registrationOpen === false">
+      <h2>注册已关闭</h2>
+      <p class="subtitle">本平台不开放自助注册，请联系管理员开通账号</p>
+      <div class="toggle" @click="router.push('/login')">返回登录</div>
+    </div>
+    <div class="login-card" v-else-if="registrationOpen">
       <h2>创建账号</h2>
       <p class="subtitle">加入 Hive Platform</p>
       <el-form :model="form" @submit.prevent="handleSubmit" label-width="0">
@@ -25,7 +30,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
@@ -35,6 +40,17 @@ const router = useRouter()
 const authStore = useAuthStore()
 const form = ref({ username: '', password: '', confirmPassword: '' })
 const loading = ref(false)
+// null = 还没问后端，两块都不渲染，避免表单闪一下又被替换
+const registrationOpen = ref(null)
+
+onMounted(async () => {
+  try {
+    const res = await api.get('/auth/registration-open', { silent: true })
+    registrationOpen.value = !!res.open
+  } catch {
+    registrationOpen.value = false
+  }
+})
 
 async function handleSubmit() {
   if (!form.value.username || !form.value.password) {

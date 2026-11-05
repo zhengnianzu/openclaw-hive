@@ -27,6 +27,7 @@ from ..core.security import get_current_user, require_operator
 from ..models.sandbox_config import (
     SandboxConfigCreate, SandboxConfigUpdate, SandboxConfigInfo, SandboxFileContent,
 )
+from ..services.secrets import mask_env_list, mask_secret, redact_sandbox_yaml
 from . import resource_pools
 
 router = APIRouter(prefix="/api/sandbox-configs", tags=["sandbox-configs"])
@@ -322,8 +323,21 @@ def apply_image(base, image: str) -> Optional[str]:
     return key
 
 
-def _build_info(row) -> SandboxConfigInfo:
-    """索引行 + 从派生文件读出的字段，合成前端要的完整对象。"""
+def _can_see_secrets(user: dict) -> bool:
+    """能否看沙箱配置里的 key 原文。
+
+    与写操作同一条线（require_operator = admin + operator）：能改配置的人
+    本来就能把 key 改成自己的，对他们遮掩没有意义；viewer 只读，给掩码。
+    """
+    return (user or {}).get("role") in ("admin", "operator")
+
+
+def _build_info(row, user: dict = None) -> SandboxConfigInfo:
+    """索引行 + 从派生文件读出的字段，合成前端要的完整对象。
+
+    user 为 None 时按「不可见 key」处理（最保守）：新增调用点若忘了传 user，
+    结果是多打码而非漏原文。
+    """
     info = dict(row)
     path = _file_for(info)
     try:
@@ -339,6 +353,17 @@ def _build_info(row) -> SandboxConfigInfo:
     info.setdefault("created_by", "")
     info.setdefault("created_at", "")
     info.setdefault("updated_at", "")
+    if not _can_see_secrets(user):
+        # controlplane_api_key 直接打码；env 里的 KEY/TOKEN/SECRET 项逐个打码。
+        # env_json 是字符串，解析失败就整体换成空列表 —— 宁可界面少显示，
+        # 也不把没能脱敏的原文发出去。
+        if info.get("controlplane_api_key"):
+            info["controlplane_api_key"] = mask_secret(info["controlplane_api_key"])
+        try:
+            env = json.loads(info.get("env_json") or "[]")
+            info["env_json"] = json.dumps(mask_env_list(env), ensure_ascii=False)
+        except (ValueError, TypeError):
+            info["env_json"] = "[]"
     return SandboxConfigInfo(**info)
 
 
@@ -385,12 +410,12 @@ def list_sandbox_configs(
     sql += " ORDER BY is_default DESC, sandbox_type ASC, id ASC"
     with get_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
-    return [_build_info(r) for r in rows]
+    return [_build_info(r, user) for r in rows]
 
 
 @router.get("/{config_id}", response_model=SandboxConfigInfo)
 def get_sandbox_config(config_id: int, user: dict = Depends(get_current_user)):
-    return _build_info(_get_row_or_404(config_id))
+    return _build_info(_get_row_or_404(config_id), user)
 
 
 @router.post("", response_model=SandboxConfigInfo)
@@ -440,7 +465,7 @@ def create_sandbox_config(req: SandboxConfigCreate, user: dict = Depends(require
             "UPDATE sandbox_configs SET file = ?, updated_at = ? WHERE id = ?",
             (os.path.basename(dst), now, new_id),
         )
-    return _build_info(_get_row_or_404(new_id))
+    return _build_info(_get_row_or_404(new_id), user)
 
 
 @router.put("/{config_id}", response_model=SandboxConfigInfo)
@@ -452,7 +477,7 @@ def update_sandbox_config(
     row = _get_row_or_404(config_id)
     data = req.model_dump(exclude_none=True)
     if not data:
-        return _build_info(row)
+        return _build_info(row, user)
 
     if "name" in data:
         data["name"] = _validate_name(data["name"])
@@ -490,7 +515,7 @@ def update_sandbox_config(
     sets.append("updated_at = ?"); vals.append(datetime.now().isoformat())
     with get_connection() as conn:
         conn.execute(f"UPDATE sandbox_configs SET {', '.join(sets)} WHERE id = ?", (*vals, config_id))
-    return _build_info(_get_row_or_404(config_id))
+    return _build_info(_get_row_or_404(config_id), user)
 
 
 def _to_quantity(v) -> float:
@@ -567,7 +592,7 @@ def copy_sandbox_config(
         shutil.copy2(_template_path(src["sandbox_type"]), dst)
     with get_connection() as conn:
         conn.execute("UPDATE sandbox_configs SET file = ? WHERE id = ?", (os.path.basename(dst), new_id))
-    return _build_info(_get_row_or_404(new_id))
+    return _build_info(_get_row_or_404(new_id), user)
 
 
 @router.put("/{config_id}/set-default")
@@ -605,6 +630,15 @@ def get_sandbox_file(config_id: int, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="派生文件不存在")
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
+    if not _can_see_secrets(user):
+        # viewer 只读：yaml 全文里的 global.api_key 与 env 里的 KEY/TOKEN/SECRET
+        # 换成掩码。能改配置的人（operator+）拿原文 —— 保存时要整份回写，
+        # 掩码会把真 key 覆盖掉，所以不能给他们脱敏后的内容。
+        try:
+            content = redact_sandbox_yaml(content, _load_yaml(path))
+        except HTTPException:
+            # yaml 解析不了就拿不到 key 清单，无法可靠脱敏 → 不下发原文
+            raise HTTPException(status_code=403, detail="配置文件无法解析，仅运行者及以上可查看原文")
     return SandboxFileContent(
         filename=os.path.basename(path), path=path, content=content,
         template=os.path.basename(_template_path(row["sandbox_type"])),

@@ -13,8 +13,17 @@ from fastapi.responses import FileResponse
 from ..core.config import settings
 from ..core.database import get_connection, async_execute
 from ..core.security import get_current_user
+from ..services.secrets import instance_create_params, redact_text
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
+
+# obs-download 需要脱敏的文本类扩展名。只列「可能承载 key」的配置/数据格式：
+# models.json、config.yaml 这类是后端用 create_params 里的 key 填出来的。
+# .log 一并纳入是兜底 —— 正文通常不含 key，替换对它是空操作。
+_REDACT_DOWNLOAD_EXTS = {
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini",
+    ".env", ".conf", ".cfg", ".txt", ".log", ".md", ".sh",
+}
 
 
 def _get_output_dir(config_path: str) -> str:
@@ -584,6 +593,24 @@ async def download_obs_log(
     if not os.path.exists(local_path):
         raise HTTPException(status_code=404, detail="文件下载失败")
 
+    # 下载通道同样能取到 models.json / config.yaml 这类含 key 的文本文件，
+    # 与 obs-view 同口径脱敏后再下发。产物可能是 pptx/zip 等二进制，
+    # 对它们做文本替换会损坏文件，故只处理文本类扩展名；
+    # 二进制产物本来也不是 key 的载体。
+    if os.path.splitext(filename)[1].lower() in _REDACT_DOWNLOAD_EXTS:
+        try:
+            async with aiofiles.open(local_path, "r", errors="replace") as f:
+                raw = await f.read()
+            safe = redact_text(raw, instance_create_params(instance_id))
+            if safe != raw:
+                # 原地改会污染缓存文件（下次命中就是脱敏版，operator 也拿不到原文），
+                # 故另写一份脱敏副本再下发。
+                local_path = local_path + ".redacted"
+                async with aiofiles.open(local_path, "w") as f:
+                    await f.write(safe)
+        except (OSError, UnicodeDecodeError):
+            pass  # 读不成文本就按原样下发（扩展名判断可能误判）
+
     return FileResponse(local_path, filename=filename)
 
 
@@ -624,6 +651,13 @@ async def view_obs_log(
 
     async with aiofiles.open(local_path, "r", errors="replace") as f:
         text = await f.read()
+
+    # 本接口能读实例产物目录下的任意文件，其中 models.json / config.yaml 这类
+    # 是后端拿 create_params 里的 key 填出来的，原样下发等于绕开实例详情
+    # 「配置文件」tab 的脱敏。故与那里同口径：全文替换掉本实例的 key 原文。
+    # 对所有角色生效（与 /configs/{filename} 一致）—— 日志正文不含 key，
+    # 替换对它是空操作，不影响排查。
+    text = redact_text(text, instance_create_params(instance_id))
 
     total_chars = len(text)
     total_lines = text.count("\n") + 1 if text else 0

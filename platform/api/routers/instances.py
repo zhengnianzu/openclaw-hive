@@ -29,7 +29,7 @@ from ..services.queue_scheduler import (
     slot_condition_params as _slot_condition_params,
 )
 from ..services.create_params import build_create_params
-from ..services.secrets import mask_create_params, redact_text
+from ..services.secrets import instance_create_params, mask_create_params, redact_text
 from . import harness_meta
 from . import harness_configs
 from . import sandbox_configs
@@ -1554,23 +1554,10 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 # 配置查看
 # ============================================================================
 
-def _instance_create_params(instance_id: str) -> dict:
-    """该实例的 create_params（原始 dict）；缺失或非法 JSON 返回空 dict。
-
-    只给脱敏用：拿不到就是没 key 可遮，不该让配置文件接口 500
-    （与 batch_output 对非法 create_params 静默降级的口径一致）。
-    """
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT create_params FROM task_instances WHERE id=?", (instance_id,)
-        ).fetchone()
-    if not row or not row["create_params"]:
-        return {}
-    try:
-        params = json.loads(row["create_params"])
-    except (ValueError, TypeError):
-        return {}
-    return params if isinstance(params, dict) else {}
+# create_params 的读取已移到 services/secrets.py（logs.py 的 obs-view 也要用
+# 同一份 key 清单脱敏，放在 router 里会让两个路由模块互相 import）。
+# 保留本名字是为了下面 /configs 的调用点不变。
+_instance_create_params = instance_create_params
 
 
 @router.get("/{instance_id}/configs")

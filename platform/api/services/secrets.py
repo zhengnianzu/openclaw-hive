@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import json
+
 MASK_PLACEHOLDER = "****"
 
 # create_params 里承载 key 的字段。顶层两个 + agents[] 里的 api_key。
@@ -103,3 +105,117 @@ def redact_text(content: str, params: dict) -> str:
     for raw in collect_secret_values(params):
         content = content.replace(raw, mask_secret(raw))
     return content
+
+
+# ---------------------------------------------------------------------------
+# 沙箱配置（sandbox_configs）的脱敏
+#
+# 与 create_params 不同：这里的 key 不来自实例入参，而是沙箱 yaml 自身的
+# global.api_key 与 sandbox[].sandbox.env[]（SERPER_API_KEY / SEARCH_API_KEY /
+# VL_API_KEY 等）。字段名无法穷举，故按「名字里带 KEY/TOKEN/SECRET」判定。
+# ---------------------------------------------------------------------------
+
+# env 变量名命中即视为敏感。PASSWORD 一并纳入：同类凭据，漏判的代价不对称。
+_SENSITIVE_ENV_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+
+
+def is_sensitive_env_name(name) -> bool:
+    """env 变量名是否该脱敏。大小写无关，子串命中即算。"""
+    if not name:
+        return False
+    upper = str(name).upper()
+    return any(h in upper for h in _SENSITIVE_ENV_HINTS)
+
+
+def mask_env_list(env) -> list:
+    """沙箱 env 列表（[{name, value}, ...]）里敏感项的 value 换成掩码。
+
+    不改入参：逐项重建 dict。非 list / 非 dict 项原样保留，
+    让界面仍能看到结构（与 mask_create_params 的降级口径一致）。
+    """
+    if not isinstance(env, list):
+        return env
+    out = []
+    for item in env:
+        if isinstance(item, dict) and is_sensitive_env_name(item.get("name")) and item.get("value"):
+            item = {**item, "value": mask_secret(item["value"])}
+        out.append(item)
+    return out
+
+
+def collect_sandbox_secret_values(cfg: dict) -> list[str]:
+    """抽出沙箱 yaml 里全部非空 key 原文，按长度降序去重返回。
+
+    给 /file 接口做整份 yaml 的原文替换用 —— yaml 结构多变（resources 两种
+    写法、boot_source 可选），逐字段遍历容易漏；拿到原文直接全文替换更稳。
+    降序理由同 collect_secret_values：短 key 若是长 key 的前缀，先替短的会留下原文尾巴。
+    """
+    if not isinstance(cfg, dict):
+        return []
+    gl = cfg.get("global")
+    values = [gl.get("api_key") if isinstance(gl, dict) else None]
+    sandboxes = cfg.get("sandbox")
+    for sb in (sandboxes.values() if isinstance(sandboxes, dict) else ()):
+        if not isinstance(sb, dict):
+            continue
+        inner = sb.get("sandbox")
+        if not isinstance(inner, dict):
+            continue
+        env = inner.get("env")
+        for item in (env if isinstance(env, list) else ()):
+            if isinstance(item, dict) and is_sensitive_env_name(item.get("name")):
+                values.append(item.get("value"))
+    seen = set()
+    out = []
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        # <=8 的值不参与全文替换：沙箱 env 里有 "on"/"off"/"sk-xxx" 这类短值，
+        # 拿它们当替换目标会命中正文里的正常内容（把 "off" 替成掩码）。
+        # 代价是摘要接口按字段打码（不看长度）、本函数按原文替换（跳过短值），
+        # 对长度<=8 的值两边不一致。可接受：这种长度的不是真凭据，是占位符。
+        if len(v) <= 8 or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def redact_sandbox_yaml(content: str, cfg: dict) -> str:
+    """把沙箱 yaml 全文里出现的 key 原文替换成掩码值。
+
+    短值（<=8 字符）不参与替换，理由同 collect_secret_values：
+    会在正常内容里误命中。这类值本就不是真 key（占位符 sk-xxx 之类）。
+    """
+    if not content:
+        return content
+    for raw in collect_sandbox_secret_values(cfg):
+        content = content.replace(raw, mask_secret(raw))
+    return content
+
+
+def instance_create_params(instance_id: str) -> dict:
+    """该实例的 create_params（原始 dict）；缺失或非法 JSON 返回空 dict。
+
+    只给脱敏用：拿不到就是没 key 可遮，不该让调用方 500
+    （与 batch_output 对非法 create_params 静默降级的口径一致）。
+
+    放在本模块而不是某个 router：instances.py 的「配置文件」tab 与
+    logs.py 的 obs-view 都要用同一份 key 清单来脱敏，
+    从 router 互相 import 会让两个路由模块耦合。
+    """
+    from ..core.database import get_connection  # 延迟导入：避免模块级循环依赖
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT create_params FROM task_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+    if not row or not row["create_params"]:
+        return {}
+    try:
+        params = json.loads(row["create_params"])
+    except (ValueError, TypeError):
+        return {}
+    return params if isinstance(params, dict) else {}

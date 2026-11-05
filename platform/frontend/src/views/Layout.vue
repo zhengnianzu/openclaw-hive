@@ -62,6 +62,7 @@
           <NotificationBell />
           <span class="role-badge" :class="'role-' + authStore.role">{{ roleLabel }}</span>
           <span class="username">{{ authStore.username }}</span>
+          <el-button text class="logout-btn" @click="pwdVisible = true">改密码</el-button>
           <el-button text class="logout-btn" @click="logout">退出</el-button>
         </div>
       </el-header>
@@ -69,12 +70,32 @@
         <router-view />
       </el-main>
     </el-container>
+
+    <el-dialog v-model="pwdVisible" title="修改密码" width="420px" destroy-on-close>
+      <el-form :model="pwdForm" label-width="80px" @submit.prevent>
+        <el-form-item label="原密码" required>
+          <el-input v-model="pwdForm.old_password" type="password" show-password />
+        </el-form-item>
+        <el-form-item label="新密码" required>
+          <el-input v-model="pwdForm.new_password" type="password" placeholder="至少4个字符" show-password />
+        </el-form-item>
+        <el-form-item label="确认" required>
+          <el-input v-model="pwdForm.confirm" type="password" show-password />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pwdVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitPwd" :loading="pwdLoading">确定</el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 import { useNotificationStore } from '../stores/notification'
@@ -115,6 +136,37 @@ onUnmounted(() => {
 function logout() {
   authStore.clearAuth()
   router.push('/login')
+}
+
+const pwdVisible = ref(false)
+const pwdLoading = ref(false)
+const pwdForm = ref({ old_password: '', new_password: '', confirm: '' })
+
+async function submitPwd() {
+  const f = pwdForm.value
+  if (!f.old_password || !f.new_password) {
+    ElMessage.warning('请填写完整')
+    return
+  }
+  if (f.new_password !== f.confirm) {
+    ElMessage.warning('两次新密码不一致')
+    return
+  }
+  pwdLoading.value = true
+  try {
+    // 后端回新 token：改密码不会让已签发的 token 失效，但换上新的，
+    // 当前会话的有效期就从这一刻重新计算。
+    const res = await api.put('/auth/me/password', {
+      old_password: f.old_password,
+      new_password: f.new_password,
+    })
+    if (res.access_token) authStore.setAuth(res)
+    ElMessage.success('密码已修改')
+    pwdVisible.value = false
+    pwdForm.value = { old_password: '', new_password: '', confirm: '' }
+  } catch { /* shown by interceptor */ } finally {
+    pwdLoading.value = false
+  }
 }
 </script>
 

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
+    # 用户自助注册（/api/auth/register）。默认关闭：平台内部使用，账号由管理员
+    # 在「用户管理」里创建。设为 True 才重新开放登录页的「去注册」入口。
+    ALLOW_REGISTRATION: bool = False
+
     # 对外 API（/openapi/v1）的鉴权 key，逗号分隔可配多个。
     # 留空 = 该接口整体不可用（返回 503），避免「没配 key 就等于无鉴权」。
     PUBLIC_API_KEYS: str = ""

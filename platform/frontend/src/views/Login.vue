@@ -16,13 +16,14 @@
           </el-button>
         </el-form-item>
       </el-form>
-      <div class="toggle" @click="router.push('/register')">没有账号？去注册</div>
+      <div v-if="registrationOpen" class="toggle" @click="router.push('/register')">没有账号？去注册</div>
+      <div v-else class="hint">需要账号请联系管理员开通</div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
@@ -32,6 +33,15 @@ const router = useRouter()
 const authStore = useAuthStore()
 const form = ref({ username: '', password: '' })
 const loading = ref(false)
+// 注册默认关闭（后端 ALLOW_REGISTRATION），拿不到就按关闭处理
+const registrationOpen = ref(false)
+
+onMounted(async () => {
+  try {
+    const res = await api.get('/auth/registration-open', { silent: true })
+    registrationOpen.value = !!res.open
+  } catch { /* 保持关闭 */ }
+})
 
 async function handleSubmit() {
   if (!form.value.username || !form.value.password) {
@@ -87,5 +97,10 @@ async function handleSubmit() {
 }
 .toggle:hover {
   color: #4f46e5;
+}
+.hint {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
 }
 </style>
