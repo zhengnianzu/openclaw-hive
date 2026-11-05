@@ -2982,6 +2982,7 @@ _TASK_RECORDS_SORT = {
 async def list_task_records(
     instance_id: str,
     category: str | None = Query(None, description="C/S/T/X 或 success"),
+    code: str | None = Query(None, description="具体错误码，如 S003"),
     status: str | None = Query(None, description="任务成功/任务失败/任务异常"),
     min_score: float | None = Query(None, description="eval_score 下限"),
     page: int = Query(1, ge=1),
@@ -3012,6 +3013,9 @@ async def list_task_records(
         else:
             where.append("error_category = ?")
             params.append(category)
+    if code:
+        where.append("error_code = ?")
+        params.append(code)
     if status:
         where.append("status = ?")
         params.append(status)

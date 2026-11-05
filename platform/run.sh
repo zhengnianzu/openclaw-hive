@@ -268,6 +268,23 @@ stop_shallow_auto() {
     _stop_pidfile shallow_auto.pid "shallow-auto"
 }
 
+# shallow-query：把任务描述（config json 的 queries[].text）回填进
+# task_records.query_text，供「会话列表」的内容检索用。
+# 按实例 LRU 只保留最近 20 个（搜索是交互行为，历史实例没人搜）。
+start_shallow_query() {
+    if [ -f shallow_query.pid ] && kill -0 "$(cat shallow_query.pid)" 2>/dev/null; then
+        echo "shallow-query 已在运行 (PID: $(cat shallow_query.pid))"
+        return
+    fi
+    rm -f shallow_query.pid
+    nohup $PYTHON offline/shallow_query.py > shallow_query.log 2>&1 &
+    echo $! > shallow_query.pid
+    echo "shallow-query 已启动 (PID: $(cat shallow_query.pid))"
+}
+stop_shallow_query() {
+    _stop_pidfile shallow_query.pid "shallow-query"
+}
+
 # auto-tracker：历史实例的发现投递（背景车道）。
 # task_tracker 是纯点击驱动,没点过的实例一行都不投 —— 实测全库 2126 个已结束实例
 # 只有 16 个被跟踪,243 个实例共 301 万行永远等不到分析,而 shallow-auto 全程闲着。
@@ -424,6 +441,7 @@ case "$ACTION" in
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
+        start_shallow_query
         start_realtime_worker
 
         # 启动 Nginx（如果已安装）
@@ -463,6 +481,7 @@ case "$ACTION" in
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
+        stop_shallow_query
         stop_realtime_worker
         stop_shallow_local
         stop_shallow_obs
@@ -492,6 +511,7 @@ case "$ACTION" in
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
+        stop_shallow_query
         stop_realtime_worker
         stop_shallow_local
         stop_shallow_obs
@@ -516,6 +536,7 @@ case "$ACTION" in
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
+        start_shallow_query
         start_realtime_worker
 
         if command -v nginx &> /dev/null; then
@@ -541,13 +562,14 @@ case "$ACTION" in
 
     # 单个 worker 的实时日志。这 4 个就是当前架构的全部常驻进程。
     #   ./run.sh logs-tracker | logs-rt | logs-auto | logs-dl
-    logs-tracker|logs-atracker|logs-rt|logs-auto|logs-dl)
+    logs-tracker|logs-atracker|logs-rt|logs-auto|logs-dl|logs-query)
         case "$ACTION" in
             logs-tracker) _f=tracker.log;          _n="tracker（发现投递/点击）" ;;
             logs-atracker) _f=auto_tracker.log;    _n="auto-tracker（历史实例投递）" ;;
             logs-rt)      _f=shallow_realtime.log; _n="shallow-realtime（实时分析/点击）" ;;
             logs-auto)    _f=shallow_auto.log;     _n="shallow-auto（背景分析/全量）" ;;
             logs-dl)      _f=realtime_worker.log;  _n="deep-realtime（实时下载/交付物）" ;;
+            logs-query)   _f=shallow_query.log;     _n="shallow-query（任务描述回填）" ;;
         esac
         if [ -f "$_f" ]; then
             echo "=== $_n → $_f ==="
@@ -627,6 +649,7 @@ case "$ACTION" in
         _ws auto_tracker.pid     "auto-tracker（历史实例投递）"      auto_tracker.log
         _ws shallow_realtime.pid "shallow-realtime（实时分析/点击）" shallow_realtime.log
         _ws shallow_auto.pid     "shallow-auto（背景分析/全量）"      shallow_auto.log
+        _ws shallow_query.pid    "shallow-query（任务描述回填）"      shallow_query.log
         _ws realtime_worker.pid  "deep-realtime（实时下载）"         realtime_worker.log
 
         # 旧进程：正常应全部「未运行」。还在跑说明升级时漏停，会和新进程抢队列。
@@ -642,6 +665,7 @@ case "$ACTION" in
                      "auto_tracker.log:auto-tracker" \
                      "shallow_realtime.log:shallow-realtime" \
                      "shallow_auto.log:shallow-auto" \
+                     "shallow_query.log:shallow-query" \
                      "realtime_worker.log:deep-realtime"; do
             _f="${_pair%%:*}"; _n="${_pair##*:}"
             echo "--- $_n ($_f) ---"
@@ -660,6 +684,7 @@ case "$ACTION" in
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
+        start_shallow_query
         start_realtime_worker
         ;;
 
@@ -668,6 +693,7 @@ case "$ACTION" in
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
+        stop_shallow_query
         stop_realtime_worker
         ;;
 
@@ -676,12 +702,14 @@ case "$ACTION" in
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
+        stop_shallow_query
         stop_realtime_worker
         sleep 1
         start_tracker
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
+        start_shallow_query
         start_realtime_worker
         ;;
 
@@ -699,6 +727,13 @@ case "$ACTION" in
             tracker-start) start_tracker ;;
             tracker-stop)  stop_tracker ;;
             tracker-restart) stop_tracker; sleep 1; start_tracker ;;
+        esac
+        ;;
+    query-start|query-stop|query-restart)
+        case "$ACTION" in
+            query-start) start_shallow_query ;;
+            query-stop)  stop_shallow_query ;;
+            query-restart) stop_shallow_query; sleep 1; start_shallow_query ;;
         esac
         ;;
     atracker-start|atracker-stop|atracker-restart)
@@ -744,18 +779,18 @@ case "$ACTION" in
             shallow-all-start)
                 start_tracker; start_auto_tracker
                 start_shallow_realtime; start_shallow_auto
-                start_realtime_worker ;;
+                start_shallow_query; start_realtime_worker ;;
             shallow-all-stop)
                 stop_tracker; stop_auto_tracker
                 stop_shallow_realtime; stop_shallow_auto
-                stop_realtime_worker ;;
+                stop_shallow_query; stop_realtime_worker ;;
             shallow-all-restart)
                 stop_tracker; stop_auto_tracker
                 stop_shallow_realtime; stop_shallow_auto
-                stop_realtime_worker; sleep 1
+                stop_shallow_query; stop_realtime_worker; sleep 1
                 start_tracker; start_auto_tracker
                 start_shallow_realtime; start_shallow_auto
-                start_realtime_worker ;;
+                start_shallow_query; start_realtime_worker ;;
         esac
         ;;
 
@@ -793,6 +828,7 @@ case "$ACTION" in
         echo "  logs-rt          shallow-realtime 实时分析 → shallow_realtime.log"
         echo "  logs-auto        shallow-auto 背景分析     → shallow_auto.log"
         echo "  logs-dl          deep-realtime 实时下载    → realtime_worker.log"
+        echo "  logs-query       shallow-query 任务描述回填 → shallow_query.log"
         echo "  shallow-logs     四个一起看（tail -f 全部，自动打文件名分隔）"
         echo "                   也可写 ./run.sh shallow logs [tracker|rt|auto|dl]"
         echo "  worker-status    四个 worker 的 PID/运行时长 + 各自日志尾部"
@@ -811,6 +847,7 @@ case "$ACTION" in
         echo "  atracker-start|stop|restart  只动历史实例投递(每轮一个实例)"
         echo "  rt-start|stop|restart        只动实时分析（用户点击，两阶段，2s）"
         echo "  auto-start|stop|restart      只动背景分析（全量，最新优先）"
+        echo "  query-start|stop|restart     只动任务描述回填（内容检索用，LRU 20 实例）"
         echo "  realtime-start|stop|restart  只动实时下载（点击的交付物，2s 轮询）"
         echo "  local-start|obs-start ...    旧的按阶段拆分进程（已被 rt/auto 取代，仅回滚用）"
         echo "  shallow-start|stop|restart   只动浅层（旧的 --shallow-only 单体循环）"

@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
@@ -72,6 +74,54 @@ _TRAJ_LEVELS = ["L0", "L1", "L1.5", "L2", "L3"]
 _SORTABLE = {
     "task_idx", "config_name", "traj_level", "status", "eval_score", "eval_completion",
 }
+
+
+# 内容检索的回填锁：同一实例被并发搜时只回填一次（uvicorn 4 worker × 多请求）。
+_QT_LOCK = threading.Lock()
+_QT_INFLIGHT: set = set()
+
+
+def _ensure_query_text(instance_id: str) -> int:
+    """确保该实例的 query_text 已回填；顺手 touch LRU。返回本次写入行数。
+
+    判据是「有没有 query_text IS NULL 的行」—— 回填过的实例（含「文件缺失
+    写空串」的行）不会再读盘。running 实例新增的任务由常驻 worker
+    （offline/shallow_query.py）跟进；用户恰好在新任务刚出现时搜，这里会补上。
+
+    同一实例并发搜时只让一个请求真回填，其余等它完成 —— 否则 4 个 uvicorn
+    worker 可能同时读 1 万个文件。
+    """
+    from offline.shallow_query import backfill_instance, touch_instance
+
+    with get_connection() as conn:
+        touch_instance(conn, instance_id)
+        conn.commit()
+        missing = conn.execute(
+            "SELECT 1 FROM task_records "
+            " WHERE instance_id=? AND query_text IS NULL LIMIT 1",
+            (instance_id,)).fetchone()
+    if not missing:
+        return 0
+
+    with _QT_LOCK:
+        if instance_id in _QT_INFLIGHT:
+            busy = True
+        else:
+            _QT_INFLIGHT.add(instance_id)
+            busy = False
+    if busy:
+        # 别的请求正在回填：等它写完（最多 ~30s），避免重复读 1 万个文件
+        for _ in range(60):
+            time.sleep(0.5)
+            with _QT_LOCK:
+                if instance_id not in _QT_INFLIGHT:
+                    break
+        return 0
+    try:
+        return backfill_instance(instance_id, only_missing=True)
+    finally:
+        with _QT_LOCK:
+            _QT_INFLIGHT.discard(instance_id)
 
 
 def _get_instance(instance_id: str) -> dict:
@@ -280,7 +330,11 @@ async def shallow_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     tag: str | None = Query(None, description="L0/L1/L1.5/L2/L3/done/fail/unevaluated"),
-    keyword: str | None = Query(None, description="按 config_name 模糊搜索"),
+    keyword: str | None = Query(None, description="按任务名称（config_name）模糊搜索"),
+    idx_keyword: str | None = Query(None, description="按任务编号精确匹配，"
+                                                      "写 task-5921 或 5921"),
+    content_keyword: str | None = Query(None, description="按任务配置 json 的正文检索"
+                                                          "（如「帮我画个花」）"),
     sort_by: str = Query("task_idx"),
     sort_dir: str = Query("asc"),
     user: dict = Depends(get_current_user),
@@ -300,11 +354,38 @@ async def shallow_tasks(
         elif tag in _TRAJ_LEVELS:
             where.append("tr.traj_level = ?")
             params.append(tag)
-    if keyword:
-        kw = keyword.strip()
-        if kw:
-            where.append("tr.config_name LIKE ?")
-            params.append(f"%{kw}%")
+    # 三个搜索框各管一件事（前端也是三个独立输入框）：
+    #   keyword         → 任务名称，config_name 模糊
+    #   idx_keyword     → 任务编号，task_idx 精确（写 task-5921 或 5921 都认）
+    #   content_keyword → 任务内容，query_text 模糊（见下）
+    # 分开而不是靠猜输入形态：用户看到的字段就是他能搜的字段，不会出现
+    # 「搜任务名恰好是纯数字就被当成编号」这种意外。
+    if keyword and keyword.strip():
+        where.append("tr.config_name LIKE ?")
+        params.append(f"%{keyword.strip()}%")
+    if idx_keyword and idx_keyword.strip():
+        m = re.fullmatch(r"(?:task-)?(\d+)", idx_keyword.strip(), re.I)
+        if m:
+            where.append("tr.task_idx = ?")
+            params.append(int(m.group(1)))
+        else:
+            # 不是合法编号：返回空而不是忽略这个条件 —— 忽略会让用户以为
+            # 「搜 task-abc 查出全部」是匹配上了。
+            where.append("1 = 0")
+
+    # 任务内容检索：按 `task_records.query_text`（= config json 的 queries[].text）
+    # 过滤，就是一个普通 LIKE —— 排序/分页/其它过滤都照常下沉到 SQL。
+    #
+    # query_text 由 offline/shallow_query.py 回填。首次搜某实例时库里可能还没有，
+    # 这里**同步补一次**（实测 0.8s，32 并发读 1 万个文件）：不能纯异步，
+    # 否则用户点下搜索的瞬间库里没数据，会看到「0 条」然后过几秒才出来，
+    # 像搜错了。补完顺手 touch LRU，让常驻 worker 后续跟进这个实例的新任务。
+    if content_keyword and content_keyword.strip():
+        ck = content_keyword.strip()
+        await async_execute(_ensure_query_text, instance_id)
+        where.append("tr.query_text LIKE ?")
+        params.append(f"%{ck}%")
+
     where_sql = " AND ".join(where)
 
     # 排序列限定到白名单；JOIN 后两表均有 task_idx 列，裸列名会歧义，统一加 tr. 前缀。

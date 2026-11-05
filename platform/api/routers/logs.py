@@ -347,6 +347,23 @@ def _tail_bytes(log_file: str, tail: int, chunk_size: int = 65536, end: int = -1
     return "".join(lines), len(lines), start_offset
 
 
+_LOG_FILENAME_RE = re.compile(r'^(task-\d+|main|nohup)\.log$')
+
+
+def _resolve_log_file(instance_id: str, filename: str) -> str:
+    """校验日志文件名并解析出绝对路径。nohup.log 在 output_dir 下，其余在 logs/ 下。
+
+    文件名白名单同时起到路径穿越防护的作用 —— 正则不接受 '/' 与 '..'。
+    """
+    if not _LOG_FILENAME_RE.match(filename):
+        raise HTTPException(status_code=400, detail="无效的日志文件名")
+    inst = _get_instance(instance_id)
+    output_dir = _get_output_dir(inst["config_path"])
+    if filename == "nohup.log":
+        return os.path.join(output_dir, filename)
+    return os.path.join(output_dir, "logs", filename)
+
+
 @router.get("/{instance_id}/task-log/{filename}")
 async def get_task_log(
     instance_id: str,
@@ -357,14 +374,7 @@ async def get_task_log(
     end: int = Query(default=-1, description="raw+tail>0 时的字节游标：取结束于该字节之前的最后 tail 行；<0 表示从 EOF 起"),
     user: dict = Depends(get_current_user),
 ):
-    if not re.match(r'^(task-\d+|main|nohup)\.log$', filename):
-        raise HTTPException(status_code=400, detail="无效的日志文件名")
-    inst = _get_instance(instance_id)
-    output_dir = _get_output_dir(inst["config_path"])
-    if filename == "nohup.log":
-        log_file = os.path.join(output_dir, filename)
-    else:
-        log_file = os.path.join(output_dir, "logs", filename)
+    log_file = _resolve_log_file(instance_id, filename)
     if not os.path.exists(log_file):
         return {"text": "", "lines": [], "total_lines": 0}
     if raw:
@@ -390,6 +400,157 @@ async def get_task_log(
     total = len(lines)
     lines = lines[-tail:] if tail < total else lines
     return {"lines": lines, "total_lines": total}
+
+
+# ============================================================================
+# 关键事件抽取（日志中心右栏时间线）
+# ============================================================================
+# hive.py 在每个任务的生命周期里打了一组固定格式的锚点行，这里把它们抽成时间线。
+# 全部锚点均在真实日志上实测过：开始 → 环境就绪 → 各阶段下载 → gateway 就绪
+# → [错误] → finalize → 终态行。
+#
+# 不做的：重试事件。重试发生在调度层，单个 task-<idx>.log 里没有记录。
+
+# 标准日志行：时间|文件:行号|函数|pid|tid|线程|级别|正文
+_LOG_LINE_RE = re.compile(
+    r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\|'
+    r'[^|]*\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|'
+    r'(?P<level>INFO|WARNING|ERROR|DEBUG)\|'
+    r'(?P<body>.*)$'
+)
+
+# 正文锚点规则：(正则, kind, 标题生成器)。顺序匹配，首个命中即停。
+# 顺序有讲究：终态行正文里也含 error_code=，必须排在泛化的错误行规则之前。
+_EVENT_RULES: list[tuple[re.Pattern, str, object]] = [
+    (re.compile(r'===== 任务执行状态=(?P<status>\S+)\s+error_code=(?P<code>\S+)'
+                r'.*?elapsed=(?P<elapsed>[\d.]+)s'),
+     "end", lambda m: m.group('status')),
+    (re.compile(r'===== BEGIN config=(?P<config>\S+)(?:\s+framework=(?P<fw>\S+))?'),
+     "begin", lambda m: "任务开始"),
+    (re.compile(r'>>>>>> Task (?P<idx>\d+): env_id=(?P<env>\S+)\s+elapsed=(?P<elapsed>[\d.]+)s'),
+     "env_ready", lambda m: "环境就绪"),
+    (re.compile(r'Downloaded skills \((?P<info>[^)]*)\) in (?P<elapsed>[\d.]+)s'),
+     "stage", lambda m: "Skill 下载完成"),
+    (re.compile(r'Downloaded user profile in (?P<elapsed>[\d.]+)s'),
+     "stage", lambda m: "用户配置下载完成"),
+    (re.compile(r'Downloaded agents in (?P<elapsed>[\d.]+)s'),
+     "stage", lambda m: "Agents 下载完成"),
+    (re.compile(r'Code extracted successfully'),
+     "stage", lambda m: "代码解压完成"),
+    (re.compile(r'Gateway started on port (?P<port>\d+)'),
+     "stage", lambda m: "Gateway 就绪"),
+    (re.compile(r'Script completed: (?P<file>\S+)'),
+     "stage", lambda m: "主脚本执行完成"),
+    (re.compile(r'finalize=BEGIN\s+name=(?P<name>\S+)'),
+     "finalize", lambda m: f"收尾开始：{m.group('name')}"),
+    (re.compile(r'finalize=END\s+name=(?P<name>\S+)\s+result=(?P<result>\S+)'),
+     "finalize", lambda m: f"收尾结束：{m.group('name')}"),
+    # 错误行：错误码就在正文行首方括号里
+    (re.compile(r'\[(?P<code>[CSTX]\d{3})\]'),
+     "error", lambda m: f"错误 {m.group('code')}"),
+]
+
+# sandbox_detail 方框块边界。块内是沙箱原始 stdout/stderr（自带时间戳、含
+# [gateway] security warning 之类），逐行匹配会污染时间线，必须整块跳过。
+_BOX_OPEN = "┌"
+_BOX_CLOSE = "└"
+
+
+def _scan_events(log_file: str, max_bytes: int = 8 * 1024 * 1024,
+                 max_events: int = 500) -> dict:
+    """扫整个日志文件抽取关键事件。返回 {events, summary, truncated}。
+
+    task 日志实测仅 50～60 行，整文件顺序扫即可（无需 _tail_bytes，那是翻页用的）。
+    main.log / nohup.log 是全实例编排日志（实测 15.9MB、上万个锚点），时间线本就
+    不适用于它们，用 max_bytes / max_events 双重兜底，避免回传巨量无用数据。
+    """
+    events: list[dict] = []
+    summary: dict = {"status": None, "error_code": None, "total_elapsed": None,
+                     "config": None, "framework": None, "started_at": None,
+                     "ended_at": None}
+    in_box = False
+    read = 0
+    truncated = False
+
+    with open(log_file, "r", errors="replace") as f:
+        for lineno, line in enumerate(f, start=1):
+            read += len(line)
+            if read > max_bytes or len(events) >= max_events:
+                truncated = True
+                break
+            # 方框块整体跳过（块内行不参与任何匹配）
+            stripped = line.lstrip()
+            if stripped.startswith(_BOX_OPEN):
+                in_box = True
+                continue
+            if in_box:
+                if stripped.startswith(_BOX_CLOSE):
+                    in_box = False
+                continue
+
+            lm = _LOG_LINE_RE.match(line)
+            if not lm:
+                continue
+            body = lm.group("body")
+            for pattern, kind, title_fn in _EVENT_RULES:
+                m = pattern.search(body)
+                if not m:
+                    continue
+                groups = m.groupdict()
+                ev = {
+                    "ts": lm.group("ts"),
+                    "level": lm.group("level"),
+                    "kind": kind,
+                    "title": title_fn(m),
+                    "line": lineno,
+                    "elapsed": float(groups["elapsed"]) if groups.get("elapsed") else None,
+                    "code": groups.get("code") if groups.get("code") != "-" else None,
+                    "detail": "",
+                }
+                if kind == "begin":
+                    ev["detail"] = groups.get("config") or ""
+                    summary["config"] = groups.get("config")
+                    summary["framework"] = groups.get("fw")
+                    summary["started_at"] = lm.group("ts")
+                elif kind == "env_ready":
+                    ev["detail"] = f"env_id={groups.get('env', '')}"
+                elif kind == "stage":
+                    ev["detail"] = groups.get("info") or groups.get("port") or ""
+                elif kind == "finalize":
+                    ev["detail"] = f"result={groups['result']}" if groups.get("result") else ""
+                elif kind == "error":
+                    # 错误正文去掉前缀码，保留可读原因
+                    ev["detail"] = body.split(f"[{groups['code']}]", 1)[-1].strip()[:200]
+                    # 同一个错误码常被打两次：raise 点一次、run() 的 except handler
+                    # 再包一次（实测 task-1216 的 S003 出现在 L32/L39）。时间线只留
+                    # 第一次——它更靠近真正的出错位置，detail 也更干净。
+                    if events and events[-1]["kind"] == "error" \
+                            and events[-1]["code"] == ev["code"]:
+                        break
+                elif kind == "end":
+                    ev["detail"] = f"error_code={groups.get('code')}" \
+                        if groups.get("code") not in (None, "-") else ""
+                    summary["status"] = groups.get("status")
+                    summary["error_code"] = ev["code"]
+                    summary["total_elapsed"] = ev["elapsed"]
+                    summary["ended_at"] = lm.group("ts")
+                events.append(ev)
+                break
+
+    return {"events": events, "summary": summary, "truncated": truncated}
+
+
+@router.get("/{instance_id}/task-log/{filename}/events")
+async def get_task_log_events(
+    instance_id: str,
+    filename: str,
+    user: dict = Depends(get_current_user),
+):
+    """抽取单个任务日志的关键事件时间线（供日志中心右栏）。"""
+    log_file = _resolve_log_file(instance_id, filename)
+    if not os.path.exists(log_file):
+        return {"events": [], "summary": {}, "truncated": False}
+    return await asyncio.to_thread(_scan_events, log_file)
 
 
 @router.websocket("/ws/{instance_id}")

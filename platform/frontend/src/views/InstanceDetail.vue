@@ -243,48 +243,214 @@
       </el-tab-pane>
       <!-- ================= 日志 ================= -->
       <el-tab-pane label="日志" name="logs">
-        <div class="toolbar">
-          <el-select-v2 v-model="logSource" placeholder="日志源" style="width:260px"
-            :options="taskSelectOptions" filterable @change="onLogSourceChange">
-            <template #default="{ item }">
-              <span class="task-opt">
-                <span class="task-dot" :style="{ background: dotColor(item.st) }"></span>
-                <span class="task-opt-name">{{ item.label }}</span>
-                <el-tag v-if="markerText(item.st)" size="small" :type="markerType(item.st)"
-                  disable-transitions class="task-opt-tag">{{ markerText(item.st) }}</el-tag>
-              </span>
-            </template>
-          </el-select-v2>
+        <div class="logc">
+          <!-- ---------- 左栏：任务列表（顺序 / 失败分组） ---------- -->
+          <div class="logc-left">
+            <el-radio-group v-model="leftView" size="small" class="logc-left-switch">
+              <el-radio-button value="seq">顺序列表</el-radio-button>
+              <el-radio-button value="grp">失败类型分组</el-radio-button>
+            </el-radio-group>
 
-          <el-select v-model="categoryFilter" placeholder="错误类型筛选" clearable style="width:150px">
-            <el-option label="成功" value="success" />
-            <el-option label="服务侧失败 S" value="S" />
-            <el-option label="任务侧失败 T" value="T" />
-            <el-option label="客户端失败 C" value="C" />
-            <el-option label="未分类 X" value="X" />
-          </el-select>
-
-          <el-input v-model="filterKeyword" placeholder="过滤关键词..." clearable style="width:200px" />
-
-          <el-button @click="scrollToBottom">滚到底部</el-button>
-          <el-button @click="loadLogs" :loading="logLoading">刷新</el-button>
-          <el-button @click="clearLogs">清屏</el-button>
-        </div>
-
-        <div ref="logContainer" class="log-container" @scroll="onScroll">
-          <div v-if="rawText !== null" class="log-more-hint">
-            <span v-if="loadingMore">加载中…</span>
-            <span v-else-if="logHasMore">上滑加载更早的日志</span>
-            <span v-else>已到日志开头</span>
-          </div>
-          <pre v-if="rawText !== null" class="log-raw">{{ displayRawText }}</pre>
-          <template v-else>
-            <div v-for="(line, idx) in filteredLines" :key="idx"
-              :class="['log-line', lineClass(line)]">{{ line }}</div>
-            <div v-if="!filteredLines.length" style="color:#666;padding:20px;text-align:center">
-              暂无日志
+            <!-- 固定两个实例级日志源 -->
+            <div class="logc-fixed">
+              <div v-for="f in fixedLogSources" :key="f.value"
+                :class="['logc-item', 'logc-item-fixed', { active: logSource === f.value }]"
+                @click="selectLogSource(f.value)">
+                <el-icon><Document /></el-icon><span>{{ f.label }}</span>
+              </div>
             </div>
-          </template>
+
+            <!-- 顺序列表 -->
+            <template v-if="leftView === 'seq'">
+              <div class="logc-filters">
+                <el-input v-model="taskSearch" placeholder="搜索 task 编号…" clearable size="small" />
+                <el-select v-model="categoryFilter" placeholder="状态" clearable size="small">
+                  <el-option label="成功" value="success" />
+                  <el-option label="服务端失败 S" value="S" />
+                  <el-option label="任务侧失败 T" value="T" />
+                  <el-option label="客户端失败 C" value="C" />
+                  <el-option label="未分类 X" value="X" />
+                </el-select>
+              </div>
+              <div class="logc-hint">共 {{ visibleTaskLogFiles.length }} 条</div>
+              <el-scrollbar class="logc-list">
+                <div v-for="f in pagedTaskFiles" :key="f"
+                  :class="['logc-item', { active: logSource === f }]"
+                  @click="selectLogSource(f)">
+                  <span class="task-dot" :style="{ background: dotColor(taskStatusOf(f)) }"></span>
+                  <div class="logc-item-main">
+                    <div class="logc-item-name">{{ f.replace('.log', '') }}</div>
+                    <div class="logc-item-sub">{{ taskStatusOf(f)?.code || taskStatusOf(f)?.status || '—' }}</div>
+                  </div>
+                  <el-tag v-if="markerText(taskStatusOf(f))" size="small"
+                    :type="markerType(taskStatusOf(f))" disable-transitions>
+                    {{ markerText(taskStatusOf(f)) }}
+                  </el-tag>
+                </div>
+                <el-empty v-if="!visibleTaskLogFiles.length" description="无匹配任务" :image-size="40" />
+              </el-scrollbar>
+              <el-pagination v-if="visibleTaskLogFiles.length > taskListPageSize"
+                v-model:current-page="taskListPage" :page-size="taskListPageSize"
+                :total="visibleTaskLogFiles.length" layout="prev, pager, next"
+                :pager-count="5" small background class="logc-pager" />
+            </template>
+
+            <!-- 失败类型分组 -->
+            <template v-else>
+              <el-scrollbar class="logc-list">
+                <el-collapse v-model="expandedGroups" class="logc-groups">
+                  <el-collapse-item v-for="grp in overview.error_tree || []" :key="grp.prefix"
+                    :name="grp.prefix">
+                    <template #title>
+                      <span class="logc-grp-title">
+                        <span class="task-dot" :style="{ background: dotColor({ category: grp.prefix }) }"></span>
+                        <span class="logc-grp-name">{{ grp.label }}</span>
+                        <el-tag size="small" type="info">{{ grp.count }}</el-tag>
+                      </span>
+                    </template>
+                    <div v-for="c in grp.codes" :key="c.code" class="logc-code">
+                      <div class="logc-code-head" @click="toggleCode(c.code)">
+                        <el-icon class="logc-code-arrow">
+                          <ArrowDown v-if="openedCode === c.code" /><ArrowRight v-else />
+                        </el-icon>
+                        <code class="err-code">{{ c.code }}</code>
+                        <span class="logc-code-desc">{{ c.desc }}</span>
+                        <el-tag size="small" type="info">{{ c.count }}</el-tag>
+                      </div>
+                      <div v-if="openedCode === c.code" class="logc-code-tasks">
+                        <div v-if="codeTasksLoading" class="logc-hint">加载中…</div>
+                        <div v-for="t in codeTasks" :key="t.task_idx"
+                          :class="['logc-item', 'logc-item-sm',
+                                   { active: logSource === `task-${t.task_idx}.log` }]"
+                          @click="selectLogSource(`task-${t.task_idx}.log`)">
+                          task-{{ t.task_idx }}
+                        </div>
+                        <el-pagination v-if="!codeTasksLoading && codeTasksTotal > codeTasksPageSize"
+                          v-model:current-page="codeTasksPage" :page-size="codeTasksPageSize"
+                          :total="codeTasksTotal" layout="prev, pager, next"
+                          :pager-count="5" small background class="logc-pager"
+                          @current-change="loadCodeTasks" />
+                        <div v-if="!codeTasksLoading && !codeTasks.length" class="logc-hint">无数据</div>
+                      </div>
+                    </div>
+                  </el-collapse-item>
+                </el-collapse>
+                <el-empty v-if="!(overview.error_tree || []).length" description="暂无失败任务" :image-size="40" />
+              </el-scrollbar>
+            </template>
+          </div>
+
+          <!-- ---------- 中栏：日志浏览区 ---------- -->
+          <div class="logc-mid">
+            <!-- 任务信息卡 -->
+            <div class="logc-card">
+              <div class="logc-card-main">
+                <el-icon class="logc-card-icon"><Document /></el-icon>
+                <div>
+                  <div class="logc-card-name">{{ logSource.replace('.log', '') }}</div>
+                  <div class="logc-card-sub">{{ eventSummary.config || '—' }}</div>
+                </div>
+              </div>
+              <div class="logc-card-meta">
+                <div><span class="logc-k">状态</span>
+                  <el-tag v-if="eventSummary.status" size="small"
+                    :type="eventSummary.status === '任务成功' ? 'success' : 'danger'">
+                    {{ eventSummary.status }}
+                  </el-tag>
+                  <span v-else class="logc-v">—</span>
+                </div>
+                <div v-if="eventSummary.error_code"><span class="logc-k">错误码</span>
+                  <el-tooltip :content="errCodeDesc(eventSummary.error_code)" placement="top">
+                    <code class="err-code">{{ eventSummary.error_code }}</code>
+                  </el-tooltip>
+                </div>
+                <div><span class="logc-k">开始</span><span class="logc-v">{{ eventSummary.started_at || '—' }}</span></div>
+                <div><span class="logc-k">结束</span><span class="logc-v">{{ eventSummary.ended_at || '—' }}</span></div>
+                <div><span class="logc-k">耗时</span><span class="logc-v">{{ fmtElapsed(eventSummary.total_elapsed) }}</span></div>
+              </div>
+            </div>
+
+            <div class="toolbar">
+              <el-input v-model="filterKeyword" placeholder="过滤关键词…" clearable style="width:240px" />
+              <el-select v-model="logPageSize" style="width:130px" @change="onLogPageSizeChange">
+                <el-option v-for="n in LOG_PAGE_SIZES" :key="n" :label="`每页 ${n} 行`" :value="n" />
+              </el-select>
+              <el-button @click="scrollToBottom">滚到底部</el-button>
+              <el-button @click="loadLogs" :loading="logLoading">刷新</el-button>
+              <el-button @click="clearLogs">清屏</el-button>
+              <span class="logc-hint" style="margin-left:auto">
+                已加载 {{ logLoadedPages }} 页{{ logHasMore ? '（上方还有更早日志）' : '（已到开头）' }}
+              </span>
+            </div>
+
+            <div ref="logContainer" class="log-container" @scroll="onScroll">
+              <!-- 顶部既是状态提示也是按钮：不想靠滚动触发时可以直接点 -->
+              <div v-if="rawText !== null"
+                :class="['log-more-hint', { 'log-more-btn': logHasMore && !loadingMore }]"
+                @click="logHasMore && !loadingMore && loadMore()">
+                <span v-if="loadingMore">加载中…</span>
+                <span v-else-if="logHasMore">↑ 点击或上滑加载更早的 {{ logPageSize }} 行</span>
+                <span v-else>已到日志开头</span>
+              </div>
+              <!-- 分段渲染：sandbox_detail 方框块默认折叠 -->
+              <template v-if="rawText !== null">
+                <template v-for="(seg, i) in logSegments" :key="i">
+                  <pre v-if="seg.type === 'text'" class="log-raw">{{ seg.content }}</pre>
+                  <div v-else class="log-box">
+                    <div class="log-box-head" @click="toggleSeg(i)">
+                      <el-icon><ArrowDown v-if="segExpanded(i)" /><ArrowRight v-else /></el-icon>
+                      <span class="log-box-title">{{ seg.title }}</span>
+                      <span class="log-box-lines">{{ seg.lineCount }} 行</span>
+                    </div>
+                    <pre v-if="segExpanded(i)" class="log-raw log-box-body">{{ seg.content }}</pre>
+                  </div>
+                </template>
+                <div v-if="!logSegments.length" class="logc-hint" style="padding:20px;text-align:center">
+                  暂无日志
+                </div>
+              </template>
+              <template v-else>
+                <div v-for="(line, idx) in filteredLines" :key="idx"
+                  :class="['log-line', lineClass(line)]">{{ line }}</div>
+                <div v-if="!filteredLines.length" style="color:#666;padding:20px;text-align:center">
+                  暂无日志
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- ---------- 右栏：关键事件 ---------- -->
+          <div class="logc-right">
+            <div class="logc-right-head">
+              <el-icon><Clock /></el-icon><span>关键事件 / 错误位置</span>
+            </div>
+            <el-scrollbar class="logc-timeline">
+              <div v-if="eventsLoading" class="logc-hint">加载中…</div>
+              <div v-for="(ev, i) in logEvents" :key="i"
+                :class="['tl-item', { 'tl-error': ev.kind === 'error',
+                                      'tl-clickable': ev.line }]"
+                @click="jumpToLine(ev.line)">
+                <span class="tl-dot" :style="{ background: eventColor(ev) }"></span>
+                <div class="tl-body">
+                  <div class="tl-title">
+                    {{ ev.title }}
+                    <el-tooltip v-if="ev.code" :content="errCodeDesc(ev.code)" placement="left">
+                      <code class="err-code">{{ ev.code }}</code>
+                    </el-tooltip>
+                  </div>
+                  <div class="tl-ts">{{ (ev.ts || '').slice(11) }}
+                    <span v-if="ev.elapsed" class="tl-elapsed">· {{ fmtElapsed(ev.elapsed) }}</span>
+                  </div>
+                  <div v-if="ev.detail" class="tl-detail">{{ ev.detail }}</div>
+                </div>
+              </div>
+              <div v-if="eventsTruncated" class="logc-hint">
+                事件过多，仅显示前 {{ logEvents.length }} 条
+              </div>
+              <el-empty v-if="!eventsLoading && !logEvents.length"
+                description="无关键事件" :image-size="40" />
+            </el-scrollbar>
+          </div>
         </div>
       </el-tab-pane>
       <!-- ================= 输出 ================= -->
@@ -547,9 +713,20 @@
                   <el-option label="未评估" value="unevaluated" />
                   <el-option label="未分级" value="fail" />
                 </el-select>
-                <el-input v-model="taskKeyword" size="small" placeholder="搜索会话..." clearable
-                  style="width:200px">
+                <!-- 三个搜索框各管一件事，不混在一起：用户看到的字段就是他能搜的字段。
+                     名称/编号走 DB 列（毫秒级）；内容走 task_records.query_text
+                     （由 shallow-query worker 回填，也是 SQL LIKE，毫秒级）。 -->
+                <el-input v-model="taskKeyword" size="small" clearable
+                  placeholder="任务名称" style="width:150px">
                   <template #prefix><el-icon><Search /></el-icon></template>
+                </el-input>
+                <el-input v-model="taskIdxKeyword" size="small" clearable
+                  placeholder="任务编号 task-5921" style="width:160px">
+                  <template #prefix><el-icon><Search /></el-icon></template>
+                </el-input>
+                <el-input v-model="taskContentKeyword" size="small" clearable
+                  placeholder="内容，如 帮我画个花" style="width:190px">
+                  <template #prefix><el-icon><Document /></el-icon></template>
                 </el-input>
               </div>
             </div>
@@ -885,7 +1062,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, ArrowRight, Search, Folder, Document, Loading } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowRight, Search, Folder, Document, Loading, Clock } from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
 import EChart from '../components/EChart.vue'
@@ -923,7 +1100,12 @@ function ensureTabLoaded(tab) {
   if (loadedTabs.has(tab)) return
   loadedTabs.add(tab)
   if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
-  else if (tab === 'logs') { loadTaskLogFiles(); loadTaskStatusMap(); loadLogs() }
+  // 日志 tab 的「失败类型分组」用的是 overview.error_tree，而 overview 默认只在
+  // config tab 拉。直接进 ?tab=logs 时它还是空的，这里补一次。
+  else if (tab === 'logs') {
+    loadTaskLogFiles(); loadTaskStatusMap(); loadLogs(); loadLogEvents()
+    if (!(overview.value.error_tree || []).length) loadData(true)
+  }
   else if (tab === 'outputs') { loadShallow(false); loadArtifactProgress(); loadProxyConfig(); setTimeout(refreshProxyExportStatus, 500) }
   // 队列 tab 不单独拉：loadData() 末尾会调 loadQueueInfo()。但切到该 tab 时
   // 不能干等下一次 10s 轮询，这里直接触发一次，插队按钮/名次才不会延迟 10 秒才出来。
@@ -1164,6 +1346,7 @@ const taskLogFiles = ref([])
 const rawText = ref(null)
 const taskStatusMap = ref({})   // { task_idx: {status, category, code} }
 const categoryFilter = ref('')
+const taskSearch = ref('')
 const logStartOffset = ref(null)  // 当前已加载窗口首字节偏移（load-more 游标）
 const logHasMore = ref(false)     // 上方是否还有更早日志
 const loadingMore = ref(false)
@@ -1199,27 +1382,189 @@ function markerText(st) {
   return st.category || (st.status === '任务异常' ? 'X' : '')
 }
 
-// 按错误类型筛选下拉里的 task 列表
+// 按错误类型 + 关键字筛选 task 列表
 const visibleTaskLogFiles = computed(() => {
-  if (!categoryFilter.value) return taskLogFiles.value
-  return taskLogFiles.value.filter(f => {
-    const st = taskStatusOf(f)
-    if (!st) return false
-    if (categoryFilter.value === 'success') return st.status === '任务成功'
-    return st.category === categoryFilter.value
-  })
+  let list = taskLogFiles.value
+  if (categoryFilter.value) {
+    list = list.filter(f => {
+      const st = taskStatusOf(f)
+      if (!st) return false
+      if (categoryFilter.value === 'success') return st.status === '任务成功'
+      return st.category === categoryFilter.value
+    })
+  }
+  if (taskSearch.value.trim()) {
+    const kw = taskSearch.value.trim().toLowerCase()
+    list = list.filter(f => f.toLowerCase().includes(kw))
+  }
+  return list
 })
 
-// el-select-v2 的扁平 options：两个固定源 + 全部 task
-const taskSelectOptions = computed(() => {
-  const base = [
-    { label: '主进程日志', value: 'main.log', st: null },
-    { label: '完整日志(nohup)', value: 'nohup.log', st: null },
-  ]
-  for (const f of visibleTaskLogFiles.value) {
-    base.push({ label: f.replace('.log', ''), value: f, st: taskStatusOf(f) })
+// 左栏固定的两个实例级日志源
+const fixedLogSources = [
+  { label: '主进程日志 (main.log)', value: 'main.log' },
+  { label: '完整日志 (nohup.log)', value: 'nohup.log' },
+]
+
+// 左栏顺序列表分页：大实例有上万个 task，一次性渲染会卡死。
+// 用真分页（而非「加载更多」累加）——累加到几千条后 DOM 依然会重，
+// 且用户想回到前面还得往回滚很远。
+const taskListPage = ref(1)
+const taskListPageSize = 100
+const pagedTaskFiles = computed(() => {
+  const start = (taskListPage.value - 1) * taskListPageSize
+  return visibleTaskLogFiles.value.slice(start, start + taskListPageSize)
+})
+
+// 筛选条件变化时回到第 1 页，否则可能停在一个超出新结果集的空页
+watch([categoryFilter, taskSearch], () => { taskListPage.value = 1 })
+
+// ---- 左栏：失败类型分组 ----
+const leftView = ref('seq')
+const expandedGroups = ref([])
+const openedCode = ref('')
+const codeTasks = ref([])
+const codeTasksLoading = ref(false)
+const codeTasksTotal = ref(0)
+const codeTasksPage = ref(1)
+const codeTasksPageSize = 50
+
+async function toggleCode(code) {
+  if (openedCode.value === code) { openedCode.value = ''; return }
+  openedCode.value = code
+  codeTasks.value = []
+  codeTasksTotal.value = 0
+  codeTasksPage.value = 1
+  loadCodeTasks()
+}
+
+// 按错误码取任务清单（服务端分页：一个码下可能有上万个任务）
+async function loadCodeTasks() {
+  const code = openedCode.value
+  if (!code) return
+  codeTasksLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/task-records`, {
+      params: { code, page: codeTasksPage.value, page_size: codeTasksPageSize,
+                sort_by: 'task_idx', sort_dir: 'asc' },
+    })
+    // 响应可能在等待期间已被另一次点击取代，丢弃过期结果
+    if (openedCode.value !== code) return
+    codeTasks.value = res.tasks || []
+    codeTasksTotal.value = res.total || 0
+  } catch { /* handled by interceptor */ }
+  finally { if (openedCode.value === code) codeTasksLoading.value = false }
+}
+
+function selectLogSource(v) {
+  logSource.value = v
+  onLogSourceChange()
+}
+
+// ---- 右栏：关键事件 ----
+const logEvents = ref([])
+const eventSummary = ref({})
+const eventsLoading = ref(false)
+const eventsTruncated = ref(false)
+
+// 事件圆点配色：错误按错误码前缀取语义色，其余按阶段
+function eventColor(ev) {
+  if (ev.kind === 'error') return dotColor({ category: (ev.code || '')[0] })
+  if (ev.kind === 'end') {
+    return ev.title === '任务成功' ? '#10b981' : dotColor({ category: (ev.code || 'X')[0] })
   }
-  return base
+  if (ev.kind === 'begin') return '#409eff'
+  return '#10b981'
+}
+
+// 错误码释义：与后端 _ERROR_CODE_DESC 同源，取自概览已拉到的 error_tree，
+// 避免为一个 tooltip 再开一个接口。查不到时退回码本身。
+function errCodeDesc(code) {
+  if (!code) return ''
+  for (const grp of overview.value.error_tree || []) {
+    for (const c of grp.codes || []) {
+      if (c.code === code) return c.desc || code
+    }
+  }
+  return code
+}
+
+function fmtElapsed(s) {
+  if (s == null) return '—'
+  if (s < 60) return `${s.toFixed(1)} 秒`
+  const m = Math.floor(s / 60)
+  return `${m} 分 ${Math.round(s - m * 60)} 秒`
+}
+
+async function loadLogEvents() {
+  eventsLoading.value = true
+  logEvents.value = []
+  eventSummary.value = {}
+  const src = logSource.value
+  try {
+    const res = await api.get(`/logs/${id}/task-log/${src}/events`, { silent: true })
+    // 切源很快时响应可能乱序到达，只认当前源的结果
+    if (logSource.value !== src) return
+    logEvents.value = res.events || []
+    eventSummary.value = res.summary || {}
+    eventsTruncated.value = !!res.truncated
+  } catch { /* 事件抽取失败不该影响看日志本身 */ }
+  finally { if (logSource.value === src) eventsLoading.value = false }
+}
+
+// 点击时间线 → 中栏定位。骨架版用关键字定位：把该事件时间戳填进过滤框，
+// 日志正文随即只剩相关行。比重新按字节游标翻页简单得多，且对用户同样有用。
+function jumpToLine(line) {
+  if (!line) return
+  const ev = logEvents.value.find(e => e.line === line)
+  if (ev?.ts) filterKeyword.value = ev.ts
+  scrollToBottom()
+}
+
+// ---- sandbox_detail 方框块分段（只影响渲染，不动 rawText） ----
+// expandedSegs 只记录「被用户手动展开过」的块，默认（无键）即折叠。
+// 不用 watch(logSegments) 去预填默认值：那个 watch 会在 setup 期间立即求值
+// logSegments → 读到后面才声明的 displayRawText，触发 TDZ ReferenceError，
+// 整个组件 setup 崩掉（表现为所有 tab 都打不开）。
+const expandedSegs = ref({})
+function toggleSeg(i) { expandedSegs.value[i] = !expandedSegs.value[i] }
+function segExpanded(i) { return !!expandedSegs.value[i] }
+
+// 换日志源 / 刷新时清空展开状态，避免下标错位到新内容上
+watch(logSource, () => { expandedSegs.value = {} })
+
+const logSegments = computed(() => {
+  const text = displayRawText.value
+  if (!text) return []
+  const segs = []
+  let buf = []
+  let box = null
+  for (const line of text.split('\n')) {
+    const s = line.trimStart()
+    if (box === null && s.startsWith('┌')) {
+      if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = [] }
+      box = []
+      continue
+    }
+    if (box !== null) {
+      if (s.startsWith('└')) {
+        // 首行去掉 ▎/│ 装饰后作为折叠标题
+        const title = (box.find(l => l.trim()) || 'sandbox detail')
+          .replace(/^[\s▎│|]+/, '').trim()
+        segs.push({ type: 'box', title: title.slice(0, 120),
+                    content: box.join('\n'), lineCount: box.length })
+        box = null
+      } else {
+        box.push(line)
+      }
+      continue
+    }
+    buf.push(line)
+  }
+  // 方框未闭合（日志被截断在块中间）：当普通文本处理，不吞内容
+  if (box !== null) buf.push(...box)
+  if (buf.length) segs.push({ type: 'text', content: buf.join('\n') })
+  return segs
 })
 
 const filteredLines = computed(() => {
@@ -1243,7 +1588,9 @@ const displayRawText = computed(() => {
 })
 
 function onLogSourceChange() {
+  filterKeyword.value = ''   // 换源时清掉上一源的定位关键字，否则新日志可能整屏空
   loadLogs()
+  loadLogEvents()
 }
 
 function lineClass(line) {
@@ -1262,23 +1609,30 @@ function scrollToBottom() {
 
 function clearLogs() { logLines.value = []; rawText.value = '' }
 
+// 日志分页：每页行数可调。默认 500 —— 实测 50 行在长日志里连一屏都不够，
+// 上滑后立刻又触顶，形成「滚一下等一下」的卡顿感。
+const LOG_PAGE_SIZES = [200, 500, 1000, 2000]
+const logPageSize = ref(500)
+const logLoadedPages = ref(0)   // 已向上翻过的页数，供「已加载 N 页」提示
+
 async function loadLogs() {
   logLoading.value = true
   try {
-    // 首屏只取最新 50 行（raw 模式，1:1 展示），后续上滑用 end 游标向上翻页
+    // 首屏取最新 logPageSize 行（raw 模式，1:1 展示），后续上滑用 end 游标向上翻页
     const res = await api.get(`/logs/${id}/task-log/${logSource.value}`, {
-      params: { tail: 50, raw: true }
+      params: { tail: logPageSize.value, raw: true }
     })
     rawText.value = res.text ?? ''
     logStartOffset.value = res.start_offset ?? 0
     logHasMore.value = !!res.has_more
     logLines.value = []
+    logLoadedPages.value = 1
     scrollToBottom()
   } catch { /* handled by interceptor */ }
   finally { logLoading.value = false }
 }
 
-// 上滑到顶时向上加载更早的 50 行，前置到 rawText，并保持视觉滚动位置不跳
+// 上滑到顶时向上加载更早的一页，前置到 rawText，并保持视觉滚动位置不跳
 async function loadMore() {
   if (!logHasMore.value || loadingMore.value || logStartOffset.value == null) return
   loadingMore.value = true
@@ -1287,22 +1641,34 @@ async function loadMore() {
   const prevTop = el ? el.scrollTop : 0
   try {
     const res = await api.get(`/logs/${id}/task-log/${logSource.value}`, {
-      params: { tail: 50, raw: true, end: logStartOffset.value }
+      params: { tail: logPageSize.value, raw: true, end: logStartOffset.value }
     })
     const chunk = res.text ?? ''
     if (chunk) rawText.value = chunk + rawText.value
     logStartOffset.value = res.start_offset ?? 0
     logHasMore.value = !!res.has_more
+    if (chunk) logLoadedPages.value++
     await nextTick()
-    if (el) el.scrollTop = prevTop + (el.scrollHeight - prevHeight)
+    // 位置补偿放进 rAF：nextTick 时浏览器可能还没完成布局，scrollHeight 读到旧值，
+    // 补偿量算错就会看到一帧跳动。等到下一帧再校正，视觉上完全不动。
+    if (el) {
+      requestAnimationFrame(() => {
+        el.scrollTop = prevTop + (el.scrollHeight - prevHeight)
+      })
+    }
   } catch { /* ignore */ }
   finally { loadingMore.value = false }
 }
 
+// 触发阈值放宽到 200px：40px 太窄，滚轮快一点就冲到顶部才开始加载，
+// 看起来就是「卡住了」。提前量留足，内容在到顶前就续上。
 function onScroll() {
   const el = logContainer.value
-  if (el && el.scrollTop < 40 && logHasMore.value && !loadingMore.value) loadMore()
+  if (el && el.scrollTop < 200 && logHasMore.value && !loadingMore.value) loadMore()
 }
+
+// 切换每页行数后按新粒度重新加载首屏
+function onLogPageSizeChange() { loadLogs() }
 
 async function loadTaskLogFiles() {
   try {
@@ -1506,6 +1872,10 @@ async function exportFunnel() {
 // ---- 表格: 分页 / 过滤 / 排序（后端 shallow/tasks 下沉，本地只透传参数触发重拉） ----
 const levelFilter = ref('')
 const taskKeyword = ref('')
+// 任务编号搜索（task-5921 / 5921），独立成框 —— 和名称模糊搜的语义不同
+const taskIdxKeyword = ref('')
+// 内容检索：走 task_records.query_text（shallow-query worker 回填的任务描述）
+const taskContentKeyword = ref('')
 const taskPage = ref(1)
 const taskPageSize = ref(50)
 const taskSort = ref({})
@@ -1522,10 +1892,23 @@ function onTaskSort({ prop, order }) {
   loadTasks()
 }
 let taskKwTimer = null
-// 关键词输入防抖：避免每敲一个字符就拉一次分页接口
+// 关键词输入防抖：避免每敲一个字符就拉一次分页接口。
+// 配置正文检索要读上万个文件（首次约 0.5s，之后走后端缓存），防抖给到 500ms。
 watch(taskKeyword, () => {
   if (taskKwTimer) clearTimeout(taskKwTimer)
   taskKwTimer = setTimeout(() => { taskPage.value = 1; loadTasks() }, 300)
+})
+let taskIdxTimer = null
+watch(taskIdxKeyword, () => {
+  if (taskIdxTimer) clearTimeout(taskIdxTimer)
+  taskIdxTimer = setTimeout(() => { taskPage.value = 1; loadTasks() }, 300)
+})
+let taskCkTimer = null
+// 内容检索：首次搜某实例时后端会同步回填 query_text（约 0.8s），之后都是
+// SQL LIKE 毫秒级。防抖给到 500ms，避免边敲边触发那次回填。
+watch(taskContentKeyword, () => {
+  if (taskCkTimer) clearTimeout(taskCkTimer)
+  taskCkTimer = setTimeout(() => { taskPage.value = 1; loadTasks() }, 500)
 })
 
 // 当前页表格数据: GET /shallow/tasks（分页 + tag + keyword + 排序）
@@ -1536,8 +1919,13 @@ async function loadTasks() {
     page_size: taskPageSize.value,
   }
   if (levelFilter.value) params.tag = levelFilter.value
+  // 任务名称 → keyword（config_name 模糊）；任务编号 → idx_keyword（task_idx 精确）
   const kw = taskKeyword.value.trim()
   if (kw) params.keyword = kw
+  const ik = taskIdxKeyword.value.trim()
+  if (ik) params.idx_keyword = ik
+  const ck = taskContentKeyword.value.trim()
+  if (ck) params.content_keyword = ck
   if (s.prop) {
     params.sort_by = s.prop
     params.sort_dir = s.order === 'descending' ? 'desc' : 'asc'
@@ -2095,6 +2483,133 @@ onUnmounted(() => {
 .task-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .task-opt-name { flex: 1; }
 .task-opt-tag { margin-left: auto; }
+
+/* ---- 日志中心：三栏布局 ---- */
+/* 三栏整体吃满视口剩余高度：用 flex + min-height:0 让子项能正确收缩，
+   避免给每一栏写死 calc(100vh - 魔法数) —— 那样页头/信息卡高度一变就对不上，
+   表现为日志区够不到底部或溢出。 */
+.logc {
+  display: flex; gap: 12px; align-items: stretch;
+  height: calc(100vh - 230px); min-height: 420px;
+}
+.logc-left {
+  width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 10px;
+  min-height: 0;
+}
+.logc-left-switch { width: 100%; display: flex; }
+.logc-left-switch :deep(.el-radio-button) { flex: 1; }
+.logc-left-switch :deep(.el-radio-button__inner) { width: 100%; }
+.logc-filters { display: flex; flex-direction: column; gap: 6px; }
+.logc-fixed { display: flex; flex-direction: column; gap: 4px; }
+.logc-hint { color: var(--text-muted); font-size: 12px; padding: 2px 4px; }
+.logc-list { flex: 1; min-height: 0; }
+.logc-item {
+  display: flex; align-items: center; gap: 8px; padding: 7px 8px;
+  border-radius: var(--radius-sm, 4px); cursor: pointer; font-size: 13px;
+}
+.logc-item:hover { background: var(--fill-color, #f4f4f5); }
+.logc-item.active { background: var(--el-color-primary-light-9, #ecf5ff); font-weight: 600; }
+.logc-item-fixed { border: 1px solid var(--border-color); }
+.logc-item-sm { padding: 4px 8px 4px 24px; font-size: 12px; }
+.logc-item-main { flex: 1; min-width: 0; }
+.logc-item-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.logc-item-sub { color: var(--text-muted); font-size: 11px; }
+.logc-more {
+  text-align: center; color: var(--el-color-primary); font-size: 12px;
+  padding: 8px; cursor: pointer; user-select: none;
+}
+.logc-pager { justify-content: center; padding: 6px 0 2px; }
+/* 日志区顶部「加载更早」提示兼按钮 */
+.log-more-btn { cursor: pointer; }
+.log-more-btn:hover { color: #e2e8f0; text-decoration: underline; }
+.logc-groups :deep(.el-collapse-item__header) { height: 38px; line-height: 38px; }
+.logc-grp-title { display: flex; align-items: center; gap: 8px; width: 100%; }
+.logc-grp-name { flex: 1; font-size: 13px; }
+.logc-code { margin-left: 4px; }
+.logc-code-head {
+  display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+  cursor: pointer; border-radius: var(--radius-sm, 4px);
+}
+.logc-code-head:hover { background: var(--fill-color, #f4f4f5); }
+.logc-code-arrow { font-size: 12px; color: var(--text-muted); }
+.logc-code-desc {
+  flex: 1; color: var(--text-muted); font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.logc-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* 中栏多了任务信息卡，日志区要相应让出高度（默认 .log-container 是 100vh-340px） */
+/* 日志区吃满中栏剩余高度（信息卡/工具栏之外的全部），不再写死 calc */
+.logc-mid .log-container { height: auto; flex: 1; min-height: 0; overflow-x: hidden; }
+/* 长行自动换行：日志里常有超长的 JSON/路径，默认 white-space:pre 会把整个
+   浏览区撑出横向滚动条，读起来要来回拖。改为保留缩进但允许折行。 */
+.logc-mid .log-raw { white-space: pre-wrap; overflow-wrap: anywhere; }
+.logc-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  flex-wrap: wrap; padding: 12px 14px; margin-bottom: 12px;
+  background: var(--fill-color-light, #fafafa);
+  border: 1px solid var(--border-color); border-radius: var(--radius-md);
+}
+.logc-card-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.logc-card-icon { font-size: 20px; color: var(--el-color-primary); }
+.logc-card-name { font-size: 15px; font-weight: 600; }
+.logc-card-sub {
+  color: var(--text-muted); font-size: 12px; max-width: 360px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.logc-card-meta { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; font-size: 13px; }
+.logc-k { color: var(--text-muted); margin-right: 6px; }
+.logc-v { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; }
+
+/* sandbox_detail 折叠块 */
+.log-box { margin: 4px 0; border-left: 2px solid #475569; }
+.log-box-head {
+  display: flex; align-items: center; gap: 6px; padding: 3px 8px;
+  cursor: pointer; color: #94a3b8; font-size: 12px; user-select: none;
+}
+.log-box-head:hover { background: #334155; }
+.log-box-title {
+  flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #cbd5e1;
+}
+.log-box-lines { color: #64748b; flex-shrink: 0; }
+.log-box-body { padding-left: 8px; }
+
+/* 右栏：关键事件时间线 */
+.logc-right {
+  width: 280px; flex-shrink: 0; display: flex; flex-direction: column;
+  border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 10px;
+}
+.logc-right-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 14px; font-weight: 600; padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-color); margin-bottom: 6px;
+}
+.logc-timeline { flex: 1; min-height: 0; }
+.tl-item {
+  display: flex; gap: 10px; padding: 8px 6px; position: relative;
+  border-radius: var(--radius-sm, 4px);
+}
+/* 竖线：除最后一项外，用圆点下方的伪元素连起来 */
+.tl-item:not(:last-child)::before {
+  content: ''; position: absolute; left: 10px; top: 20px; bottom: -4px;
+  width: 1px; background: var(--border-color);
+}
+.tl-clickable { cursor: pointer; }
+.tl-clickable:hover { background: var(--fill-color, #f4f4f5); }
+.tl-error { background: var(--el-color-danger-light-9, #fef0f0); }
+.tl-dot {
+  width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+  margin-top: 4px; margin-left: 2px; z-index: 1;
+}
+.tl-body { flex: 1; min-width: 0; }
+.tl-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.tl-ts { color: var(--text-muted); font-size: 11px; font-family: 'Cascadia Code', monospace; }
+.tl-elapsed { color: var(--el-color-primary); }
+.tl-detail {
+  color: var(--text-muted); font-size: 11px; margin-top: 2px;
+  word-break: break-all; line-height: 1.4;
+}
 
 /* ---- 输出 tab: 漏斗柱状图 ---- */
 .funnel-bar-row {

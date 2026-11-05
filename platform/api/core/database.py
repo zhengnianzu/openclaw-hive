@@ -562,6 +562,17 @@ INSTANCE_EXTRA_COLUMNS = (
 # 会把同一个日志判多次。
 TASK_EXTRA_COLUMNS = (
     "task_done INTEGER",
+    # 任务描述（config json 的 queries[].text），供「会话列表」的内容检索用。
+    #
+    # 为什么落库而不是搜的时候现场读文件：配置是 task_input_path 下每任务一个的
+    # json，不在库里。现场 grep 单实例 1 万个文件要 0.8s（32 并发）、20MB 占在
+    # uvicorn 进程内存里（4 个 worker 各一份），而且命中几千条时要拼几批 IN，
+    # 没法和其它过滤、排序、分页一起下沉到 SQL。落库后就是一个普通 LIKE 条件。
+    #
+    # **存完整不截断**：实测平均 129 字，而截断到 100 字会丢 54~66% 的命中
+    # （「保存到工作区」这类关键信息常在句尾），而存储只省 23% —— 不划算。
+    # 真正的省法是按实例 LRU 只保留最近 20 个（见 offline/shallow_query.py）。
+    "query_text TEXT",
 )
 
 # shallow_queue 的「新增可选列」。产物下载维（artifact_*）是为了让 task_tracker
