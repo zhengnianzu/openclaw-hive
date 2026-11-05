@@ -1,4 +1,4 @@
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, computed_field, field_validator
 from typing import Optional, List
 
 
@@ -146,6 +146,17 @@ class InstanceInfo(BaseModel):
     done_tasks: int = 0
     concurrent_num: int = 100
     harness_type: str = "openclaw"
+    # 展示序号：按创建时间升序分配的持久编号（最早=1，最新最大），创建后永不变。
+    # 删除实例会留空洞 —— 这是「稳定」的代价，详见 database.INSTANCE_EXTRA_COLUMNS。
+    # 必须容忍 NULL：DB 里该列可为空（迁移刚加完列、回填还没跑完的窗口期），
+    # 而调用方是 InstanceInfo(**row) 直接塞 DB 行，声明成 int 会整个接口 500。
+    # 用 0 表示「还没编号」，前端显示 '—'。
+    seq: Optional[int] = 0
+
+    @field_validator("seq", mode="before")
+    @classmethod
+    def _seq_default(cls, v):
+        return 0 if v is None else v
     # 镜像：create_params.image_name 存的是完整地址，这里拆成筛选值 + 展示名。
     # 首页「镜像」下拉按 image_address 筛（唯一稳定），显示 image_name（注册短名；
     # 未注册的镜像回退地址末段）。沙箱 OS 不在这里，用已有的 sandbox_type。

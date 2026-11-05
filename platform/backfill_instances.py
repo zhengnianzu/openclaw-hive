@@ -55,6 +55,17 @@ def dir_mtime_iso(p: Path) -> str:
     return datetime.fromtimestamp(p.stat().st_mtime).isoformat()
 
 
+def next_seq(conn) -> int:
+    """展示序号：取当前最大值 +1，只增不复用（口径同 api/routers/instances.py）。
+
+    本脚本插的是历史实例（created_at 取目录 mtime，早于库里现有的行），
+    所以回填出来的号会「时间早但序号大」。这是故意的：序号的硬要求是**创建后
+    永不变**，重排历史号会把已有实例的号全改掉，代价比顺序不完美大得多。
+    """
+    return (conn.execute(
+        "SELECT MAX(seq) FROM task_instances").fetchone()[0] or 0) + 1
+
+
 def main():
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.execute("PRAGMA busy_timeout=30000")
@@ -85,10 +96,11 @@ def main():
             """INSERT INTO task_instances
                (id, name, config_path, status, created_by,
                 total_tasks, completed_tasks, failed_tasks, concurrent_num,
-                created_at, stopped_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, stopped_at, seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (instance_id, parse_name(instance_id), str(cfg), status, "admin",
-             total, completed, failed, concurrent, created, created),
+             total, completed, failed, concurrent, created, created,
+             next_seq(conn)),
         )
         inserted.append((instance_id, status, f"{completed}/{failed}/{total}"))
 

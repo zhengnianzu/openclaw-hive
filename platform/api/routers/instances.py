@@ -1494,17 +1494,24 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             _create_params["harness_config_version_id"] = harness_version_row["id"]
             _create_params["harness_config_version"] = harness_version_row["version"]
         _create_params["harness_config_label"] = harness_version_label
+        # 展示序号：取当前最大值 +1，**只增不复用**（删掉的号留空洞）。
+        # 与 INSERT 同一连接同一事务，并发创建不会撞号（SQLite 单写者）。
+        # 不用 COUNT(*)+1：删过实例后会和已有的号重复。
+        next_seq = (conn.execute(
+            "SELECT MAX(seq) AS m FROM task_instances"
+        ).fetchone()["m"] or 0) + 1
         conn.execute(
             """INSERT INTO task_instances
                (id, name, config_path, status, created_by, total_tasks, concurrent_num,
                 config_snapshot, create_params, created_at, queue_id, queue_position,
-                suffix_api_keys, copied_from)
-               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                suffix_api_keys, copied_from, seq)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (instance_id, req.name, config_path, user["username"], 0,
              req.concurrent_num, OmegaConf.to_yaml(base),
              json.dumps(_create_params, ensure_ascii=False),
              datetime.now().isoformat(), req.queue_id, queue_position,
-             1 if req.suffix_api_keys else 0, req.copy_complete_from or None),
+             1 if req.suffix_api_keys else 0, req.copy_complete_from or None,
+             next_seq),
         )
         row = conn.execute("SELECT * FROM task_instances WHERE id=?", (instance_id,)).fetchone()
 

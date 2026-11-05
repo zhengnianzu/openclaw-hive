@@ -174,6 +174,18 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="pagedInstances" v-loading="loading" stripe style="width:100%" border>
+        <!-- 序号：实例名称又长又像（2611032107-wanyi26110321070534-d5b7），
+             先给一列短编号方便口头/截图指认「第 23 条」。
+             用后端的持久 seq（按创建时间升序，最早=1、最新最大），**不是行号** ——
+             行号会随筛选/翻页/排序变，而这个编号创建后永不变，删实例也不影响其他行。
+             代价是会有空洞（删掉的号消失），取舍见后端注释。 -->
+        <el-table-column prop="seq" label="序号" width="80" align="center" sortable>
+          <template #default="{row}">
+            <span style="color:var(--text-muted);font-variant-numeric:tabular-nums">
+              {{ row.seq || '—' }}
+            </span>
+          </template>
+        </el-table-column>
         <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip resizable>
           <template #default="{row}">
             <span>{{ row.name }}</span>

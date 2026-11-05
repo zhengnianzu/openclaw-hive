@@ -549,6 +549,17 @@ INSTANCE_EXTRA_COLUMNS = (
     # 原先只存在 create_params JSON 里，汇总 SQL 每行都要 json_extract 一次，
     # 提成真实列后可以直接建索引式过滤。语义见 _leaf_instance_filter()。
     "copied_from TEXT",
+    # 展示用序号：按创建时间升序，最早=1，最新最大。首页表格首列显示，
+    # 用来替代又长又像的实例名（2611032107-wanyi26110321070534-d5b7）口头指认。
+    #
+    # **为什么是持久列而不是查询时 ROW_NUMBER()**：要求「保持不变」。实时排名在
+    # 删除旧实例后会让其后所有行的序号集体 −1（该库历史上已删掉 43% 的实例），
+    # 截图/工单里写的「第 1203 条」第二天就对不上了。代价是删除会留空洞，
+    # 这是「稳定」的必然结果，取舍上稳定 > 连续。
+    #
+    # 不复用 rowid：rowid 同样单调（实测 2321 行零逆序对），但空洞更大
+    # （最大 4076 vs 实际 2321 行），一上来就显示四位数很怪。
+    "seq INTEGER",
 )
 
 # task_records 的「新增可选列」。
@@ -691,6 +702,21 @@ def ensure_traj_extra_columns() -> None:
                 if added:
                     conn.commit()
                     print(f"[db] {table} 补列: {', '.join(added)}")
+                # seq 刚加出来时是全 NULL，按 created_at 升序回填一次（最早=1）。
+                # 只在本次真的新增了该列时跑，之后的启动不再动历史值 —— 否则
+                # 删过实例的库每次重启都会重新压缩序号，就不「保持不变」了。
+                if table == "task_instances" and "seq" in added:
+                    conn.execute("""
+                        UPDATE task_instances SET seq = (
+                            SELECT COUNT(*) FROM task_instances AS t
+                            WHERE t.created_at <= task_instances.created_at
+                        )
+                    """)
+                    conn.commit()
+                    n = conn.execute(
+                        "SELECT COUNT(*) FROM task_instances WHERE seq IS NOT NULL"
+                    ).fetchone()[0]
+                    print(f"[db] task_instances.seq 回填 {n} 行")
                 if table == "task_traj_records":
                     _ensure_traj_indexes(conn)
                     conn.commit()
