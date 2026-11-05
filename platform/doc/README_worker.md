@@ -8,16 +8,17 @@
 
 ---
 
-## 一、五个 Worker
+## 一、六个 Worker
 
-当前架构共 **5 个常驻进程**。切分维度是**场景**(是不是用户在等),不是阶段(读本地还是读 OBS)。
+当前架构共 **6 个常驻进程**。切分维度是**场景**(是不是用户在等),不是阶段(读本地还是读 OBS)。
 
 | 进程 | 启动命令 | 职责 | 车道 | 日志 |
 |------|---------|------|------|------|
 | **tracker** | `offline/task_tracker.py` | 发现投递(**点击 + running 自动**):增量读 jsonl,把新完成的 config 投进队列 | 按实例状态 | `tracker.log` |
 | **auto-tracker** | `offline/auto_tracker.py` | 发现投递(**历史补全**):每轮挑一个已结束+有缺口的实例 | 恒 `priority=0` | `auto_tracker.log` |
-| **shallow-realtime** | `offline/shallow_worker.py --mode realtime` | 浅层分析(两阶段),**仍在跑的实例** | `priority >= 100` | `shallow_realtime.log` |
-| **shallow-auto** | `offline/shallow_worker.py --mode auto` | 浅层分析(两阶段),**已结束实例**,批量补全,最新优先 | `priority < 100` | `shallow_auto.log` |
+| **shallow-realtime** | `offline/shallow_worker.py --mode realtime` | 浅层分析(两阶段),**点击 + 仍在跑的实例** | `priority >= 90` | `shallow_realtime.log` |
+| **shallow-auto** | `offline/shallow_worker.py --mode auto` | 浅层分析(两阶段),**已结束实例**,批量补全,最新优先 | `priority < 90` | `shallow_auto.log` |
+| **shallow-query** | `offline/shallow_query.py` | 回填任务描述(`query_text`),供会话列表的**内容检索** | — | `shallow_query.log` |
 | **deep-realtime** | `offline/output_worker.py --realtime-only` | 交付物下载,只处理用户点击的 | `artifact_priority >= 100` | `realtime_worker.log` |
 
 ### 1.1 浅层车道怎么分:按实例是否还在跑
@@ -178,6 +179,70 @@ auto-tracker 每轮只处理一个实例,所以直接打实例 ID;tracker 每轮
 (`2611031754-wanyi26110317530533-70b2` → `2611031754-70b2`),固定 15 字符。
 不用 `name`:实测同批次的 name 只差末尾几个字(「…lego」/「…lego-copy」/
 「…lego-copy-copy」),截断后分不出谁是谁;而且含中文、长到 50+,对齐难看。
+
+### 1.5 shallow-query:会话列表的内容检索
+
+会话列表有三个搜索框,各管一件事(前端也是三个独立输入框):
+
+| 搜索框 | 接口参数 | 匹配的列 | 速度 |
+|--------|---------|---------|------|
+| 任务名称 | `keyword` | `config_name` 模糊 | 毫秒 |
+| 任务编号 | `idx_keyword` | `task_idx` 精确(`task-5921` / `5921`) | 毫秒 |
+| 内容 | `content_keyword` | **`query_text`** 模糊 | 毫秒(已回填) / 0.8s(首次) |
+
+分三个框而不是靠猜输入形态:否则「搜任务名恰好是纯数字」会被当成编号。
+编号框输入 `task-abc` 返回空(`WHERE 1=0`)而不是忽略该条件 ——
+忽略会让用户以为「搜 task-abc 查出全部」是匹配上了。
+
+**`query_text` 是什么**:任务配置 json 的 `queries[].text`,也就是下发给 agent
+的那句话(如「给我画一张双色球蓝号最近20期的横向走势图…」)。
+由 `shallow-query` worker 回填进 `task_records.query_text`。
+
+**为什么要落库**,而不是搜的时候现场读文件:
+
+| | 现场 grep 文件 | 落库 + SQL |
+|---|---|---|
+| 首次搜 | 0.8s(32 并发读 1 万个 json) | 0.8s(同步回填一次) |
+| 后续搜 | 靠进程内缓存,只留 3 个实例 | **0.02s**,DB 持久 |
+| 内存 | 20MB/实例 × 4 个 uvicorn worker | 0 |
+| 排序分页 | 要先 grep 出几千 `config_name` 拼 7 批 `IN` | 普通 `LIKE`,和其它过滤一视同仁 |
+
+最后一条是最大的收益 —— 拼 `IN` 是架构性的别扭。
+
+**只取 `queries[].text`,不 grep 整个 json**:json 里大量是 `gateway_ws_url` /
+`workspace_base` / `agents` 这类固定样板,搜「画」会被 `MAP_Linux.json` 之类的
+路径串误命中。结构不符预期时返回空串,**不回退到整个 json**。
+
+**存完整,不截断**。实测平均 prompt 129 字,截断到 100 字的代价:
+
+| 关键词 | 全文命中 | 仅前 100 字 | 漏掉 |
+|--------|---------|------------|------|
+| 文档 | 1,815 | 837 | 54% |
+| 保存到工作区 | 5,824 | 1,965 | **66%** |
+| Word | 1,220 | 451 | 63% |
+
+关键信息(「保存到工作区」「整理成 Word 文档」)常在**句尾**,截断会让搜索
+变成「有时能搜到」—— 比没有更糟。而存储只省 23%(4.2GB → 3.3GB),不划算。
+
+**真正的省法:按实例 LRU**。搜索是交互行为,只发生在用户正在看的实例上 ——
+全库 1,094 万行里 running + 点击过的只占 **3%(28 万行)**。
+`SHALLOW_QUERY_KEEP` 默认 **20 个实例**(注意单位是**实例**不是任务:
+全库 2,313 个实例、平均每个 4,730 个任务,所以 20 个实例 ≈ 9.5 万个任务)。
+超出的把 `query_text` 置 NULL —— **行保留**,它是可重建的缓存,下次搜到再回填。
+
+**触发方式**(两条路,不能只要异步那条):
+
+| 时机 | 做法 |
+|------|------|
+| 用户首次搜某实例 | `batch_output._ensure_query_text` **同步**回填(0.8s),顺手 touch LRU |
+| 常驻 | 本 worker 每 30s 给「已在 LRU 且仍在 running」的实例补新增任务 |
+
+纯异步有个窗口问题:用户点下搜索的瞬间库里还没数据,会看到「0 条」
+然后过几秒才出来,像搜错了。所以首次必须同步。
+
+> 并发保护:同一实例被多个 uvicorn worker 同时搜时只回填一次(`_QT_INFLIGHT`),
+> 其余请求等它完成 —— 否则 4 个 worker 可能同时读 1 万个文件。
+> 回填按 2000 行分批提交:一条 `executemany` 几千行会长时间独占写锁。
 
 ### 为什么没有 deep-auto
 
@@ -392,7 +457,18 @@ offset 会指向新内容中间,前面的行被整段跳过。
 同一实例内部,jsonl 按文件顺序读(先完成的在前),所以 `id` 递增 ≈ 完成时间递增;
 而 shallow-auto 按 `id DESC` 领取,**新完成的任务先定级**,两层口径一致。
 
-### 3.4 心跳与监控
+### 3.4 shallow-query
+
+| 常量 | 值 | 环境变量 | 说明 |
+|------|-----|---------|------|
+| `DEFAULT_KEEP` | 20 | `SHALLOW_QUERY_KEEP` | LRU 保留的**实例**数(非任务数) |
+| `READ_CONCURRENCY` | 32 | `SHALLOW_QUERY_CONCURRENCY` | 读 json 的并发;瓶颈在 NFS 往返,再高收益有限 |
+| `DEFAULT_INTERVAL` | 30s | `--interval` | 只给 running 实例补新增任务,不必太频 |
+
+调试:`python offline/shallow_query.py --instance <id>` 全量回填单个实例
+(`only_missing=False`,会重写已有值)。
+
+### 3.5 心跳与监控
 
 `worker_heartbeats` 表,**按 worker 分组各留 `KEEP_ROWS=2000` 行**
 (`offline/heartbeat.py`)。
@@ -406,16 +482,31 @@ offset 会指向新内容中间,前面的行被整段跳过。
 `processed` 的语义各进程不同(tracker=新投递数、shallow=两阶段 done 之和、
 deep-realtime=下载完成数),**混加没有意义**,看板按 worker 分别画曲线。
 
-相关接口:`/api/worker-monitor/overview` | `/queue` | `/trend` | `/eta` | `/reclaim`,
+相关接口:`/api/worker-monitor/overview` | `/queue` | `/trend` | **`/load`** | `/eta` | `/reclaim`,
 前端 `frontend/src/components/WorkerMonitor.vue`。
 
-`/eta` 按**车道**分别估算(`by_lane`),每条车道用自己 worker 的吞吐 ÷ 自己队列的积压:
+**`_queue_counts` 带 5s TTL 缓存**:它被 4 个接口共用,而看板一次加载并发调 3 个。
+里面是对 1000 万行表的全表聚合(实测 2.4s),不缓存就要跑 3 遍 —— 实测看板首屏
+从 7s+ 降到 3.9s(冷)/ 0.7s(热)。
 
-| 车道 | 分子(心跳 worker) | 分母(权威队列 `shallow_queue`) |
-|------|------------------|------------------------------|
-| `shallow_realtime` | `shallow-realtime` | 两阶段任一 queued 且 `priority>=100` |
-| `shallow_auto` | `shallow-auto` | 同上,`priority<100` |
-| `artifact` | `deep-realtime`(兼容旧名 `deep`/`realtime`/`artifacts`) | `artifact_state='queued'` |
+**`/load`(车道负载)**是看板的主面板,回答「排队多少 / 吞吐多少 / 多久清完 /
+会不会积压」:
+
+| 车道 | 吞吐来源(心跳 worker) | 积压(权威队列 `shallow_queue`) | 新增速率 |
+|------|---------------------|------------------------------|---------|
+| `shallow_realtime` | `shallow-realtime` | 两阶段任一 queued 且 `priority >= 90` | `tracker` |
+| `shallow_auto` | `shallow-auto` | 同上,`priority < 90` | `auto-tracker` |
+| `artifact` | `deep-realtime`(兼容旧名 `deep`/`realtime`/`artifacts`) | `artifact_state='queued'` | — (纯点击驱动) |
+
+**过载判定**:`新增 > 消化 且有待办` → 标红「积压中」;`吞吐=0 但有待办` →
+标红「无吞吐」(worker 卡住)。`/eta` 的 `by_lane` 同口径但只给 ETA。
+
+> 已删除的两个面板:「执行时间估计」(三个数全取自产物车道,而产物纯点击驱动、
+> 队列恒为 0,算出来永远是「—」,且与车道负载完全重复)、「浅层分级进度」
+> (给的是全库累计 1000 万量级的静态数字,看不出此刻堵不堵)。
+> 「下载队列」明细表改名「交付物下载明细」—— 它的「活跃」筛选里混了
+> `failed`/`skipped` 两个终态,而 `queued`/`downloading` 结构上恒为 0,
+> 所以那个「队列」里永远只有死行(实测 failed 166 + skipped 6)。
 
 > 阶段 2 的积压统计**必须带 `_OBS_CLAIMABLE`**(EXISTS + `traj_level IS NULL`),
 > 与 `shallow_obs.claim` 同源。线上有 2.5 万行 `obs_state='queued'` 但 `traj_level`
@@ -500,7 +591,8 @@ SQLite 的 WAL **只允许一个写者**。`BUSY_TIMEOUT_MS=15000`(`DB_BUSY_TIME
 cd /root/openclaw-hive/platform
 
 # ── 启停(4 个进程一起)──
-./run.sh worker-start          # = tracker + auto-tracker + shallow-realtime + shallow-auto + deep-realtime
+./run.sh worker-start          # = tracker + auto-tracker + shallow-realtime
+                               #   + shallow-auto + shallow-query + deep-realtime
 ./run.sh worker-stop           # 停新旧全部(含历史进程,避免升级期留孤儿)
 ./run.sh worker-restart
 ./run.sh shallow-all-start     # 同 worker-start
@@ -510,6 +602,7 @@ cd /root/openclaw-hive/platform
 ./run.sh atracker-start|atracker-stop|atracker-restart    # 历史实例投递
 ./run.sh rt-start|rt-stop|rt-restart            # shallow-realtime
 ./run.sh auto-start|auto-stop|auto-restart      # shallow-auto
+./run.sh query-start|query-stop|query-restart   # shallow-query
 ./run.sh realtime-start|realtime-stop|realtime-restart   # deep-realtime
 
 # ── 日志 ──
@@ -517,6 +610,7 @@ cd /root/openclaw-hive/platform
 ./run.sh logs-atracker         # auto_tracker.log
 ./run.sh logs-rt               # shallow_realtime.log
 ./run.sh logs-auto             # shallow_auto.log
+./run.sh logs-query            # shallow_query.log
 ./run.sh logs-dl               # realtime_worker.log
 ./run.sh shallow-logs          # 四个一起 tail -f
 ./run.sh worker-status         # 4 个 PID/运行时长 + 各自日志尾部 5 行
@@ -527,6 +621,7 @@ python offline/auto_tracker.py --once            # 投一个历史实例
 python offline/auto_tracker.py --once --min-gap 100
 python offline/shallow_worker.py --mode realtime --once
 python offline/shallow_worker.py --mode auto --once
+python offline/shallow_query.py --once
 ```
 
 `worker-status` 会额外检查旧进程(`worker.pid` / `deep_worker.pid` /
@@ -578,11 +673,14 @@ python offline/shallow_worker.py --mode auto --once
 | `offline/shallow_local.py` | 阶段 1 的 `claim` / `judge_one` / `apply_results` |
 | `offline/shallow_obs.py` | 阶段 2 的 `claim` / `grade_one` / `apply_results` |
 | `offline/output_worker.py` | 交付物下载(`_claim_and_download`)、出队回收 |
+| `offline/shallow_query.py` | 任务描述回填(内容检索),按实例 LRU |
 | `offline/heartbeat.py` | 心跳写入与按 worker 分组裁剪 |
 | `src/offline_analysis.py` | 分级引擎(`compute_level`)、缓存路径、详情解析 |
 | `api/routers/worker_monitor.py` | 监控接口(overview/queue/trend/eta/reclaim) |
 | `api/routers/artifacts.py` | 交付物工作区(列表/树/内容/入队) |
 | `api/routers/batch_output.py` | 浅层登记、会话详情(deep) |
 | `test/test_shallow_worker.py` | 车道三档(点击/跟踪/背景)、插队、阶段串联、投递顺序、reset 语义、auto-tracker 挑选、两处水位、tsr 降噪(50 项) |
+| `test/test_shallow_task_search.py` | 内容检索:query_text 抽取、不回退整 json、LRU 淘汰(8 项) |
+| `test/test_task_config.py` | 任务配置弹窗:路径穿越防护、脱敏(7 项) |
 | `test/test_artifact_queue.py` | 产物状态机(20 项) |
 | `test/test_worker_monitor.py` | 心跳、ETA、回收(11 项) |
