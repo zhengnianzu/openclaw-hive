@@ -273,8 +273,9 @@ class TaskConfig:
     main_python_file: str = "harness_automation.py"
     main_python_timeout: int = 36000
     # 单 query 超时(秒)。>0 时由 _upload_data_config 在上传副本里覆盖
-    # queries[].timeout; <=0 表示沿用任务配置自带的原值。与平台查询超时保持同源,
-    # 但注入点在 hive 侧 —— 原始任务配置不被改写。
+    # queries[].timeout; <=0 表示沿用任务配置自带的原值。平台侧按
+    # 沙箱 max_ttl_second - 1200s 算出该值并写进 config.yaml, 注入点在 hive 侧
+    # —— 原始任务配置不被改写。
     query_timeout: int = 0
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10

@@ -38,26 +38,37 @@ from . import resource_pools
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
-DEFAULT_QUERY_TIMEOUT = 15000
-MAIN_TIMEOUT_BUFFER_SECONDS = 600
-SANDBOX_TTL_BUFFER_SECONDS = 1200
+DEFAULT_MAX_TTL_SECOND = 14400
+MAIN_TIMEOUT_MARGIN_SECONDS = 600
+QUERY_TIMEOUT_MARGIN_SECONDS = 1200
 
 
-def _apply_timeout_settings(base, query_timeout: int, query_count: int) -> tuple[int, int]:
-    """按单 query 超时和最大 queries 数覆盖实例级两层超时。"""
-    query_timeout = max(1, int(query_timeout))
-    query_count = max(1, int(query_count))
-    main_timeout = query_timeout * query_count + MAIN_TIMEOUT_BUFFER_SECONDS
-    sandbox_ttl = query_timeout * query_count + SANDBOX_TTL_BUFFER_SECONDS
+def _apply_timeout_settings(base, max_ttl_second: int) -> tuple[int, int, int]:
+    """按沙箱 max_ttl_second 逐级下扣，派生三层超时。
+
+    用户只填最外层的沙箱存活上限，另两层从它减固定余量得到：
+        沙箱 TTL  >  主程序超时 (−600s)  >  单 query 超时 (−1200s)
+    这个顺序保证内层先触发、外层还活着 —— query 卡死时 harness 还有 600s 收尾
+    落盘，主程序超时退出后沙箱还有 600s 供 OBS 上传轨迹。反过来（沙箱先消失）
+    会把日志和轨迹一起带走，失败原因就查不到了。
+
+    queries[].timeout 本身不在这里改写：由 hive.py 的 ``_upload_data_config``
+    读 run_config.task.query_timeout 后在上传副本里注入，原始任务配置保持原样。
+    """
+    # 下限保证最内层的 query 超时至少为 1s，避免填太小导出非正数。
+    max_ttl_second = max(QUERY_TIMEOUT_MARGIN_SECONDS + 1, int(max_ttl_second))
+    main_timeout = max_ttl_second - MAIN_TIMEOUT_MARGIN_SECONDS
+    query_timeout = max_ttl_second - QUERY_TIMEOUT_MARGIN_SECONDS
     base.run_config.task.main_python_timeout = main_timeout
+    base.run_config.task.query_timeout = query_timeout
     sandbox_key = sandbox_configs.active_sandbox_key(base)
     if sandbox_key and base.sandbox.get(sandbox_key) is not None:
         # 模板/派生配置里可能没有这个键(或写成了别的形式), 此时直接赋值会抛
         # ConfigAttributeError。用 force_add 保证缺失时补上, 存在时覆盖。
         OmegaConf.update(
-            base, f"sandbox.{sandbox_key}.max_ttl_second", sandbox_ttl, force_add=True
+            base, f"sandbox.{sandbox_key}.max_ttl_second", max_ttl_second, force_add=True
         )
-    return main_timeout, sandbox_ttl
+    return max_ttl_second, main_timeout, query_timeout
 
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
 _OCCUPYING_STATUSES = OCCUPYING_STATUSES
@@ -907,7 +918,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     base.run_config.concurrent_num = req.concurrent_num
     base.run_config.start_index = req.start_index
     base.run_config.total_num = req.total_num
-    query_timeout = max(1, int(req.query_timeout or DEFAULT_QUERY_TIMEOUT))
+    max_ttl_second = int(req.max_ttl_second or DEFAULT_MAX_TTL_SECOND)
     # 任务级开关：hive 上传配置前给模型 key 追加 _<env_id uuid> 后缀。
     # 模板里没有该键，这里显式写入；关闭时写 False，语义与缺失一致。
     base.run_config.task.suffix_api_keys = bool(req.suffix_api_keys)
@@ -934,11 +945,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # 无论有没有选沙箱配置，都按生效的 sandbox key 改写本实例 config.yaml，
     # 不动任何模板/派生文件（选沙箱配置时该 key 由派生文件决定，否则取模板自带的）。
     sandbox_configs.apply_image(base, req.image_name or "")
-    # 创建阶段任务 configs 尚未下载，先按一条 query 写入可用初值；启动准备阶段
-    # 扫描实例私有 configs 后会按实际最大 queries 数覆盖。
-    _apply_timeout_settings(base, query_timeout, 1)
-    # hive 侧据此覆盖上传副本的 queries[].timeout；启动准备阶段会按实际值重写。
-    base.run_config.task.query_timeout = query_timeout
+    # 三层超时全部由沙箱 TTL 派生，不依赖任务 configs 内容，创建阶段即是终值，
+    # 启动准备阶段不再重算（因此用户手改实例 config.yaml 的超时能保留下来）。
+    _apply_timeout_settings(base, max_ttl_second)
 
     if req.skill_dir:
         base.run_config.obs.skill_download_path = req.skill_dir
@@ -1725,31 +1734,6 @@ def get_create_params_full(instance_id: str, user: dict = Depends(require_operat
 # ============================================================================
 
 
-def _scan_task_queries(configs_dir: str) -> int:
-    """扫描任务 JSON, 返回单任务的最大 queries 数(至少 1)。
-
-    只读不写: queries[].timeout 的实际覆盖由 hive.py 的 ``_upload_data_config``
-    在上传副本里完成(那里是所有运行时字段的统一注入点, 且天然不改原始配置)。
-    这里扫描只为拿 max_queries —— 实例级 main_python_timeout 与沙箱 TTL 都要按
-    「单 query 超时 × 最大 queries 数」估算。
-
-    目录中可能混有评测结果、transcript 等 JSON; 没有非空 queries 数组的文件
-    不属于任务配置, 直接跳过。
-    """
-    max_queries = 1
-    for path in Path(configs_dir).rglob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError, UnicodeDecodeError):
-            continue
-        queries = data.get("queries") if isinstance(data, dict) else None
-        if not isinstance(queries, list) or not queries:
-            continue
-        max_queries = max(max_queries, len(queries))
-    return max_queries
-
-
 async def _prepare_instance(instance_id: str, inst: dict):
     """启动前的准备工作：下载用户配置、下载代码仓、打包、统计任务数。"""
     config_path = inst["config_path"]
@@ -1810,25 +1794,6 @@ async def _prepare_instance(instance_id: str, inst: dict):
                 actual_dir = os.path.join(actual_dir, entries[0])
             else:
                 break
-
-        query_timeout = max(
-            1, int(create_params.get("query_timeout") or DEFAULT_QUERY_TIMEOUT)
-        )
-        max_queries = _scan_task_queries(actual_dir)
-        # 两层实例级超时按「单 query 超时 × 最大 queries 数」估算。注意 queries[].timeout
-        # 本身不在这里改写 —— 由 hive.py 的 _upload_data_config 在上传副本里注入,
-        # 原始任务配置保持原样。
-        main_timeout, sandbox_ttl = _apply_timeout_settings(
-            base, query_timeout, max_queries
-        )
-        # hive 侧按此值覆盖上传副本的 queries[].timeout(index 之外的同步口)
-        base.run_config.task.query_timeout = query_timeout
-        print(
-            f"[prepare] 实例 {instance_id} timeout={query_timeout}s "
-            f"max_queries={max_queries} "
-            f"main_python_timeout={main_timeout}s "
-            f"max_ttl_second={sandbox_ttl}s"
-        )
 
         # 更新配置中的 task_input_path
         base.run_config.task.task_input_path = actual_dir
