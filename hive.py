@@ -28,6 +28,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import SimpleNamespace
 from typing import Optional, List
 
 import aiofiles
@@ -271,6 +272,10 @@ class TaskConfig:
     main_code_dir: str = ""
     main_python_file: str = "harness_automation.py"
     main_python_timeout: int = 36000
+    # 单 query 超时(秒)。>0 时由 _upload_data_config 在上传副本里覆盖
+    # queries[].timeout; <=0 表示沿用任务配置自带的原值。与平台查询超时保持同源,
+    # 但注入点在 hive 侧 —— 原始任务配置不被改写。
+    query_timeout: int = 0
     openclaw_gateway_timeout: int = 300
     simple_bash_timeout: int = 10
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
@@ -616,6 +621,23 @@ class OpenClawDistillationTask:
 
         if port is not None:
             data["gateway_ws_url"] = f"ws://127.0.0.1:{port}/gateway"
+
+        # 单 query 超时: 只改上传副本, 原始任务配置保持原样。
+        # 放在这里而不是平台侧的配置准备流程, 是因为这是所有运行时
+        # 字段(platform/harness_type/port/...)的统一注入点 —— 改完即上传, 沙箱拿到的
+        # 就是最终值, 不必依赖平台先物化一份私有目录再原地重写。
+        query_timeout = int(getattr(self.config, "query_timeout", 0) or 0)
+        if query_timeout > 0:
+            queries = data.get("queries")
+            if isinstance(queries, list):
+                applied = 0
+                for query in queries:
+                    if isinstance(query, dict):
+                        query["timeout"] = query_timeout
+                        applied += 1
+                self.logger.info(
+                    f"Applied query_timeout={query_timeout}s to {applied} queries"
+                )
 
         local_dir = Path(self.config.task_output_path) / "sandbox_task_configs"
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -1236,53 +1258,120 @@ class OpenClawDistillationTask:
     ) -> str:
         """上传单个源目录, 返回 'ok' | 'missing' | 'fail:<rc>'。
 
-        每个源单独一次 exec。旧实现把 purge 和所有源串成一条 cmd `&` 链, 而
-        `&` 的退出码只等于最后一条 —— 前序全失败也报 OK, 于是 1016 / 1016v1
-        两轮 7 个任务只有 1 个真正传上桶, 其余 6 个前缀根本不存在。
+        首次使用增量上传；若 obsutil 返回 rc=8（批量任务部分成功），从输出
+        提取 Task id，后续通过 ``cp -recover=<TaskId>`` 只重传失败对象，不再
+        重新扫描和上传整个目录。Windows / Linux 使用同一套恢复语义。
         """
         s3 = self.client_config.s3
         exe = s3.s3_download_script or "obsutil"
         remote = f"{s3.bucket_name}/{dst}"
-        if sandbox_type == "windows":
-            # 显式区分「源不存在」与「上传失败」: 旧写法 if exist 让两者等价。
-            script = (
-                f"if (Test-Path '{src}') {{ "
-                f"& '{exe}' cp '{src}' '{remote}' -r -f; "
-                f"Write-Output ('HIVE_RC=' + $LASTEXITCODE) "
-                f"}} else {{ Write-Output 'HIVE_MISSING' }}"
-            )
-            exec_command = ps_command(script, config_dir)
-        else:
-            script = (
-                f"if [ -e '{src}' ]; then {exe} cp '{src}' '{remote}' -r -f; "
-                f"echo HIVE_RC=$?; else echo HIVE_MISSING; fi"
-            )
-            exec_command = ["/bin/bash", "-c", script]
+        upload_retries = 3
+        attempts = upload_retries + 1
+        recover_task_id: Optional[str] = None
+        result = None
+        stdout = ""
+        stderr = ""
+        effective_rc = None
 
-        result = await self._exec_sandbox(
-            exec_command, self.config.obs_config.upload_timeout
-        )
-        result_data = result.data or {}
-        stdout = result_data.get("stdout", "") or ""
-        stderr = result_data.get("stderr", "") or ""
-        if "HIVE_MISSING" in stdout:
-            return "missing"
-        m = re.search(r"HIVE_RC=(-?\d+)", stdout)
-        rc = int(m.group(1)) if m else None
-        if rc == 0 and result.code == ErrorCode.SUCCESS[0]:
-            noise = _meaningful_stderr(stderr)
-            if noise:
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                delay = random.uniform(0, 60)
                 self.logger.warning(
-                    f"[upload_traj] obsutil stderr {src} -> {remote}:\n{noise}"
+                    f"[upload_traj] recover {attempt - 1}/{upload_retries} | "
+                    f"wait={delay:.1f}s | task_id={recover_task_id} | src={src}"
                 )
-            return "ok"
-        effective_rc = rc if rc is not None else result_data.get("exit_code")
+                await asyncio.sleep(delay)
+
+            if sandbox_type == "windows":
+                if recover_task_id:
+                    script = (
+                        f"& '{exe}' cp '-recover={recover_task_id}' "
+                        "-f -u -j=2 -p=2; "
+                        "Write-Output ('HIVE_RC=' + $LASTEXITCODE)"
+                    )
+                else:
+                    # 显式区分「源不存在」与「上传失败」。
+                    script = (
+                        f"if (Test-Path '{src}') {{ "
+                        f"& '{exe}' cp '{src}' '{remote}' -r -f -u -j=2 -p=2; "
+                        "Write-Output ('HIVE_RC=' + $LASTEXITCODE) "
+                        "} else { Write-Output 'HIVE_MISSING' }"
+                    )
+                exec_command = ps_command(script, config_dir)
+            else:
+                if recover_task_id:
+                    script = (
+                        f"{exe} cp -recover={recover_task_id} "
+                        "-f -u -j=2 -p=2; echo HIVE_RC=$?"
+                    )
+                else:
+                    script = (
+                        f"if [ -e '{src}' ]; then "
+                        f"{exe} cp '{src}' '{remote}' -r -f -u -j=2 -p=2; "
+                        "echo HIVE_RC=$?; else echo HIVE_MISSING; fi"
+                    )
+                exec_command = ["/bin/bash", "-c", script]
+
+            result = await self._exec_sandbox(
+                exec_command, self.config.obs_config.upload_timeout
+            )
+            result_data = result.data or {}
+            stdout = result_data.get("stdout", "") or ""
+            stderr = result_data.get("stderr", "") or ""
+            if "HIVE_MISSING" in stdout:
+                return "missing"
+
+            rc_match = re.search(r"HIVE_RC=(-?\d+)", stdout)
+            rc = int(rc_match.group(1)) if rc_match else None
+            effective_rc = rc if rc is not None else result_data.get("exit_code")
+            if rc == 0 and result.code == ErrorCode.SUCCESS[0]:
+                noise = _meaningful_stderr(stderr)
+                if noise:
+                    self.logger.warning(
+                        f"[upload_traj] obsutil stderr {src} -> {remote}:\n{noise}"
+                    )
+                if attempt > 1:
+                    self.logger.info(
+                        f"[upload_traj] recover OK | "
+                        f"attempt={attempt}/{attempts} | src={src}"
+                    )
+                return "ok"
+
+            # 部分失败时 obsutil 会生成失败任务清单。recover 本身也可能生成
+            # 新 Task id，所以下一轮始终使用本轮输出里的最后一个 id。
+            task_ids = re.findall(
+                r"Task id:\s*([0-9A-Za-z-]+)",
+                f"{stdout}\n{stderr}",
+                re.IGNORECASE,
+            )
+            if rc != 8 or not task_ids or attempt == attempts:
+                break
+            recover_task_id = task_ids[-1]
+
+        # 普通日志只保留一行摘要；完整 stdout/stderr 使用项目统一的边框样式，
+        # 且带 sandbox_detail 标记，不污染 main.log。
+        result_data = result.data or {}
         self.logger.error(
-            f"[upload_traj] obsutil command failed {src} -> {remote} "
-            f"rc={effective_rc} sdk_code={result.code} "
-            f"exit_code={result_data.get('exit_code')}\n"
-            f"stdout(last 8000 chars):\n{stdout[-8000:]}\n"
-            f"stderr:\n{stderr}"
+            f"[upload_traj] upload FAILED | attempts={attempt}/{attempts} | "
+            f"rc={effective_rc} | sdk_code={result.code} | "
+            f"exit_code={result_data.get('exit_code')} | src={src} | dst={remote}"
+        )
+        # obsutil 在大量小文件场景可能输出很长的进度信息，只展示末尾 2000 字符，
+        # 其中通常包含失败统计、Task id 和具体错误。
+        detail_result = SimpleNamespace(
+            code=result.code,
+            msg=getattr(result, "msg", ""),
+            data={
+                **result_data,
+                "stdout": stdout[-2000:],
+                "stderr": stderr[-2000:],
+            },
+        )
+        _log_sandbox_detail(
+            self.logger,
+            f"OBS upload failed — rc={effective_rc} — {src} -> {remote}",
+            detail_result,
+            level=logging.ERROR,
         )
         return f"fail:{effective_rc}"
 
@@ -1346,72 +1435,78 @@ class OpenClawDistillationTask:
 
         # ---- 清理旧 skills: 逐条执行, 失败只告警 ----
         # 注意: _exec_sandbox 只在「命令没发出去」时抛异常, 命令本身跑失败(退出码非 0)
-        # 不会抛。原先只 try/except 而不看返回码, 清理失败是完全静默的 —— 这正是
-        # skills/ 里的 node_modules 一直能混进上传、把整批拖成 S009 的原因。
+        # 不会抛。原先只 try/except 而不看返回码, 清理失败是完全静默的
         for target in purge_targets:
             if sandbox_type == "windows":
-                # cmd.exe 不认单引号: `if exist 'x'` 会把引号当字面字符, 永远判不中
-                purge_cmd = f'if exist "{target}" rmdir /s /q "{target}"'
-                exec_command = ["cmd.exe", "/c", purge_cmd]
+                # rmdir 在文件被占用时可能输出错误却仍返回 0，不能只信退出码。
+                # 最多尝试 3 次，每次都用 Test-Path 验证目录是否真的消失。
+                ps_target = target.replace("'", "''")
+                purge_cmd = (
+                    f"$target='{ps_target}'; $purged=$false; "
+                    "for($attempt=1; $attempt -le 3; $attempt++) { "
+                    "if(!(Test-Path -LiteralPath $target)) { "
+                    "$purged=$true; Write-Output ('HIVE_PURGE_OK attempt='+$attempt); break }; "
+                    "Remove-Item -LiteralPath $target -Recurse -Force "
+                    "-ErrorAction SilentlyContinue; "
+                    "if(!(Test-Path -LiteralPath $target)) { "
+                    "$purged=$true; Write-Output ('HIVE_PURGE_OK attempt='+$attempt); break }; "
+                    "if($attempt -lt 3) { Start-Sleep -Seconds 2 } }; "
+                    "if(!$purged) { Write-Output 'HIVE_PURGE_FAILED attempts=3'; exit 1 }"
+                )
+                exec_command = ps_command(purge_cmd, config_dir)
+                purge_timeout = max(self.config.simple_bash_timeout, 120)
             else:
                 purge_cmd = f"rm -rf '{target}'"
                 exec_command = ["/bin/bash", "-c", purge_cmd]
+                purge_timeout = self.config.simple_bash_timeout
             try:
                 purge_result = await self._exec_sandbox(
-                    exec_command, self.config.simple_bash_timeout
+                    exec_command, purge_timeout
                 )
-                purge_code = (purge_result.data or {}).get("exit_code")
+                purge_data = purge_result.data or {}
+                purge_code = purge_data.get("exit_code")
+                purge_stdout = purge_data.get("stdout", "") or ""
                 if purge_result.code != ErrorCode.SUCCESS[0] or purge_code != 0:
-                    purge_err = (purge_result.data or {}).get("stderr", "") or ""
+                    purge_err = purge_data.get("stderr", "") or ""
                     self.logger.warning(
                         f"[upload_traj] purge non-zero {target}: "
-                        f"code={purge_result.code} exit={purge_code} {purge_err[:200]}"
+                        f"code={purge_result.code} exit={purge_code} "
+                        f"stdout={purge_stdout[:200]!r} stderr={purge_err[:200]!r}; "
+                        "continue uploading this workspace"
+                    )
+                elif sandbox_type == "windows":
+                    self.logger.info(
+                        f"[upload_traj] purge verified {target}: "
+                        f"{purge_stdout.strip()}"
                     )
             except Exception as e:
-                self.logger.warning(f"[upload_traj] purge failed {target}: {e}")
+                self.logger.warning(
+                    f"[upload_traj] purge failed {target}: {e}; "
+                    "continue uploading this workspace"
+                )
 
         # ---- 上传: 每个源单独 exec, 各自判定 ok / missing / fail ----
-        # S009 多为 OBS/网络瞬时抖动, 失败源最多重试 3 次(共 4 次尝试)。
-        # 重试间加 random(0~60s) 时延, 让并发任务的重试错开, 均分 obsutil 流量。
-        upload_retries = 3
+        # rc=8 的重试由 _upload_one 使用 obsutil -recover 完成，只重传失败对象。
         uploaded_srcs: list[str] = []
         missing_srcs: list[str] = []
         failures: list[str] = []
-        pending = list(uploads)
-        for attempt in range(1, upload_retries + 2):  # 第 1 次为初试, 之后为重试
-            next_pending = []
-            attempt_failures: list[str] = []
-            for src, dst in pending:
-                try:
-                    outcome = await self._upload_one(src, dst, sandbox_type, config_dir)
-                except Exception as e:
-                    attempt_failures.append(f"{src} -> {dst} ({type(e).__name__}: {e})")
-                    next_pending.append((src, dst))
-                    self.logger.error(
-                        f"[upload_traj] FAILED {src} -> {dst} {type(e).__name__}: {e}"
-                    )
-                    continue
-                if outcome == "ok":
-                    uploaded_srcs.append(src)
-                elif outcome == "missing":
-                    # 显式记录缺失, 不再让 if exist 把「没有」伪装成「成功」
-                    missing_srcs.append(src)
-                    self.logger.warning(f"[upload_traj] skip (src missing): {src}")
-                else:
-                    attempt_failures.append(f"{src} -> {dst} ({outcome})")
-                    next_pending.append((src, dst))
-                    self.logger.error(f"[upload_traj] FAILED {src} -> {dst} {outcome}")
-            failures = attempt_failures
-            if not next_pending:
-                break
-            if attempt <= upload_retries:
-                delay = random.uniform(0, 60)  # 秒, 随机错开重试, 均分 obsutil 流量
-                self.logger.warning(
-                    f"[upload_traj] retry {attempt}/{upload_retries}: "
-                    f"{len(next_pending)} source(s) still failing, backoff {delay:.1f}s"
+        for src, dst in uploads:
+            try:
+                outcome = await self._upload_one(src, dst, sandbox_type, config_dir)
+            except Exception as e:
+                failures.append(f"{src} -> {dst} ({type(e).__name__}: {e})")
+                self.logger.error(
+                    f"[upload_traj] FAILED {src} -> {dst} {type(e).__name__}: {e}"
                 )
-                await asyncio.sleep(delay)
-            pending = next_pending
+                continue
+            if outcome == "ok":
+                uploaded_srcs.append(src)
+            elif outcome == "missing":
+                # 显式记录缺失, 不再让 if exist 把「没有」伪装成「成功」
+                missing_srcs.append(src)
+                self.logger.warning(f"[upload_traj] skip (src missing): {src}")
+            else:
+                failures.append(f"{src} -> {dst} ({outcome})")
 
         self.logger.info(
             f"[upload_traj] bucket={self.client_config.s3.bucket_name}/{bucket_path} "

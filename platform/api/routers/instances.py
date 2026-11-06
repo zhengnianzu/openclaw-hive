@@ -38,6 +38,26 @@ from . import resource_pools
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
+DEFAULT_QUERY_TIMEOUT = 15000
+MAIN_TIMEOUT_BUFFER_SECONDS = 600
+SANDBOX_TTL_BUFFER_SECONDS = 1200
+
+
+def _apply_timeout_settings(base, query_timeout: int, query_count: int) -> tuple[int, int]:
+    """按单 query 超时和最大 queries 数覆盖实例级两层超时。"""
+    query_timeout = max(1, int(query_timeout))
+    query_count = max(1, int(query_count))
+    main_timeout = query_timeout * query_count + MAIN_TIMEOUT_BUFFER_SECONDS
+    sandbox_ttl = query_timeout * query_count + SANDBOX_TTL_BUFFER_SECONDS
+    base.run_config.task.main_python_timeout = main_timeout
+    sandbox_key = sandbox_configs.active_sandbox_key(base)
+    if sandbox_key and base.sandbox.get(sandbox_key) is not None:
+        # 模板/派生配置里可能没有这个键(或写成了别的形式), 此时直接赋值会抛
+        # ConfigAttributeError。用 force_add 保证缺失时补上, 存在时覆盖。
+        OmegaConf.update(
+            base, f"sandbox.{sandbox_key}.max_ttl_second", sandbox_ttl, force_add=True
+        )
+    return main_timeout, sandbox_ttl
 
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
 _OCCUPYING_STATUSES = OCCUPYING_STATUSES
@@ -887,6 +907,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     base.run_config.concurrent_num = req.concurrent_num
     base.run_config.start_index = req.start_index
     base.run_config.total_num = req.total_num
+    query_timeout = max(1, int(req.query_timeout or DEFAULT_QUERY_TIMEOUT))
     # 任务级开关：hive 上传配置前给模型 key 追加 _<env_id uuid> 后缀。
     # 模板里没有该键，这里显式写入；关闭时写 False，语义与缺失一致。
     base.run_config.task.suffix_api_keys = bool(req.suffix_api_keys)
@@ -913,6 +934,11 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # 无论有没有选沙箱配置，都按生效的 sandbox key 改写本实例 config.yaml，
     # 不动任何模板/派生文件（选沙箱配置时该 key 由派生文件决定，否则取模板自带的）。
     sandbox_configs.apply_image(base, req.image_name or "")
+    # 创建阶段任务 configs 尚未下载，先按一条 query 写入可用初值；启动准备阶段
+    # 扫描实例私有 configs 后会按实际最大 queries 数覆盖。
+    _apply_timeout_settings(base, query_timeout, 1)
+    # hive 侧据此覆盖上传副本的 queries[].timeout；启动准备阶段会按实际值重写。
+    base.run_config.task.query_timeout = query_timeout
 
     if req.skill_dir:
         base.run_config.obs.skill_download_path = req.skill_dir
@@ -1699,6 +1725,31 @@ def get_create_params_full(instance_id: str, user: dict = Depends(require_operat
 # ============================================================================
 
 
+def _scan_task_queries(configs_dir: str) -> int:
+    """扫描任务 JSON, 返回单任务的最大 queries 数(至少 1)。
+
+    只读不写: queries[].timeout 的实际覆盖由 hive.py 的 ``_upload_data_config``
+    在上传副本里完成(那里是所有运行时字段的统一注入点, 且天然不改原始配置)。
+    这里扫描只为拿 max_queries —— 实例级 main_python_timeout 与沙箱 TTL 都要按
+    「单 query 超时 × 最大 queries 数」估算。
+
+    目录中可能混有评测结果、transcript 等 JSON; 没有非空 queries 数组的文件
+    不属于任务配置, 直接跳过。
+    """
+    max_queries = 1
+    for path in Path(configs_dir).rglob("*.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        queries = data.get("queries") if isinstance(data, dict) else None
+        if not isinstance(queries, list) or not queries:
+            continue
+        max_queries = max(max_queries, len(queries))
+    return max_queries
+
+
 async def _prepare_instance(instance_id: str, inst: dict):
     """启动前的准备工作：下载用户配置、下载代码仓、打包、统计任务数。"""
     config_path = inst["config_path"]
@@ -1759,6 +1810,25 @@ async def _prepare_instance(instance_id: str, inst: dict):
                 actual_dir = os.path.join(actual_dir, entries[0])
             else:
                 break
+
+        query_timeout = max(
+            1, int(create_params.get("query_timeout") or DEFAULT_QUERY_TIMEOUT)
+        )
+        max_queries = _scan_task_queries(actual_dir)
+        # 两层实例级超时按「单 query 超时 × 最大 queries 数」估算。注意 queries[].timeout
+        # 本身不在这里改写 —— 由 hive.py 的 _upload_data_config 在上传副本里注入,
+        # 原始任务配置保持原样。
+        main_timeout, sandbox_ttl = _apply_timeout_settings(
+            base, query_timeout, max_queries
+        )
+        # hive 侧按此值覆盖上传副本的 queries[].timeout(index 之外的同步口)
+        base.run_config.task.query_timeout = query_timeout
+        print(
+            f"[prepare] 实例 {instance_id} timeout={query_timeout}s "
+            f"max_queries={max_queries} "
+            f"main_python_timeout={main_timeout}s "
+            f"max_ttl_second={sandbox_ttl}s"
+        )
 
         # 更新配置中的 task_input_path
         base.run_config.task.task_input_path = actual_dir
@@ -1917,6 +1987,65 @@ async def start_instance(instance_id: str, user: dict = Depends(require_operator
     return {"message": "实例准备中，正在后台下载配置并启动", "status": "preparing"}
 
 
+def _clear_failed_task_logs(output_dir: str) -> list[tuple[str, int, str | None]]:
+    """删除上一轮失败/异常的 task-*.log，保留其它所有日志。
+
+    返回 ``(path, task_idx, config_name)``，供调用方同步清理对应数据库明细。
+    成功任务会被 complete.jsonl 跳过，必须保留其日志和统计；main/nohup 日志也
+    不属于单任务重跑范围，因此一律不动。
+    """
+    logs_dir = os.path.join(output_dir, "logs")
+    if not os.path.isdir(logs_dir):
+        return []
+
+    failed = []
+    with os.scandir(logs_dir) as entries:
+        for entry in entries:
+            match = re.fullmatch(r"task-(\d+)\.log", entry.name)
+            if not match or not entry.is_file(follow_symlinks=False):
+                continue
+            status, _code, config_name = _scan_task_file(entry.path)
+            if status in ("任务失败", "任务异常"):
+                failed.append((entry.path, int(match.group(1)), config_name))
+
+    failed.sort(key=lambda item: item[1])
+    removed = []
+    for path, task_idx, config_name in failed:
+        try:
+            os.remove(path)
+            removed.append((path, task_idx, config_name))
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def _reset_failed_task_log_stats(
+    instance_id: str,
+    config_path: str,
+    removed_logs: list[tuple[str, int, str | None]],
+) -> None:
+    """清除已删除失败日志对应的缓存和数据库明细，保留成功任务统计。"""
+    if not removed_logs:
+        return
+    _status_cache.pop(instance_id, None)
+    _analyze_cache[config_path] = ({}, time.time())
+    _analyze_tree_cache[config_path] = []
+    _analyze_file_state.pop(config_path, None)
+    _analyze_changed.pop(config_path, None)
+    task_indexes = [task_idx for _path, task_idx, _name in removed_logs]
+    placeholders = ",".join("?" * len(task_indexes))
+    with get_connection() as conn:
+        conn.execute(
+            f"DELETE FROM task_records WHERE instance_id=? "
+            f"AND task_idx IN ({placeholders})",
+            (instance_id, *task_indexes),
+        )
+        conn.execute(
+            "UPDATE task_instances SET task_done_sync=0 WHERE id=?",
+            (instance_id,),
+        )
+
+
 def _launch_mock_task(output_dir: str, log_file: str):
     """空跑任务（MOCK_TASK_RUN=1 时替代真实 hive.py）。
 
@@ -1985,6 +2114,13 @@ async def _prepare_and_launch(instance_id: str, inst: dict):
         config_path = inst["config_path"]
         output_dir = _get_output_dir(config_path)
         os.makedirs(output_dir, exist_ok=True)
+        removed_logs = _clear_failed_task_logs(output_dir)
+        _reset_failed_task_log_stats(instance_id, config_path, removed_logs)
+        if removed_logs:
+            print(
+                f"[start] 实例 {instance_id} 已清空上一轮失败任务日志 "
+                f"({len(removed_logs)} files)"
+            )
         log_file = os.path.join(output_dir, "nohup.log")
         clean_log_file = os.path.join(output_dir, "nohup_clean.log")
 
@@ -2315,7 +2451,7 @@ def _scan_task_file(fpath: str):
     last_code = None
     last_config = None
     try:
-        with open(fpath, "r", errors="replace") as f:
+        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 m = _STATUS_RE.search(line)
                 if m:

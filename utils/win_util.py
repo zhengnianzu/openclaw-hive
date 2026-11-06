@@ -568,28 +568,8 @@ async def _start_jiuwenswarm_gateway_windows(self, config_file: str) -> None:
 
 
 async def _stop_jiuwenswarm_gateway_windows(self) -> None:
-    """停止 Windows 沙箱里的 JiuwenSwarm 服务树, 让会话文件落盘后再上传 OBS。
-
-    两阶段 (对齐 Linux 的 TERM → 等 → KILL): 先 taskkill 不带 /F 让进程有机会
-    正常退出, 等 5s, 再 /F 强制清场并按命令行特征兜底。
-    """
+    """强制停止 Windows 沙箱里的 JiuwenSwarm 服务树，再上传 OBS。"""
     paths = _jiuwenswarm_win_paths(self.config.sandbox_config)
-
-    term_script = (
-        f"$pidPath='{paths['pid_path']}'; "
-        "if(Test-Path $pidPath) { "
-        "$procId=((Get-Content $pidPath -ErrorAction SilentlyContinue) | Select-Object -First 1); "
-        "if($procId) { $procId=$procId.Trim(); "
-        "taskkill /PID $procId /T 2>&1 | Out-Null; "
-        "Write-Output ('HIVE_JIUWENSWARM_TERM_PID='+$procId) } } "
-        "else { Write-Output 'HIVE_JIUWENSWARM_TERM_FALLBACK' }"
-    )
-    term_result = await self._exec_sandbox(
-        ps_command(term_script, paths["config_dir"]), self.config.simple_bash_timeout
-    )
-    _log_sandbox_detail(self.logger, "jiuwenswarm gateway stop TERM", term_result)
-
-    await asyncio.sleep(5)
 
     kill_script = (
         f"$pidPath='{paths['pid_path']}'; "

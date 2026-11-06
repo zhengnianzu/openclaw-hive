@@ -83,6 +83,9 @@ class InstanceCreate(BaseModel):
     traj_save_path: Optional[str] = None
     start_index: int = 0
     total_num: int = 0
+    # 单条 query 的执行超时（秒）。实例启动时会批量写入任务 configs，并按
+    # 最大 queries 数量派生 main_python_timeout / sandbox max TTL。
+    query_timeout: int = 15000
 
     # openclaw.json 可配置项
     model_api_key: str = ""
