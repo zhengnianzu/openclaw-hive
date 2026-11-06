@@ -24,18 +24,26 @@
     <el-tabs v-model="activeTab" class="detail-tabs">
       <!-- ================= 配置信息 ================= -->
       <el-tab-pane label="配置信息" name="config">
+        <!-- 概览卡：左侧图标色块 + 右侧「标签在上、数值在下」。
+             图标只是辅助识别，含义由标签文字承担，不靠色相单独区分。 -->
         <div class="stat-grid">
-          <div class="stat-card"><span class="stat-num">{{ overview.total }}</span><span class="stat-label">总任务</span></div>
-          <div class="stat-card"><span class="stat-num" style="color:#10b981">{{ overview.completed }}</span><span class="stat-label">已完成</span></div>
-          <div class="stat-card"><span class="stat-num" :style="{color: overview.failed > 0 ? '#ef4444' : ''}">{{ overview.failed }}</span><span class="stat-label">失败</span></div>
-          <div class="stat-card"><span class="stat-num" style="color:#f59e0b">{{ overview.running }}</span><span class="stat-label">运行中</span></div>
-          <div class="stat-card"><span class="stat-num">{{ overview.pending }}</span><span class="stat-label">队列中</span></div>
-          <div class="stat-card"><span class="stat-num" style="color:#6366f1">{{ overview.success_rate }}%</span><span class="stat-label">成功率</span></div>
+          <div v-for="s in statCards" :key="s.key" class="stat-card">
+            <span class="stat-icon" :style="{ background: s.tint, color: s.color }">
+              <el-icon :size="20"><component :is="s.icon" /></el-icon>
+            </span>
+            <span class="stat-body">
+              <span class="stat-label">{{ s.label }}</span>
+              <span class="stat-num" :style="{ color: s.color }">{{ s.value }}</span>
+            </span>
+          </div>
         </div>
 
         <el-row :gutter="20">
           <el-col :span="12">
-            <el-card header="实例信息">
+            <el-card class="sec-card">
+              <template #header>
+                <span class="sec-head"><el-icon class="sec-head-icon"><Postcard /></el-icon>实例信息</span>
+              </template>
               <el-descriptions :column="1" border>
                 <el-descriptions-item label="实例ID">{{ inst.id }}</el-descriptions-item>
                 <el-descriptions-item label="状态"><el-tag :type="statusColor(inst.status)">{{ statusText(inst.status) }}</el-tag></el-descriptions-item>
@@ -66,7 +74,10 @@
             </el-card>
           </el-col>
           <el-col :span="12">
-            <el-card header="任务执行情况">
+            <el-card class="sec-card">
+              <template #header>
+                <span class="sec-head"><el-icon class="sec-head-icon"><TrendCharts /></el-icon>任务执行情况</span>
+              </template>
               <div v-if="Object.keys(overview.error_breakdown || {}).length">
                 <!-- 环形图：任务的最终归属（成功/失败/异常/未执行）。
                      颜色是状态语义色，不随大小变；每段都带文字+数值图例，
@@ -116,9 +127,19 @@
             </el-card>
           </el-col>
         </el-row>
-        <el-card header="创建参数" style="margin-top:20px" v-if="Object.keys(createParams).length">
-          <el-collapse v-model="expandedPanels">
-            <el-collapse-item title="基本配置" name="basic">
+        <el-card class="sec-card" style="margin-top:20px" v-if="Object.keys(createParams).length">
+          <template #header>
+            <span class="sec-head"><el-icon class="sec-head-icon"><Setting /></el-icon>创建参数</span>
+          </template>
+          <el-collapse v-model="expandedPanels" class="param-collapse">
+            <el-collapse-item name="basic">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><Setting /></el-icon>
+                  <span class="param-name">基本配置</span>
+                  <span class="param-peek">{{ peek.basic }}</span>
+                </span>
+              </template>
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="Harness类型">
@@ -142,7 +163,14 @@
               </el-descriptions>
             </el-collapse-item>
 
-            <el-collapse-item title="OBS配置" name="obs">
+            <el-collapse-item name="obs">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><FolderOpened /></el-icon>
+                  <span class="param-name">OBS配置</span>
+                  <span class="param-peek">{{ peek.obs }}</span>
+                </span>
+              </template>
               <el-descriptions :column="1" border size="small">
                 <el-descriptions-item label="技能目录">{{ obsPath(createParams.skill_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="默认技能">{{ createParams.default_skills || '-' }}</el-descriptions-item>
@@ -153,7 +181,14 @@
               </el-descriptions>
             </el-collapse-item>
 
-            <el-collapse-item title="模型配置" name="model">
+            <el-collapse-item name="model">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><Cpu /></el-icon>
+                  <span class="param-name">模型配置</span>
+                  <span class="param-peek">{{ peek.model }}</span>
+                </span>
+              </template>
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="Base URL">{{ createParams.model_base_url || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="API Key">{{ maskKey(createParams.model_api_key) }}</el-descriptions-item>
@@ -162,7 +197,14 @@
               </el-descriptions>
             </el-collapse-item>
 
-            <el-collapse-item title="用户模拟配置" name="agents">
+            <el-collapse-item name="agents">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><User /></el-icon>
+                  <span class="param-name">用户模拟配置</span>
+                  <span class="param-peek">{{ peek.agents }}</span>
+                </span>
+              </template>
               <template v-if="createParams.agents && createParams.agents.length">
                 <div v-for="(ag, idx) in createParams.agents" :key="idx" :style="idx > 0 ? 'margin-top:12px' : ''">
                   <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Agent {{ idx + 1 }}: {{ ag.name || '-' }}</div>
@@ -185,7 +227,14 @@
               <el-empty v-else description="未配置" :image-size="40" />
             </el-collapse-item>
 
-            <el-collapse-item title="高级配置" name="advanced">
+            <el-collapse-item name="advanced">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><Box /></el-icon>
+                  <span class="param-name">高级配置</span>
+                  <span class="param-peek">{{ peek.advanced }}</span>
+                </span>
+              </template>
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="起始索引">{{ createParams.start_index ?? 0 }}</el-descriptions-item>
                 <el-descriptions-item label="任务总数">{{ createParams.total_num ? createParams.total_num : '不限' }}</el-descriptions-item>
@@ -232,14 +281,81 @@
           </el-collapse>
         </el-card>
 
-        <el-card header="配置文件" style="margin-top:20px">
-          <el-tabs v-model="activeConfigTab" @tab-change="loadConfigContent">
+        <!-- 配置文件：卡片上只放摘要（文件数 / 最后更新 / 文件名快捷入口），
+             正文很长（几百行 yaml），塞在页面里会把下面的内容推没，
+             所以点开走弹窗看，弹窗里再给搜索 / 复制 / 下载 / 全屏。 -->
+        <el-card class="sec-card" style="margin-top:20px">
+          <template #header>
+            <span class="sec-head"><el-icon class="sec-head-icon"><Document /></el-icon>配置文件</span>
+          </template>
+          <div v-if="configFiles.length" class="cfg-summary">
+            <el-icon class="cfg-summary-icon" :size="22"><Document /></el-icon>
+            <div class="cfg-summary-main">
+              <div class="cfg-summary-title">配置文件（{{ configFiles.length }} 个）</div>
+              <div class="cfg-summary-sub">最后更新：{{ configLastModified || '-' }}</div>
+              <div class="cfg-chips">
+                <el-tag v-for="cf in configFiles" :key="cf.name" size="small"
+                  :type="cf.name === activeConfigTab ? 'primary' : 'info'"
+                  :effect="cf.name === activeConfigTab ? 'light' : 'plain'"
+                  class="cfg-chip" @click="openConfigViewer(cf.name)">{{ cf.name }}</el-tag>
+              </div>
+              <div class="cfg-actions">
+                <el-button size="small" :icon="View" @click="openConfigViewer()">查看配置</el-button>
+                <el-button size="small" :icon="CopyDocument" @click="copyConfigPath">复制路径</el-button>
+                <el-button size="small" :icon="Download" @click="downloadConfig()">下载</el-button>
+                <el-button size="small" text :loading="configLoading" @click="loadConfigFiles">刷新</el-button>
+              </div>
+            </div>
+          </div>
+          <el-empty v-else :description="configLoading ? '加载中' : '暂无配置文件'" :image-size="40" />
+        </el-card>
+
+        <!-- 配置文件查看弹窗 -->
+        <el-dialog v-model="configViewerOpen" :fullscreen="configFullscreen"
+          :width="configFullscreen ? undefined : '960px'" top="6vh"
+          class="cfg-dialog" append-to-body destroy-on-close>
+          <template #header>
+            <div class="cfg-dialog-head">
+              <span class="sec-head">
+                <el-icon class="sec-head-icon"><Document /></el-icon>
+                配置文件 · {{ activeConfigTab || '-' }}
+              </span>
+              <div class="cfg-dialog-ops">
+                <el-button size="small" :icon="CopyDocument" @click="copyConfigContent">复制</el-button>
+                <el-button size="small" :icon="Download" @click="downloadConfig()">下载</el-button>
+                <el-button size="small" :icon="FullScreen" @click="configFullscreen = !configFullscreen">
+                  {{ configFullscreen ? '退出全屏' : '全屏' }}
+                </el-button>
+              </div>
+            </div>
+          </template>
+
+          <el-tabs v-model="activeConfigTab" @tab-change="onConfigTabChange" class="cfg-dialog-tabs">
             <el-tab-pane v-for="cf in configFiles" :key="cf.name" :label="cf.name" :name="cf.name" />
           </el-tabs>
-          <el-button size="small" style="margin-bottom:12px" @click="loadConfigFiles" :loading="configLoading">刷新</el-button>
-          <pre class="config-preview" v-if="configContent">{{ configContent }}</pre>
-          <el-empty v-else-if="!configLoading" description="选择配置文件查看" :image-size="40" />
-        </el-card>
+
+          <div class="cfg-search">
+            <el-input v-model="configQuery" size="default" clearable placeholder="搜索配置项（支持键名、值或注释）"
+              :prefix-icon="Search" @keyup.enter="stepMatch(1)" />
+            <el-button-group>
+              <el-button :icon="ArrowUp" :disabled="!configMatches.length" @click="stepMatch(-1)" />
+              <el-button :icon="ArrowDown" :disabled="!configMatches.length" @click="stepMatch(1)" />
+            </el-button-group>
+            <span class="cfg-match-count" v-if="configQuery">
+              {{ configMatches.length ? `${configMatchIdx + 1} / ${configMatches.length}` : '无匹配' }}
+            </span>
+          </div>
+
+          <div class="cfg-code" :class="{ 'is-full': configFullscreen }" ref="cfgCodeEl" v-loading="configLoading">
+            <div v-for="ln in configLines" :key="ln.n" class="cfg-line"
+              :id="`cfg-l-${ln.n}`"
+              :class="{ 'is-hit': ln.hit, 'is-current': ln.n === currentMatchLine }">
+              <span class="cfg-ln">{{ ln.n }}</span>
+              <span class="cfg-text" v-html="ln.html"></span>
+            </div>
+            <el-empty v-if="!configLines.length && !configLoading" description="无内容" :image-size="40" />
+          </div>
+        </el-dialog>
       </el-tab-pane>
       <!-- ================= 日志 ================= -->
       <el-tab-pane label="日志" name="logs">
@@ -1038,7 +1154,11 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, ArrowRight, Search, Folder, Document, Loading, Clock } from '@element-plus/icons-vue'
+import {
+  ArrowDown, ArrowRight, ArrowUp, Box, CircleCheckFilled, CircleCloseFilled, Clock,
+  CopyDocument, Cpu, DataLine, Document, Download, Files, FolderOpened, FullScreen,
+  Loading, Postcard, Search, Setting, Timer, TrendCharts, User, VideoPlay, View,
+} from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
 import TrajBlocks from '../components/TrajBlocks.vue'
@@ -1096,6 +1216,21 @@ const createParams = ref({})
 const expandedPanels = ref([])
 const expandedErrorGroups = ref([])
 let timer = null
+
+// ── 顶部概览卡 ───────────────────────────────────────────────────────────
+// 颜色与下面环形图的状态语义色同源（成功绿 / 失败红 / 运行中橙 / 中性）。
+// tint 是同色的浅底，只给图标块用，不承担含义。
+const statCards = computed(() => {
+  const o = overview.value
+  return [
+    { key: 'total', label: '总任务', value: o.total, icon: Files, color: '#475569', tint: '#eef2f7' },
+    { key: 'completed', label: '已完成', value: o.completed, icon: CircleCheckFilled, color: '#0ca30c', tint: '#e8f6e8' },
+    { key: 'failed', label: '失败', value: o.failed, icon: CircleCloseFilled, color: o.failed > 0 ? '#d03b3b' : '#475569', tint: '#fdecec' },
+    { key: 'running', label: '运行中', value: o.running, icon: VideoPlay, color: '#c98500', tint: '#fdf3e0' },
+    { key: 'pending', label: '队列中', value: o.pending, icon: Timer, color: '#475569', tint: '#eef2f7' },
+    { key: 'rate', label: '成功率', value: `${o.success_rate}%`, icon: DataLine, color: '#6366f1', tint: '#eeeefc' },
+  ]
+})
 
 // ── 任务执行情况环形图 ────────────────────────────────────────────────────
 // 四类最终归属：成功 / 失败 / 异常 / 未执行。颜色是状态语义色（good / critical /
@@ -1278,6 +1413,46 @@ const trajSaveFullPath = computed(() => {
   return `${String(bucket).replace(/\/+$/, '')}/${String(rawPath).replace(/^\/+/, '')}`
 })
 
+// 折叠面板收起时的摘要：每组挑 2~3 个最能定位配置的字段拼一行，
+// 省得为了确认「用的哪个模型/哪个桶」把五个面板挨个展开。
+// 只取已有值的字段，全空时返回空串（模板里就什么都不显示）。
+const peek = computed(() => {
+  const cp = createParams.value
+  const join = (...parts) => parts.filter(Boolean).join(' · ')
+  const short = (v, n = 28) => {
+    const s = String(v ?? '')
+    return s.length > n ? s.slice(0, n) + '…' : s
+  }
+
+  const agentCount = cp.agents?.length
+  const agentModel = cp.agents?.[0]?.model || cp.user_proxy_model_name
+
+  return {
+    basic: join(
+      cp.harness_type && `环境: ${harnessLabel(cp.harness_type)}`,
+      cp.task_name && `项目: ${short(cp.task_name)}`,
+      cp.harness_config_name && `配置: ${short(cp.harness_config_name)}`,
+    ),
+    obs: join(
+      cp.obs_bucket && `数据桶: ${short(cp.obs_bucket)}`,
+      cp.default_skills && `技能: ${short(cp.default_skills, 20)}`,
+    ),
+    model: join(
+      cp.model_id && `模型: ${short(cp.model_id)}`,
+      cp.model_api_type && `类型: ${cp.model_api_type}`,
+    ),
+    agents: join(
+      agentCount ? `Agent 数: ${agentCount}` : (agentModel ? '单模型' : ''),
+      agentModel && `模拟模型: ${short(agentModel)}`,
+    ),
+    advanced: join(
+      cp.sandbox_config_name && `沙箱: ${short(cp.sandbox_config_name, 20)}`,
+      cp.total_num ? `任务数: ${cp.total_num}` : '任务数: 不限',
+      inst.value.concurrent_num && `并发: ${inst.value.concurrent_num}`,
+    ),
+  }
+})
+
 async function copyTrajPath() {
   try {
     await navigator.clipboard.writeText(trajSaveFullPath.value)
@@ -1306,12 +1481,151 @@ async function startInstance() { await api.post(`/instances/${id}/start`); ElMes
 async function stopInstance() { await ElMessageBox.confirm('确认停止？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadData() }
 async function retryFailed() { router.push(`/create?copy_from=${id}&copy_complete_from=${id}`) }
 
-const configFiles = ref([]); const configLoading = ref(false); const activeConfigTab = ref(''); const configContent = ref('')
+// ============ 配置文件查看 ============
+// 卡片上只有摘要，正文在弹窗里渲染：按行拆开配号、做 yaml/json 轻量着色，
+// 并支持搜索跳转。内容不再随页面常驻，首次打开弹窗时才拉正文。
+const configFiles = ref([])
+const configLoading = ref(false)
+const activeConfigTab = ref('')
+const configContent = ref('')
+const configViewerOpen = ref(false)
+const configFullscreen = ref(false)
+const configQuery = ref('')
+const configMatchIdx = ref(0)
+const cfgCodeEl = ref(null)
+
 async function loadConfigFiles() {
   configLoading.value = true
-  try { const res = await api.get(`/instances/${id}/configs`); configFiles.value = res.files || []; if (configFiles.value.length && !activeConfigTab.value) { activeConfigTab.value = configFiles.value[0].name; loadConfigContent(activeConfigTab.value) } } finally { configLoading.value = false }
+  try {
+    const res = await api.get(`/instances/${id}/configs`)
+    configFiles.value = res.files || []
+    // 只定位默认文件，正文等打开弹窗再拉——列表页不需要几百行 yaml。
+    if (configFiles.value.length && !activeConfigTab.value) {
+      activeConfigTab.value = configFiles.value[0].name
+    }
+  } finally { configLoading.value = false }
 }
-async function loadConfigContent(filename) { if (!filename) return; try { const res = await api.get(`/instances/${id}/configs/${filename}`); configContent.value = res.content } catch { configContent.value = '' } }
+
+async function loadConfigContent(filename) {
+  if (!filename) return
+  configLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/configs/${filename}`)
+    configContent.value = res.content
+  } catch { configContent.value = '' } finally { configLoading.value = false }
+}
+
+// 卡片摘要里的「最后更新」取所有配置文件里最新的 mtime。
+const configLastModified = computed(() => {
+  const ts = configFiles.value.map(f => f.modified_at).filter(Boolean).sort()
+  return ts.length ? ts[ts.length - 1].replace('T', ' ').slice(0, 19) : ''
+})
+
+async function openConfigViewer(filename) {
+  const target = filename || activeConfigTab.value || configFiles.value[0]?.name
+  if (!target) return
+  configViewerOpen.value = true
+  if (target !== activeConfigTab.value || !configContent.value) {
+    activeConfigTab.value = target
+    configQuery.value = ''
+    await loadConfigContent(target)
+  }
+}
+
+function onConfigTabChange(name) {
+  configQuery.value = ''
+  configMatchIdx.value = 0
+  loadConfigContent(name)
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// 轻量着色：只认 yaml/json 里「键名 / 字符串 / 数字与布尔 / 注释」四类，
+// 不引语法高亮库——配置文件就这两种格式，正则够用且没有额外依赖。
+function highlightConfigLine(raw) {
+  const text = escapeHtml(raw)
+  const comment = text.match(/(^|\s)#.*$/)
+  let code = text, tail = ''
+  if (comment) {
+    const at = comment.index + comment[1].length
+    code = text.slice(0, at)
+    tail = `<span class="t-cmt">${text.slice(at)}</span>`
+  }
+  code = code
+    .replace(/^(\s*-?\s*)("?[\w.-]+"?)(\s*:)/, '$1<span class="t-key">$2</span>$3')
+    .replace(/:(\s+)('[^']*'|"[^"]*")/g, ':$1<span class="t-str">$2</span>')
+    .replace(/:(\s+)(true|false|null|-?\d+(?:\.\d+)?)(\s*,?)$/g, ':$1<span class="t-num">$2</span>$3')
+  return code + tail
+}
+
+const configLines = computed(() => {
+  if (!configContent.value) return []
+  const q = configQuery.value.trim().toLowerCase()
+  return configContent.value.split('\n').map((raw, i) => ({
+    n: i + 1,
+    hit: !!q && raw.toLowerCase().includes(q),
+    html: highlightConfigLine(raw),
+  }))
+})
+
+const configMatches = computed(() => configLines.value.filter(l => l.hit).map(l => l.n))
+const currentMatchLine = computed(() => configMatches.value[configMatchIdx.value] ?? -1)
+
+// 搜索词一变，命中集就变了，游标必须归零，否则会停在越界的下标上。
+watch(configQuery, () => { configMatchIdx.value = 0; scrollToMatch() })
+
+function stepMatch(delta) {
+  const n = configMatches.value.length
+  if (!n) return
+  configMatchIdx.value = (configMatchIdx.value + delta + n) % n
+  scrollToMatch()
+}
+
+function scrollToMatch() {
+  nextTick(() => {
+    const line = currentMatchLine.value
+    if (line < 0 || !cfgCodeEl.value) return
+    cfgCodeEl.value.querySelector(`#cfg-l-${line}`)
+      ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  })
+}
+
+async function copyConfigContent() {
+  if (!configContent.value) return ElMessage.warning('暂无内容')
+  try {
+    await navigator.clipboard.writeText(configContent.value)
+    ElMessage.success('已复制配置内容')
+  } catch { ElMessage.warning('复制失败，请手动选择复制') }
+}
+
+async function copyConfigPath() {
+  const p = inst.value.config_path
+  if (!p) return ElMessage.warning('暂无配置路径')
+  try {
+    await navigator.clipboard.writeText(p)
+    ElMessage.success('已复制配置路径')
+  } catch { ElMessage.warning('复制失败，请手动选择复制') }
+}
+
+// 下载走前端生成 Blob：正文已在手上（且后端做过 key 脱敏），
+// 另开一个下载接口反而会绕过那层脱敏。
+async function downloadConfig(filename) {
+  const target = filename || activeConfigTab.value
+  if (!target) return ElMessage.warning('请先选择配置文件')
+  if (target !== activeConfigTab.value || !configContent.value) {
+    activeConfigTab.value = target
+    await loadConfigContent(target)
+  }
+  if (!configContent.value) return ElMessage.warning('暂无内容')
+  const url = URL.createObjectURL(new Blob([configContent.value], { type: 'text/plain;charset=utf-8' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${id}-${target}`
+  a.click()
+  URL.revokeObjectURL(url)
+}
 
 // ============ 日志 tab ============
 const filterKeyword = ref('')
@@ -2367,11 +2681,71 @@ onUnmounted(() => {
 }
 .stat-card {
   background: #fff; border: 1px solid var(--border-color); border-radius: var(--radius-md);
-  padding: 16px 20px; display: flex; flex-direction: column; align-items: center;
+  padding: 14px 16px; display: flex; align-items: center; gap: 12px;
   box-shadow: var(--shadow-sm);
 }
-.stat-num { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
-.stat-label { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+.stat-icon {
+  flex: 0 0 40px; width: 40px; height: 40px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+}
+.stat-body { display: flex; flex-direction: column; min-width: 0; }
+.stat-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.15; }
+.stat-label { font-size: 13px; color: var(--text-muted); margin-bottom: 2px; }
+
+/* 卡片标题：图标 + 文字。图标只是分区锚点，含义由文字承担。 */
+.sec-head { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--text-primary); }
+.sec-head-icon { color: var(--accent-purple); font-size: 17px; }
+
+/* 创建参数折叠面板：收起时在标题右侧给一行灰色摘要 */
+.param-collapse :deep(.el-collapse-item__header) { height: 46px; line-height: 46px; }
+.param-title { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding-right: 8px; }
+.param-icon { color: var(--accent-purple); font-size: 16px; flex: 0 0 auto; }
+.param-name { font-weight: 600; color: var(--text-primary); flex: 0 0 auto; }
+.param-peek {
+  flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--text-muted);
+  font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 配置文件摘要卡 */
+.cfg-summary { display: flex; gap: 12px; align-items: flex-start; }
+.cfg-summary-icon {
+  flex: 0 0 40px; width: 40px; height: 40px; border-radius: 10px;
+  background: #eeeefc; color: var(--accent-purple);
+  display: flex; align-items: center; justify-content: center;
+}
+.cfg-summary-main { flex: 1 1 auto; min-width: 0; }
+.cfg-summary-title { font-weight: 600; color: var(--text-primary); }
+.cfg-summary-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.cfg-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.cfg-chip { cursor: pointer; }
+.cfg-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+/* 配置文件弹窗 */
+.cfg-dialog :deep(.el-dialog__body) { padding-top: 8px; }
+.cfg-dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cfg-dialog-ops { display: flex; gap: 8px; }
+.cfg-dialog-tabs :deep(.el-tabs__header) { margin-bottom: 12px; }
+.cfg-search { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.cfg-match-count { font-size: 12px; color: var(--text-muted); white-space: nowrap; min-width: 56px; }
+.cfg-code {
+  background: #1e293b; border-radius: var(--radius-sm); padding: 12px 0;
+  max-height: 60vh; overflow: auto;
+  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; line-height: 1.6;
+}
+.cfg-code.is-full { max-height: calc(100vh - 300px); }
+.cfg-line { display: flex; padding: 0 12px; }
+.cfg-line.is-hit { background: rgba(245, 158, 11, 0.16); }
+.cfg-line.is-current { background: rgba(245, 158, 11, 0.34); }
+.cfg-ln {
+  flex: 0 0 44px; text-align: right; padding-right: 12px;
+  color: #64748b; user-select: none; font-variant-numeric: tabular-nums;
+}
+.cfg-text { flex: 1 1 auto; min-width: 0; color: #e2e8f0; white-space: pre-wrap; word-break: break-all; }
+/* yaml/json 着色：键名蓝、字符串绿、数值橙、注释灰（都在深底上过 4.5:1） */
+.cfg-text :deep(.t-key) { color: #7dd3fc; }
+.cfg-text :deep(.t-str) { color: #86efac; }
+.cfg-text :deep(.t-num) { color: #fdba74; }
+.cfg-text :deep(.t-cmt) { color: #94a3b8; font-style: italic; }
 .breakdown-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); }
 .breakdown-row:last-child { border-bottom: none; }
 /* 任务执行情况：左环形图 + 右图例。图例带文字和数值，色块只是辅助识别，
@@ -2412,11 +2786,6 @@ onUnmounted(() => {
   font-size: 12px; color: var(--text-secondary);
 }
 .err-desc { color: var(--text-muted); font-size: 12px; margin-left: 8px; }
-.config-preview {
-  background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: var(--radius-sm);
-  max-height: 500px; overflow: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
-  white-space: pre-wrap; word-break: break-all;
-}
 
 /* ---- 日志 tab ---- */
 .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
