@@ -19,8 +19,8 @@
           <el-radio-button :value="168">最近 7d</el-radio-button>
           <el-radio-button :value="720">最近 30d</el-radio-button>
         </el-radio-group>
-        <el-select v-model="poolFilter" size="small" class="pool-select">
-          <el-option label="全部资源池" value="" />
+        <el-select v-model="poolFilter" size="small" class="pool-select" placeholder="全部资源池">
+          <el-option label="全部资源池" value="all" />
           <el-option v-for="p in pools" :key="p.namespace" :label="p.namespace" :value="p.namespace" />
         </el-select>
         <!-- 自动刷新开关：关掉后停轮询，长时间盯屏时不被 30s 跳动打断 -->
@@ -172,7 +172,7 @@
           <div class="glass-card panel">
             <div class="panel-head">
               <span class="panel-title">资源池容量</span>
-              <span class="panel-hint">{{ poolFilter || '全部资源池' }}</span>
+              <span class="panel-hint">{{ isAllPools ? '全部资源池' : poolFilter }}</span>
             </div>
             <el-empty v-if="!fPools.length" description="未配置资源池" :image-size="70" />
             <template v-else>
@@ -235,23 +235,25 @@
                   <span class="rank-no" :class="'rank-' + ($index + 1)">{{ $index + 1 }}</span>
                 </template>
               </el-table-column>
-              <el-table-column label="用户" min-width="100">
+              <el-table-column label="用户" min-width="96">
                 <template #default="{ row }">
-                  <i class="dot user-dot" :style="{ background: userColor(row.user) }"></i>{{ row.user }}
+                  <span class="user-cell">
+                    <i class="dot user-dot" :style="{ background: userColor(row.user) }"></i>{{ row.user }}
+                  </span>
                 </template>
               </el-table-column>
-              <el-table-column prop="running" label="运行" width="52" align="right" />
-              <el-table-column prop="queued" label="排队" width="52" align="right" />
+              <el-table-column prop="running" label="运行" width="48" align="right" />
+              <el-table-column prop="queued" label="排队" width="48" align="right" />
               <el-table-column label="沙箱数" width="64" align="right">
                 <template #default="{ row }">{{ fmtCompact(row.pods) }}</template>
               </el-table-column>
-              <el-table-column label="CPU(核)" width="76" align="right">
+              <el-table-column label="CPU(核)" width="72" align="right">
                 <template #default="{ row }">{{ fmtNum(row.cpu) }}</template>
               </el-table-column>
-              <el-table-column label="内存(GiB)" width="84" align="right">
+              <el-table-column label="内存(GiB)" width="78" align="right">
                 <template #default="{ row }">{{ fmtNum(row.memory_gb) }}</template>
               </el-table-column>
-              <el-table-column label="占比" min-width="120">
+              <el-table-column label="占比" width="116">
                 <template #default="{ row }">
                   <div class="share-cell">
                     <span class="share-pct">{{ rankShare(row) }}%</span>
@@ -337,8 +339,8 @@
           <div class="glass-card panel">
             <div class="panel-head">
               <span class="panel-title">代理实例</span>
-              <el-select v-model="proxyRole" size="small" class="role-select">
-                <el-option label="全部角色" value="" />
+              <el-select v-model="proxyRole" size="small" class="role-select" placeholder="全部角色">
+                <el-option label="全部角色" value="all" />
                 <el-option v-for="r in PROXY_ROLES" :key="r" :label="r" :value="r" />
               </el-select>
             </div>
@@ -442,8 +444,8 @@ const refreshing = ref(false)
 const hours = ref(24)
 const trendMetric = ref('cpu')
 const rankMetric = ref('pods')
-const poolFilter = ref('')
-const proxyRole = ref('')
+const poolFilter = ref('all')
+const proxyRole = ref('all')
 const autoRefresh = ref(true)
 const isFullscreen = ref(false)
 
@@ -493,11 +495,12 @@ function percentColor(p) {
 // ---------- 资源池筛选 ----------
 // 顶部下拉选中某个池时，整页的 KPI / 计量条都跟着只看这个池；
 // 分布类数据后端未按池拆分，保持全量（面板标题已标注口径）。
+const isAllPools = computed(() => poolFilter.value === 'all')
 const fPools = computed(() =>
-  poolFilter.value ? pools.value.filter(p => p.namespace === poolFilter.value) : pools.value)
+  isAllPools.value ? pools.value : pools.value.filter(p => p.namespace === poolFilter.value))
 
 const fSummary = computed(() => {
-  if (!poolFilter.value) return summary.value
+  if (isAllPools.value) return summary.value
   const p = fPools.value[0]
   if (!p) return summary.value
   return {
@@ -543,9 +546,9 @@ const PROXY_ROLE_COLOR = {
 }
 
 const proxyRows = computed(() => {
-  const rows = proxyRole.value
-    ? proxyUsage.value.filter(p => p.role === proxyRole.value)
-    : proxyUsage.value
+  const rows = proxyRole.value === 'all'
+    ? proxyUsage.value
+    : proxyUsage.value.filter(p => p.role === proxyRole.value)
   return [...rows].sort((a, b) => (b.pods || 0) - (a.pods || 0))
 })
 // 条形只在当前可见行内比较，分母取可见最大值：不同角色量级差很大，
@@ -806,13 +809,13 @@ const osOption = computed(() => {
     },
     series: [
       {
-        name: 'Linux', type: 'bar', barMaxWidth: 24,
+        name: 'Linux', type: 'bar', barMaxWidth: 40, barGap: '10%',
         data: [l.cpu || 0, l.memory_gb || 0],
         itemStyle: { color: sandboxColor.linux, borderRadius: [4, 4, 0, 0] },
         label: { show: true, position: 'top', color: AXIS_LABEL, formatter: ({ value }) => fmtCompact(value) },
       },
       {
-        name: 'Windows', type: 'bar', barMaxWidth: 24,
+        name: 'Windows', type: 'bar', barMaxWidth: 40,
         data: [w.cpu || 0, w.memory_gb || 0],
         itemStyle: { color: sandboxColor.windows, borderRadius: [4, 4, 0, 0] },
         label: { show: true, position: 'top', color: AXIS_LABEL, formatter: ({ value }) => fmtCompact(value) },
@@ -937,8 +940,8 @@ async function load({ silent = false } = {}) {
     trend.value = d.trend || { points: [], truncated: false }
     generatedAt.value = (d.generated_at || '').replace('T', ' ')
     // 选中的池被删掉后回到全部，避免筛出空页面
-    if (poolFilter.value && !pools.value.some(p => p.namespace === poolFilter.value)) {
-      poolFilter.value = ''
+    if (!isAllPools.value && !pools.value.some(p => p.namespace === poolFilter.value)) {
+      poolFilter.value = 'all'
     }
   } finally {
     loading.value = false
@@ -1123,10 +1126,11 @@ onBeforeUnmount(() => {
 .rank-no.rank-1 { background: #2a78d6; color: #fff; }
 .rank-no.rank-2 { background: #eb6834; color: #fff; }
 .rank-no.rank-3 { background: #1baf7a; color: #fff; }
+.user-cell { display: inline-flex; align-items: center; min-width: 0; }
 .user-dot { margin-right: 6px; }
 .share-cell { display: flex; align-items: center; gap: 8px; }
-.share-pct { width: 44px; flex: none; font-size: 12px; color: var(--text-secondary); text-align: right; }
-.share-cell .meter-track { flex: 1; }
+.share-pct { width: 40px; flex: none; font-size: 12px; color: var(--text-secondary); text-align: right; }
+.share-cell .meter-track { flex: 1; min-width: 50px; }
 
 /* ---------- 分布：分段条 / 甜甜圈 / 列表 ---------- */
 .seg-bar {

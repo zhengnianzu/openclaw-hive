@@ -38,7 +38,8 @@ from . import resource_pools
 router = APIRouter(prefix="/api/instances", tags=["instances"])
 
 JIUWENSWARM_TYPES = {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}
-DEFAULT_MAX_TTL_SECOND = 14400
+DEFAULT_MAX_TTL_SECOND = 36000
+MAX_MAX_TTL_SECOND = 36000  # 10 小时, 与前端 el-input-number 的 :max 保持一致
 MAIN_TIMEOUT_MARGIN_SECONDS = 600
 QUERY_TIMEOUT_MARGIN_SECONDS = 1200
 
@@ -55,8 +56,10 @@ def _apply_timeout_settings(base, max_ttl_second: int) -> tuple[int, int, int]:
     queries[].timeout 本身不在这里改写：由 hive.py 的 ``_upload_data_config``
     读 run_config.task.query_timeout 后在上传副本里注入，原始任务配置保持原样。
     """
-    # 下限保证最内层的 query 超时至少为 1s，避免填太小导出非正数。
+    # 下限保证最内层的 query 超时至少为 1s，避免填太小导出非正数；
+    # 上限 10 小时，和前端输入框一致，防止直接打 API 绕过界面约束。
     max_ttl_second = max(QUERY_TIMEOUT_MARGIN_SECONDS + 1, int(max_ttl_second))
+    max_ttl_second = min(MAX_MAX_TTL_SECOND, max_ttl_second)
     main_timeout = max_ttl_second - MAIN_TIMEOUT_MARGIN_SECONDS
     query_timeout = max_ttl_second - QUERY_TIMEOUT_MARGIN_SECONDS
     base.run_config.task.main_python_timeout = main_timeout
