@@ -62,6 +62,11 @@ from utils.win_util import (
     _stop_jiuwenswarm_gateway_windows,
     _run_main_script_windows,
 )
+from sandbox_log_tap import (
+    get_log_tap_service,
+    start_log_tap_service,
+    stop_log_tap_service,
+)
 # Module-level logger
 logger = get_logger()
 
@@ -1618,6 +1623,27 @@ class OpenClawDistillationTask:
                                 sandbox_result=result)
             self.execution_client = result
             env_ready = True
+            log_tap_service = get_log_tap_service()
+            if log_tap_service is not None:
+                sandbox_cfg = self.config.sandbox_config
+                path_cls = (
+                    PureWindowsPath
+                    if sandbox_cfg.sandbox_type == "windows"
+                    else PurePosixPath
+                )
+                log_tap_service.register(
+                    env_id=self.execution_client.get_env_id(),
+                    task_idx=task_idx,
+                    config_name=os.path.basename(config_file),
+                    client=self.execution_client,
+                    sandbox_type=sandbox_cfg.sandbox_type,
+                    run_log_path=str(path_cls(
+                        sandbox_cfg.result_workdir, sandbox_cfg.result_log
+                    )),
+                    gateway_log_path=str(path_cls(
+                        sandbox_cfg.result_workdir, sandbox_cfg.gateway_log
+                    )),
+                )
             self.logger.info(
                 f">>>>>> Task {task_idx}: env_id={self.execution_client.get_env_id()} "
                 f"elapsed={time.perf_counter() - start_time:.1f}s <<<<<<"
@@ -1678,6 +1704,9 @@ class OpenClawDistillationTask:
 
             # ---- 关闭 execution_client ----
             if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
+                log_tap_service = get_log_tap_service()
+                if log_tap_service is not None:
+                    await log_tap_service.unregister(self.execution_client.get_env_id())
                 try:
                     await self.execution_client.close()
                 except Exception as e:
@@ -1948,12 +1977,29 @@ async def run_tasks(
     for idx, name in enumerate(sorted_configs[task_start:task_start + task_num]):
         await task_queue.put((idx, name))
 
+    # 按需沙箱日志控制端：空闲时不访问沙箱，只有本地按钮/CLI 请求到来才读取。
+    log_tap_service = None
+    try:
+        log_tap_service = await start_log_tap_service(
+            config.task_output_path, logger=logger
+        )
+    except Exception as e:
+        # 日志辅助能力失败不能阻断任务主流程。
+        logger.warning(f"Sandbox log tap disabled: {type(e).__name__}: {e}")
+
     # Run workers
     workers = [
         _worker(i, task_queue, config) for i in range(concurrent_num)
     ]
-    if workers:
-        await asyncio.gather(*workers)
+    try:
+        if workers:
+            await asyncio.gather(*workers)
+    finally:
+        if log_tap_service is not None:
+            try:
+                await stop_log_tap_service()
+            except Exception as e:
+                logger.warning(f"Sandbox log tap shutdown failed: {type(e).__name__}: {e}")
 
     # 合并重写 failed.jsonl（累计语义），必须在上传前完成，否则传上去的还是旧内容
     await _rewrite_failed_record(config)
