@@ -3,9 +3,6 @@
     <h2 class="page-title">新建任务实例</h2>
 
     <div class="glass-card" style="max-width:800px">
-    <el-alert v-if="isRetry" type="warning" :closable="false" show-icon
-      title="重跑实例会继承运行参数；任务范围由源实例有效 configs 减去 complete.jsonl 自动生成，运行产物从空开始。"
-      style="margin-bottom:16px" />
     <el-form :model="form" label-width="160px">
       <el-form-item label="实例名称" required>
         <el-input v-model="form.name" placeholder="例如：web_skill_test_0608" />
@@ -71,9 +68,9 @@
           </el-form-item>
 
           <el-form-item label="用户Config目录" required>
-            <el-input v-model="form.user_config_dir" :disabled="isRetry" placeholder="task_data/260520/web_configs">
+            <el-input v-model="form.user_config_dir" placeholder="task_data/260520/web_configs">
               <template #append>
-                <el-button :disabled="isRetry" @click="openObsBrowser('user_config_dir')"><el-icon><FolderOpened /></el-icon></el-button>
+                <el-button @click="openObsBrowser('user_config_dir')"><el-icon><FolderOpened /></el-icon></el-button>
               </template>
             </el-input>
           </el-form-item>
@@ -204,11 +201,11 @@
 
         <el-tab-pane label="高级配置" name="advanced">
           <el-form-item label="起始索引">
-            <el-input-number v-model="form.start_index" :min="0" :disabled="isRetry" />
+            <el-input-number v-model="form.start_index" :min="0" />
           </el-form-item>
 
           <el-form-item label="任务总数">
-            <el-input-number v-model="form.total_num" :min="0" :disabled="isRetry" />
+            <el-input-number v-model="form.total_num" :min="0" />
             <span style="margin-left:8px;color:#999;font-size:12px">0 表示不限制</span>
           </el-form-item>
 
@@ -345,7 +342,6 @@ import { toCores as cores } from '../utils/quantity'
 
 const router = useRouter()
 const route = useRoute()
-const isRetry = computed(() => !!route.query.retry_source_id)
 const authStore = useAuthStore()
 const harnessStore = useHarnessStore()
 const creating = ref(false)
@@ -430,7 +426,7 @@ const form = ref({
   invite_code: '',
   harness_config_id: null,
   harness_config_version_id: null,
-  retry_source_id: null,
+  copy_complete_from: null,
   queue_id: null,
   sandbox_config_id: 0,
   agents: [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }],
@@ -704,16 +700,15 @@ onMounted(async () => {
       // 直接回填会让复制出的任务带着掩码当 key 去跑。
       const params = await api.get(`/instances/${copyFrom}/create-params/full`)
       Object.assign(form.value, params)
-      // 普通复制沿用当前默认值；重跑必须继承源实例的实际运行开关。
-      if (!isRetry.value) form.value.suffix_api_keys = true
+      // 历史实例的 suffix_api_keys 统一是 false（迁移默认值），直接继承会让
+      // 「复制」出来的新任务默认关闭后缀。复制时回到当前默认值，用户仍可手动改。
+      form.value.suffix_api_keys = true
       form.value.name = params.name + '-copy'
       form.value.task_name = genTaskId()
-      // 重跑失败场景：后端为新实例生成“源有效 configs - 源 complete”的独立输入目录。
-      form.value.retry_source_id = route.query.retry_source_id || null
-      if (route.query.retry_source_id) {
+      // 重跑失败场景: 透传 copy_complete_from, 后端创建时搬源实例 complete.jsonl
+      form.value.copy_complete_from = route.query.copy_complete_from || null
+      if (route.query.copy_complete_from) {
         form.value.name = params.name + '-retry'
-        // 本地 outputs 本来就是新的；OBS 轨迹路径也必须重新生成，不能覆盖源实例。
-        form.value.traj_save_path = ''
       }
       if (!form.value.agents || form.value.agents.length === 0) {
         form.value.agents = [{ name: 'user_simulator', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }]
