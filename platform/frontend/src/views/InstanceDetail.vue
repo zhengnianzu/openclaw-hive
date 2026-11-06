@@ -941,25 +941,7 @@
         <el-tabs v-model="detailTab" class="detail-sub-tabs">
           <!-- 轨迹 -->
           <el-tab-pane label="轨迹" name="traj">
-            <div v-if="assistantBlocks.length" class="traj-viewer">
-              <div v-for="(b, i) in assistantBlocks" :key="i" class="traj-block" :class="`traj-${b.role || 'meta'}`">
-                <div class="traj-block-head">
-                  <span class="traj-role">{{ roleLabel(b) }}</span>
-                  <span v-if="b.part_type === 'thinking'" class="traj-type">thinking</span>
-                  <span v-if="b.tool_name" class="traj-tool">{{ b.tool_name }}</span>
-                  <span v-if="b.part_type === 'toolCall'" class="traj-type">toolCall</span>
-                  <span v-if="b.isError || b.exitCode" class="traj-err">exit {{ b.exitCode ?? '?' }}</span>
-                  <el-icon v-if="i < assistantBlocks.length - 1" class="traj-fold" :size="14"
-                    @click="toggleBlock(i)">
-                    <ArrowDown v-if="!collapsedBlocks[i]" /><ArrowRight v-else />
-                  </el-icon>
-                </div>
-                <div v-if="!collapsedBlocks[i] && (b.content || b.args)" class="traj-body">
-                  <pre v-if="b.content" class="traj-content">{{ b.content }}</pre>
-                  <pre v-if="b.args" class="traj-args">{{ b.args }}</pre>
-                </div>
-              </div>
-            </div>
+            <TrajBlocks v-if="assistantBlocks.length" :blocks="assistantBlocks" />
             <el-empty v-else description="无 assistant 轨迹" :image-size="40" />
           </el-tab-pane>
 
@@ -1009,16 +991,10 @@
                 <span v-else style="color:#c0c4cc">—</span>
               </div>
             </div>
-            <div v-if="evaluatorBlocks.length" class="traj-viewer" style="margin-top:12px">
-              <div v-for="(b, i) in evaluatorBlocks" :key="i" class="traj-block" :class="`traj-${b.role || 'meta'}`">
-                <div class="traj-block-head">
-                  <span class="traj-role">{{ roleLabel(b) }}</span>
-                  <span v-if="b.part_type === 'thinking'" class="traj-type">thinking</span>
-                  <span v-if="b.tool_name" class="traj-tool">{{ b.tool_name }}</span>
-                </div>
-                <pre v-if="b.content" class="traj-content">{{ b.content }}</pre>
-              </div>
-            </div>
+            <!-- 原来这里是「无折叠、不显示 args」的简化版，与上面「轨迹」tab 各写一份。
+                 统一到 TrajBlocks 后 evaluator 轨迹也能折叠、也能看到工具入参。 -->
+            <TrajBlocks v-if="evaluatorBlocks.length" :blocks="evaluatorBlocks"
+              style="margin-top:12px" />
             <el-empty v-else description="无 evaluator 轨迹" :image-size="40" style="margin-top:12px" />
           </el-tab-pane>
         </el-tabs>
@@ -1065,6 +1041,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, Search, Folder, Document, Loading, Clock } from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
+import TrajBlocks from '../components/TrajBlocks.vue'
 import EChart from '../components/EChart.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -2162,7 +2139,6 @@ const detailStatusHint = ref('')
 const detailData = ref(null)
 const detailTab = ref('traj')
 const logTab = ref('task')
-const collapsedBlocks = ref({})
 const detailLogTailFull = ref(false)
 let deepPollTimer = null
 
@@ -2231,7 +2207,6 @@ async function openTaskDetail(row) {
   detailLoading.value = true
   detailTab.value = 'traj'
   logTab.value = 'task'
-  collapsedBlocks.value = {}
   detailLogTailFull.value = false
   detailStatusHint.value = '正在读取本地交付物…'
   await fetchDetail()
@@ -2290,22 +2265,8 @@ async function pollDeep() {
   await fetchDetail()
 }
 
-// 轨迹 viewer 辅助
-function roleLabel(b) {
-  if (!b) return '?'
-  const map = {
-    assistant: '助手',
-    user: '用户',
-    toolResult: '工具结果',
-    thinking: '思考',
-    toolCall: '工具调用',
-    meta: '系统',
-  }
-  return map[b.role] || map[b.part_type] || b.role || b.part_type || '系统'
-}
-function toggleBlock(i) {
-  collapsedBlocks.value = { ...collapsedBlocks.value, [i]: !collapsedBlocks.value[i] }
-}
+// roleLabel / toggleBlock / collapsedBlocks 已随气泡模板搬进
+// components/TrajBlocks.vue（折叠态由组件自管）。
 function logDisplayText(text) {
   if (detailLogTailFull.value) return text
   return (text || '').slice(-20000)
@@ -2665,40 +2626,7 @@ onUnmounted(() => {
 /* ---- 输出 tab: 会话详情弹窗 ---- */
 .detail-sub-tabs { margin-top: 4px; }
 .log-sub-tabs { margin-top: 4px; }
-.traj-viewer {
-  max-height: 520px; overflow-y: auto; border: 1px solid var(--border-color);
-  border-radius: var(--radius-md); padding: 8px;
-}
-.traj-block { border-radius: 6px; margin-bottom: 6px; overflow: hidden; }
-.traj-block:last-child { margin-bottom: 0; }
-.traj-block-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px; font-size: 12px; min-height: 26px;
-}
-.traj-role { font-weight: 600; }
-.traj-type { color: #909399; font-size: 11px; }
-.traj-tool {
-  font-family: 'Cascadia Code', 'Fira Code', monospace;
-  color: #6366f1; font-size: 11px;
-}
-.traj-err { color: #f56c6c; font-size: 11px; font-weight: 600; }
-.traj-fold { margin-left: auto; cursor: pointer; color: #909399; }
-.traj-fold:hover { color: var(--text-primary); }
-.traj-body { padding: 2px 10px 8px; }
-.traj-content, .traj-args {
-  margin: 0; padding: 0; font-size: 12px; line-height: 1.55;
-  font-family: 'Cascadia Code', 'Fira Code', monospace;
-  white-space: pre-wrap; word-break: break-all;
-}
-.traj-args { color: var(--text-muted); margin-top: 4px; }
-.traj-assistant .traj-block-head { background: rgba(99, 102, 241, .10); }
-.traj-assistant .traj-role { color: #6366f1; }
-.traj-user .traj-block-head { background: rgba(16, 185, 129, .10); }
-.traj-user .traj-role { color: #10b981; }
-.traj-toolResult .traj-block-head { background: #f5f7fa; }
-.traj-toolResult .traj-role { color: #606266; }
-.traj-meta .traj-block-head { background: rgba(230, 162, 60, .10); }
-.traj-meta .traj-role { color: #e6a23c; }
+/* 轨迹气泡的样式已搬进 components/TrajBlocks.vue（scoped） */
 .log-panel-head {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 6px;

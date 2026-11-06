@@ -105,7 +105,7 @@
               <div v-for="f in g.items" :key="f.rel" class="aw-file"
                 :class="{ active: selected && selected.rel === f.rel, empty: f.size === 0 }"
                 @click="onNodeClick(f)">
-                <span class="aw-file-icon" :class="g.id">{{ iconOf(f.name) }}</span>
+                <span class="aw-file-icon" :class="g.id">{{ iconOf(f.name, f.rel) }}</span>
                 <span class="aw-file-body">
                   <span class="aw-file-name">{{ f.name }}</span>
                   <span class="aw-file-meta">{{ f.rel }} · {{ fmtSize(f.size) }}</span>
@@ -191,6 +191,13 @@
             <MarkdownView v-else-if="kind === 'markdown' && !isEmptyText" class="aw-markdown"
               :content="text" />
 
+            <!-- 轨迹：openclaw/hermes/openjiuwen 的会话文件，用「会话详情」那套
+                 对话气泡渲染（助手/用户/思考/工具调用/工具结果 配色 + 逐块折叠）。
+                 必须排在 json / jsonl 两个分支之前 —— 轨迹本身就是 .jsonl/.json。
+                 想看原始字段切「原始内容」tab。 -->
+            <TrajBlocks v-else-if="isTrajView" :blocks="trajBlocks"
+              :header="trajHeader" :truncated-note="trajTruncNote" :scroll="false" />
+
             <!-- JSON：格式化 + 语法高亮。内容来自本实例的沙箱产出、已全部转义，
                  v-html 在这里是安全的（highlightJson 先 escapeHtml 再加 span）。 -->
             <div v-else-if="kind === 'json'" class="aw-json">
@@ -271,7 +278,7 @@
             <div class="aw-prop"><span>相对路径</span><span>{{ selected.rel }}</span></div>
             <div class="aw-prop"><span>大小</span><span>{{ fmtSize(selected.size) || '—' }}</span></div>
             <div class="aw-prop"><span>修改时间</span><span>{{ fmtTime(selected.mtime) || '—' }}</span></div>
-            <div class="aw-prop"><span>分组</span><span>{{ groupLabel(groupOf(selected.name)) }}</span></div>
+            <div class="aw-prop"><span>分组</span><span>{{ groupLabel(groupOfEntry(selected.rel, selected.name)) }}</span></div>
           </div>
         </div>
       </template>
@@ -290,8 +297,10 @@ import { ElMessage } from 'element-plus'
 import { Folder, Document, Search, Refresh, Box } from '@element-plus/icons-vue'
 import api from '../api'
 import MarkdownView from './MarkdownView.vue'
+import TrajBlocks from './TrajBlocks.vue'
+import { detectTrajKind, parseTrajectory } from '../utils/trajectory.js'
 import {
-  fmtSize, fmtTime, groupOf, groupLabel, previewKindOf,
+  fmtSize, fmtTime, groupOfEntry, groupLabel, previewKindOf,
   GROUPS, collectLocalRefs, rewriteLocalRefs,
   formatJson, highlightJson, parseJsonl,
 } from '../utils/artifacts'
@@ -306,6 +315,9 @@ const VIEW_MODES = [
   { id: 'tree', label: '目录视图' },
   { id: 'group', label: '分组视图' },
 ]
+
+// 后端 /content 的 limit 上限（artifacts.py: Query(..., le=2000000)）。
+const CONTENT_MAX_CHARS = 2000000
 
 const tasks = ref([])
 const task = ref('')
@@ -334,6 +346,10 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const text = ref('')
 const source = ref('')
+// /content 的截断口径（后端 has_more / truncated_file）。取出来显式提示，
+// 不让大文件静默少内容。
+const textTruncated = ref(false)
+const textTotalChars = ref(0)
 const htmlSrcdoc = ref('')
 const blobUrl = ref('')
 const downloading = ref(false)
@@ -371,6 +387,38 @@ const isEmptyText = computed(() =>
 const jsonState = computed(() => (kind.value === 'json' ? formatJson(text.value) : null))
 const jsonHtml = computed(() =>
   (jsonState.value ? highlightJson(jsonState.value.text) : ''))
+
+// ── 轨迹预览 ───────────────────────────────────────────────────────────────
+// 轨迹文件（openclaw agents/*/sessions/*.jsonl、hermes profiles/*/sessions/*.json、
+// openjiuwen logs/**/trajectories/**/query<N>.json）改用「会话详情」那套对话气泡渲染。
+// 判定按**路径**而不是扩展名：hermes/openjiuwen 的轨迹也是 .json，和
+// traj_stats_result.json 这类普通配置同扩展名。
+const trajInfo = computed(() =>
+  (selected.value ? detectTrajKind(selected.value.rel) : null))
+
+const trajBlocks = computed(() => {
+  if (!trajInfo.value || !text.value) return []
+  return parseTrajectory(trajInfo.value.kind, text.value,
+    { truncated: textTruncated.value })
+})
+
+// 命中轨迹路径但一块都解析不出来（格式超出已知三种 / 文件损坏）时回落到原来的
+// JSON / JSONL 渲染 —— 「解析器没认出来」不该表现成一片空白。
+const isTrajView = computed(() => !!trajInfo.value && trajBlocks.value.length > 0)
+
+const trajHeader = computed(() => {
+  if (!isTrajView.value) return ''
+  const role = trajInfo.value.role === 'evaluator' ? 'evaluator' : 'assistant'
+  return `${trajInfo.value.kind} · ${role} · 共 ${trajBlocks.value.length} 块`
+})
+
+const trajTruncNote = computed(() => {
+  if (!textTruncated.value) return ''
+  const total = textTotalChars.value
+  return total
+    ? `文件共 ${total.toLocaleString()} 字符，仅解析已加载的前 ${CONTENT_MAX_CHARS.toLocaleString()} 字符，完整内容请下载`
+    : '文件过大，仅解析已加载部分，完整内容请下载'
+})
 
 // ── JSONL 预览：逐行解析 + 分块懒加载 ──────────────────────────────────────
 // 默认只渲染前 JSONL_PAGE 条。trajectory.jsonl 单行可达十几万字符，
@@ -696,7 +744,7 @@ const grouped = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
   for (const f of flatEntries.value) {
     if (kw && !`${f.name} ${f.rel}`.toLowerCase().includes(kw)) continue
-    const gid = groupOf(f.name)
+    const gid = groupOfEntry(f.rel, f.name)
     ;(map.get(gid) || map.get('other')).push(f)
   }
   return GROUPS.map(g => ({ ...g, items: map.get(g.id) || [] })).filter(g => g.items.length)
@@ -718,7 +766,9 @@ function toggleGroup(id) {
   collapsed.value = s
 }
 
-function iconOf(name) {
+function iconOf(name, rel) {
+  // 轨迹文件单独给个图标：它和普通 .json/.jsonl 同扩展名，但点开是对话气泡。
+  if (rel && detectTrajKind(rel)) return '💬'
   return { html: 'H', markdown: 'M', json: '{}', image: '▧', office: 'W', pdf: 'PDF',
            text: '≡', binary: '?' }[
     previewKindOf(name)] || '?'
@@ -762,6 +812,8 @@ function resetPreview() {
   previewError.value = ''
   text.value = ''
   source.value = ''
+  textTruncated.value = false
+  textTotalChars.value = 0
   htmlSrcdoc.value = ''
   pdfState.value = 'idle'
   pdfLoading.value = false
@@ -787,10 +839,17 @@ async function loadPreview() {
         || kind.value === 'markdown' || kind.value === 'json'
         || kind.value === 'jsonl') {
       const res = await api.get(`/artifacts/${props.instanceId}/content`, {
-        params: { task: task.value, key: rel }, silent: true,
+        // 必须显式传 limit：后端默认只给 200000 **字符**（artifacts.py 的
+        // Query(default=200000, le=2000000)）。实测轨迹 jsonl 单文件 230 KB、
+        // 单行最长 2.2 万字符 —— 不传就被静默截断在中间，JSONL 逐行解析把残行
+        // 算成「解析失败」刷个告警，用户以为文件坏了。顶到后端上限。
+        params: { task: task.value, key: rel, limit: CONTENT_MAX_CHARS }, silent: true,
       })
       text.value = res.text || ''
       source.value = text.value
+      // 后端已返回这三个字段，之前完全没取 → 截断对用户不可见
+      textTruncated.value = !!(res.has_more || res.truncated_file)
+      textTotalChars.value = res.total_chars ?? 0
     } else if (kind.value === 'html') {
       const res = await api.get(`/artifacts/${props.instanceId}/inline`, {
         params: { task: task.value, key: rel }, responseType: 'text', silent: true,
@@ -1019,6 +1078,7 @@ onBeforeUnmount(() => { stopPoll(); revokeBlob(); clearPdfCache() })
   width: 22px; height: 22px; display: grid; place-items: center; flex-shrink: 0;
   border-radius: 5px; background: #eaf0fe; color: #5273c8; font-size: 9px; font-weight: 700;
 }
+.aw-file-icon.traj { color: #6366f1; background: #eef0ff; font-size: 11px; }
 .aw-file-icon.html { color: #a863cd; background: #f6edff; }
 .aw-file-icon.image { color: #448cce; background: #e9f6ff; }
 .aw-file-icon.office { color: #d36b36; background: #fff0e5; }
