@@ -209,6 +209,13 @@
             <span style="margin-left:8px;color:#999;font-size:12px">0 表示不限制</span>
           </el-form-item>
 
+          <el-form-item label="沙箱存活时间（秒）">
+            <el-input-number v-model="form.max_ttl_second" :min="1800" :step="600" />
+            <div style="font-size:12px;color:#999;margin-top:4px">
+              沙箱 max_ttl_second；主程序超时为该值 − 600 秒，每条 queries[].timeout 为该值 − 1200 秒
+            </div>
+          </el-form-item>
+
           <el-form-item label="镜像名称">
             <el-select v-model="form.image_name" filterable allow-create default-first-option
               placeholder="选择或输入镜像地址" style="width:100%" clearable>
@@ -410,6 +417,7 @@ const form = ref({
   name: '', task_name: genTaskId(), concurrent_num: 100,
   skill_dir: '', default_skills: '', agent_dir: '', user_config_dir: '', user_profile_dir: '',
   traj_save_path: '', start_index: 0, total_num: 0, image_name: '',
+  max_ttl_second: 14400,
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   suffix_api_keys: true,
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
