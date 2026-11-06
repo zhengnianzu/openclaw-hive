@@ -2,7 +2,19 @@
   <div v-loading="loading">
     <div class="header-row">
       <el-page-header @back="$router.back()">
-        <template #content>{{ inst.name || '实例详情' }}</template>
+        <!-- 标题带上「序号」和「Harness 类型」：实例名又长又像
+             （2611032107-wanyi26110321070534-d5b7），光看名字很难确认
+             自己打开的是不是首页点的那一条。序号用后端的持久编号
+             （与首页「序号」列同源，创建后不变），可直接口头/截图指认。 -->
+        <template #content>
+          <span class="title-row">
+            <span v-if="inst.seq" class="title-seq">#{{ inst.seq }}</span>
+            <span class="title-name">{{ inst.name || '实例详情' }}</span>
+            <el-tag v-if="inst.harness_type" size="small" :style="harnessTagStyle(inst.harness_type)">
+              {{ harnessLabel(inst.harness_type) }}
+            </el-tag>
+          </span>
+        </template>
       </el-page-header>
       <div style="display:flex;gap:8px">
         <el-button type="success" v-if="authStore.isOperator && !['running','preparing'].includes(inst.status)" @click="startInstance">
@@ -2671,6 +2683,14 @@ onUnmounted(() => {
   word-break: break-all;
 }
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+/* 详情页标题：序号 + 实例名 + Harness 标签 */
+.title-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.title-seq {
+  flex: 0 0 auto; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--text-muted); background: var(--bg-hover);
+  border: 1px solid var(--border-color); border-radius: 6px; padding: 1px 8px;
+}
+.title-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-tabs { margin-top: 4px; }
 
 /* ---- 配置信息 tab ---- */
