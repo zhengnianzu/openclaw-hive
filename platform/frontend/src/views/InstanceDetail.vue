@@ -16,15 +16,34 @@
           </span>
         </template>
       </el-page-header>
-      <div style="display:flex;gap:8px">
-        <el-button type="success" v-if="authStore.isOperator && !['running','preparing'].includes(inst.status)" @click="startInstance">
-          {{ inst.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
+      <!-- 操作统一收进一个下拉：原先 启动/停止/重跑失败 三个按钮按状态互斥显示，
+           同一位置在不同状态下变成不同按钮，容易误点。收拢后入口位置固定，
+           各项按状态 disable 而非消失，用户能看到「有这个操作、当前不可用」。
+           命令集与首页的「更多」下拉保持一致，两处行为相同。 -->
+      <el-dropdown v-if="authStore.isOperator" trigger="click" @command="handleCommand">
+        <el-button type="primary">
+          操作<el-icon style="margin-left:4px"><ArrowDown /></el-icon>
         </el-button>
-        <el-button type="danger" v-if="authStore.isOperator && ['running','queued'].includes(inst.status)" @click="stopInstance">
-          {{ inst.status === 'queued' ? '停止（退出队列）' : '停止' }}
-        </el-button>
-        <el-button type="warning" v-if="authStore.isOperator && inst.failed_tasks > 0 && !['running','preparing'].includes(inst.status)" @click="retryFailed">重跑失败</el-button>
-      </div>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="copy">
+              <el-icon><CopyDocument /></el-icon>复制（以此为模板新建）
+            </el-dropdown-item>
+            <el-dropdown-item command="start" divided :disabled="!canStart">
+              <el-icon><VideoPlay /></el-icon>
+              {{ inst.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
+            </el-dropdown-item>
+            <el-dropdown-item command="stop" :disabled="!canStop">
+              <el-icon><VideoPause /></el-icon>
+              {{ inst.status === 'queued' ? '停止（退出队列）' : '停止' }}
+            </el-dropdown-item>
+            <el-dropdown-item command="retry" divided :disabled="!canRetry">
+              <el-icon><RefreshLeft /></el-icon>
+              重跑失败{{ inst.failed_tasks > 0 ? `（${inst.failed_tasks}）` : '' }}
+            </el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
     </div>
 
     <div v-if="inst.status === 'preparing'" class="glass-card" style="padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:10px">
@@ -112,6 +131,22 @@
                       <span class="donut-pct">{{ o.pct }}%</span>
                     </div>
                   </div>
+                </div>
+
+                <!-- 成功率趋势：数据来自后台每分钟一次的进度采样。
+                     默认看「窗口内成功率」而非累计——跑了几千个任务后累计值
+                     会被历史压得几乎不动，最近开始大面积失败也看不出来。 -->
+                <div class="trend-head">
+                  <span class="trend-title">成功率趋势</span>
+                  <el-radio-group v-model="trendWindow" size="small" @change="loadMetrics">
+                    <el-radio-button :value="5">5m</el-radio-button>
+                    <el-radio-button :value="15">15m</el-radio-button>
+                    <el-radio-button :value="60">1h</el-radio-button>
+                  </el-radio-group>
+                </div>
+                <EChart v-if="metricPoints.length >= 2" :option="trendOption" height="180px" />
+                <div v-else class="trend-empty">
+                  {{ metricsLoading ? '加载中…' : '暂无采样数据（运行中的实例每分钟采样一次，约 2 分钟后出现）' }}
                 </div>
 
                 <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
@@ -372,10 +407,11 @@
       <!-- ================= 日志 ================= -->
       <el-tab-pane label="日志" name="logs">
         <div class="logc">
-          <!-- ---------- 左栏：任务列表（顺序 / 失败分组） ---------- -->
+          <!-- ---------- 左栏：任务列表（编号顺序 / 执行顺序 / 失败分组） ---------- -->
           <div class="logc-left">
             <el-radio-group v-model="leftView" size="small" class="logc-left-switch">
               <el-radio-button value="seq">顺序列表</el-radio-button>
+              <el-radio-button value="exec">执行顺序</el-radio-button>
               <el-radio-button value="grp">失败类型分组</el-radio-button>
             </el-radio-group>
 
@@ -388,8 +424,8 @@
               </div>
             </div>
 
-            <!-- 顺序列表 -->
-            <template v-if="leftView === 'seq'">
+            <!-- 顺序列表 / 执行顺序：同一套列表，差别只在排序与副标题 -->
+            <template v-if="leftView === 'seq' || leftView === 'exec'">
               <div class="logc-filters">
                 <el-input v-model="taskSearch" placeholder="搜索 task 编号…" clearable size="small" />
                 <el-select v-model="categoryFilter" placeholder="状态" clearable size="small">
@@ -400,15 +436,34 @@
                   <el-option label="未分类 X" value="X" />
                 </el-select>
               </div>
+              <!-- 执行顺序视图：给出排序方向开关 + 口径说明。
+                   mtime 是日志最后写入时间，并发跑时同批任务非常接近，
+                   不说明的话用户会以为这是严格的调度先后。 -->
+              <div v-if="leftView === 'exec'" class="logc-exec-bar">
+                <el-radio-group v-model="execSortDesc" size="small">
+                  <el-radio-button :value="false">最早在前</el-radio-button>
+                  <el-radio-button :value="true">最近在前</el-radio-button>
+                </el-radio-group>
+                <el-tooltip placement="top"
+                  content="按日志文件最后写入时间排序，约等于任务收尾顺序；并发执行时同批任务时间非常接近">
+                  <el-icon class="logc-exec-help"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </div>
               <div class="logc-hint">共 {{ visibleTaskLogFiles.length }} 条</div>
               <el-scrollbar class="logc-list">
-                <div v-for="f in pagedTaskFiles" :key="f"
+                <div v-for="(f, i) in pagedTaskFiles" :key="f"
                   :class="['logc-item', { active: logSource === f }]"
                   @click="selectLogSource(f)">
+                  <span v-if="leftView === 'exec'" class="logc-exec-idx">
+                    {{ (taskListPage - 1) * taskListPageSize + i + 1 }}
+                  </span>
                   <span class="task-dot" :style="{ background: dotColor(taskStatusOf(f)) }"></span>
                   <div class="logc-item-main">
                     <div class="logc-item-name">{{ f.replace('.log', '') }}</div>
-                    <div class="logc-item-sub">{{ taskStatusOf(f)?.code || taskStatusOf(f)?.status || '—' }}</div>
+                    <div class="logc-item-sub">
+                      <template v-if="leftView === 'exec'">{{ execTimeOf(f) }}</template>
+                      <template v-else>{{ taskStatusOf(f)?.code || taskStatusOf(f)?.status || '—' }}</template>
+                    </div>
                   </div>
                   <el-tag v-if="markerText(taskStatusOf(f))" size="small"
                     :type="markerType(taskStatusOf(f))" disable-transitions>
@@ -1169,7 +1224,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowDown, ArrowRight, ArrowUp, Box, CircleCheckFilled, CircleCloseFilled, Clock,
   CopyDocument, Cpu, DataLine, Document, Download, Files, FolderOpened, FullScreen,
-  Loading, Postcard, Search, Setting, Timer, TrendCharts, User, VideoPlay, View,
+  Loading, Postcard, QuestionFilled, RefreshLeft, Search, Setting, Timer, TrendCharts,
+  User, VideoPause, VideoPlay, View,
 } from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
@@ -1208,7 +1264,7 @@ watch(activeTab, (tab) => {
 function ensureTabLoaded(tab) {
   if (loadedTabs.has(tab)) return
   loadedTabs.add(tab)
-  if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
+  if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles(); loadMetrics() }
   // 日志 tab 的「失败类型分组」用的是 overview.error_tree，而 overview 默认只在
   // config tab 拉。直接进 ?tab=logs 时它还是空的，这里补一次。
   else if (tab === 'logs') {
@@ -1228,6 +1284,7 @@ const createParams = ref({})
 const expandedPanels = ref([])
 const expandedErrorGroups = ref([])
 let timer = null
+let metricsTimer = null
 
 // ── 顶部概览卡 ───────────────────────────────────────────────────────────
 // 颜色与下面环形图的状态语义色同源（成功绿 / 失败红 / 运行中橙 / 中性）。
@@ -1303,6 +1360,71 @@ const outcomeOption = computed(() => {
 
 function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger', created: '' }[s] || '' }
 function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s }
+
+// ── 成功率趋势 ──────────────────────────────────────────────────────────
+// 数据源是后台每分钟一次的 instance_metrics 采样（overview 只有当前快照）。
+const metricPoints = ref([])
+const metricsLoading = ref(false)
+const trendWindow = ref(15)
+
+async function loadMetrics() {
+  metricsLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/metrics`, { params: { window: trendWindow.value } })
+    metricPoints.value = res.points || []
+  } catch { metricPoints.value = [] } finally { metricsLoading.value = false }
+}
+
+const trendOption = computed(() => {
+  const pts = metricPoints.value
+  const labels = pts.map(p => p.ts.slice(11, 16))   // HH:MM
+  return {
+    tooltip: {
+      trigger: 'axis',
+      formatter: (ps) => {
+        const i = ps[0]?.dataIndex ?? 0
+        const p = pts[i]
+        if (!p) return ''
+        const win = p.win_success_rate == null ? '—' : `${p.win_success_rate}%`
+        const cum = p.cum_success_rate == null ? '—' : `${p.cum_success_rate}%`
+        return `${p.ts.replace('T', ' ')}<br/>`
+          + `窗口成功率：<b>${win}</b>（${p.win_finished} 个完成）<br/>`
+          + `累计成功率：${cum}<br/>`
+          + `成功 ${p.completed} · 失败 ${p.failed}`
+      },
+    },
+    legend: { data: ['窗口成功率', '累计成功率'], bottom: 0, itemHeight: 8, textStyle: { fontSize: 11 } },
+    grid: { left: 38, right: 12, top: 12, bottom: 32 },
+    xAxis: {
+      type: 'category', data: labels, boundaryGap: false,
+      axisLabel: { fontSize: 10, color: '#94a3b8' },
+      axisLine: { lineStyle: { color: '#e5e7eb' } },
+    },
+    yAxis: {
+      type: 'value', min: 0, max: 100,
+      axisLabel: { fontSize: 10, color: '#94a3b8', formatter: '{value}%' },
+      splitLine: { lineStyle: { color: '#f0f0f0' } },
+    },
+    series: [
+      {
+        name: '窗口成功率', type: 'line', smooth: true, showSymbol: false,
+        // null 不连线：窗口内没有新完成的任务时该点无意义，断开比画成 0 诚实
+        connectNulls: false,
+        data: pts.map(p => p.win_success_rate),
+        lineStyle: { width: 2, color: '#6366f1' },
+        itemStyle: { color: '#6366f1' },
+        areaStyle: { color: 'rgba(99,102,241,0.10)' },
+      },
+      {
+        name: '累计成功率', type: 'line', smooth: true, showSymbol: false,
+        connectNulls: false,
+        data: pts.map(p => p.cum_success_rate),
+        lineStyle: { width: 1.5, color: '#94a3b8', type: 'dashed' },
+        itemStyle: { color: '#94a3b8' },
+      },
+    ],
+  }
+})
 function queueStatusType(s) {
   return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger' }[s] || ''
 }
@@ -1493,6 +1615,23 @@ async function startInstance() { await api.post(`/instances/${id}/start`); ElMes
 async function stopInstance() { await ElMessageBox.confirm('确认停止？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadData() }
 async function retryFailed() { router.push(`/create?copy_from=${id}&copy_complete_from=${id}`) }
 
+// 「操作」下拉的可用性：与原先三个按钮的 v-if 条件逐条对应，只是从「隐藏」
+// 改成「置灰」，用户能看到操作存在但当前状态下不可用。
+const canStart = computed(() => !['running', 'preparing'].includes(inst.value.status))
+const canStop = computed(() => ['running', 'queued'].includes(inst.value.status))
+const canRetry = computed(() =>
+  inst.value.failed_tasks > 0 && !['running', 'preparing'].includes(inst.value.status))
+
+function handleCommand(cmd) {
+  const actions = {
+    copy: () => router.push(`/create?copy_from=${id}`),
+    start: () => canStart.value && startInstance(),
+    stop: () => canStop.value && stopInstance(),
+    retry: () => canRetry.value && retryFailed(),
+  }
+  actions[cmd]?.()
+}
+
 // ============ 配置文件查看 ============
 // 卡片上只有摘要，正文在弹窗里渲染：按行拆开配号、做 yaml/json 轻量着色，
 // 并支持搜索跳转。内容不再随页面常驻，首次打开弹窗时才拉正文。
@@ -1646,6 +1785,7 @@ const logContainer = ref(null)
 const logLoading = ref(false)
 const logSource = ref('main.log')
 const taskLogFiles = ref([])
+const taskLogMtimes = ref({})   // { 'task-3.log': 1762... } 日志文件最后写入时间（秒）
 const rawText = ref(null)
 const taskStatusMap = ref({})   // { task_idx: {status, category, code} }
 const categoryFilter = ref('')
@@ -1685,7 +1825,7 @@ function markerText(st) {
   return st.category || (st.status === '任务异常' ? 'X' : '')
 }
 
-// 按错误类型 + 关键字筛选 task 列表
+// 按错误类型 + 关键字筛选 task 列表；leftView='exec' 时改按执行（收尾）顺序排。
 const visibleTaskLogFiles = computed(() => {
   let list = taskLogFiles.value
   if (categoryFilter.value) {
@@ -1699,6 +1839,18 @@ const visibleTaskLogFiles = computed(() => {
   if (taskSearch.value.trim()) {
     const kw = taskSearch.value.trim().toLowerCase()
     list = list.filter(f => f.toLowerCase().includes(kw))
+  }
+  if (leftView.value === 'exec') {
+    // 后端给的是日志文件 mtime —— 近似「完成时间」而非开始时间。
+    // 没有 mtime 的（文件被清理等）沉到末尾，而不是当成 0 排到最前面。
+    const mt = taskLogMtimes.value
+    list = [...list].sort((a, b) => {
+      const ta = mt[a], tb = mt[b]
+      if (ta == null && tb == null) return 0
+      if (ta == null) return 1
+      if (tb == null) return -1
+      return execSortDesc.value ? tb - ta : ta - tb
+    })
   }
   return list
 })
@@ -1719,11 +1871,24 @@ const pagedTaskFiles = computed(() => {
   return visibleTaskLogFiles.value.slice(start, start + taskListPageSize)
 })
 
-// 筛选条件变化时回到第 1 页，否则可能停在一个超出新结果集的空页
-watch([categoryFilter, taskSearch], () => { taskListPage.value = 1 })
+// ---- 左栏视图切换：seq=编号顺序 / exec=执行顺序 / grp=失败类型分组 ----
+// 必须声明在下面的 watch 之前：<script setup> 里 const 有 TDZ，
+// watch 的依赖数组是立即求值的。
+const leftView = ref('seq')
+const execSortDesc = ref(false)   // 执行顺序：false=最早完成在前
+
+// 执行顺序视图的副标题：日志最后写入时间，只到秒。
+function execTimeOf(fname) {
+  const t = taskLogMtimes.value[fname]
+  if (t == null) return '—'
+  return new Date(t * 1000).toLocaleString('zh-CN', { hour12: false })
+}
+
+// 筛选条件变化时回到第 1 页，否则可能停在一个超出新结果集的空页。
+// leftView / 排序方向同理：换了视图后原页码对应的是另一批任务。
+watch([categoryFilter, taskSearch, leftView, execSortDesc], () => { taskListPage.value = 1 })
 
 // ---- 左栏：失败类型分组 ----
-const leftView = ref('seq')
 const expandedGroups = ref([])
 const openedCode = ref('')
 const codeTasks = ref([])
@@ -1977,6 +2142,7 @@ async function loadTaskLogFiles() {
   try {
     const res = await api.get(`/logs/${id}/task-log-list`)
     taskLogFiles.value = res.files || []
+    taskLogMtimes.value = res.mtimes || {}
   } catch { /* ignore */ }
 }
 
@@ -2613,6 +2779,11 @@ onMounted(async () => {
   // 顶部状态条 10s 轮询；overview 只在「配置信息」tab 需要（汇总/错误树都在那），
   // 其它 tab 只刷新实例本身，避免每个周期多打一次带目录扫描的 /overview。
   timer = setInterval(() => loadData(activeTab.value === 'config'), 10000)
+  // 趋势图单独一条更慢的轮询：后端每分钟才打一个点，跟着 10s 的状态轮询刷
+  // 只是白拉 6 次同样的数据。实例已是终态时不再刷新——采样序列不会再变。
+  metricsTimer = setInterval(() => {
+    if (activeTab.value === 'config' && inst.value.status === 'running') loadMetrics()
+  }, 60000)
   ensureTabLoaded(activeTab.value)
   if (activeTab.value === 'logs') {
     nextTick(() => { if (logContainer.value) logContainer.value.addEventListener('scroll', onScroll) })
@@ -2660,6 +2831,7 @@ watch(activeTab, (tab) => {
 
 onUnmounted(() => {
   clearInterval(timer)
+  clearInterval(metricsTimer)
   clearInterval(shallowTimer)
   clearInterval(deepPollTimer)
   stopExportPoll()
@@ -2793,6 +2965,16 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--text-muted);
 }
+/* 成功率趋势 */
+.trend-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 14px 0 2px; padding-top: 12px; border-top: 1px solid var(--border-color);
+}
+.trend-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.trend-empty {
+  padding: 24px 12px; text-align: center;
+  font-size: 12px; color: var(--text-muted); line-height: 1.6;
+}
 /* 异常明细折叠树 */
 .error-tree { margin-top: 6px; border-top: 1px solid var(--border-color); }
 .error-tree :deep(.el-collapse-item__header) { height: 40px; line-height: 40px; font-size: 14px; }
@@ -2849,7 +3031,19 @@ onUnmounted(() => {
 }
 .logc-left-switch { width: 100%; display: flex; }
 .logc-left-switch :deep(.el-radio-button) { flex: 1; }
-.logc-left-switch :deep(.el-radio-button__inner) { width: 100%; }
+/* 三个选项挤在窄侧栏里，收掉默认横向 padding 以免文字被截断 */
+.logc-left-switch :deep(.el-radio-button__inner) { width: 100%; padding-left: 6px; padding-right: 6px; }
+/* 执行顺序：排序方向 + 口径说明 */
+.logc-exec-bar { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.logc-exec-bar :deep(.el-radio-group) { flex: 1; display: flex; }
+.logc-exec-bar :deep(.el-radio-button) { flex: 1; }
+.logc-exec-bar :deep(.el-radio-button__inner) { width: 100%; padding-left: 6px; padding-right: 6px; }
+.logc-exec-help { color: var(--text-muted); cursor: help; flex: 0 0 auto; }
+/* 执行序号：固定宽度，避免三位数把任务名挤变形 */
+.logc-exec-idx {
+  flex: 0 0 26px; text-align: right; font-size: 11px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
 .logc-filters { display: flex; flex-direction: column; gap: 6px; }
 .logc-fixed { display: flex; flex-direction: column; gap: 4px; }
 .logc-hint { color: var(--text-muted); font-size: 12px; padding: 2px 4px; }

@@ -307,12 +307,25 @@ async def list_task_logs(
     inst = _get_instance(instance_id)
     logs_dir = os.path.join(_get_output_dir(inst["config_path"]), "logs")
     if not os.path.isdir(logs_dir):
-        return {"files": []}
+        return {"files": [], "mtimes": {}}
+    names = [f for f in os.listdir(logs_dir) if f.startswith("task-") and f.endswith(".log")]
     files = sorted(
-        [f for f in os.listdir(logs_dir) if f.startswith("task-") and f.endswith(".log")],
+        names,
         key=lambda f: int(m.group()) if (m := re.search(r'\d+', f)) else 0,
     )
-    return {"files": files}
+
+    # mtime 用于前端左栏的「执行顺序」视图：task_records 里没有任何开始/结束
+    # 时间戳，日志文件的最后写入时间是现成的近似——它代表该 task **最后一次
+    # 产生输出**的时刻，约等于完成时间，不是开始时间。并发跑时同一批 task 的
+    # mtime 会很接近，所以这个顺序是「谁先收尾」而非严格的调度顺序。
+    # 取不到 stat 的文件（并发清理等）直接跳过，不让整个接口 500。
+    mtimes = {}
+    for f in files:
+        try:
+            mtimes[f] = os.path.getmtime(os.path.join(logs_dir, f))
+        except OSError:
+            pass
+    return {"files": files, "mtimes": mtimes}
 
 
 def _tail_bytes(log_file: str, tail: int, chunk_size: int = 65536, end: int = -1) -> tuple[str, int, int]:

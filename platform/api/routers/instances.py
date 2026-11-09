@@ -2286,6 +2286,78 @@ def _count_config_files(root: str) -> int:
         return 0
 
 
+@router.get("/{instance_id}/metrics")
+def get_instance_metrics(
+    instance_id: str,
+    window: int = Query(15, ge=1, le=360, description="滑动窗口分钟数"),
+    user: dict = Depends(get_current_user),
+):
+    """实例进度采样序列 —— 详情页「任务执行情况」的成功率折线图数据源。
+
+    返回的每个点都带两类口径：
+      - `cum_success_rate`：到该时刻为止的**累计**成功率
+      - `win_success_rate`：与 window 分钟前那个点做差得到的**窗口内**成功率
+
+    窗口口径更能反映「现在跑得怎么样」—— 累计成功率在跑了几千个任务之后
+    会被历史压得几乎不动，看不出最近是不是开始大面积失败了。
+    窗口内没有新完成的任务时该点的 win_success_rate 为 None（前端断线而非画 0）。
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT ts, completed, failed, running, total FROM instance_metrics "
+            "WHERE instance_id=? ORDER BY ts ASC",
+            (instance_id,),
+        ).fetchall()
+    if not rows:
+        return {"instance_id": instance_id, "window_minutes": window, "points": []}
+
+    pts = []
+    for r in rows:
+        d = dict(r)
+        ts = d["ts"]
+        # sqlite 可能返回 str 或 datetime，统一成 datetime 再算窗口
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+        pts.append({
+            "ts": ts,
+            "completed": d["completed"] or 0,
+            "failed": d["failed"] or 0,
+            "running": d["running"] or 0,
+            "total": d["total"] or 0,
+        })
+
+    span = timedelta(minutes=window)
+    out = []
+    base = 0   # 滑动左端指针：序列按 ts 升序，左端只会右移，不必每点二分
+    for i, p in enumerate(pts):
+        finished = p["completed"] + p["failed"]
+        cum = round(p["completed"] / finished * 100, 1) if finished else None
+
+        while base < i and p["ts"] - pts[base]["ts"] > span:
+            base += 1
+        ref = pts[base]
+        d_done = p["completed"] - ref["completed"]
+        d_fail = p["failed"] - ref["failed"]
+        d_fin = d_done + d_fail
+        win = round(d_done / d_fin * 100, 1) if d_fin > 0 else None
+
+        out.append({
+            "ts": p["ts"].isoformat(timespec="seconds"),
+            "completed": p["completed"],
+            "failed": p["failed"],
+            "running": p["running"],
+            "total": p["total"],
+            "cum_success_rate": cum,
+            "win_success_rate": win,
+            "win_finished": d_fin,
+        })
+
+    return {"instance_id": instance_id, "window_minutes": window, "points": out}
+
+
 @router.post("/overview-batch")
 def get_overview_batch(payload: OverviewBatchRequest, user: dict = Depends(get_current_user)):
     """批量返回首页需要的概览字段。
@@ -2705,6 +2777,46 @@ def recover_orphan_preparing() -> int:
         return 0
 
 
+# 实例进度采样间隔（秒）。refresher 每 8s 跑一轮，按那个频率打点会让
+# instance_metrics 在一个长任务上堆出几万行，而折线图根本画不了那么密。
+METRICS_SAMPLE_INTERVAL = 60.0
+# instance_id -> 上次采样的单调时钟读数
+_metrics_last_sample: dict[str, float] = {}
+
+
+def _sample_instance_metrics(inst: dict) -> None:
+    """给 running 实例打一个进度采样点（节流到 METRICS_SAMPLE_INTERVAL）。
+
+    只写累计计数，不写成功率 —— 比率由前端按相邻两点做差算「窗口内成功率」。
+    采样失败不能影响 refresher 的主流程（状态同步、队列调度都挂在它上面），
+    所以整体 try/except 吞掉。
+    """
+    iid = inst.get("id")
+    if not iid:
+        return
+    now = time.monotonic()
+    last = _metrics_last_sample.get(iid)
+    if last is not None and now - last < METRICS_SAMPLE_INTERVAL:
+        return
+    try:
+        total = inst.get("total_tasks") or 0
+        completed = inst.get("completed_tasks") or 0
+        failed = inst.get("failed_tasks") or 0
+        finished = completed + failed
+        running_pods = 0
+        if total > finished:
+            running_pods = min(inst.get("concurrent_num") or 0, total - finished)
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO instance_metrics (instance_id, ts, completed, failed, running, total) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (iid, datetime.now(), completed, failed, running_pods, total),
+            )
+        _metrics_last_sample[iid] = now
+    except Exception:
+        pass
+
+
 def _refresh_running_once():
     """后台线程：预热 running/preparing 实例的状态与分析缓存。
 
@@ -2735,6 +2847,8 @@ def _refresh_running_once():
             inst = _sync_instance_status(inst, persist=True)
             if inst["status"] == "running":
                 _compute_analyze(inst["config_path"], inst["total_tasks"])
+                # 进度采样：画详情页成功率/吞吐折线用，内部按 60s 节流
+                _sample_instance_metrics(inst)
                 # 复用刚刷新的 file_state，把 per-task 明细写进 task_records
                 try:
                     _sync_task_records(inst["id"], inst["config_path"])
@@ -2762,6 +2876,10 @@ def _refresh_running_once():
                         _compute_analyze(inst["config_path"], inst["total_tasks"])
                     except Exception:
                         pass
+                    # 收尾采样：running 期间的最后一个点是「跑到一半」的，
+                    # 不补这一下，折线永远到不了最终值。绕过节流强制写入。
+                    _metrics_last_sample.pop(inst["id"], None)
+                    _sample_instance_metrics(inst)
                 # 队列续跑：本实例刚跑完，放行同队列的下一排队任务
                 if prev_status in ("running", "preparing") and inst.get("queue_id"):
                     queues_to_schedule.add(inst["queue_id"])
