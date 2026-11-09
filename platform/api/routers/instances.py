@@ -66,11 +66,13 @@ def _apply_timeout_settings(base, max_ttl_second: int) -> tuple[int, int, int]:
     base.run_config.task.query_timeout = query_timeout
     sandbox_key = sandbox_configs.active_sandbox_key(base)
     if sandbox_key and base.sandbox.get(sandbox_key) is not None:
-        # 模板/派生配置里可能没有这个键(或写成了别的形式), 此时直接赋值会抛
-        # ConfigAttributeError。用 force_add 保证缺失时补上, 存在时覆盖。
-        OmegaConf.update(
-            base, f"sandbox.{sandbox_key}.max_ttl_second", max_ttl_second, force_add=True
-        )
+        for field_name in ("max_ttl_second", "max_ttl_seconds"):
+            OmegaConf.update(
+                base,
+                f"sandbox.{sandbox_key}.{field_name}",
+                max_ttl_second,
+                force_add=True,
+            )
     return max_ttl_second, main_timeout, query_timeout
 
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
