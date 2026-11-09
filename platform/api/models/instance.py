@@ -85,7 +85,7 @@ class InstanceCreate(BaseModel):
     total_num: int = 0
     # 沙箱最大存活时间（秒），三层超时的唯一入口：主程序超时 = 该值 − 600s，
     # 单条 queries[].timeout = 该值 − 1200s（见 instances._apply_timeout_settings）。
-    max_ttl_second: int = 14400
+    max_ttl_second: int = 36000
 
     # openclaw.json 可配置项
     model_api_key: str = ""

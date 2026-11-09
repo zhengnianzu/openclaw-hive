@@ -1,6 +1,10 @@
 // 沙箱产物浏览的纯前端工具：扩展名分类、条目排序、大小格式化。
 // 只放无副作用的小函数，便于在组件外单测。
 
+// 带 .js 后缀：Vite 不需要，但这样纯 node 也能直接 import 本模块
+// （platform/test/test_trajectory_js.py 的对账测试就是拿 node 跑的）。
+import { detectTrajKind } from './trajectory.js'
+
 // 扩展名 → 分组。`.md` 归「文本」而不是「文档」，因为它是纯文本、直接预览即可；
 // 真正的「文档」是那些必须转换才能看的格式。
 // 与后端 api/services/artifact_store.py 的扩展名分类保持一致：
@@ -31,6 +35,9 @@ const GROUP_RULES = [
 ]
 
 export const GROUPS = [
+  // 「轨迹」排首位：分组视图的价值就在于它能看到 main + evaluator + 多 session
+  // 的**全部**轨迹，而会话详情弹窗只认一条（取最大的那个 session 文件）。
+  { id: 'traj', label: '轨迹' },
   ...GROUP_RULES.map(g => ({ id: g.id, label: g.label })),
   { id: 'other', label: '其它' },
 ]
@@ -44,6 +51,18 @@ export function groupOf(name) {
   const ext = extOf(name)
   const hit = GROUP_RULES.find(g => g.exts.includes(ext))
   return hit ? hit.id : 'other'
+}
+
+/**
+ * 分组判定（带路径）。轨迹文件必须按**相对路径**识别，不能只看扩展名：
+ * hermes 的 session_*.json 与 openjiuwen 的 query<N>.json 都是 .json，
+ * 和 traj_stats_result.json 这类普通配置同扩展名，只按扩展名会误伤。
+ *
+ * rel 为空时退化成 groupOf(name)（纯扩展名判定）。
+ */
+export function groupOfEntry(rel, name) {
+  if (rel && detectTrajKind(rel)) return 'traj'
+  return groupOf(name || rel || '')
 }
 
 export function groupLabel(id) {

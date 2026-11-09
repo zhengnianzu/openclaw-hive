@@ -1099,6 +1099,24 @@ def init_db_unlocked():
 
             CREATE INDEX IF NOT EXISTS idx_task_records_inst ON task_records(instance_id);
             CREATE INDEX IF NOT EXISTS idx_task_records_cat  ON task_records(instance_id, error_category);
+
+            -- 实例进度采样：详情页「任务执行情况」的成功率/吞吐折线图的数据源。
+            -- overview 接口只给当前时刻的快照，没有历史；这里由后台 refresher
+            -- 每隔一段时间给 running 实例打一个点，重启后历史仍在。
+            -- 只存累计计数，不存比率 —— 比率由前端按相邻两点做差得到「窗口内成功率」，
+            -- 存成比率的话换窗口大小就得重算，而且丢精度。
+            CREATE TABLE IF NOT EXISTS instance_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                ts TIMESTAMP NOT NULL,               -- 采样时刻（UTC naive，与表内其它时间列一致）
+                completed INTEGER DEFAULT 0,         -- 累计成功数
+                failed INTEGER DEFAULT 0,            -- 累计失败数
+                running INTEGER DEFAULT 0,           -- 该时刻在跑的 pod 数
+                total INTEGER DEFAULT 0              -- 任务总数（可能随配置补扫变化，一并留痕）
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_instance_metrics_inst
+                ON instance_metrics(instance_id, ts);
         """, task_data_schema(conn)))
 
         # migrate: 为已存在的 task_records 补列（IF NOT EXISTS 不会加列），风格同上

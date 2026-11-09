@@ -2,17 +2,48 @@
   <div v-loading="loading">
     <div class="header-row">
       <el-page-header @back="$router.back()">
-        <template #content>{{ inst.name || '实例详情' }}</template>
+        <!-- 标题带上「序号」和「Harness 类型」：实例名又长又像
+             （2611032107-wanyi26110321070534-d5b7），光看名字很难确认
+             自己打开的是不是首页点的那一条。序号用后端的持久编号
+             （与首页「序号」列同源，创建后不变），可直接口头/截图指认。 -->
+        <template #content>
+          <span class="title-row">
+            <span v-if="inst.seq" class="title-seq">#{{ inst.seq }}</span>
+            <span class="title-name">{{ inst.name || '实例详情' }}</span>
+            <el-tag v-if="inst.harness_type" size="small" :style="harnessTagStyle(inst.harness_type)">
+              {{ harnessLabel(inst.harness_type) }}
+            </el-tag>
+          </span>
+        </template>
       </el-page-header>
-      <div style="display:flex;gap:8px">
-        <el-button type="success" v-if="authStore.isOperator && !['running','preparing'].includes(inst.status)" @click="startInstance">
-          {{ inst.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
+      <!-- 操作统一收进一个下拉：原先 启动/停止/重跑失败 三个按钮按状态互斥显示，
+           同一位置在不同状态下变成不同按钮，容易误点。收拢后入口位置固定，
+           各项按状态 disable 而非消失，用户能看到「有这个操作、当前不可用」。
+           命令集与首页的「更多」下拉保持一致，两处行为相同。 -->
+      <el-dropdown v-if="authStore.isOperator" trigger="click" @command="handleCommand">
+        <el-button type="primary">
+          操作<el-icon style="margin-left:4px"><ArrowDown /></el-icon>
         </el-button>
-        <el-button type="danger" v-if="authStore.isOperator && ['running','queued'].includes(inst.status)" @click="stopInstance">
-          {{ inst.status === 'queued' ? '停止（退出队列）' : '停止' }}
-        </el-button>
-        <el-button type="warning" v-if="authStore.isOperator && inst.failed_tasks > 0 && !['running','preparing'].includes(inst.status)" @click="retryFailed">重跑失败</el-button>
-      </div>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="copy">
+              <el-icon><CopyDocument /></el-icon>复制（以此为模板新建）
+            </el-dropdown-item>
+            <el-dropdown-item command="start" divided :disabled="!canStart">
+              <el-icon><VideoPlay /></el-icon>
+              {{ inst.status === 'queued' ? '启动（重新加入排队）' : '启动' }}
+            </el-dropdown-item>
+            <el-dropdown-item command="stop" :disabled="!canStop">
+              <el-icon><VideoPause /></el-icon>
+              {{ inst.status === 'queued' ? '停止（退出队列）' : '停止' }}
+            </el-dropdown-item>
+            <el-dropdown-item command="retry" divided :disabled="!canRetry">
+              <el-icon><RefreshLeft /></el-icon>
+              重跑失败{{ inst.failed_tasks > 0 ? `（${inst.failed_tasks}）` : '' }}
+            </el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
     </div>
 
     <div v-if="inst.status === 'preparing'" class="glass-card" style="padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:10px">
@@ -24,18 +55,26 @@
     <el-tabs v-model="activeTab" class="detail-tabs">
       <!-- ================= 配置信息 ================= -->
       <el-tab-pane label="配置信息" name="config">
+        <!-- 概览卡：左侧图标色块 + 右侧「标签在上、数值在下」。
+             图标只是辅助识别，含义由标签文字承担，不靠色相单独区分。 -->
         <div class="stat-grid">
-          <div class="stat-card"><span class="stat-num">{{ overview.total }}</span><span class="stat-label">总任务</span></div>
-          <div class="stat-card"><span class="stat-num" style="color:#10b981">{{ overview.completed }}</span><span class="stat-label">已完成</span></div>
-          <div class="stat-card"><span class="stat-num" :style="{color: overview.failed > 0 ? '#ef4444' : ''}">{{ overview.failed }}</span><span class="stat-label">失败</span></div>
-          <div class="stat-card"><span class="stat-num" style="color:#f59e0b">{{ overview.running }}</span><span class="stat-label">运行中</span></div>
-          <div class="stat-card"><span class="stat-num">{{ overview.pending }}</span><span class="stat-label">队列中</span></div>
-          <div class="stat-card"><span class="stat-num" style="color:#6366f1">{{ overview.success_rate }}%</span><span class="stat-label">成功率</span></div>
+          <div v-for="s in statCards" :key="s.key" class="stat-card">
+            <span class="stat-icon" :style="{ background: s.tint, color: s.color }">
+              <el-icon :size="20"><component :is="s.icon" /></el-icon>
+            </span>
+            <span class="stat-body">
+              <span class="stat-label">{{ s.label }}</span>
+              <span class="stat-num" :style="{ color: s.color }">{{ s.value }}</span>
+            </span>
+          </div>
         </div>
 
         <el-row :gutter="20">
           <el-col :span="12">
-            <el-card header="实例信息">
+            <el-card class="sec-card">
+              <template #header>
+                <span class="sec-head"><el-icon class="sec-head-icon"><Postcard /></el-icon>实例信息</span>
+              </template>
               <el-descriptions :column="1" border>
                 <el-descriptions-item label="实例ID">{{ inst.id }}</el-descriptions-item>
                 <el-descriptions-item label="状态"><el-tag :type="statusColor(inst.status)">{{ statusText(inst.status) }}</el-tag></el-descriptions-item>
@@ -66,7 +105,10 @@
             </el-card>
           </el-col>
           <el-col :span="12">
-            <el-card header="任务执行情况">
+            <el-card class="sec-card">
+              <template #header>
+                <span class="sec-head"><el-icon class="sec-head-icon"><TrendCharts /></el-icon>任务执行情况</span>
+              </template>
               <div v-if="Object.keys(overview.error_breakdown || {}).length">
                 <!-- 环形图：任务的最终归属（成功/失败/异常/未执行）。
                      颜色是状态语义色，不随大小变；每段都带文字+数值图例，
@@ -89,6 +131,22 @@
                       <span class="donut-pct">{{ o.pct }}%</span>
                     </div>
                   </div>
+                </div>
+
+                <!-- 成功率趋势：数据来自后台每分钟一次的进度采样。
+                     默认看「窗口内成功率」而非累计——跑了几千个任务后累计值
+                     会被历史压得几乎不动，最近开始大面积失败也看不出来。 -->
+                <div class="trend-head">
+                  <span class="trend-title">成功率趋势</span>
+                  <el-radio-group v-model="trendWindow" size="small" @change="loadMetrics">
+                    <el-radio-button :value="5">5m</el-radio-button>
+                    <el-radio-button :value="15">15m</el-radio-button>
+                    <el-radio-button :value="60">1h</el-radio-button>
+                  </el-radio-group>
+                </div>
+                <EChart v-if="metricPoints.length >= 2" :option="trendOption" height="180px" />
+                <div v-else class="trend-empty">
+                  {{ metricsLoading ? '加载中…' : '暂无采样数据（运行中的实例每分钟采样一次，约 2 分钟后出现）' }}
                 </div>
 
                 <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
@@ -116,9 +174,19 @@
             </el-card>
           </el-col>
         </el-row>
-        <el-card header="创建参数" style="margin-top:20px" v-if="Object.keys(createParams).length">
-          <el-collapse v-model="expandedPanels">
-            <el-collapse-item title="基本配置" name="basic">
+        <el-card class="sec-card" style="margin-top:20px" v-if="Object.keys(createParams).length">
+          <template #header>
+            <span class="sec-head"><el-icon class="sec-head-icon"><Setting /></el-icon>创建参数</span>
+          </template>
+          <el-collapse v-model="expandedPanels" class="param-collapse">
+            <el-collapse-item name="basic">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><Setting /></el-icon>
+                  <span class="param-name">基本配置</span>
+                  <span class="param-peek">{{ peek.basic }}</span>
+                </span>
+              </template>
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="Harness类型">
@@ -142,7 +210,14 @@
               </el-descriptions>
             </el-collapse-item>
 
-            <el-collapse-item title="OBS配置" name="obs">
+            <el-collapse-item name="obs">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><FolderOpened /></el-icon>
+                  <span class="param-name">OBS配置</span>
+                  <span class="param-peek">{{ peek.obs }}</span>
+                </span>
+              </template>
               <el-descriptions :column="1" border size="small">
                 <el-descriptions-item label="技能目录">{{ obsPath(createParams.skill_dir) }}</el-descriptions-item>
                 <el-descriptions-item label="默认技能">{{ createParams.default_skills || '-' }}</el-descriptions-item>
@@ -153,7 +228,14 @@
               </el-descriptions>
             </el-collapse-item>
 
-            <el-collapse-item title="模型配置" name="model">
+            <el-collapse-item name="model">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><Cpu /></el-icon>
+                  <span class="param-name">模型配置</span>
+                  <span class="param-peek">{{ peek.model }}</span>
+                </span>
+              </template>
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="Base URL">{{ createParams.model_base_url || '-' }}</el-descriptions-item>
                 <el-descriptions-item label="API Key">{{ maskKey(createParams.model_api_key) }}</el-descriptions-item>
@@ -162,7 +244,14 @@
               </el-descriptions>
             </el-collapse-item>
 
-            <el-collapse-item title="用户模拟配置" name="agents">
+            <el-collapse-item name="agents">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><User /></el-icon>
+                  <span class="param-name">用户模拟配置</span>
+                  <span class="param-peek">{{ peek.agents }}</span>
+                </span>
+              </template>
               <template v-if="createParams.agents && createParams.agents.length">
                 <div v-for="(ag, idx) in createParams.agents" :key="idx" :style="idx > 0 ? 'margin-top:12px' : ''">
                   <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Agent {{ idx + 1 }}: {{ ag.name || '-' }}</div>
@@ -185,7 +274,14 @@
               <el-empty v-else description="未配置" :image-size="40" />
             </el-collapse-item>
 
-            <el-collapse-item title="高级配置" name="advanced">
+            <el-collapse-item name="advanced">
+              <template #title>
+                <span class="param-title">
+                  <el-icon class="param-icon"><Box /></el-icon>
+                  <span class="param-name">高级配置</span>
+                  <span class="param-peek">{{ peek.advanced }}</span>
+                </span>
+              </template>
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="起始索引">{{ createParams.start_index ?? 0 }}</el-descriptions-item>
                 <el-descriptions-item label="任务总数">{{ createParams.total_num ? createParams.total_num : '不限' }}</el-descriptions-item>
@@ -232,22 +328,90 @@
           </el-collapse>
         </el-card>
 
-        <el-card header="配置文件" style="margin-top:20px">
-          <el-tabs v-model="activeConfigTab" @tab-change="loadConfigContent">
+        <!-- 配置文件：卡片上只放摘要（文件数 / 最后更新 / 文件名快捷入口），
+             正文很长（几百行 yaml），塞在页面里会把下面的内容推没，
+             所以点开走弹窗看，弹窗里再给搜索 / 复制 / 下载 / 全屏。 -->
+        <el-card class="sec-card" style="margin-top:20px">
+          <template #header>
+            <span class="sec-head"><el-icon class="sec-head-icon"><Document /></el-icon>配置文件</span>
+          </template>
+          <div v-if="configFiles.length" class="cfg-summary">
+            <el-icon class="cfg-summary-icon" :size="22"><Document /></el-icon>
+            <div class="cfg-summary-main">
+              <div class="cfg-summary-title">配置文件（{{ configFiles.length }} 个）</div>
+              <div class="cfg-summary-sub">最后更新：{{ configLastModified || '-' }}</div>
+              <div class="cfg-chips">
+                <el-tag v-for="cf in configFiles" :key="cf.name" size="small"
+                  :type="cf.name === activeConfigTab ? 'primary' : 'info'"
+                  :effect="cf.name === activeConfigTab ? 'light' : 'plain'"
+                  class="cfg-chip" @click="openConfigViewer(cf.name)">{{ cf.name }}</el-tag>
+              </div>
+              <div class="cfg-actions">
+                <el-button size="small" :icon="View" @click="openConfigViewer()">查看配置</el-button>
+                <el-button size="small" :icon="CopyDocument" @click="copyConfigPath">复制路径</el-button>
+                <el-button size="small" :icon="Download" @click="downloadConfig()">下载</el-button>
+                <el-button size="small" text :loading="configLoading" @click="loadConfigFiles">刷新</el-button>
+              </div>
+            </div>
+          </div>
+          <el-empty v-else :description="configLoading ? '加载中' : '暂无配置文件'" :image-size="40" />
+        </el-card>
+
+        <!-- 配置文件查看弹窗 -->
+        <el-dialog v-model="configViewerOpen" :fullscreen="configFullscreen"
+          :width="configFullscreen ? undefined : '960px'" top="6vh"
+          class="cfg-dialog" append-to-body destroy-on-close>
+          <template #header>
+            <div class="cfg-dialog-head">
+              <span class="sec-head">
+                <el-icon class="sec-head-icon"><Document /></el-icon>
+                配置文件 · {{ activeConfigTab || '-' }}
+              </span>
+              <div class="cfg-dialog-ops">
+                <el-button size="small" :icon="CopyDocument" @click="copyConfigContent">复制</el-button>
+                <el-button size="small" :icon="Download" @click="downloadConfig()">下载</el-button>
+                <el-button size="small" :icon="FullScreen" @click="configFullscreen = !configFullscreen">
+                  {{ configFullscreen ? '退出全屏' : '全屏' }}
+                </el-button>
+              </div>
+            </div>
+          </template>
+
+          <el-tabs v-model="activeConfigTab" @tab-change="onConfigTabChange" class="cfg-dialog-tabs">
             <el-tab-pane v-for="cf in configFiles" :key="cf.name" :label="cf.name" :name="cf.name" />
           </el-tabs>
-          <el-button size="small" style="margin-bottom:12px" @click="loadConfigFiles" :loading="configLoading">刷新</el-button>
-          <pre class="config-preview" v-if="configContent">{{ configContent }}</pre>
-          <el-empty v-else-if="!configLoading" description="选择配置文件查看" :image-size="40" />
-        </el-card>
+
+          <div class="cfg-search">
+            <el-input v-model="configQuery" size="default" clearable placeholder="搜索配置项（支持键名、值或注释）"
+              :prefix-icon="Search" @keyup.enter="stepMatch(1)" />
+            <el-button-group>
+              <el-button :icon="ArrowUp" :disabled="!configMatches.length" @click="stepMatch(-1)" />
+              <el-button :icon="ArrowDown" :disabled="!configMatches.length" @click="stepMatch(1)" />
+            </el-button-group>
+            <span class="cfg-match-count" v-if="configQuery">
+              {{ configMatches.length ? `${configMatchIdx + 1} / ${configMatches.length}` : '无匹配' }}
+            </span>
+          </div>
+
+          <div class="cfg-code" :class="{ 'is-full': configFullscreen }" ref="cfgCodeEl" v-loading="configLoading">
+            <div v-for="ln in configLines" :key="ln.n" class="cfg-line"
+              :id="`cfg-l-${ln.n}`"
+              :class="{ 'is-hit': ln.hit, 'is-current': ln.n === currentMatchLine }">
+              <span class="cfg-ln">{{ ln.n }}</span>
+              <span class="cfg-text" v-html="ln.html"></span>
+            </div>
+            <el-empty v-if="!configLines.length && !configLoading" description="无内容" :image-size="40" />
+          </div>
+        </el-dialog>
       </el-tab-pane>
       <!-- ================= 日志 ================= -->
       <el-tab-pane label="日志" name="logs">
         <div class="logc">
-          <!-- ---------- 左栏：任务列表（顺序 / 失败分组） ---------- -->
+          <!-- ---------- 左栏：任务列表（编号顺序 / 执行顺序 / 失败分组） ---------- -->
           <div class="logc-left">
             <el-radio-group v-model="leftView" size="small" class="logc-left-switch">
               <el-radio-button value="seq">顺序列表</el-radio-button>
+              <el-radio-button value="exec">执行顺序</el-radio-button>
               <el-radio-button value="grp">失败类型分组</el-radio-button>
             </el-radio-group>
 
@@ -260,8 +424,8 @@
               </div>
             </div>
 
-            <!-- 顺序列表 -->
-            <template v-if="leftView === 'seq'">
+            <!-- 顺序列表 / 执行顺序：同一套列表，差别只在排序与副标题 -->
+            <template v-if="leftView === 'seq' || leftView === 'exec'">
               <div class="logc-filters">
                 <el-input v-model="taskSearch" placeholder="搜索 task 编号…" clearable size="small" />
                 <el-select v-model="categoryFilter" placeholder="状态" clearable size="small">
@@ -272,15 +436,34 @@
                   <el-option label="未分类 X" value="X" />
                 </el-select>
               </div>
+              <!-- 执行顺序视图：给出排序方向开关 + 口径说明。
+                   mtime 是日志最后写入时间，并发跑时同批任务非常接近，
+                   不说明的话用户会以为这是严格的调度先后。 -->
+              <div v-if="leftView === 'exec'" class="logc-exec-bar">
+                <el-radio-group v-model="execSortDesc" size="small">
+                  <el-radio-button :value="false">最早在前</el-radio-button>
+                  <el-radio-button :value="true">最近在前</el-radio-button>
+                </el-radio-group>
+                <el-tooltip placement="top"
+                  content="按日志文件最后写入时间排序，约等于任务收尾顺序；并发执行时同批任务时间非常接近">
+                  <el-icon class="logc-exec-help"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </div>
               <div class="logc-hint">共 {{ visibleTaskLogFiles.length }} 条</div>
               <el-scrollbar class="logc-list">
-                <div v-for="f in pagedTaskFiles" :key="f"
+                <div v-for="(f, i) in pagedTaskFiles" :key="f"
                   :class="['logc-item', { active: logSource === f }]"
                   @click="selectLogSource(f)">
+                  <span v-if="leftView === 'exec'" class="logc-exec-idx">
+                    {{ (taskListPage - 1) * taskListPageSize + i + 1 }}
+                  </span>
                   <span class="task-dot" :style="{ background: dotColor(taskStatusOf(f)) }"></span>
                   <div class="logc-item-main">
                     <div class="logc-item-name">{{ f.replace('.log', '') }}</div>
-                    <div class="logc-item-sub">{{ taskStatusOf(f)?.code || taskStatusOf(f)?.status || '—' }}</div>
+                    <div class="logc-item-sub">
+                      <template v-if="leftView === 'exec'">{{ execTimeOf(f) }}</template>
+                      <template v-else>{{ taskStatusOf(f)?.code || taskStatusOf(f)?.status || '—' }}</template>
+                    </div>
                   </div>
                   <el-tag v-if="markerText(taskStatusOf(f))" size="small"
                     :type="markerType(taskStatusOf(f))" disable-transitions>
@@ -941,25 +1124,7 @@
         <el-tabs v-model="detailTab" class="detail-sub-tabs">
           <!-- 轨迹 -->
           <el-tab-pane label="轨迹" name="traj">
-            <div v-if="assistantBlocks.length" class="traj-viewer">
-              <div v-for="(b, i) in assistantBlocks" :key="i" class="traj-block" :class="`traj-${b.role || 'meta'}`">
-                <div class="traj-block-head">
-                  <span class="traj-role">{{ roleLabel(b) }}</span>
-                  <span v-if="b.part_type === 'thinking'" class="traj-type">thinking</span>
-                  <span v-if="b.tool_name" class="traj-tool">{{ b.tool_name }}</span>
-                  <span v-if="b.part_type === 'toolCall'" class="traj-type">toolCall</span>
-                  <span v-if="b.isError || b.exitCode" class="traj-err">exit {{ b.exitCode ?? '?' }}</span>
-                  <el-icon v-if="i < assistantBlocks.length - 1" class="traj-fold" :size="14"
-                    @click="toggleBlock(i)">
-                    <ArrowDown v-if="!collapsedBlocks[i]" /><ArrowRight v-else />
-                  </el-icon>
-                </div>
-                <div v-if="!collapsedBlocks[i] && (b.content || b.args)" class="traj-body">
-                  <pre v-if="b.content" class="traj-content">{{ b.content }}</pre>
-                  <pre v-if="b.args" class="traj-args">{{ b.args }}</pre>
-                </div>
-              </div>
-            </div>
+            <TrajBlocks v-if="assistantBlocks.length" :blocks="assistantBlocks" />
             <el-empty v-else description="无 assistant 轨迹" :image-size="40" />
           </el-tab-pane>
 
@@ -1009,16 +1174,10 @@
                 <span v-else style="color:#c0c4cc">—</span>
               </div>
             </div>
-            <div v-if="evaluatorBlocks.length" class="traj-viewer" style="margin-top:12px">
-              <div v-for="(b, i) in evaluatorBlocks" :key="i" class="traj-block" :class="`traj-${b.role || 'meta'}`">
-                <div class="traj-block-head">
-                  <span class="traj-role">{{ roleLabel(b) }}</span>
-                  <span v-if="b.part_type === 'thinking'" class="traj-type">thinking</span>
-                  <span v-if="b.tool_name" class="traj-tool">{{ b.tool_name }}</span>
-                </div>
-                <pre v-if="b.content" class="traj-content">{{ b.content }}</pre>
-              </div>
-            </div>
+            <!-- 原来这里是「无折叠、不显示 args」的简化版，与上面「轨迹」tab 各写一份。
+                 统一到 TrajBlocks 后 evaluator 轨迹也能折叠、也能看到工具入参。 -->
+            <TrajBlocks v-if="evaluatorBlocks.length" :blocks="evaluatorBlocks"
+              style="margin-top:12px" />
             <el-empty v-else description="无 evaluator 轨迹" :image-size="40" style="margin-top:12px" />
           </el-tab-pane>
         </el-tabs>
@@ -1062,9 +1221,15 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, ArrowRight, Search, Folder, Document, Loading, Clock } from '@element-plus/icons-vue'
+import {
+  ArrowDown, ArrowRight, ArrowUp, Box, CircleCheckFilled, CircleCloseFilled, Clock,
+  CopyDocument, Cpu, DataLine, Document, Download, Files, FolderOpened, FullScreen,
+  Loading, Postcard, QuestionFilled, RefreshLeft, Search, Setting, Timer, TrendCharts,
+  User, VideoPause, VideoPlay, View,
+} from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
+import TrajBlocks from '../components/TrajBlocks.vue'
 import EChart from '../components/EChart.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -1099,7 +1264,7 @@ watch(activeTab, (tab) => {
 function ensureTabLoaded(tab) {
   if (loadedTabs.has(tab)) return
   loadedTabs.add(tab)
-  if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles() }
+  if (tab === 'config') { loadData(); loadCreateParams(); loadConfigFiles(); loadMetrics() }
   // 日志 tab 的「失败类型分组」用的是 overview.error_tree，而 overview 默认只在
   // config tab 拉。直接进 ?tab=logs 时它还是空的，这里补一次。
   else if (tab === 'logs') {
@@ -1119,6 +1284,22 @@ const createParams = ref({})
 const expandedPanels = ref([])
 const expandedErrorGroups = ref([])
 let timer = null
+let metricsTimer = null
+
+// ── 顶部概览卡 ───────────────────────────────────────────────────────────
+// 颜色与下面环形图的状态语义色同源（成功绿 / 失败红 / 运行中橙 / 中性）。
+// tint 是同色的浅底，只给图标块用，不承担含义。
+const statCards = computed(() => {
+  const o = overview.value
+  return [
+    { key: 'total', label: '总任务', value: o.total, icon: Files, color: '#475569', tint: '#eef2f7' },
+    { key: 'completed', label: '已完成', value: o.completed, icon: CircleCheckFilled, color: '#0ca30c', tint: '#e8f6e8' },
+    { key: 'failed', label: '失败', value: o.failed, icon: CircleCloseFilled, color: o.failed > 0 ? '#d03b3b' : '#475569', tint: '#fdecec' },
+    { key: 'running', label: '运行中', value: o.running, icon: VideoPlay, color: '#c98500', tint: '#fdf3e0' },
+    { key: 'pending', label: '队列中', value: o.pending, icon: Timer, color: '#475569', tint: '#eef2f7' },
+    { key: 'rate', label: '成功率', value: `${o.success_rate}%`, icon: DataLine, color: '#6366f1', tint: '#eeeefc' },
+  ]
+})
 
 // ── 任务执行情况环形图 ────────────────────────────────────────────────────
 // 四类最终归属：成功 / 失败 / 异常 / 未执行。颜色是状态语义色（good / critical /
@@ -1179,6 +1360,71 @@ const outcomeOption = computed(() => {
 
 function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger', created: '' }[s] || '' }
 function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s }
+
+// ── 成功率趋势 ──────────────────────────────────────────────────────────
+// 数据源是后台每分钟一次的 instance_metrics 采样（overview 只有当前快照）。
+const metricPoints = ref([])
+const metricsLoading = ref(false)
+const trendWindow = ref(15)
+
+async function loadMetrics() {
+  metricsLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/metrics`, { params: { window: trendWindow.value } })
+    metricPoints.value = res.points || []
+  } catch { metricPoints.value = [] } finally { metricsLoading.value = false }
+}
+
+const trendOption = computed(() => {
+  const pts = metricPoints.value
+  const labels = pts.map(p => p.ts.slice(11, 16))   // HH:MM
+  return {
+    tooltip: {
+      trigger: 'axis',
+      formatter: (ps) => {
+        const i = ps[0]?.dataIndex ?? 0
+        const p = pts[i]
+        if (!p) return ''
+        const win = p.win_success_rate == null ? '—' : `${p.win_success_rate}%`
+        const cum = p.cum_success_rate == null ? '—' : `${p.cum_success_rate}%`
+        return `${p.ts.replace('T', ' ')}<br/>`
+          + `窗口成功率：<b>${win}</b>（${p.win_finished} 个完成）<br/>`
+          + `累计成功率：${cum}<br/>`
+          + `成功 ${p.completed} · 失败 ${p.failed}`
+      },
+    },
+    legend: { data: ['窗口成功率', '累计成功率'], bottom: 0, itemHeight: 8, textStyle: { fontSize: 11 } },
+    grid: { left: 38, right: 12, top: 12, bottom: 32 },
+    xAxis: {
+      type: 'category', data: labels, boundaryGap: false,
+      axisLabel: { fontSize: 10, color: '#94a3b8' },
+      axisLine: { lineStyle: { color: '#e5e7eb' } },
+    },
+    yAxis: {
+      type: 'value', min: 0, max: 100,
+      axisLabel: { fontSize: 10, color: '#94a3b8', formatter: '{value}%' },
+      splitLine: { lineStyle: { color: '#f0f0f0' } },
+    },
+    series: [
+      {
+        name: '窗口成功率', type: 'line', smooth: true, showSymbol: false,
+        // null 不连线：窗口内没有新完成的任务时该点无意义，断开比画成 0 诚实
+        connectNulls: false,
+        data: pts.map(p => p.win_success_rate),
+        lineStyle: { width: 2, color: '#6366f1' },
+        itemStyle: { color: '#6366f1' },
+        areaStyle: { color: 'rgba(99,102,241,0.10)' },
+      },
+      {
+        name: '累计成功率', type: 'line', smooth: true, showSymbol: false,
+        connectNulls: false,
+        data: pts.map(p => p.cum_success_rate),
+        lineStyle: { width: 1.5, color: '#94a3b8', type: 'dashed' },
+        itemStyle: { color: '#94a3b8' },
+      },
+    ],
+  }
+})
 function queueStatusType(s) {
   return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger' }[s] || ''
 }
@@ -1301,6 +1547,46 @@ const trajSaveFullPath = computed(() => {
   return `${String(bucket).replace(/\/+$/, '')}/${String(rawPath).replace(/^\/+/, '')}`
 })
 
+// 折叠面板收起时的摘要：每组挑 2~3 个最能定位配置的字段拼一行，
+// 省得为了确认「用的哪个模型/哪个桶」把五个面板挨个展开。
+// 只取已有值的字段，全空时返回空串（模板里就什么都不显示）。
+const peek = computed(() => {
+  const cp = createParams.value
+  const join = (...parts) => parts.filter(Boolean).join(' · ')
+  const short = (v, n = 28) => {
+    const s = String(v ?? '')
+    return s.length > n ? s.slice(0, n) + '…' : s
+  }
+
+  const agentCount = cp.agents?.length
+  const agentModel = cp.agents?.[0]?.model || cp.user_proxy_model_name
+
+  return {
+    basic: join(
+      cp.harness_type && `环境: ${harnessLabel(cp.harness_type)}`,
+      cp.task_name && `项目: ${short(cp.task_name)}`,
+      cp.harness_config_name && `配置: ${short(cp.harness_config_name)}`,
+    ),
+    obs: join(
+      cp.obs_bucket && `数据桶: ${short(cp.obs_bucket)}`,
+      cp.default_skills && `技能: ${short(cp.default_skills, 20)}`,
+    ),
+    model: join(
+      cp.model_id && `模型: ${short(cp.model_id)}`,
+      cp.model_api_type && `类型: ${cp.model_api_type}`,
+    ),
+    agents: join(
+      agentCount ? `Agent 数: ${agentCount}` : (agentModel ? '单模型' : ''),
+      agentModel && `模拟模型: ${short(agentModel)}`,
+    ),
+    advanced: join(
+      cp.sandbox_config_name && `沙箱: ${short(cp.sandbox_config_name, 20)}`,
+      cp.total_num ? `任务数: ${cp.total_num}` : '任务数: 不限',
+      inst.value.concurrent_num && `并发: ${inst.value.concurrent_num}`,
+    ),
+  }
+})
+
 async function copyTrajPath() {
   try {
     await navigator.clipboard.writeText(trajSaveFullPath.value)
@@ -1329,12 +1615,168 @@ async function startInstance() { await api.post(`/instances/${id}/start`); ElMes
 async function stopInstance() { await ElMessageBox.confirm('确认停止？', '提示', { type: 'warning' }); await api.post(`/instances/${id}/stop`); ElMessage.success('已停止'); loadData() }
 async function retryFailed() { router.push(`/create?copy_from=${id}&copy_complete_from=${id}`) }
 
-const configFiles = ref([]); const configLoading = ref(false); const activeConfigTab = ref(''); const configContent = ref('')
+// 「操作」下拉的可用性：与原先三个按钮的 v-if 条件逐条对应，只是从「隐藏」
+// 改成「置灰」，用户能看到操作存在但当前状态下不可用。
+const canStart = computed(() => !['running', 'preparing'].includes(inst.value.status))
+const canStop = computed(() => ['running', 'queued'].includes(inst.value.status))
+const canRetry = computed(() =>
+  inst.value.failed_tasks > 0 && !['running', 'preparing'].includes(inst.value.status))
+
+function handleCommand(cmd) {
+  const actions = {
+    copy: () => router.push(`/create?copy_from=${id}`),
+    start: () => canStart.value && startInstance(),
+    stop: () => canStop.value && stopInstance(),
+    retry: () => canRetry.value && retryFailed(),
+  }
+  actions[cmd]?.()
+}
+
+// ============ 配置文件查看 ============
+// 卡片上只有摘要，正文在弹窗里渲染：按行拆开配号、做 yaml/json 轻量着色，
+// 并支持搜索跳转。内容不再随页面常驻，首次打开弹窗时才拉正文。
+const configFiles = ref([])
+const configLoading = ref(false)
+const activeConfigTab = ref('')
+const configContent = ref('')
+const configViewerOpen = ref(false)
+const configFullscreen = ref(false)
+const configQuery = ref('')
+const configMatchIdx = ref(0)
+const cfgCodeEl = ref(null)
+
 async function loadConfigFiles() {
   configLoading.value = true
-  try { const res = await api.get(`/instances/${id}/configs`); configFiles.value = res.files || []; if (configFiles.value.length && !activeConfigTab.value) { activeConfigTab.value = configFiles.value[0].name; loadConfigContent(activeConfigTab.value) } } finally { configLoading.value = false }
+  try {
+    const res = await api.get(`/instances/${id}/configs`)
+    configFiles.value = res.files || []
+    // 只定位默认文件，正文等打开弹窗再拉——列表页不需要几百行 yaml。
+    if (configFiles.value.length && !activeConfigTab.value) {
+      activeConfigTab.value = configFiles.value[0].name
+    }
+  } finally { configLoading.value = false }
 }
-async function loadConfigContent(filename) { if (!filename) return; try { const res = await api.get(`/instances/${id}/configs/${filename}`); configContent.value = res.content } catch { configContent.value = '' } }
+
+async function loadConfigContent(filename) {
+  if (!filename) return
+  configLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/configs/${filename}`)
+    configContent.value = res.content
+  } catch { configContent.value = '' } finally { configLoading.value = false }
+}
+
+// 卡片摘要里的「最后更新」取所有配置文件里最新的 mtime。
+const configLastModified = computed(() => {
+  const ts = configFiles.value.map(f => f.modified_at).filter(Boolean).sort()
+  return ts.length ? ts[ts.length - 1].replace('T', ' ').slice(0, 19) : ''
+})
+
+async function openConfigViewer(filename) {
+  const target = filename || activeConfigTab.value || configFiles.value[0]?.name
+  if (!target) return
+  configViewerOpen.value = true
+  if (target !== activeConfigTab.value || !configContent.value) {
+    activeConfigTab.value = target
+    configQuery.value = ''
+    await loadConfigContent(target)
+  }
+}
+
+function onConfigTabChange(name) {
+  configQuery.value = ''
+  configMatchIdx.value = 0
+  loadConfigContent(name)
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// 轻量着色：只认 yaml/json 里「键名 / 字符串 / 数字与布尔 / 注释」四类，
+// 不引语法高亮库——配置文件就这两种格式，正则够用且没有额外依赖。
+function highlightConfigLine(raw) {
+  const text = escapeHtml(raw)
+  const comment = text.match(/(^|\s)#.*$/)
+  let code = text, tail = ''
+  if (comment) {
+    const at = comment.index + comment[1].length
+    code = text.slice(0, at)
+    tail = `<span class="t-cmt">${text.slice(at)}</span>`
+  }
+  code = code
+    .replace(/^(\s*-?\s*)("?[\w.-]+"?)(\s*:)/, '$1<span class="t-key">$2</span>$3')
+    .replace(/:(\s+)('[^']*'|"[^"]*")/g, ':$1<span class="t-str">$2</span>')
+    .replace(/:(\s+)(true|false|null|-?\d+(?:\.\d+)?)(\s*,?)$/g, ':$1<span class="t-num">$2</span>$3')
+  return code + tail
+}
+
+const configLines = computed(() => {
+  if (!configContent.value) return []
+  const q = configQuery.value.trim().toLowerCase()
+  return configContent.value.split('\n').map((raw, i) => ({
+    n: i + 1,
+    hit: !!q && raw.toLowerCase().includes(q),
+    html: highlightConfigLine(raw),
+  }))
+})
+
+const configMatches = computed(() => configLines.value.filter(l => l.hit).map(l => l.n))
+const currentMatchLine = computed(() => configMatches.value[configMatchIdx.value] ?? -1)
+
+// 搜索词一变，命中集就变了，游标必须归零，否则会停在越界的下标上。
+watch(configQuery, () => { configMatchIdx.value = 0; scrollToMatch() })
+
+function stepMatch(delta) {
+  const n = configMatches.value.length
+  if (!n) return
+  configMatchIdx.value = (configMatchIdx.value + delta + n) % n
+  scrollToMatch()
+}
+
+function scrollToMatch() {
+  nextTick(() => {
+    const line = currentMatchLine.value
+    if (line < 0 || !cfgCodeEl.value) return
+    cfgCodeEl.value.querySelector(`#cfg-l-${line}`)
+      ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  })
+}
+
+async function copyConfigContent() {
+  if (!configContent.value) return ElMessage.warning('暂无内容')
+  try {
+    await navigator.clipboard.writeText(configContent.value)
+    ElMessage.success('已复制配置内容')
+  } catch { ElMessage.warning('复制失败，请手动选择复制') }
+}
+
+async function copyConfigPath() {
+  const p = inst.value.config_path
+  if (!p) return ElMessage.warning('暂无配置路径')
+  try {
+    await navigator.clipboard.writeText(p)
+    ElMessage.success('已复制配置路径')
+  } catch { ElMessage.warning('复制失败，请手动选择复制') }
+}
+
+// 下载走前端生成 Blob：正文已在手上（且后端做过 key 脱敏），
+// 另开一个下载接口反而会绕过那层脱敏。
+async function downloadConfig(filename) {
+  const target = filename || activeConfigTab.value
+  if (!target) return ElMessage.warning('请先选择配置文件')
+  if (target !== activeConfigTab.value || !configContent.value) {
+    activeConfigTab.value = target
+    await loadConfigContent(target)
+  }
+  if (!configContent.value) return ElMessage.warning('暂无内容')
+  const url = URL.createObjectURL(new Blob([configContent.value], { type: 'text/plain;charset=utf-8' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${id}-${target}`
+  a.click()
+  URL.revokeObjectURL(url)
+}
 
 // ============ 日志 tab ============
 const filterKeyword = ref('')
@@ -1343,6 +1785,7 @@ const logContainer = ref(null)
 const logLoading = ref(false)
 const logSource = ref('main.log')
 const taskLogFiles = ref([])
+const taskLogMtimes = ref({})   // { 'task-3.log': 1762... } 日志文件最后写入时间（秒）
 const rawText = ref(null)
 const taskStatusMap = ref({})   // { task_idx: {status, category, code} }
 const categoryFilter = ref('')
@@ -1382,7 +1825,7 @@ function markerText(st) {
   return st.category || (st.status === '任务异常' ? 'X' : '')
 }
 
-// 按错误类型 + 关键字筛选 task 列表
+// 按错误类型 + 关键字筛选 task 列表；leftView='exec' 时改按执行（收尾）顺序排。
 const visibleTaskLogFiles = computed(() => {
   let list = taskLogFiles.value
   if (categoryFilter.value) {
@@ -1396,6 +1839,18 @@ const visibleTaskLogFiles = computed(() => {
   if (taskSearch.value.trim()) {
     const kw = taskSearch.value.trim().toLowerCase()
     list = list.filter(f => f.toLowerCase().includes(kw))
+  }
+  if (leftView.value === 'exec') {
+    // 后端给的是日志文件 mtime —— 近似「完成时间」而非开始时间。
+    // 没有 mtime 的（文件被清理等）沉到末尾，而不是当成 0 排到最前面。
+    const mt = taskLogMtimes.value
+    list = [...list].sort((a, b) => {
+      const ta = mt[a], tb = mt[b]
+      if (ta == null && tb == null) return 0
+      if (ta == null) return 1
+      if (tb == null) return -1
+      return execSortDesc.value ? tb - ta : ta - tb
+    })
   }
   return list
 })
@@ -1416,11 +1871,24 @@ const pagedTaskFiles = computed(() => {
   return visibleTaskLogFiles.value.slice(start, start + taskListPageSize)
 })
 
-// 筛选条件变化时回到第 1 页，否则可能停在一个超出新结果集的空页
-watch([categoryFilter, taskSearch], () => { taskListPage.value = 1 })
+// ---- 左栏视图切换：seq=编号顺序 / exec=执行顺序 / grp=失败类型分组 ----
+// 必须声明在下面的 watch 之前：<script setup> 里 const 有 TDZ，
+// watch 的依赖数组是立即求值的。
+const leftView = ref('seq')
+const execSortDesc = ref(false)   // 执行顺序：false=最早完成在前
+
+// 执行顺序视图的副标题：日志最后写入时间，只到秒。
+function execTimeOf(fname) {
+  const t = taskLogMtimes.value[fname]
+  if (t == null) return '—'
+  return new Date(t * 1000).toLocaleString('zh-CN', { hour12: false })
+}
+
+// 筛选条件变化时回到第 1 页，否则可能停在一个超出新结果集的空页。
+// leftView / 排序方向同理：换了视图后原页码对应的是另一批任务。
+watch([categoryFilter, taskSearch, leftView, execSortDesc], () => { taskListPage.value = 1 })
 
 // ---- 左栏：失败类型分组 ----
-const leftView = ref('seq')
 const expandedGroups = ref([])
 const openedCode = ref('')
 const codeTasks = ref([])
@@ -1674,6 +2142,7 @@ async function loadTaskLogFiles() {
   try {
     const res = await api.get(`/logs/${id}/task-log-list`)
     taskLogFiles.value = res.files || []
+    taskLogMtimes.value = res.mtimes || {}
   } catch { /* ignore */ }
 }
 
@@ -2162,7 +2631,6 @@ const detailStatusHint = ref('')
 const detailData = ref(null)
 const detailTab = ref('traj')
 const logTab = ref('task')
-const collapsedBlocks = ref({})
 const detailLogTailFull = ref(false)
 let deepPollTimer = null
 
@@ -2231,7 +2699,6 @@ async function openTaskDetail(row) {
   detailLoading.value = true
   detailTab.value = 'traj'
   logTab.value = 'task'
-  collapsedBlocks.value = {}
   detailLogTailFull.value = false
   detailStatusHint.value = '正在读取本地交付物…'
   await fetchDetail()
@@ -2290,22 +2757,8 @@ async function pollDeep() {
   await fetchDetail()
 }
 
-// 轨迹 viewer 辅助
-function roleLabel(b) {
-  if (!b) return '?'
-  const map = {
-    assistant: '助手',
-    user: '用户',
-    toolResult: '工具结果',
-    thinking: '思考',
-    toolCall: '工具调用',
-    meta: '系统',
-  }
-  return map[b.role] || map[b.part_type] || b.role || b.part_type || '系统'
-}
-function toggleBlock(i) {
-  collapsedBlocks.value = { ...collapsedBlocks.value, [i]: !collapsedBlocks.value[i] }
-}
+// roleLabel / toggleBlock / collapsedBlocks 已随气泡模板搬进
+// components/TrajBlocks.vue（折叠态由组件自管）。
 function logDisplayText(text) {
   if (detailLogTailFull.value) return text
   return (text || '').slice(-20000)
@@ -2326,6 +2779,11 @@ onMounted(async () => {
   // 顶部状态条 10s 轮询；overview 只在「配置信息」tab 需要（汇总/错误树都在那），
   // 其它 tab 只刷新实例本身，避免每个周期多打一次带目录扫描的 /overview。
   timer = setInterval(() => loadData(activeTab.value === 'config'), 10000)
+  // 趋势图单独一条更慢的轮询：后端每分钟才打一个点，跟着 10s 的状态轮询刷
+  // 只是白拉 6 次同样的数据。实例已是终态时不再刷新——采样序列不会再变。
+  metricsTimer = setInterval(() => {
+    if (activeTab.value === 'config' && inst.value.status === 'running') loadMetrics()
+  }, 60000)
   ensureTabLoaded(activeTab.value)
   if (activeTab.value === 'logs') {
     nextTick(() => { if (logContainer.value) logContainer.value.addEventListener('scroll', onScroll) })
@@ -2373,6 +2831,7 @@ watch(activeTab, (tab) => {
 
 onUnmounted(() => {
   clearInterval(timer)
+  clearInterval(metricsTimer)
   clearInterval(shallowTimer)
   clearInterval(deepPollTimer)
   stopExportPoll()
@@ -2396,6 +2855,14 @@ onUnmounted(() => {
   word-break: break-all;
 }
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+/* 详情页标题：序号 + 实例名 + Harness 标签 */
+.title-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.title-seq {
+  flex: 0 0 auto; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--text-muted); background: var(--bg-hover);
+  border: 1px solid var(--border-color); border-radius: 6px; padding: 1px 8px;
+}
+.title-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-tabs { margin-top: 4px; }
 
 /* ---- 配置信息 tab ---- */
@@ -2406,11 +2873,71 @@ onUnmounted(() => {
 }
 .stat-card {
   background: #fff; border: 1px solid var(--border-color); border-radius: var(--radius-md);
-  padding: 16px 20px; display: flex; flex-direction: column; align-items: center;
+  padding: 14px 16px; display: flex; align-items: center; gap: 12px;
   box-shadow: var(--shadow-sm);
 }
-.stat-num { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.2; }
-.stat-label { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+.stat-icon {
+  flex: 0 0 40px; width: 40px; height: 40px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+}
+.stat-body { display: flex; flex-direction: column; min-width: 0; }
+.stat-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.15; }
+.stat-label { font-size: 13px; color: var(--text-muted); margin-bottom: 2px; }
+
+/* 卡片标题：图标 + 文字。图标只是分区锚点，含义由文字承担。 */
+.sec-head { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--text-primary); }
+.sec-head-icon { color: var(--accent-purple); font-size: 17px; }
+
+/* 创建参数折叠面板：收起时在标题右侧给一行灰色摘要 */
+.param-collapse :deep(.el-collapse-item__header) { height: 46px; line-height: 46px; }
+.param-title { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding-right: 8px; }
+.param-icon { color: var(--accent-purple); font-size: 16px; flex: 0 0 auto; }
+.param-name { font-weight: 600; color: var(--text-primary); flex: 0 0 auto; }
+.param-peek {
+  flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--text-muted);
+  font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 配置文件摘要卡 */
+.cfg-summary { display: flex; gap: 12px; align-items: flex-start; }
+.cfg-summary-icon {
+  flex: 0 0 40px; width: 40px; height: 40px; border-radius: 10px;
+  background: #eeeefc; color: var(--accent-purple);
+  display: flex; align-items: center; justify-content: center;
+}
+.cfg-summary-main { flex: 1 1 auto; min-width: 0; }
+.cfg-summary-title { font-weight: 600; color: var(--text-primary); }
+.cfg-summary-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.cfg-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.cfg-chip { cursor: pointer; }
+.cfg-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+/* 配置文件弹窗 */
+.cfg-dialog :deep(.el-dialog__body) { padding-top: 8px; }
+.cfg-dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cfg-dialog-ops { display: flex; gap: 8px; }
+.cfg-dialog-tabs :deep(.el-tabs__header) { margin-bottom: 12px; }
+.cfg-search { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.cfg-match-count { font-size: 12px; color: var(--text-muted); white-space: nowrap; min-width: 56px; }
+.cfg-code {
+  background: #1e293b; border-radius: var(--radius-sm); padding: 12px 0;
+  max-height: 60vh; overflow: auto;
+  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; line-height: 1.6;
+}
+.cfg-code.is-full { max-height: calc(100vh - 300px); }
+.cfg-line { display: flex; padding: 0 12px; }
+.cfg-line.is-hit { background: rgba(245, 158, 11, 0.16); }
+.cfg-line.is-current { background: rgba(245, 158, 11, 0.34); }
+.cfg-ln {
+  flex: 0 0 44px; text-align: right; padding-right: 12px;
+  color: #64748b; user-select: none; font-variant-numeric: tabular-nums;
+}
+.cfg-text { flex: 1 1 auto; min-width: 0; color: #e2e8f0; white-space: pre-wrap; word-break: break-all; }
+/* yaml/json 着色：键名蓝、字符串绿、数值橙、注释灰（都在深底上过 4.5:1） */
+.cfg-text :deep(.t-key) { color: #7dd3fc; }
+.cfg-text :deep(.t-str) { color: #86efac; }
+.cfg-text :deep(.t-num) { color: #fdba74; }
+.cfg-text :deep(.t-cmt) { color: #94a3b8; font-style: italic; }
 .breakdown-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); }
 .breakdown-row:last-child { border-bottom: none; }
 /* 任务执行情况：左环形图 + 右图例。图例带文字和数值，色块只是辅助识别，
@@ -2438,6 +2965,16 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--text-muted);
 }
+/* 成功率趋势 */
+.trend-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 14px 0 2px; padding-top: 12px; border-top: 1px solid var(--border-color);
+}
+.trend-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.trend-empty {
+  padding: 24px 12px; text-align: center;
+  font-size: 12px; color: var(--text-muted); line-height: 1.6;
+}
 /* 异常明细折叠树 */
 .error-tree { margin-top: 6px; border-top: 1px solid var(--border-color); }
 .error-tree :deep(.el-collapse-item__header) { height: 40px; line-height: 40px; font-size: 14px; }
@@ -2451,11 +2988,6 @@ onUnmounted(() => {
   font-size: 12px; color: var(--text-secondary);
 }
 .err-desc { color: var(--text-muted); font-size: 12px; margin-left: 8px; }
-.config-preview {
-  background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: var(--radius-sm);
-  max-height: 500px; overflow: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px;
-  white-space: pre-wrap; word-break: break-all;
-}
 
 /* ---- 日志 tab ---- */
 .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
@@ -2499,7 +3031,19 @@ onUnmounted(() => {
 }
 .logc-left-switch { width: 100%; display: flex; }
 .logc-left-switch :deep(.el-radio-button) { flex: 1; }
-.logc-left-switch :deep(.el-radio-button__inner) { width: 100%; }
+/* 三个选项挤在窄侧栏里，收掉默认横向 padding 以免文字被截断 */
+.logc-left-switch :deep(.el-radio-button__inner) { width: 100%; padding-left: 6px; padding-right: 6px; }
+/* 执行顺序：排序方向 + 口径说明 */
+.logc-exec-bar { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.logc-exec-bar :deep(.el-radio-group) { flex: 1; display: flex; }
+.logc-exec-bar :deep(.el-radio-button) { flex: 1; }
+.logc-exec-bar :deep(.el-radio-button__inner) { width: 100%; padding-left: 6px; padding-right: 6px; }
+.logc-exec-help { color: var(--text-muted); cursor: help; flex: 0 0 auto; }
+/* 执行序号：固定宽度，避免三位数把任务名挤变形 */
+.logc-exec-idx {
+  flex: 0 0 26px; text-align: right; font-size: 11px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
 .logc-filters { display: flex; flex-direction: column; gap: 6px; }
 .logc-fixed { display: flex; flex-direction: column; gap: 4px; }
 .logc-hint { color: var(--text-muted); font-size: 12px; padding: 2px 4px; }
@@ -2665,40 +3209,7 @@ onUnmounted(() => {
 /* ---- 输出 tab: 会话详情弹窗 ---- */
 .detail-sub-tabs { margin-top: 4px; }
 .log-sub-tabs { margin-top: 4px; }
-.traj-viewer {
-  max-height: 520px; overflow-y: auto; border: 1px solid var(--border-color);
-  border-radius: var(--radius-md); padding: 8px;
-}
-.traj-block { border-radius: 6px; margin-bottom: 6px; overflow: hidden; }
-.traj-block:last-child { margin-bottom: 0; }
-.traj-block-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px; font-size: 12px; min-height: 26px;
-}
-.traj-role { font-weight: 600; }
-.traj-type { color: #909399; font-size: 11px; }
-.traj-tool {
-  font-family: 'Cascadia Code', 'Fira Code', monospace;
-  color: #6366f1; font-size: 11px;
-}
-.traj-err { color: #f56c6c; font-size: 11px; font-weight: 600; }
-.traj-fold { margin-left: auto; cursor: pointer; color: #909399; }
-.traj-fold:hover { color: var(--text-primary); }
-.traj-body { padding: 2px 10px 8px; }
-.traj-content, .traj-args {
-  margin: 0; padding: 0; font-size: 12px; line-height: 1.55;
-  font-family: 'Cascadia Code', 'Fira Code', monospace;
-  white-space: pre-wrap; word-break: break-all;
-}
-.traj-args { color: var(--text-muted); margin-top: 4px; }
-.traj-assistant .traj-block-head { background: rgba(99, 102, 241, .10); }
-.traj-assistant .traj-role { color: #6366f1; }
-.traj-user .traj-block-head { background: rgba(16, 185, 129, .10); }
-.traj-user .traj-role { color: #10b981; }
-.traj-toolResult .traj-block-head { background: #f5f7fa; }
-.traj-toolResult .traj-role { color: #606266; }
-.traj-meta .traj-block-head { background: rgba(230, 162, 60, .10); }
-.traj-meta .traj-role { color: #e6a23c; }
+/* 轨迹气泡的样式已搬进 components/TrajBlocks.vue（scoped） */
 .log-panel-head {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 6px;

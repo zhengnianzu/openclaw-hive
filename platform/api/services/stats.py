@@ -283,6 +283,9 @@ def pool_usage(rows: list, pools: dict) -> list:
             "total_cpu": _num(spec.get("total_cpu")),
             "total_memory_gb": _num(spec.get("total_memory_gb")),
             "max_sandboxes": _num(spec.get("max_sandboxes")),
+            # 机器组明细：看板按组展开容量构成；老格式池没有 groups，保持空列表
+            "frames": _num(spec.get("frames")),
+            "groups": [dict(g) for g in (spec.get("groups") or [])],
             "used_cpu": 0.0, "used_memory_gb": 0.0,
             "queued_cpu": 0.0, "queued_memory_gb": 0.0,
             "pods": 0, "instances": 0, "configured": True,
@@ -297,6 +300,7 @@ def pool_usage(rows: list, pools: dict) -> list:
             out[ns] = {
                 "namespace": ns or "未归属",
                 "total_cpu": 0.0, "total_memory_gb": 0.0, "max_sandboxes": 0.0,
+                "frames": 0.0, "groups": [],
                 "used_cpu": 0.0, "used_memory_gb": 0.0,
                 "queued_cpu": 0.0, "queued_memory_gb": 0.0,
                 "pods": 0, "instances": 0, "configured": False,
