@@ -213,6 +213,43 @@
                   </span>
                 </div>
               </div>
+
+              <!-- 机器组构成：容量分母从哪来，按组摊开 -->
+              <div v-if="poolGroups.length" class="group-block">
+                <div class="sub-title">
+                  机器组构成
+                  <span class="sub-note">共 {{ fmtCompact(poolFrames) }} 台机器</span>
+                </div>
+                <table class="group-table">
+                  <thead>
+                    <tr>
+                      <th>机器组</th>
+                      <th class="num">台数</th>
+                      <th class="num">CPU(核)</th>
+                      <th class="num">内存(GiB)</th>
+                      <th class="num">沙箱</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="g in poolGroups" :key="g.key">
+                      <td>{{ g.name }}</td>
+                      <td class="num">{{ fmtCompact(g.nodes) }}</td>
+                      <td class="num">{{ fmtCompact(g.total_cpu) }}</td>
+                      <td class="num">{{ fmtCompact(g.total_memory_gb) }}</td>
+                      <td class="num">
+                        {{ fmtCompact(g.max_sandboxes) }}
+                        <!-- 声明上限被单机核数压住时标出来，否则看不懂为何 256 没跑满 -->
+                        <el-tooltip
+                          v-if="g.capped" placement="top"
+                          :content="`单机声明 ${fmtCompact(g.max_sandboxes_per_node)} 个，`
+                            + `但只有 ${fmtCompact(g.cpu_per_node)} 核，实际每台 ${fmtCompact(g.usable_sandboxes_per_node)} 个`">
+                          <span class="capped-flag">受核数限制</span>
+                        </el-tooltip>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </template>
           </div>
         </div>
@@ -294,9 +331,10 @@
             </template>
           </div>
 
-          <div class="glass-card panel">
+          <div class="glass-card panel os-card">
             <div class="panel-head">
               <span class="panel-title">沙箱操作系统分布</span>
+              <span class="panel-hint">沙箱数与资源占用</span>
             </div>
             <el-empty v-if="!sandboxDist.length" description="无数据" :image-size="70" />
             <div v-else class="donut-row">
@@ -307,14 +345,30 @@
                   <div class="donut-cap">沙箱总数</div>
                 </div>
               </div>
-              <div class="dist-list">
-                <div v-for="s in sandboxShare" :key="s.key" class="dist-line">
-                  <i class="dot" :style="{ background: s.color }"></i>
-                  <span class="dist-label">{{ s.label }}</span>
-                  <span class="dist-val">{{ fmtCompact(s.pods) }}</span>
-                  <span class="dist-pct">{{ s.share }}%</span>
-                </div>
-              </div>
+              <!-- 同一维度的两套读数并在一处：沙箱数 / 占比，以及该 OS 吃掉的 CPU 与内存 -->
+              <table class="os-table">
+                <thead>
+                  <tr>
+                    <th>系统</th>
+                    <th class="num">沙箱</th>
+                    <th class="num">占比</th>
+                    <th class="num">CPU(核)</th>
+                    <th class="num">内存(GiB)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="s in sandboxShare" :key="s.key">
+                    <td>
+                      <i class="dot" :style="{ background: s.color }"></i>
+                      <span class="os-cell-name">{{ s.label }}</span>
+                    </td>
+                    <td class="num strong">{{ fmtCompact(s.pods) }}</td>
+                    <td class="num muted">{{ s.share }}%</td>
+                    <td class="num">{{ fmtCompact(s.cpu) }}</td>
+                    <td class="num">{{ fmtCompact(s.memory_gb) }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
             <div v-if="inferredCount" class="panel-foot">
               {{ inferredCount }} 个实例的类型由配置推断得出
@@ -406,14 +460,6 @@
           </div>
         </div>
 
-        <!-- ⑤ Linux / Windows 资源对比：操作系统维度的 CPU / 内存绝对值 -->
-        <div class="glass-card panel">
-          <div class="panel-head">
-            <span class="panel-title">Linux / Windows 资源对比</span>
-            <span class="panel-hint">占用中实例</span>
-          </div>
-          <EChart :option="osOption" height="220px" />
-        </div>
         </div>
       </el-tab-pane>
       <el-tab-pane label="调度监控" name="worker">
@@ -458,7 +504,6 @@ const statusDist = ref([])
 const harnessDist = ref([])
 const sandboxDist = ref([])
 const specDist = ref([])
-const osCompare = ref({ linux: {}, windows: {} })
 const leaderboard = ref([])
 const pools = ref([])
 const proxyUsage = ref([])
@@ -675,6 +720,9 @@ function shareList(items, { key, value, label, color }) {
       color: color(it[key]),
       pods: it[value] || 0,
       count: it[value] || 0,
+      // 资源列：OS 分布要同时显示该类吃掉的 CPU / 内存，其余分布用不到也无害
+      cpu: it.cpu || 0,
+      memory_gb: it.memory_gb || 0,
       share: total ? Math.round(((it[value] || 0) / total) * 1000) / 10 : 0,
     }))
 }
@@ -789,40 +837,25 @@ const specOption = computed(() => {
   }
 })
 
-const osOption = computed(() => {
-  const l = osCompare.value.linux || {}
-  const w = osCompare.value.windows || {}
-  return {
-    grid: { left: 8, right: 16, top: 36, bottom: 8, containLabel: true },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    legend: {
-      top: 0, icon: 'circle', itemWidth: 8, itemHeight: 8,
-      textStyle: { color: '#475569', fontSize: 12 },
-    },
-    xAxis: {
-      type: 'category', data: ['CPU(核)', '内存(GiB)'],
-      axisLabel: { color: AXIS_LABEL }, axisLine: { lineStyle: { color: '#e5e7eb' } },
-    },
-    yAxis: {
-      type: 'value', axisLabel: { color: AXIS_LABEL, formatter: (v) => fmtCompact(v) },
-      splitLine: SPLIT_LINE,
-    },
-    series: [
-      {
-        name: 'Linux', type: 'bar', barMaxWidth: 40, barGap: '10%',
-        data: [l.cpu || 0, l.memory_gb || 0],
-        itemStyle: { color: sandboxColor.linux, borderRadius: [4, 4, 0, 0] },
-        label: { show: true, position: 'top', color: AXIS_LABEL, formatter: ({ value }) => fmtCompact(value) },
-      },
-      {
-        name: 'Windows', type: 'bar', barMaxWidth: 40,
-        data: [w.cpu || 0, w.memory_gb || 0],
-        itemStyle: { color: sandboxColor.windows, borderRadius: [4, 4, 0, 0] },
-        label: { show: true, position: 'top', color: AXIS_LABEL, formatter: ({ value }) => fmtCompact(value) },
-      },
-    ],
+// 机器组：单池时直接取该池的组；多池时各组前缀 namespace 以免重名撞在一起
+const poolGroups = computed(() => {
+  const rows = []
+  for (const p of fPools.value) {
+    for (const g of (p.groups || [])) {
+      rows.push({
+        ...g,
+        key: `${p.namespace}/${g.name}`,
+        name: fPools.value.length > 1 ? `${p.namespace} · ${g.name}` : g.name,
+        // 声明上限 > 实际可用，说明被单机核数压住了
+        capped: (g.max_sandboxes_per_node || 0) > (g.usable_sandboxes_per_node || 0),
+      })
+    }
   }
+  return rows
 })
+
+const poolFrames = computed(() =>
+  fPools.value.reduce((s, p) => s + (p.frames || 0), 0))
 
 // 趋势指标：总量 + Linux / Windows 拆分
 const TREND_METRICS = {
@@ -933,7 +966,6 @@ async function load({ silent = false } = {}) {
     harnessDist.value = d.harness_distribution || []
     sandboxDist.value = d.sandbox_type_distribution || []
     specDist.value = d.spec_distribution || []
-    osCompare.value = d.os_resource_comparison || { linux: {}, windows: {} }
     leaderboard.value = d.user_leaderboard || []
     pools.value = d.pool_usage || []
     proxyUsage.value = d.proxy_usage || []
@@ -1039,7 +1071,7 @@ onBeforeUnmount(() => {
 /* ---------- 面板与栅格 ---------- */
 .grid-row { display: grid; gap: 16px; align-items: stretch; }
 .row-2 { grid-template-columns: 2fr 1fr; }
-.row-3 { grid-template-columns: 1.5fr 1fr 1fr; }
+.row-3 { grid-template-columns: 1.7fr 0.95fr 1.35fr; }
 .row-4 { grid-template-columns: 1fr 1.2fr 1fr; }
 
 .panel { display: flex; flex-direction: column; height: 100%; padding: 20px; min-width: 0; }
@@ -1108,8 +1140,7 @@ onBeforeUnmount(() => {
 .pool-foot-item { display: inline-flex; align-items: center; gap: 6px; }
 .pool-divider { width: 1px; height: 12px; background: var(--border-color); }
 
-.pool-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
-.pool-line { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.pool-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }.pool-line { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .pool-name { width: 90px; flex: none; color: var(--text-primary); font-weight: 500;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pool-line .meter-track { flex: 1; }
@@ -1140,7 +1171,10 @@ onBeforeUnmount(() => {
 .seg { height: 100%; min-width: 2px; }
 
 .donut-row { display: flex; align-items: center; gap: 14px; }
-.donut-wrap { position: relative; width: 170px; flex: none; }
+.donut-wrap { position: relative; width: 150px; flex: none; }
+/* OS 卡要同时放甜甜圈和四列读数，圈收窄一档 */
+.os-card .donut-wrap { width: 112px; }
+.os-card .donut-row { gap: 10px; }
 .donut-center {
   position: absolute; inset: 0;
   display: flex; flex-direction: column;
@@ -1156,6 +1190,9 @@ onBeforeUnmount(() => {
   flex: 1; min-width: 0; color: var(--text-secondary);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* OS 只有 Linux / Windows 两项，名字短，不该被省略号截断 */
+.donut-row .dist-label { flex: 0 1 auto; overflow: visible; }
+.donut-row .dist-val { margin-left: auto; }
 .dist-val { font-weight: 600; color: var(--text-primary); text-align: right; }
 .dist-pct { width: 44px; flex: none; text-align: right; color: var(--text-muted); }
 
@@ -1172,6 +1209,52 @@ onBeforeUnmount(() => {
 .proxy-table td.strong { font-weight: 600; color: var(--text-primary); }
 .proxy-name { color: var(--text-primary); font-weight: 500; }
 .proxy-ip { margin-left: 6px; font-size: 11px; color: var(--text-muted); }
+
+/* ---------- 机器组构成 / OS 占用：资源池卡内的两个子块 ---------- */
+.group-block {
+  margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--border-color-light);
+}
+.sub-title {
+  font-size: 12px; font-weight: 600; color: var(--text-primary);
+  margin-bottom: 8px; display: flex; align-items: baseline; gap: 8px;
+}
+.sub-note { font-size: 11px; font-weight: 400; color: var(--text-muted); }
+
+.group-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.group-table th {
+  text-align: left; font-weight: 500; color: var(--text-muted);
+  padding: 4px 6px; border-bottom: 1px solid var(--border-color-light);
+}
+.group-table th.num, .group-table td.num { text-align: right; }
+.group-table td {
+  padding: 6px; color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color-light);
+}
+.group-table tr:last-child td { border-bottom: none; }
+/* 声明上限被核数压住的提示：弱化成脚注，不与数值抢视线 */
+.capped-flag {
+  display: inline-block; margin-left: 6px; padding: 0 5px;
+  font-size: 10px; line-height: 15px; border-radius: 3px;
+  color: #a16207; background: #fef3c7; cursor: help; white-space: nowrap;
+}
+
+/* OS 分布表：甜甜圈右侧，沙箱数 + 占比 + CPU/内存 四列 */
+.os-table { flex: 1; min-width: 0; border-collapse: collapse; font-size: 12px; }
+.os-table th {
+  text-align: left; font-weight: 500; color: var(--text-muted);
+  padding: 4px 3px; border-bottom: 1px solid var(--border-color-light);
+  white-space: nowrap;
+}
+.os-table th.num, .os-table td.num { text-align: right; }
+.os-table td {
+  padding: 7px 3px; color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color-light); white-space: nowrap;
+}
+.os-table tr:last-child td { border-bottom: none; }
+.os-table td.strong { font-weight: 600; color: var(--text-primary); }
+.os-table td.muted { color: var(--text-muted); }
+.os-cell-name { margin-left: 5px; color: var(--text-secondary); }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1400px) {

@@ -207,6 +207,42 @@ class PoolUsageTest(unittest.TestCase):
         self.assertEqual(out[0]["queued_cpu"], 20.0)
         self.assertEqual(out[0]["instances"], 0)
 
+    def test_groups_and_frames_passed_through(self):
+        """机器组明细要透到看板：容量构成按组展开，分母才解释得清。"""
+        out = stats.pool_usage([], {"pool-a": {
+            "total_cpu": 100, "total_memory_gb": 400, "max_sandboxes": 80,
+            "frames": 3,
+            "groups": [
+                {"name": "group1", "nodes": 2, "total_cpu": 64, "max_sandboxes": 64},
+                {"name": "group2", "nodes": 1, "total_cpu": 36, "max_sandboxes": 16},
+            ],
+        }})
+        self.assertEqual(out[0]["frames"], 3.0)
+        self.assertEqual([g["name"] for g in out[0]["groups"]], ["group1", "group2"])
+        self.assertEqual(out[0]["groups"][0]["nodes"], 2)
+
+    def test_groups_copied_not_aliased(self):
+        """返回的 group dict 必须是副本，否则改动会写回 load_pools 的缓存。"""
+        spec_group = {"name": "group1", "nodes": 2}
+        out = stats.pool_usage([], {"pool-a": {
+            "total_cpu": 1, "total_memory_gb": 1, "groups": [spec_group],
+        }})
+        out[0]["groups"][0]["nodes"] = 999
+        self.assertEqual(spec_group["nodes"], 2)
+
+    def test_legacy_pool_has_empty_groups(self):
+        """老格式池没有 groups，要给出空列表而不是缺字段。"""
+        out = stats.pool_usage([], {"pool-a": {"total_cpu": 8, "total_memory_gb": 32}})
+        self.assertEqual(out[0]["groups"], [])
+        self.assertEqual(out[0]["frames"], 0.0)
+
+    def test_unconfigured_namespace_has_group_fields(self):
+        """未登记的池也要带上新字段，前端不必做存在性判断。"""
+        out = stats.pool_usage([_inst(sandbox_namespace="pool-z")], {})
+        z = [x for x in out if x["namespace"] == "pool-z"][0]
+        self.assertEqual(z["groups"], [])
+        self.assertEqual(z["frames"], 0.0)
+
 
 class EffectivePodsTest(unittest.TestCase):
     """尾部折算：running 实例的活沙箱数 = min(并发, 剩余任务数)。

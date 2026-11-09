@@ -88,12 +88,28 @@ class UserUsage(BaseModel):
     windows_memory_gb: float = 0.0
 
 
+class PoolGroup(BaseModel):
+    """资源池里的一个机器组（resource_pools.yaml 的 groups 项 + 派生量）。"""
+    name: str = ""
+    nodes: float = 0.0                    # 机器台数
+    cpu_per_node: float = 0.0
+    memory_gb_per_node: float = 0.0
+    max_sandboxes_per_node: float = 0.0   # 声明上限
+    usable_sandboxes_per_node: float = 0.0  # min(上限, 核数)，实际可开数
+    total_cpu: float = 0.0
+    total_memory_gb: float = 0.0
+    max_sandboxes: float = 0.0
+
+
 class PoolUsageItem(BaseModel):
     namespace: str
     total_cpu: float = 0.0
     total_memory_gb: float = 0.0
     # 沙箱并发上限；0 表示该池没按机器组配置（老格式），前端显示「—」
     max_sandboxes: float = 0.0
+    # 机器总台数与各机器组明细；老格式池为 0 / 空列表
+    frames: float = 0.0
+    groups: list[PoolGroup] = []
     used_cpu: float = 0.0
     used_memory_gb: float = 0.0
     queued_cpu: float = 0.0
