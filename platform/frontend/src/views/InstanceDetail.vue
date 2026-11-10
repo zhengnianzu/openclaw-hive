@@ -147,7 +147,7 @@
                 </div>
                 <EChart v-if="metricPoints.length >= 2" :option="trendOption" height="180px" />
                 <div v-else class="trend-empty">
-                  {{ metricsLoading ? '加载中…' : '暂无数据（刚打开本页已开始采集，约 10 秒后出现；需要至少两批完成的任务才能连成线）' }}
+                  {{ metricsLoading ? '加载中…' : '暂无数据（运行中的实例随扫随有；较早的历史实例需离线回填过完成时间）' }}
                 </div>
 
                 <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->

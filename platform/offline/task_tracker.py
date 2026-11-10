@@ -125,8 +125,7 @@ def _head_hash(path: str, n: int = 128) -> str:
         return ""
 
 
-def read_new_lines(conn, instance_id: str, path: str,
-                   state_table: str = "tracker_state") -> list[str]:
+def read_new_lines(conn, instance_id: str, path: str) -> list[str]:
     """从上次的 offset 开始读新增行，返回非空行列表；同时把新 offset 落库。
 
     调用方负责 commit（本函数不提交），以便和投递放进同一个事务。
@@ -134,10 +133,6 @@ def read_new_lines(conn, instance_id: str, path: str,
     重置 offset 的两个条件（任一成立）：
       1. inode 变了 —— 文件被删除后重建（complete.jsonl 不会，但失败重跑时会）
       2. 文件头指纹变了 —— 原地 truncate 重写（failed.jsonl 每轮结束都会重写）
-
-    `state_table` 让不同的跟踪进程各记各的偏移。表结构必须与 tracker_state 一致。
-    offset 表没有「属主」列，两个进程共用一张表会互相推进对方的偏移，
-    各自只能读到一部分行 —— success_tracker 因此传自己的表名。
     """
     try:
         st = os.stat(path)
@@ -145,7 +140,7 @@ def read_new_lines(conn, instance_id: str, path: str,
         return []
 
     row = conn.execute(
-        f"SELECT inode, offset, head_hash FROM {state_table} "
+        "SELECT inode, offset, head_hash FROM tracker_state "
         "WHERE instance_id=? AND file_path=?",
         (instance_id, path),
     ).fetchone()
@@ -177,7 +172,7 @@ def read_new_lines(conn, instance_id: str, path: str,
         offset += consumed
 
     conn.execute(
-        f"INSERT INTO {state_table} (instance_id, file_path, inode, offset, head_hash, updated_at) "
+        "INSERT INTO tracker_state (instance_id, file_path, inode, offset, head_hash, updated_at) "
         "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP) "
         "ON CONFLICT(instance_id, file_path) DO UPDATE SET "
         "  inode=excluded.inode, offset=excluded.offset, "

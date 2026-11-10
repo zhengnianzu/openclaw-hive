@@ -1,10 +1,16 @@
    # 离线 Worker 架构与配置(Worker)
 
-本文描述 openclaw-hive platform 的**离线分析链路**:四个常驻进程的职责划分、协作方式、
+本文描述 openclaw-hive platform 的**离线分析链路**:六个常驻进程的职责划分、协作方式、
 全部可调参数与运维命令。
 
 > 核心目标:用户点「输出」能秒级看到分级结果,点「下载交付物」能秒级拿到文件,
 > 而几十万条历史积压在背景慢慢跑,两者互不干扰。
+
+> **另有一个不在这六个之内的后台任务**:`background_cache_refresher` 跑在 uvicorn
+> 进程里(不是独立进程、不走 `shallow_queue`),负责保持首页/详情页的汇总数字是新的,
+> 并顺带产出成功率趋势图的数据。见[第二节](#二后台-refresher跑在-uvicorn-里的第七个)
+> 和[第三节](#三成功率趋势图的原理) —— 排查「某个数字为什么不更新」时,
+> 先确认该由谁负责,能省很多时间。
 
 ---
 
@@ -271,11 +277,207 @@ auto-tracker 每轮只处理一个实例,所以直接打实例 ID;tracker 每轮
 
 ---
 
-## 二、协作方式
+## 二、后台 refresher:跑在 uvicorn 里的「第七个」
+
+读这篇文档最容易产生的误解是「所有后台扫描都是离线 worker 干的」。实际上还有一个
+**跑在 uvicorn 进程里的协程**,它不在上面那张表里,但承担了相当一部分后台工作:
+
+`background_cache_refresher`(`api/routers/instances.py`),**8 秒一轮**,
+由 `main.py` 的 startup hook 拉起。
+
+### 它和六个 worker 的根本差异
+
+| | 六个离线 worker | background_cache_refresher |
+|---|---|---|
+| 进程 | 独立进程,`run.sh` 单独启停 | **uvicorn 进程内的 asyncio 协程**,随 API 服务生死 |
+| 队列 | 靠 `shallow_queue` 领取、CAS 协作 | **不走队列**,每轮直接扫一遍 running 实例 |
+| 覆盖 | 要被 tracker 投递到才会处理 | **所有 running/preparing 实例,无条件** |
+| 触发 | 用户点击 / 背景补全 | 纯定时,与用户行为无关 |
+| 并发控制 | 车道 + CAS | **文件 flock 选 leader**(见下) |
+| 日志 | 各自 `*.log` | 混在 `platform.log` 里 |
+
+一句话区分:**离线 worker 做的是「深加工」(判 DONE、OBS 定级、下交付物),
+refresher 做的是「保持首页和详情页的数字是新的」。**
+
+### 每轮做五件事
+
+```
+background_cache_refresher(8s 一轮)
+├─ _refresh_running_once()              ← 主体
+│    对每个 running/preparing 实例:
+│      ├─ _sync_instance_status()       数 complete/failed.jsonl 行数,判是否转终态
+│      ├─ _compute_analyze()            增量扫 task-N.log → 成功/失败/异常分类
+│      └─ _sync_task_records()          写 per-task 明细(status/error_code/finished_at)
+│    返回「本轮刚跑完」的队列 id → 触发 schedule_queue 放行下一个排队任务
+├─ _save_shared_caches()                扫描结果落盘,供另外 3 个 uvicorn worker 共享
+├─ _save_file_state()                   每文件 (mtime,size) 签名落盘
+├─ recover_stuck_preparing()            看门狗:卡在 preparing 的实例标 failed 并放行队列
+└─ find_schedulable_queues()            兜底:有排队任务但无人占位的队列重交调度器
+```
+
+### 两个必须知道的设计
+
+**(1) Leader 选举 —— uvicorn 开了 4 个 worker**
+
+每个 worker 都会执行 startup hook。不选举的话 4 份刷新各扫同一批实例、重复写同一张表,
+CPU 直接翻 4 倍。用 `.refresher.lock` 上的非阻塞 `flock` 解决:拿到锁的才跑,
+其余只读 leader 落盘的快照(`.analyze_snapshot.json`)。
+
+锁句柄**故意不关闭**(关闭即释放);进程死掉由内核释放,下一轮新 leader 自然接上。
+
+**(2) 签名持久化 —— 否则重启要重读全部日志**
+
+`_analyze_file_state` 记每个日志文件的 `(mtime, size)`。不落盘的话进程重启后
+`_compute_analyze` 会把所有 task 日志整篇重读一遍 —— 实测 37 个 running 实例、
+11.7 万份日志、**136 秒**。落盘后重启只需 stat 核对签名,约 5 秒。
+
+### 为什么它不跟着浅层走
+
+曾经考虑把成功率统计挂到浅层 local 阶段(它也在读同一批 `task-N.log`),
+但覆盖率对不上:
+
+| 字段 | 覆盖 | 写入者 |
+|---|---|---|
+| `status` / `finished_at` | **2220 / 2220 实例** | refresher,所有 running 实例无条件扫 |
+| `task_done` | **841 / 2220 实例** | 浅层 local,要先被 `shallow_queue` 投递到 |
+
+挂在浅层上只有 38% 的实例会有数据 —— 用户点开一个没点过「输出」的实例就是空白。
+
+---
+
+## 三、成功率趋势图的原理
+
+详情页「任务执行情况」里那条成功率曲线,数据链路完全挂在上面的 refresher 上,
+**没有独立进程、没有独立队列、没有采样表**。
+
+### 真源是 task 日志的行首时间戳
+
+每个 `task-N.log` 里判定终态的那一行:
+
+```
+2026-11-09 10:05:42|hive.py:...|INFO|任务执行状态=任务成功 error_code=0 config=abc_q1.json
+└──────┬──────────┘                 └────┬─────┘
+   行首时间戳 = 该任务的完成时刻          状态
+```
+
+logger 的 `datefmt` 是 `%Y-%m-%d %H:%M:%S`(`settings/config.yaml`),状态行本身就是
+一条普通日志行,所以**完成时刻是现成的**,不需要额外记录。
+
+> ⚠️ 这个时间**没有时区**,是 hive 进程所在机器的本地时间。与 `task_records.updated_at`
+> (`CURRENT_TIMESTAMP`,**UTC**)口径不同,差 8 小时,**不要相减**。
+> 趋势图只用它做相对时间轴,所以无妨。
+
+### 链路
+
+```
+refresher 每 8s
+  └─ _compute_analyze()  增量扫变化过的 task-N.log
+       └─ _scan_task_file()  取最后一条状态行的 (status, code, config, 行首时间戳)
+            │                 取不到时间戳时回退文件 mtime
+            ▼
+       new_state[fname] = (mtime, size, status, code, config_name, finished_at)
+            │                                                      └ 本次新增的第 6 项
+            ▼
+  └─ _sync_task_records()  UPSERT 进 task_records,finished_at 用 COALESCE 不覆盖已有值
+
+GET /api/instances/{id}/metrics?window=N
+  └─ SELECT finished_at, status FROM task_records
+       WHERE instance_id=? AND finished_at IS NOT NULL AND status IS NOT NULL
+       ORDER BY finished_at
+  └─ 按 window 截取尾部时间段 → 其中分成约 30 个桶 → 每桶算成功率
+```
+
+**边际成本接近零**:`_compute_analyze` 本来就在逐行读这些日志找「任务执行状态=」,
+只是顺手把行首的时间戳一起取出来。没有新增 IO、没有新的扫描周期。
+
+### 两种成功率口径
+
+接口每个点返回两个值,前端默认画**窗口**那条:
+
+| 口径 | 含义 | 为什么需要 |
+|---|---|---|
+| `win_success_rate` | **桶内**成功率 | 反映「这段时间跑得怎么样」 |
+| `cum_success_rate` | 累计成功率(前缀和) | 整体水平 |
+
+跑了几千个任务之后累计值会被历史压得几乎不动。实测对照:某实例前 10 分钟全成功、
+之后全失败,第 10 分钟时**窗口值已经是 0%,而累计值还显示 94.3%**,要再过十分钟才
+爬到 50%。只看累计的话,大面积失败开始了也看不出来。
+
+桶内没有完成任务时 `win_success_rate` 为 `None`,前端断线而不是画成 0。
+
+### 分桶策略
+
+`window` 的语义是**「看最近多久」而不是桶宽**。一个实例可能有几十小时历史,
+全画出来既看不清也撑爆点数(实测 19 小时按固定 120s 桶 = **567 个点**)。
+
+所以先按 `window` 截取尾部时间段,再在其中分成约 30 个桶:
+
+| 前端选项 | window | 典型桶宽 | 点数 |
+|---|---|---|---|
+| 30m | 30 | ~59s | ~30 |
+| 3h(默认) | 180 | ~358s | ~30 |
+| 24h | 1440 | ~2300s | ~30 |
+| 全部 | 10080 | 随数据跨度 | ~30 |
+
+### 口径差异:趋势图 ≠ 顶部「成功率」卡片
+
+**这两个数字在有异常任务的实例上不会完全相等,是刻意的:**
+
+| | 数的是什么 | 「任务异常」算什么 |
+|---|---|---|
+| 顶部「成功率」卡片 | `complete.jsonl` / `failed.jsonl` 的**行数** | 混在 failed 里 |
+| 趋势图 | `task_records` 的 **status 列** | 单独一类,计入失败 |
+
+趋势图跟**同一张卡片里的环形图**(成功/失败/异常/未执行四分类)对齐更重要 ——
+两者相邻,口径不一致会更让人困惑。
+
+### 历史实例要离线回填一次
+
+refresher **只扫 running/preparing 实例** —— 实例一转终态日志就不再变化,没必要重扫。
+所以加列之前就已跑完的实例,`task_records` 行是齐的、唯独 `finished_at` 为 NULL。
+
+用 `offline/backfill_finished_at.py` 补:
+
+```bash
+python3 offline/backfill_finished_at.py --limit 1      # 先验 1 个
+python3 offline/backfill_finished_at.py --limit 100    # 默认补最近 100 个实例
+python3 offline/backfill_finished_at.py --dry-run      # 只扫不写库
+```
+
+- 复用 `output_worker._logs_dir()` 解析日志目录(处理了实例搬迁、几种目录布局)
+- 16 并发读(NFS 上单个日志约 35ms,串行扫 1 万个要 350s)
+- **幂等**:只填 NULL、不覆盖已有值,重复跑更新 0 行
+- 实测:100 个实例 / 28.6 万条 / **110 秒**
+
+> 为什么只补最近 100 个:全库 2200+ 个实例,绝大多数是几周前的历史,没人会去看它们的
+> 实时成功率曲线,而扫它们的日志要付几十分钟 NFS IO。更早的实例 `finished_at` 留 NULL,
+> 前端显示「暂无数据」。要补更多就调 `--limit`。
+
+### 一个常见疑问:重跑的任务会记两条吗
+
+不会 —— 而且**不需要**。`task_records` 是 `UNIQUE(instance_id, config_name)`,
+每个 config 一行;`_scan_task_file` 取日志里**最后一条**状态行。
+
+实测确认这不丢信息:
+
+- 扫某实例全部 5000 个日志,**每个文件都只有 1 条状态行**,0 个文件有多条
+- 全库统计 9.7 万个 config,有多次完成记录的 **0 个**
+
+原因是平台的「重跑失败」是**新建实例**(`copied_from` 指向源,实测 356 个),
+不是在原实例里重跑同一个 config。两次尝试**本来就分别存在两个实例的 task_records 里**,
+各有各的时间戳和结果 —— 每个实例的曲线各自反映「那一轮跑得怎么样」,
+历史不会被后来的重跑抹掉。
+
+> 如果将来 hive 改成在同一实例内重试同一 config,这个假设才会失效,
+> 届时需要把 `task_records` 换成允许多行的事件表。
+
+---
+
+## 四、协作方式
 
 权威队列是 `shallow_queue` **一张表、三个独立状态维**,靠 CAS 领取 + DB 层 UNIQUE 去重协作。
 
-### 2.1 数据流
+### 4.1 数据流
 
 ```
 用户点「输出」 → POST /api/batch-output/{id}/shallow      (batch_output.py)
@@ -310,7 +512,7 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 用户点开会话详情 → GET /deep/{traj}/detail  只读本地;没有则 409 + 入队按钮
 ```
 
-### 2.2 三个不能破坏的约定
+### 4.2 三个不能破坏的约定
 
 **(1) 双维解耦**
 阶段 1 只写 `local_state`,阶段 2 只认 `obs_state`。历史上两者共用一个 `state`,
@@ -331,7 +533,7 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 而且 tracker 每 5s 重投一遍,**产物维必须完全不看 `priority`** ——
 否则已下完的行被无限打回队列(线上实测同一 task 重下 8 轮以上)。
 
-### 2.3 状态机
+### 4.3 状态机
 
 `shallow_queue` 的三个维度:
 
@@ -345,7 +547,7 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 它不被任何 worker 领取,所以不占下载配额、不占磁盘。
 `artifacts_status`(`task_traj_records` 镜像列)同口径 —— 前端据此显示「未下载」而非「排队中」。
 
-### 2.4 实例出队时的回收
+### 4.4 实例出队时的回收
 
 `output_worker._clear_shallow_request` 在实例浅层跑完(无缺口)时:
 
@@ -358,9 +560,9 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 
 ---
 
-## 三、配置
+## 五、配置
 
-### 3.1 浅层(shallow_worker.py)
+### 5.1 浅层(shallow_worker.py)
 
 两种模式的差异**只有车道过滤 + 并发/间隔**,判定与定级逻辑完全共用
 (`shallow_local.judge_one` / `shallow_obs.grade_one`)。
@@ -395,7 +597,7 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 > (实测 attempts 涨到 938、9488 条毒行占满并发槽);但用户点击卡在 3 次之后
 > 永远领不到,页面表现为「点了没反应」(实测某实例 20 条全被挡住)。
 
-### 3.2 产物下载(settings/worker/config.yaml)
+### 5.2 产物下载(settings/worker/config.yaml)
 
 优先级:**环境变量 > yaml > 代码内置默认**。改完执行 `./run.sh realtime-restart` 生效。
 
@@ -419,7 +621,7 @@ deep-realtime 每 2s → _claim_and_download() 领 artifact_priority>=100
 **已废弃键**(发现逻辑迁到 tracker 后无调用方,保留仅为旧配置文件能解析):
 `download.max_tasks_per_round` / `max_instances_per_round` / `auto_discover_days`。
 
-### 3.3 tracker
+### 5.3 tracker
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
@@ -457,7 +659,7 @@ offset 会指向新内容中间,前面的行被整段跳过。
 同一实例内部,jsonl 按文件顺序读(先完成的在前),所以 `id` 递增 ≈ 完成时间递增;
 而 shallow-auto 按 `id DESC` 领取,**新完成的任务先定级**,两层口径一致。
 
-### 3.4 shallow-query
+### 5.4 shallow-query
 
 | 常量 | 值 | 环境变量 | 说明 |
 |------|-----|---------|------|
@@ -468,7 +670,7 @@ offset 会指向新内容中间,前面的行被整段跳过。
 调试:`python offline/shallow_query.py --instance <id>` 全量回填单个实例
 (`only_missing=False`,会重写已有值)。
 
-### 3.5 心跳与监控
+### 5.5 心跳与监控
 
 `worker_heartbeats` 表,**按 worker 分组各留 `KEEP_ROWS=2000` 行**
 (`offline/heartbeat.py`)。
@@ -514,9 +716,9 @@ deep-realtime=下载完成数),**混加没有意义**,看板按 worker 分别画
 
 ---
 
-## 四、缓存与数据库
+## 六、缓存与数据库
 
-### 4.1 本地缓存布局
+### 6.1 本地缓存布局
 
 根目录 = `.env` 的 `OUTPUT_CACHE`,当前值
 `/mnt/sfs_turbo/s3-asset-b-hd-cce-aifm-nlp-exp/zhengnianzu/output_cache_v1`。
@@ -542,7 +744,7 @@ obs://bucket/zhangchen/smoke_test_oc_traj/acad_000012
 只有 `logs/`,用 isdir 判断会全部误报已下载(历史上实测 11678 行全被误标,
 其中 11459 行一条交付物都没下)。判定一律看 DB 的 `artifacts_status == 'done'`。
 
-### 4.2 分库
+### 6.2 分库
 
 | 库 | 内容 | 量级(2026-11-03,持续增长) |
 |---|------|------|
@@ -567,7 +769,7 @@ main 优先 → 一张空表把 attached 库的 1030 万行**整个遮蔽且不�
 迁移脚本:`platform/migrate_split_db.py`
 (`--dry-run` → `--copy` → `--drop-old --yes` → `--vacuum`)。
 
-### 4.3 写锁注意事项
+### 6.3 写锁注意事项
 
 SQLite 的 WAL **只允许一个写者**。`BUSY_TIMEOUT_MS=15000`(`DB_BUSY_TIMEOUT` 可覆盖)。
 
@@ -585,7 +787,7 @@ SQLite 的 WAL **只允许一个写者**。`BUSY_TIMEOUT_MS=15000`(`DB_BUSY_TIME
 
 ---
 
-## 五、运维命令
+## 七、运维命令
 
 ```bash
 cd /root/openclaw-hive/platform
@@ -641,7 +843,7 @@ python offline/shallow_query.py --once
 
 ---
 
-## 六、实测性能基线
+## 八、实测性能基线
 
 | 项 | 实测值 |
 |---|-------|
@@ -657,7 +859,7 @@ python offline/shallow_query.py --once
 
 ---
 
-## 七、相关文档与代码
+## 九、相关文档与代码
 
 | 文档 | 内容 |
 |------|------|
@@ -675,6 +877,8 @@ python offline/shallow_query.py --once
 | `offline/output_worker.py` | 交付物下载(`_claim_and_download`)、出队回收 |
 | `offline/shallow_query.py` | 任务描述回填(内容检索),按实例 LRU |
 | `offline/heartbeat.py` | 心跳写入与按 worker 分组裁剪 |
+| `offline/backfill_finished_at.py` | 一次性回填历史实例的 `finished_at`(成功率曲线的时间轴) |
+| `api/routers/instances.py` | **不是离线 worker**:`background_cache_refresher` / `_compute_analyze` / `_sync_task_records` / `get_instance_metrics` 都在这里 |
 | `src/offline_analysis.py` | 分级引擎(`compute_level`)、缓存路径、详情解析 |
 | `api/routers/worker_monitor.py` | 监控接口(overview/queue/trend/eta/reclaim) |
 | `api/routers/artifacts.py` | 交付物工作区(列表/树/内容/入队) |

@@ -2289,30 +2289,26 @@ def _count_config_files(root: str) -> int:
 
 
 @router.get("/{instance_id}/metrics")
-def get_instance_metrics(
+async def get_instance_metrics(
     instance_id: str,
-    window: int = Query(180, ge=1, le=43200, description="看最近多少分钟（上限 30 天，前端「全部」传 10080）"),
+    window: int = Query(180, ge=1, le=43200,
+                        description="看最近多少分钟（上限 30 天，前端「全部」传 10080）"),
     user: dict = Depends(get_current_user),
 ):
     """实例成功率时序 —— 详情页「任务执行情况」成功率折线图的数据源。
 
-    **数据来源**：`task_events`，由 offline/success_tracker.py 写入。
-    一行 = 一次任务完成（某 config 在某时刻以某结果结束）。两种来源：
-      · 扫 task-N.log 得到（`source='log'`）—— 时间是任务**真实完成时刻**
-      · 增量读 complete/failed.jsonl 得到（`source='jsonl'`）—— 时间≈观测时刻
+    **数据来源**：`task_records.finished_at`，即每个 task-N.log 里
+    「任务执行状态=」那行行首的时间戳（解析不到时回退日志文件 mtime）。
+    由 `_compute_analyze` 的增量扫描顺手填入，不需要额外的采集进程。
 
-    **如实记录，不做改判**：同一 config 先失败后重跑成功是两行事件，
-    各自落在自己的时间桶里。所以历史曲线不会因为今天重跑成功而把昨天的
-    失败峰抹掉。
+    **覆盖范围**：running 实例随扫随有；历史实例需要离线回填过
+    （`offline/backfill_finished_at.py`，只补最近 100 个）。
+    `finished_at` 为 NULL 的实例返回空点集，前端显示「暂无数据」。
 
-    ⚠️ 代价：累计总数会比 complete/failed.jsonl 的行数**多**（同一任务被计了
-    两次），与顶部「成功率」卡片不是一个口径 —— 那张卡片数的是 jsonl 当前行数
-    （重跑成功后失败那条会被摘掉）。本接口回答的是「当时跑得怎么样」，
-    卡片回答的是「现在总共成了多少」。
-
-    **顺带登记**：本接口被调用说明用户正看着详情页，于是写一行
-    success_requests，让 tracker 把它纳入跟踪。running 实例本来就自动跟踪，
-    这一步是为了让**已结束**的实例也能在点开详情后回填出完整曲线。
+    **口径**：`任务成功` 算成功，`任务失败`/`任务异常` 都算失败 —— 与同一张卡片里
+    环形图的四分类一致。
+    ⚠️ 这与顶部「成功率」卡片**不完全相同**：那个数的是 complete.jsonl /
+    failed.jsonl 的行数，不把「任务异常」单列。有异常任务的实例上两者会有差异。
 
     每个点给两类：
       - `win_success_rate`：**桶内**成功率，反映「这段时间跑得怎么样」
@@ -2321,21 +2317,22 @@ def get_instance_metrics(
     所以前端默认展示窗口口径。桶内没有完成任务时 win_success_rate 为 None
     （前端断线而非画成 0）。
     """
-    with get_connection() as conn:
-        # 登记：第一次见到这个实例时写 queued，tracker 下一轮会扫日志回填历史。
-        # 已登记的不打回（否则每次刷新页面都要重新回填一遍）。
-        conn.execute(
-            "INSERT INTO success_requests (instance_id, status) VALUES (?, 'queued') "
-            "ON CONFLICT(instance_id) DO NOTHING",
-            (instance_id,),
-        )
-        rows = conn.execute(
-            # success=-1 是「该实例没有可扫的日志」的哨兵行（见 success_tracker
-            # 的回填分支），不是真实事件，不能进聚合。
-            "SELECT finished_at, success FROM task_events "
-            "WHERE instance_id=? AND success >= 0 ORDER BY finished_at ASC",
-            (instance_id,),
-        ).fetchall()
+    # 兜底填充：历史实例的 task_records 可能一行都没有（从没被扫过），
+    # 这个已有的 helper 对 running 实例每次刷新、对 0 行的实例做一次全量扫描，
+    # 正好覆盖「点开详情页就自动构建」的诉求。
+    row = await async_query_one(
+        "SELECT * FROM task_instances WHERE id=?", (instance_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="实例不存在")
+    await _ensure_task_records(
+        instance_id, row["config_path"], row["status"], row["total_tasks"])
+
+    rows = await async_query(
+        "SELECT finished_at, status FROM task_records "
+        "WHERE instance_id=? AND finished_at IS NOT NULL AND status IS NOT NULL "
+        "ORDER BY finished_at ASC",
+        (instance_id,),
+    )
     if not rows:
         return {"instance_id": instance_id, "window_minutes": window, "points": []}
 
@@ -2350,15 +2347,14 @@ def get_instance_metrics(
                 continue
         elif not isinstance(ts, datetime):
             continue
-        events.append((ts, bool(d["success"])))
+        events.append((ts, d["status"] == "任务成功"))
 
     if not events:
         return {"instance_id": instance_id, "window_minutes": window, "points": []}
 
-    # window 是「看最近多久」—— 回填后一个实例可能有几十小时的历史，
-    # 全画出来既看不清也撑爆点数（实测 19 小时 / 120s 桶 = 567 个点）。
-    # 所以先按 window 截取尾部时间range，再在其中分成约 30 个桶。
-    # window 覆盖不到全部数据时只画最近那段；数据本来就短则全画。
+    # window 是「看最近多久」—— 一个实例可能有几十小时的历史，全画出来既看不清
+    # 也撑爆点数（实测 19 小时 / 120s 桶 = 567 个点）。先按 window 截取尾部
+    # 时间段，再在其中分成约 30 个桶。数据本来就短则全画。
     t_end = events[-1][0]
     t_start = t_end - timedelta(minutes=window)
     if events[0][0] > t_start:
@@ -2392,7 +2388,7 @@ def get_instance_metrics(
             "completed": cum_done,
             "failed": cum_fail,
             "running": 0,
-            "total": 0,
+            "total": row["total_tasks"] or 0,
             "cum_success_rate": round(cum_done / cum_fin * 100, 1) if cum_fin else None,
             "win_success_rate": round(done / fin * 100, 1) if fin else None,
             "win_finished": fin,
@@ -2531,13 +2527,24 @@ _STATUS_RE = re.compile(
 )
 # 状态行里的 config=<文件名> 字段，用于把 task_idx 映射到具体配置名（进而查 eval 缓存）
 _CONFIG_RE = re.compile(r"config=(?P<config>\S+)")
+# 日志行首的时间戳。logger 的 datefmt 是 '%Y-%m-%d %H:%M:%S'（settings/config.yaml），
+# 状态行本身就是一条普通日志行，行首自带该任务的完成时刻 —— 成功率趋势图的时间源。
+# ⚠️ 这个时间**没有时区**，是 hive 进程所在机器的本地时间，与 task_records.updated_at
+# （CURRENT_TIMESTAMP，UTC）口径不同。趋势图只用它做相对时间轴，不要和 UTC 列相减。
+_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
 def _scan_task_file(fpath: str):
-    """读取单个 task 日志，返回 (last_status, last_code, last_config)；异常返回 (None, None, None)。"""
+    """读取单个 task 日志，返回 (last_status, last_code, last_config, last_ts)。
+
+    last_ts 是**最后一条**状态行行首的时间戳字符串，与 last_status 取最后一条
+    的口径一致。行首格式不符时为 None，由调用方回退到文件 mtime。
+    异常返回 (None, None, None, None)。
+    """
     last_status = None
     last_code = None
     last_config = None
+    last_ts = None
     try:
         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -2545,12 +2552,14 @@ def _scan_task_file(fpath: str):
                 if m:
                     last_status = m.group("status")
                     last_code = m.group("code")
+                    mt = _TS_RE.match(line)
+                    last_ts = mt.group(1) if mt else None
                     mc = _CONFIG_RE.search(line)
                     if mc:
                         last_config = mc.group("config")
     except OSError:
-        return None, None, None
-    return last_status, last_code, last_config
+        return None, None, None, None
+    return last_status, last_code, last_config, last_ts
 
 
 def _compute_analyze(config_path: str, total_tasks: int) -> dict:
@@ -2604,8 +2613,12 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
                 with _cf.ThreadPoolExecutor(max_workers=16) as pool:
                     scanned = list(pool.map(lambda t: _scan_task_file(t[1]), to_read))
                 results = [(f, p, s, r) for (f, p, s), r in zip(to_read, scanned)]
-            for fname, _path, sig, (status, code, cfg) in results:
-                new_state[fname] = (sig[0], sig[1], status, code, cfg)
+            for fname, _path, sig, (status, code, cfg, ts) in results:
+                # ts 解析不到就回退文件 mtime（sig[0]），转成与日志同格式的本地
+                # 时间串，下游一视同仁。
+                if not ts:
+                    ts = datetime.fromtimestamp(sig[0]).strftime("%Y-%m-%d %H:%M:%S")
+                new_state[fname] = (sig[0], sig[1], status, code, cfg, ts)
 
     _analyze_file_state[config_path] = new_state
     _analyze_changed[config_path] = changed
@@ -2616,7 +2629,11 @@ def _compute_analyze(config_path: str, total_tasks: int) -> dict:
     # 具体错误码计数：{prefix: {code: count}}
     abnormal_by_code = {"C": {}, "S": {}, "T": {}, "X": {}}
 
-    for _mtime, _size, last_status, last_code, _cfg in new_state.values():
+    # 用索引而非解包：落盘的签名缓存里可能同时存在旧的 5 元组（没有 finished_at）
+    # 和新的 6 元组，`for a, b, c, d, e in ...` 会对旧记录抛 ValueError。
+    for rec in new_state.values():
+        last_status = rec[2]
+        last_code = rec[3]
         if last_status == "任务成功":
             succeeded += 1
         elif last_status == "任务失败":
@@ -2691,11 +2708,20 @@ def _compute_task_rows(config_path: str, only_fnames=None) -> list[dict]:
         items = state.items()
     rows = []
     for fname, tup in items:
-        # tup = (mtime, size, status, code, config_name)
-        _mtime, _size, status, code, config_name = tup
+        # tup = (mtime, size, status, code, config_name[, finished_at])
+        # 用索引取：落盘缓存里可能还有旧的 5 元组，解包会抛 ValueError。
+        _mtime, _size, status, code, config_name = tup[0], tup[1], tup[2], tup[3], tup[4]
+        finished_at = tup[5] if len(tup) > 5 else None
         if not config_name:
             # config= 未解析出：跳过，避免用文件名兜底制造 phantom 行
             continue
+        # 旧缓存没有时间戳时回退文件 mtime，与 _compute_analyze 的回退口径一致。
+        # 只对已有终态的任务给时间 —— 还没跑完的不该出现在趋势图里。
+        if not finished_at and status:
+            try:
+                finished_at = datetime.fromtimestamp(_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                finished_at = None
         m = re.search(r"task-(\d+)\.log", fname)
         task_idx = int(m.group(1)) if m else None
         category = None
@@ -2708,6 +2734,7 @@ def _compute_task_rows(config_path: str, only_fnames=None) -> list[dict]:
             "status": status,
             "error_code": code,
             "error_category": category,
+            "finished_at": finished_at,
         })
     return rows
 
@@ -2765,8 +2792,8 @@ def _sync_task_records(instance_id: str, config_path: str, full: bool = False) -
                 """
                 INSERT INTO task_records
                     (instance_id, task_idx, config_name, status, error_code, error_category,
-                     eval_score, eval_completion, gate, traj_level, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     eval_score, eval_completion, gate, traj_level, finished_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(instance_id, config_name) DO UPDATE SET
                     task_idx        = excluded.task_idx,
                     status          = excluded.status,
@@ -2776,13 +2803,14 @@ def _sync_task_records(instance_id: str, config_path: str, full: bool = False) -
                     eval_completion = COALESCE(excluded.eval_completion, task_records.eval_completion),
                     gate            = COALESCE(excluded.gate, task_records.gate),
                     traj_level      = COALESCE(excluded.traj_level, task_records.traj_level),
+                    finished_at     = COALESCE(excluded.finished_at, task_records.finished_at),
                     updated_at      = CURRENT_TIMESTAMP
                 """,
                 (
                     instance_id, r["task_idx"], r["config_name"], r["status"],
                     r["error_code"], r["error_category"],
                     ev.get("score"), ev.get("completion"), ev.get("gate"),
-                    tj.get("level"),
+                    tj.get("level"), r["finished_at"],
                 ),
             )
 
