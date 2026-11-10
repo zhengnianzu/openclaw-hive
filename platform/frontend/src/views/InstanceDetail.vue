@@ -133,7 +133,8 @@
                   </div>
                 </div>
 
-                <!-- 成功率趋势：数据来自后台每分钟一次的进度采样。
+                <!-- 成功率趋势。三个维度分开控制：
+                     时间范围（看最近多久）/ 统计粒度（每个点代表多长时间）/ 是否滑动。
                      默认看「窗口内成功率」而非累计——跑了几千个任务后累计值
                      会被历史压得几乎不动，最近开始大面积失败也看不出来。 -->
                 <div class="trend-head">
@@ -145,10 +146,25 @@
                     <el-radio-button :value="10080">全部</el-radio-button>
                   </el-radio-group>
                 </div>
+                <div class="trend-head trend-head-sub">
+                  <span class="trend-sub-label">统计粒度</span>
+                  <el-radio-group v-model="trendBucket" size="small" @change="loadMetrics">
+                    <el-radio-button :value="1">1m</el-radio-button>
+                    <el-radio-button :value="5">5m</el-radio-button>
+                    <el-radio-button :value="10">10m</el-radio-button>
+                    <el-radio-button :value="30">30m</el-radio-button>
+                  </el-radio-group>
+                  <el-tooltip placement="top"
+                    content="滑动窗口：步长取粒度的一半、相邻点 50% 重叠，曲线更平滑；代价是点数翻倍、相邻点不独立">
+                    <el-checkbox v-model="trendSlide" size="small" @change="loadMetrics">滑动</el-checkbox>
+                  </el-tooltip>
+                </div>
                 <EChart v-if="metricPoints.length >= 2" :option="trendOption" height="180px" />
                 <div v-else class="trend-empty">
                   {{ metricsLoading ? '加载中…' : '暂无数据（运行中的实例随扫随有；较早的历史实例需离线回填过完成时间）' }}
                 </div>
+                <!-- 粒度被接口降级时说明一下，否则用户选了 1m 却看到 27m 的点会以为是 bug -->
+                <div v-if="metricNote" class="trend-note">{{ metricNote }}</div>
 
                 <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
                 <el-collapse v-if="overview.error_tree && overview.error_tree.length"
@@ -1406,20 +1422,35 @@ function statusColor(s) { return { running: 'success', preparing: 'warning', que
 function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s }
 
 // ── 成功率趋势 ──────────────────────────────────────────────────────────
-// 数据源是 offline/success_tracker.py 增量读 complete/failed.jsonl 记下的
-// 每轮新增量（instance_progress 表），后端按时间分桶聚合。
-// 与顶部「成功率」卡片同源，所以两处数字一致。
-// 打开本页时后端会顺带登记该实例，已结束的历史实例也会开始采集。
+// 数据源是 task_records.finished_at（task 日志里「任务执行状态=」那行的行首
+// 时间戳），由后台 refresher 的增量扫描顺手填入，后端按时间分桶聚合。
+// 口径：任务成功算成功，任务失败/任务异常都算失败（与环形图一致）——
+// 与顶部「成功率」卡片不完全相同，那个数的是两个 jsonl 的行数。
+//
+// 只有这些状态的实例还会产生新数据：后台 refresher 只扫 running/preparing，
+// 转终态后日志不再变化，轮询刷新纯属空转。
+const METRICS_LIVE_STATUSES = ['running', 'preparing']
 const metricPoints = ref([])
 const metricsLoading = ref(false)
-const trendWindow = ref(180)   // 默认看最近 3 小时
+const trendWindow = ref(180)   // 时间范围：默认看最近 3 小时
+const trendBucket = ref(5)     // 统计粒度：每个点代表 5 分钟内的成功率
+const trendSlide = ref(false)  // 滑动窗口（步长 = 粒度的一半）
+const metricNote = ref('')     // 粒度被接口降级时的说明
 
 async function loadMetrics() {
   metricsLoading.value = true
   try {
-    const res = await api.get(`/instances/${id}/metrics`, { params: { window: trendWindow.value } })
+    const res = await api.get(`/instances/${id}/metrics`, {
+      params: { window: trendWindow.value, bucket: trendBucket.value, slide: trendSlide.value },
+    })
     metricPoints.value = res.points || []
-  } catch { metricPoints.value = [] } finally { metricsLoading.value = false }
+    // 接口为控制点数可能把粒度放大（如「1m + 全部」会算出几千个点）。
+    // 不说明的话用户选了 1m 却看到 27m 的点，会以为是 bug。
+    const actual = (res.bucket_seconds || 0) / 60
+    metricNote.value = (actual && Math.abs(actual - trendBucket.value) > 0.01)
+      ? `时间范围过长，统计粒度已自动放大到 ${actual >= 1 ? Math.round(actual) + ' 分钟' : Math.round(actual * 60) + ' 秒'}（缩小时间范围可恢复所选粒度）`
+      : ''
+  } catch { metricPoints.value = []; metricNote.value = '' } finally { metricsLoading.value = false }
 }
 
 const trendOption = computed(() => {
@@ -1644,6 +1675,7 @@ async function copyTrajPath() {
 }
 
 async function loadData(withOverview = true) {
+  const prevStatus = inst.value.status
   try {
     const reqs = [api.get(`/instances/${id}`)]
     if (withOverview) reqs.push(api.get(`/instances/${id}/overview`))
@@ -1651,6 +1683,14 @@ async function loadData(withOverview = true) {
     inst.value = i
     if (o) overview.value = o
   } catch {}
+  // 跑完那一刻补最后一次趋势：60s 的 metricsTimer 下一次触发时状态已是终态、
+  // 会被 METRICS_LIVE_STATUSES 挡掉，最后那批任务就永远画不进曲线。
+  // 这里在「活跃 → 终态」的跳变上补一发，之后才真正停止刷新。
+  if (prevStatus && METRICS_LIVE_STATUSES.includes(prevStatus)
+      && !METRICS_LIVE_STATUSES.includes(inst.value.status)
+      && activeTab.value === 'config') {
+    loadMetrics()
+  }
   // 准备中：拉下载进度（已下载多少个 config）
   if (inst.value.status === 'preparing') {
     try { prepareInfo.value = await api.get(`/instances/${id}/prepare-progress`) } catch {}
@@ -2920,10 +2960,17 @@ onMounted(async () => {
   // 顶部状态条 10s 轮询；overview 只在「配置信息」tab 需要（汇总/错误树都在那），
   // 其它 tab 只刷新实例本身，避免每个周期多打一次带目录扫描的 /overview。
   timer = setInterval(() => loadData(activeTab.value === 'config'), 10000)
-  // 趋势图单独一条更慢的轮询：后端每分钟才打一个点，跟着 10s 的状态轮询刷
-  // 只是白拉 6 次同样的数据。实例已是终态时不再刷新——采样序列不会再变。
+  // 趋势图单独一条更慢的轮询：后端 8s 一轮写数据，但曲线是分桶聚合的、
+  // 一分钟内看不出变化，跟着 10s 的状态轮询刷只是白拉 6 次。
+  //
+  // 只在实例**还会产生新数据**时刷新：后台 refresher 只扫 running/preparing，
+  // 实例一转终态（stopped/finished/completed/failed）日志就不再变化，
+  // finished_at 也不会再有新行 —— 继续轮询纯属空转。
+  // 转终态那一刻由 10s 的 loadData 更新 inst.status，下一个 60s 周期自然停住。
   metricsTimer = setInterval(() => {
-    if (activeTab.value === 'config' && inst.value.status === 'running') loadMetrics()
+    if (activeTab.value === 'config' && METRICS_LIVE_STATUSES.includes(inst.value.status)) {
+      loadMetrics()
+    }
   }, 60000)
   ensureTabLoaded(activeTab.value)
   if (activeTab.value === 'logs') {
@@ -3113,6 +3160,11 @@ onUnmounted(() => {
   margin: 14px 0 2px; padding-top: 12px; border-top: 1px solid var(--border-color);
 }
 .trend-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+/* 第二行（粒度 + 滑动）：不再画分隔线，与上一行视觉上同属一组 */
+.trend-head-sub { margin-top: 6px; padding-top: 0; border-top: none; gap: 8px; justify-content: flex-start; }
+.trend-sub-label { font-size: 12px; color: var(--text-muted); flex: 0 0 auto; }
+.trend-head-sub :deep(.el-checkbox) { margin-left: auto; }
+.trend-note { font-size: 11px; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
 .trend-empty {
   padding: 24px 12px; text-align: center;
   font-size: 12px; color: var(--text-muted); line-height: 1.6;

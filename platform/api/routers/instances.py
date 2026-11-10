@@ -2293,6 +2293,10 @@ async def get_instance_metrics(
     instance_id: str,
     window: int = Query(180, ge=1, le=43200,
                         description="看最近多少分钟（上限 30 天，前端「全部」传 10080）"),
+    bucket: float = Query(5, gt=0, le=1440,
+                          description="统计粒度（分钟）：每个点代表多长时间内的成功率"),
+    slide: bool = Query(False,
+                        description="滑动窗口：步长取粒度的一半，相邻点 50% 重叠，曲线更平滑"),
     user: dict = Depends(get_current_user),
 ):
     """实例成功率时序 —— 详情页「任务执行情况」成功率折线图的数据源。
@@ -2310,9 +2314,20 @@ async def get_instance_metrics(
     ⚠️ 这与顶部「成功率」卡片**不完全相同**：那个数的是 complete.jsonl /
     failed.jsonl 的行数，不把「任务异常」单列。有异常任务的实例上两者会有差异。
 
+    **三个维度分开控制**：
+      - `window`：看最近多久（时间范围）
+      - `bucket`：统计粒度，每个点代表多长时间内的成功率
+      - `slide` ：是否滑动窗口。开启后步长取粒度的一半、相邻点 50% 重叠，
+                  单个异常值被摊薄、曲线不会因落在桶边界而跳变；
+                  代价是点数翻倍且相邻点不独立
+
+    粒度要按实例的吞吐选：低吞吐实例用小粒度会让每个点只统计到一两个任务，
+    成功率只能是 0% 或 100%（实测 seq=2371 约 1 个任务/分钟，56s 桶下标准差
+    高达 41.7，而 48 分钟粒度下只有 14.3）。
+
     每个点给两类：
-      - `win_success_rate`：**桶内**成功率，反映「这段时间跑得怎么样」
-      - `cum_success_rate`：累计成功率（前缀和）
+      - `win_success_rate`：**窗口内**成功率，反映「这段时间跑得怎么样」
+      - `cum_success_rate`：累计成功率（截至该点右边界的全部任务）
     累计值在跑了几千个任务后会被历史压得几乎不动，看不出最近是否开始大面积失败，
     所以前端默认展示窗口口径。桶内没有完成任务时 win_success_rate 为 None
     （前端断线而非画成 0）。
@@ -2363,41 +2378,88 @@ async def get_instance_metrics(
     if not events:
         return {"instance_id": instance_id, "window_minutes": window, "points": []}
 
-    span = max(1.0, (events[-1][0] - events[0][0]).total_seconds())
-    bucket_seconds = max(10, int(span / 30))
+    # 统计尺度由前端显式指定（bucket 分钟），不再按「约 30 个点」自动推导。
+    #
+    # 自动推导在低吞吐实例上会失真：实测 seq=2371 约 1 个任务/分钟，
+    # 30m 窗口 /30 桶 = 56s 一桶，中位数每桶只有 1 个任务 —— 成功率只能是
+    # 0% 或 100%，曲线变成一排噪声（标准差 41.7，而同实例 24h 下只有 14.3）。
+    # 让用户自己选尺度更直接：任务跑得慢就选大一点的粒度。
+    bucket_seconds = max(10, int(bucket * 60))
+
+    # slide=True 时用**滑动窗口**：步长取桶宽的一半，相邻点有 50% 重叠。
+    # 作用是平滑 —— 每个任务会被计进两个相邻窗口，单个异常值的影响被摊薄，
+    # 曲线不会因为「恰好落在桶边界」而跳变。代价是点数翻倍、相邻点不独立。
+    step_seconds = bucket_seconds // 2 if slide else bucket_seconds
+    step_seconds = max(5, step_seconds)
 
     t0 = events[0][0]
-    buckets: dict[int, list] = {}
-    for ts, ok in events:
-        idx = int((ts - t0).total_seconds() // bucket_seconds)
-        b = buckets.setdefault(idx, [0, 0])
-        b[0 if ok else 1] += 1
+    span = (events[-1][0] - t0).total_seconds()
 
+    # 点数上限：防止「1 分钟粒度 + 全部窗口」这种组合算出几千个点。
+    # 超了就把粒度按比例放大，并在响应里回传实际用的值，前端据此提示。
+    MAX_POINTS = 400
+    n_est = int(span / step_seconds) + 1
+    if n_est > MAX_POINTS:
+        scale = n_est / MAX_POINTS
+        bucket_seconds = int(bucket_seconds * scale)
+        step_seconds = max(5, int(step_seconds * scale))
+
+    # 按步长扫窗口。事件已按时间升序，用双指针而不是每个窗口重新过滤全量 ——
+    # 滑动模式下窗口数翻倍，O(窗口数 × 事件数) 在上万个任务时会明显变慢。
     out = []
     cum_done = 0
     cum_fail = 0
-    for idx in sorted(buckets):
-        done, fail = buckets[idx]
-        cum_done += done
-        cum_fail += fail
-        fin = done + fail
+    lo = 0          # 窗口左端在 events 中的下标
+    hi = 0          # 窗口右端（不含）
+    n_ev = len(events)
+    win_done = win_fail = 0
+    idx = 0
+    while True:
+        w_start = t0 + timedelta(seconds=idx * step_seconds)
+        w_end = w_start + timedelta(seconds=bucket_seconds)
+        if w_start > events[-1][0]:
+            break
+        # 右端推进：把落入窗口的新事件计进来
+        while hi < n_ev and events[hi][0] < w_end:
+            if events[hi][1]:
+                win_done += 1
+            else:
+                win_fail += 1
+            hi += 1
+        # 左端推进：把滑出窗口的事件去掉
+        while lo < hi and events[lo][0] < w_start:
+            if events[lo][1]:
+                win_done -= 1
+            else:
+                win_fail -= 1
+            lo += 1
+
+        fin = win_done + win_fail
+        # 累计口径按「窗口右端之前的全部事件」算，与滑动无关
+        cum_done = sum(1 for e in events[:hi] if e[1])
+        cum_fail = hi - cum_done
         cum_fin = cum_done + cum_fail
         out.append({
-            # 桶的右边界：该桶代表「截至这一刻的这段时间」
-            "ts": (t0 + timedelta(seconds=(idx + 1) * bucket_seconds)).isoformat(timespec="seconds"),
+            # 窗口右边界：该点代表「截至这一刻的最近 bucket 分钟」
+            "ts": w_end.isoformat(timespec="seconds"),
             "completed": cum_done,
             "failed": cum_fail,
             "running": 0,
             "total": row["total_tasks"] or 0,
             "cum_success_rate": round(cum_done / cum_fin * 100, 1) if cum_fin else None,
-            "win_success_rate": round(done / fin * 100, 1) if fin else None,
+            "win_success_rate": round(win_done / fin * 100, 1) if fin else None,
             "win_finished": fin,
         })
+        idx += 1
+        if idx > MAX_POINTS * 2:        # 兜底，防止任何意外的死循环
+            break
 
     return {
         "instance_id": instance_id,
         "window_minutes": window,
         "bucket_seconds": bucket_seconds,
+        "step_seconds": step_seconds,
+        "slide": slide,
         "points": out,
     }
 
