@@ -240,6 +240,23 @@ stop_tracker() {
     _stop_pidfile tracker.pid "task_tracker"
 }
 
+# success-tracker：采集每个实例的成功率时序（详情页「任务执行情况」趋势图）。
+# 与浅层那套无关，只复用了 task_tracker 读 jsonl 的函数；offset 记在自己的
+# success_tracker_state 表里，不会和 task_tracker 互相推进偏移。
+start_success_tracker() {
+    if [ -f success_tracker.pid ] && kill -0 "$(cat success_tracker.pid)" 2>/dev/null; then
+        echo "success-tracker 已在运行 (PID: $(cat success_tracker.pid))"
+        return
+    fi
+    rm -f success_tracker.pid
+    nohup $PYTHON offline/success_tracker.py > success_tracker.log 2>&1 &
+    echo $! > success_tracker.pid
+    echo "success-tracker 已启动 (PID: $(cat success_tracker.pid))"
+}
+stop_success_tracker() {
+    _stop_pidfile success_tracker.pid "success-tracker"
+}
+
 start_shallow_realtime() {
     if [ -f shallow_realtime.pid ] && kill -0 "$(cat shallow_realtime.pid)" 2>/dev/null; then
         echo "shallow-realtime 已在运行 (PID: $(cat shallow_realtime.pid))"
@@ -438,6 +455,7 @@ case "$ACTION" in
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
         # 目标架构 4 进程（不含旧单体循环与 deep-auto 背景全量下载）
         start_tracker
+        start_success_tracker
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
@@ -478,6 +496,7 @@ case "$ACTION" in
         # 停全部：目标架构 4 进程 + 旧进程（单体循环 / deep-auto），
         # 两边都停才不会在升级期间留下孤儿进程继续抢队列。
         stop_tracker
+        stop_success_tracker
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
@@ -508,6 +527,7 @@ case "$ACTION" in
         # 停全部：目标架构 4 进程 + 旧进程（单体循环 / deep-auto），
         # 两边都停才不会在升级期间留下孤儿进程继续抢队列。
         stop_tracker
+        stop_success_tracker
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
@@ -533,6 +553,7 @@ case "$ACTION" in
         echo "Uvicorn 已启动 (PID: $(cat platform.pid))"
         # 目标架构 4 进程（不含旧单体循环与 deep-auto 背景全量下载）
         start_tracker
+        start_success_tracker
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
@@ -681,6 +702,7 @@ case "$ACTION" in
     # 要跑旧进程用 ./run.sh shallow-start / deep-start 单独起。
     worker-start)
         start_tracker
+        start_success_tracker
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
@@ -690,6 +712,7 @@ case "$ACTION" in
 
     worker-stop)
         stop_tracker
+        stop_success_tracker
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
@@ -699,6 +722,7 @@ case "$ACTION" in
 
     worker-restart)
         stop_tracker
+        stop_success_tracker
         stop_auto_tracker
         stop_shallow_realtime
         stop_shallow_auto
@@ -706,6 +730,7 @@ case "$ACTION" in
         stop_realtime_worker
         sleep 1
         start_tracker
+        start_success_tracker
         start_auto_tracker
         start_shallow_realtime
         start_shallow_auto
@@ -727,6 +752,9 @@ case "$ACTION" in
             tracker-start) start_tracker ;;
             tracker-stop)  stop_tracker ;;
             tracker-restart) stop_tracker; sleep 1; start_tracker ;;
+            success-tracker-start) start_success_tracker ;;
+            success-tracker-stop)  stop_success_tracker ;;
+            success-tracker-restart) stop_success_tracker; sleep 1; start_success_tracker ;;
         esac
         ;;
     query-start|query-stop|query-restart)
@@ -777,18 +805,18 @@ case "$ACTION" in
         # 不含 deep-auto（产物纯点击驱动，全量下载会写爆磁盘）。
         case "$ACTION" in
             shallow-all-start)
-                start_tracker; start_auto_tracker
+                start_tracker; start_success_tracker; start_auto_tracker
                 start_shallow_realtime; start_shallow_auto
                 start_shallow_query; start_realtime_worker ;;
             shallow-all-stop)
-                stop_tracker; stop_auto_tracker
+                stop_tracker; stop_success_tracker; stop_auto_tracker
                 stop_shallow_realtime; stop_shallow_auto
                 stop_shallow_query; stop_realtime_worker ;;
             shallow-all-restart)
-                stop_tracker; stop_auto_tracker
+                stop_tracker; stop_success_tracker; stop_auto_tracker
                 stop_shallow_realtime; stop_shallow_auto
                 stop_shallow_query; stop_realtime_worker; sleep 1
-                start_tracker; start_auto_tracker
+                start_tracker; start_success_tracker; start_auto_tracker
                 start_shallow_realtime; start_shallow_auto
                 start_shallow_query; start_realtime_worker ;;
         esac

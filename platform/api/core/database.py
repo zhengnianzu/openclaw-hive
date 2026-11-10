@@ -143,6 +143,22 @@ def task_data_schema(conn) -> str:
 # 放长只是等待、不是失败，真正的解法是让写事务变短（见 output_worker 的产物队列）。
 BUSY_TIMEOUT_MS = int(os.environ.get("DB_BUSY_TIMEOUT", "15000"))
 
+# 启动期（init_db_unlocked）专用的更长 busy_timeout。
+#
+# 为什么不能用上面的 15s：init_db_lock() 只串行化 4 个 uvicorn worker 之间的迁移，
+# 但 run.sh 同时还拉起 6 个离线进程（task_tracker / success_tracker / auto_tracker /
+# shallow_worker ×2 / output_worker），它们是独立进程、**从不调用 init_db_lock()**
+# （见下方 _ensure_output_status_column 的注释），flock 挡不住它们。
+# 启动瞬间这些 worker 已经在写主库，2.5GB 的主库触发 WAL checkpoint 时独占写锁，
+# 轻易超过 15s —— 于是 init_db_unlocked() 里第一条真正的写语句
+# （UPDATE users SET role='admin'）拿不到锁抛 OperationalError，
+# 而它跑在模块顶层 import 期间，异常直接让该 uvicorn worker 起不来，
+# 日志表现为 `sqlite3.OperationalError: database is locked`
+# + `INFO: Child process [xxx] died`，并被 uvicorn 反复重启刷屏。
+#
+# 启动期的迁移只跑一次，等久一点完全可以接受（等待不是失败）。
+INIT_BUSY_TIMEOUT_MS = int(os.environ.get("DB_INIT_BUSY_TIMEOUT", "120000"))
+
 
 def _configure_connection(conn):
     conn.row_factory = sqlite3.Row
@@ -731,6 +747,9 @@ def init_db_unlocked():
     （实测卡在 locks_lock_inode_wait 永不返回，该 uvicorn worker 直接起不来）。
     """
     with get_connection() as conn:
+        # 启动期迁移用更长的 busy_timeout：离线 worker 不受 init_db_lock 约束，
+        # 会和这里抢主库写锁（见 INIT_BUSY_TIMEOUT_MS 的说明）。
+        conn.execute(f"PRAGMA busy_timeout={INIT_BUSY_TIMEOUT_MS}")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -828,7 +847,18 @@ def init_db_unlocked():
                 conn.execute(f"ALTER TABLE task_registrations ADD COLUMN {col}")
             except Exception:
                 pass
-        conn.execute("UPDATE users SET role = 'admin' WHERE username = ?", (settings.ADMIN_USERNAME,))
+        # 兜 admin 角色。**不能让它把启动搞挂**：这条是本函数里第一条真正的写语句
+        # （上面的 ALTER TABLE 全被 try/except 吞掉了，所以锁冲突总是在这一行首次暴露），
+        # 而 init_db_unlocked() 跑在 main.py 的模块顶层 —— 这里抛异常 = uvicorn worker
+        # 直接起不来。而它的作用只是把已存在的 admin 账号角色兜一下，
+        # 并非启动的硬依赖：拿不到锁就跳过，下次启动会再兜一次。
+        try:
+            conn.execute(
+                "UPDATE users SET role = 'admin' WHERE username = ?",
+                (settings.ADMIN_USERNAME,),
+            )
+        except sqlite3.OperationalError as e:
+            print(f"[db] 警告: 兜 admin 角色失败（{e}），跳过，不影响启动", flush=True)
 
         # 创建队列表
         conn.executescript("""
@@ -1099,24 +1129,6 @@ def init_db_unlocked():
 
             CREATE INDEX IF NOT EXISTS idx_task_records_inst ON task_records(instance_id);
             CREATE INDEX IF NOT EXISTS idx_task_records_cat  ON task_records(instance_id, error_category);
-
-            -- 实例进度采样：详情页「任务执行情况」的成功率/吞吐折线图的数据源。
-            -- overview 接口只给当前时刻的快照，没有历史；这里由后台 refresher
-            -- 每隔一段时间给 running 实例打一个点，重启后历史仍在。
-            -- 只存累计计数，不存比率 —— 比率由前端按相邻两点做差得到「窗口内成功率」，
-            -- 存成比率的话换窗口大小就得重算，而且丢精度。
-            CREATE TABLE IF NOT EXISTS instance_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                instance_id TEXT NOT NULL,
-                ts TIMESTAMP NOT NULL,               -- 采样时刻（UTC naive，与表内其它时间列一致）
-                completed INTEGER DEFAULT 0,         -- 累计成功数
-                failed INTEGER DEFAULT 0,            -- 累计失败数
-                running INTEGER DEFAULT 0,           -- 该时刻在跑的 pod 数
-                total INTEGER DEFAULT 0              -- 任务总数（可能随配置补扫变化，一并留痕）
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_instance_metrics_inst
-                ON instance_metrics(instance_id, ts);
         """, task_data_schema(conn)))
 
         # migrate: 为已存在的 task_records 补列（IF NOT EXISTS 不会加列），风格同上
@@ -1393,6 +1405,120 @@ def init_db_unlocked():
                 PRIMARY KEY (instance_id, file_path)
             );
         """)
+
+        # ── 成功率跟踪（offline/success_tracker.py 专用）────────────────────
+        #
+        # 独立于 task_tracker/浅层分析那套：职责只有一个 —— 如实记录「哪个 config
+        # 在什么时刻、以什么结果完成了」，供详情页成功率趋势图按时间窗口聚合。
+        #
+        # **存事件而不是计数**：一行 = 一次任务完成。同一个 config 先失败后重跑
+        # 成功就是两行（时间不同、结果不同），不做改判、不冲正。这样历史曲线永远
+        # 是「当时跑得怎么样」的如实记录，不会因为今天重跑成功就把昨天的失败峰
+        # 抹掉。代价是累计总数会比 jsonl 行数多（同一任务计了两次）。
+        #
+        # 两种数据来源，都往这张表写，靠 UNIQUE 去重：
+        #   · 实时：按 offset 增量读 complete/failed.jsonl（秒级发现，时间≈观测时刻）
+        #   · 回填：扫 task-N.log 的「任务执行状态=」行（拿到**真实完成时刻**）
+        # 回填优先 —— 日志里的时间是任务真正结束的时刻，比观测时刻准。
+        #
+        # **时间一律写本地时间**：用 datetime('now','localtime') 而不是
+        # CURRENT_TIMESTAMP —— 后者在 SQLite 里恒为 UTC 且无法配置，会比本机时间
+        # 差 8 小时，与 task_instances（Python datetime.now() 写入）对不上。
+        conn.executescript("""
+            -- 自己的 offset 表。结构与 tracker_state 完全一致，但**必须分开**：
+            -- 那张表没有「属主」列，两个进程共用会互相推进对方的偏移，
+            -- 各自只能读到一部分行。read_new_lines(state_table=...) 据此切换。
+            CREATE TABLE IF NOT EXISTS success_tracker_state (
+                instance_id TEXT NOT NULL,
+                file_path   TEXT NOT NULL,
+                inode       INTEGER,
+                offset      INTEGER NOT NULL DEFAULT 0,
+                head_hash   TEXT,
+                updated_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (instance_id, file_path)
+            );
+
+            -- 登记表：用户点开「详情」页时由后端写入，tracker 据此决定跟谁。
+            -- 与 shallow_requests 同构但分开 —— 那张表的语义是「用户要浅层分析」，
+            -- 混用会带偏它的出队逻辑和 output_status 门控。
+            -- status: queued=待回填历史 / tracking=已回填完、只做增量
+            CREATE TABLE IF NOT EXISTS success_requests (
+                instance_id TEXT PRIMARY KEY,
+                status      TEXT NOT NULL DEFAULT 'queued',
+                created_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
+                updated_at  TIMESTAMP DEFAULT (datetime('now','localtime'))
+            );
+
+            -- 任务完成事件：一行 = 某个 config 在某时刻以某结果完成。
+            --
+            -- UNIQUE(instance_id, config_name, finished_at)：
+            --   · 同一 config 同一时刻只记一次 —— 增量读在 failed.jsonl 被重写、
+            --     或文件不足 128 字节时会把整份重读，靠它幂等去重
+            --   · 但**不同时刻允许多行** —— 重跑是真实发生的两次完成
+            -- source: 'log'=扫 task 日志得到（时间准）/ 'jsonl'=增量读得到（时间≈观测时刻）
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT NOT NULL,
+                config_name TEXT NOT NULL,
+                finished_at TIMESTAMP NOT NULL,   -- 本地时间
+                success     INTEGER NOT NULL,     -- 1=任务成功 0=失败/异常
+                status      TEXT,                 -- 任务成功/任务失败/任务异常，可空
+                source      TEXT NOT NULL DEFAULT 'jsonl',
+                UNIQUE(instance_id, config_name, finished_at)
+            );
+
+            -- 趋势图按 (instance_id, finished_at) 顺序扫该实例的全部事件
+            CREATE INDEX IF NOT EXISTS idx_task_events_inst
+                ON task_events(instance_id, finished_at);
+        """)
+
+        # migrate: 清理旧的「计数式」统计表 —— 已被 task_events 事件表取代。
+        # 旧设计存每轮增量计数 + 一张改判账本，无法表达「同一任务重跑了两次」，
+        # 且曲线会因为今天重跑成功而把昨天的失败峰抹掉。直接丢弃：这些数据都能
+        # 从 jsonl / task 日志重新推出来，没有不可再生的信息。
+        for _old in ("instance_progress", "instance_progress_seen"):
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS {_old}")
+            except Exception:
+                pass
+
+        # migrate: 把早期用 CURRENT_TIMESTAMP(UTC) 建出来的表改成本地时间默认值。
+        # CREATE TABLE IF NOT EXISTS 对已存在的表不生效，而 SQLite 不支持
+        # ALTER COLUMN 改默认值，只能重建。这两张表都很小，重建是毫秒级的；
+        # 判据是建表 SQL 里有没有 localtime。已有行的 UTC 值顺带补正 8 小时。
+        for tbl in ("success_requests", "success_tracker_state"):
+            try:
+                row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (tbl,)).fetchone()
+                if not row or not row[0] or "localtime" in row[0]:
+                    continue
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")]
+                time_cols = [c for c in cols if c in ("created_at", "updated_at")]
+                # RENAME TO 会把索引一起带走，重建前先把建索引的 SQL 抄下来
+                idx_sqls = [r[0] for r in conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? "
+                    "AND sql IS NOT NULL", (tbl,))]
+                new_sql = row[0].replace("DEFAULT CURRENT_TIMESTAMP",
+                                         "DEFAULT (datetime('now','localtime'))")
+                collist = ", ".join(cols)
+                conn.execute(f"ALTER TABLE {tbl} RENAME TO {tbl}__old")
+                conn.execute(new_sql)
+                conn.execute(f"INSERT INTO {tbl} ({collist}) "
+                             f"SELECT {collist} FROM {tbl}__old")
+                for tc in time_cols:
+                    conn.execute(
+                        f"UPDATE {tbl} SET {tc} = datetime({tc}, 'localtime') "
+                        f"WHERE {tc} IS NOT NULL")
+                conn.execute(f"DROP TABLE {tbl}__old")
+                for isql in idx_sqls:
+                    conn.execute(isql)
+            except Exception as e:
+                print(f"[migrate] {tbl} 时间口径迁移失败（不影响启动）: {e}", flush=True)
+                try:
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}__old")
+                except Exception:
+                    pass
 
         # 模型配置面板「对话导出」登记表：一行 = 某实例某角色（主Agent/用户模拟/Evaluator）的导出任务。
         # 提交导出时 UPSERT（UNIQUE(instance_id, role)），外部服务返回 export_id/session_path 落库；

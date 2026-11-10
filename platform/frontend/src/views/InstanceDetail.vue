@@ -139,14 +139,15 @@
                 <div class="trend-head">
                   <span class="trend-title">成功率趋势</span>
                   <el-radio-group v-model="trendWindow" size="small" @change="loadMetrics">
-                    <el-radio-button :value="5">5m</el-radio-button>
-                    <el-radio-button :value="15">15m</el-radio-button>
-                    <el-radio-button :value="60">1h</el-radio-button>
+                    <el-radio-button :value="30">30m</el-radio-button>
+                    <el-radio-button :value="180">3h</el-radio-button>
+                    <el-radio-button :value="1440">24h</el-radio-button>
+                    <el-radio-button :value="10080">全部</el-radio-button>
                   </el-radio-group>
                 </div>
                 <EChart v-if="metricPoints.length >= 2" :option="trendOption" height="180px" />
                 <div v-else class="trend-empty">
-                  {{ metricsLoading ? '加载中…' : '暂无采样数据（运行中的实例每分钟采样一次，约 2 分钟后出现）' }}
+                  {{ metricsLoading ? '加载中…' : '暂无数据（刚打开本页已开始采集，约 10 秒后出现；需要至少两批完成的任务才能连成线）' }}
                 </div>
 
                 <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
@@ -1362,10 +1363,13 @@ function statusColor(s) { return { running: 'success', preparing: 'warning', que
 function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s }
 
 // ── 成功率趋势 ──────────────────────────────────────────────────────────
-// 数据源是后台每分钟一次的 instance_metrics 采样（overview 只有当前快照）。
+// 数据源是 offline/success_tracker.py 增量读 complete/failed.jsonl 记下的
+// 每轮新增量（instance_progress 表），后端按时间分桶聚合。
+// 与顶部「成功率」卡片同源，所以两处数字一致。
+// 打开本页时后端会顺带登记该实例，已结束的历史实例也会开始采集。
 const metricPoints = ref([])
 const metricsLoading = ref(false)
-const trendWindow = ref(15)
+const trendWindow = ref(180)   // 默认看最近 3 小时
 
 async function loadMetrics() {
   metricsLoading.value = true

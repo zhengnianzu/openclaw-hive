@@ -98,18 +98,26 @@ app.include_router(worker_monitor.router)
 # 实测卡在 locks_lock_inode_wait 永不返回。
 with init_db_lock():
     init_db_unlocked()
-    harness_configs.ensure_defaults()
-    sandbox_configs.ensure_defaults()
+    # 这两步也会写库，同样可能撞上离线 worker 的写锁（init_db_lock 管不到它们，
+    # 见 database.py 的 INIT_BUSY_TIMEOUT_MS 说明）。它们都是幂等的「补默认配置」，
+    # 不能因为一次拿不到锁就让整个 uvicorn worker 起不来 —— 下次启动会再补一遍。
+    for _ensure in (harness_configs.ensure_defaults, sandbox_configs.ensure_defaults):
+        try:
+            _ensure()
+        except Exception as e:
+            print(f"[startup] 警告: {_ensure.__module__}.ensure_defaults 失败（{e}），跳过", flush=True)
 
-    with get_connection() as conn:
-        existing = conn.execute("SELECT id FROM users WHERE username = ?", (settings.ADMIN_USERNAME,)).fetchone()
-        if not existing:
-            hashed = get_password_hash(settings.ADMIN_PASSWORD)
-            try:
+    # 首次部署时创建 admin。整块包起来：连接本身和 SELECT 也可能撞锁，
+    # 而这段跑在模块顶层，任何异常都等于 uvicorn worker 起不来。
+    try:
+        with get_connection() as conn:
+            existing = conn.execute("SELECT id FROM users WHERE username = ?", (settings.ADMIN_USERNAME,)).fetchone()
+            if not existing:
+                hashed = get_password_hash(settings.ADMIN_PASSWORD)
                 conn.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, 'admin')", (settings.ADMIN_USERNAME, hashed))
                 print(f"已创建管理员账号: {settings.ADMIN_USERNAME}")
-            except Exception:
-                pass
+    except Exception as e:
+        print(f"[startup] 警告: 创建管理员账号失败（{e}），跳过", flush=True)
 
 
 @app.get("/api/health")
