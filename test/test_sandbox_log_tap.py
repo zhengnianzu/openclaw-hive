@@ -253,34 +253,77 @@ class SandboxGoneTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(issubclass(tap.SandboxUnreachable, tap.LogExportError))
 
     async def test_follow_finishes_gracefully_when_sandbox_closes(self):
+        """控制面确认沙箱关闭 → follow 以成功状态收尾，保留已读内容。
+
+        必须传 state_check：脚本只认控制面的终态结论，拿不到结论时会无上限
+        退避重试（见 sandbox_log_tap 的 UNREACHABLE_RETRY_DELAY 注释），
+        不传就会一直重试到测试超时。
+        """
         content = b"complete-run-log\n" * 10
         fake_read, _state = self._fake_read(content, fail_after=2)
         tap._read_remote_chunk = fake_read
+
+        async def closed_state():
+            return tap.SandboxState("closed", "close_reason=manual_close")
 
         events = []
         result = await tap.export_with_client(
             object(), self.settings, follow=True, chunk_bytes=1024,
             poll_interval=0.01, progress=lambda e: events.append(e),
+            state_check=closed_state,
         )
 
         done = events[-1]
         self.assertEqual(done["event"], "done")
-        self.assertEqual(done["reason"], "sandbox_gone")
-        self.assertIn("ReadTimeout", done["detail"])
+        # 快照已读完才关闭 → sandbox_closed；没读完是 sandbox_closed_incomplete。
+        self.assertEqual(done["reason"], "sandbox_closed")
+        self.assertIn("closed", done["detail"])
         # 已经读到的完整日志必须保留。
         self.assertEqual(result.read_bytes(), content)
 
     async def test_unreachable_before_complete_snapshot_still_fails(self):
-        """一个字节都没读到就连不上 —— 这是真失败，不能伪装成成功。"""
+        """一个字节都没读到、且控制面确认已关闭 —— 不能伪装成成功。"""
         async def fake_read(client, settings, next_byte, max_bytes):
+            raise tap.SandboxUnreachable("sandbox is unreachable (ReadTimeout)")
+
+        async def closed_state():
+            return tap.SandboxState("deleted", "sandbox_not_found")
+
+        tap._read_remote_chunk = fake_read
+        events = []
+        await tap.export_with_client(
+            object(), self.settings, follow=True, poll_interval=0.01,
+            progress=lambda e: events.append(e), state_check=closed_state,
+        )
+        # 快照一个字节都没拿到就关闭：reason 必须标成 incomplete，
+        # 让调用方知道这份日志不完整（不是正常跑完）。
+        self.assertEqual(events[-1]["reason"], "sandbox_closed_incomplete")
+        self.assertEqual(events[-1]["bytes"], 0)
+
+    async def test_unreachable_retries_until_stopped(self):
+        """控制面问不出状态时持续重试，直到调用方 stop —— 不靠次数判死。
+
+        这是刻意的取舍：用重试次数推断沙箱死亡会让网络抖动导致日志进程
+        早于沙箱退出（sandbox_log_tap.py 的 UNREACHABLE_RETRY_DELAY 注释）。
+        """
+        attempts = {"n": 0}
+        stop = asyncio.Event()
+
+        async def fake_read(client, settings, next_byte, max_bytes):
+            attempts["n"] += 1
+            if attempts["n"] >= 3:
+                stop.set()          # 模拟调用方中止
             raise tap.SandboxUnreachable("sandbox is unreachable (ReadTimeout)")
 
         tap._read_remote_chunk = fake_read
         with self.assertRaises(tap.SandboxUnreachable):
-            await tap.export_with_client(
-                object(), self.settings, follow=True, poll_interval=0.01,
+            await tap._read_chunk_with_retry(
+                object(), self.settings, 0, 1024,
+                stop_event=stop,
+                state_check=None,   # 控制面问不出来
             )
-        self.assertFalse(self.settings.local_path.exists())
+        # 没有上限：一直重试到 stop_event 被设置。
+        self.assertGreaterEqual(attempts["n"], 3)
 
     async def test_transient_blip_is_retried_not_treated_as_gone(self):
         """一次抖动之后沙箱还活着，follow 应该继续而不是收尾。"""
@@ -333,7 +376,7 @@ class ControlPlaneStateTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(tap.SandboxState("").is_known)
 
     async def test_closed_sandbox_skips_retries(self):
-        """控制面说 closed，就不该再浪费重试次数。"""
+        """控制面说 closed，就该立刻判定，不再重试。"""
         calls = {"n": 0}
 
         async def fake_read(client, settings, next_byte, max_bytes):
@@ -344,28 +387,34 @@ class ControlPlaneStateTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(tap.SandboxClosed):
             await tap._read_chunk_with_retry(
                 object(), self.settings, 0, 1024,
-                retries=5, stop_event=asyncio.Event(),
+                stop_event=asyncio.Event(),
                 state_check=self._state("closed", "close_reason=manual_close"),
             )
+        # 终态结论立即生效：只探测一次，不浪费退避。
+        self.assertEqual(calls["n"], 1)
         self.assertEqual(calls["n"], 1)
 
     async def test_running_sandbox_still_retries(self):
-        """控制面说 running，说明是抖动，重试次数必须照用。"""
+        """控制面说 running，说明是抖动，必须继续重试而不是判死。"""
         calls = {"n": 0}
+        stop = asyncio.Event()
 
         async def fake_read(client, settings, next_byte, max_bytes):
             calls["n"] += 1
+            if calls["n"] >= 3:
+                stop.set()          # 模拟调用方中止，否则会无上限重试
             raise tap.SandboxUnreachable("sandbox is unreachable (ReadTimeout)")
 
         tap._read_remote_chunk = fake_read
         with self.assertRaises(tap.SandboxUnreachable) as ctx:
             await tap._read_chunk_with_retry(
                 object(), self.settings, 0, 1024,
-                retries=2, stop_event=asyncio.Event(),
+                stop_event=stop,
                 state_check=self._state("running"),
             )
+        # 关键：running 绝不能被升级成 SandboxClosed。
         self.assertNotIsInstance(ctx.exception, tap.SandboxClosed)
-        self.assertEqual(calls["n"], 3)  # 首次 + 2 次重试
+        self.assertGreaterEqual(calls["n"], 3)
 
     async def test_idle_follow_never_queries_control_plane(self):
         """follow 空闲轮询不产生控制面请求 —— 只在探测失败时才查。"""
@@ -420,14 +469,22 @@ class ControlPlaneStateTest(unittest.IsolatedAsyncioTestCase):
         # 控制面给了确定答案，不该再消耗重试：第 2 次探测失败后就收尾。
         self.assertEqual(probes["n"], 2)
 
-    async def test_unknown_state_falls_back_to_heuristic(self):
-        """控制面问不出来时，退回原来的启发式，reason 标成 sandbox_gone。"""
+    async def test_unknown_state_keeps_retrying_until_stopped(self):
+        """控制面问不出来 → 持续重试，绝不自行判定沙箱已死。
+
+        原来这里断言 reason == "sandbox_gone"（按重试次数耗尽判死）。脚本
+        后来刻意去掉了那条路径：网络抖动会让日志进程早于沙箱退出，日志就
+        永久丢了。现在只有控制面给出终态才收尾，否则重试到调用方 stop。
+        """
         content = b"partial-but-complete\n"
         state = {"n": 0}
+        stop = asyncio.Event()
 
         async def fake_read(client, settings, next_byte, max_bytes):
             state["n"] += 1
             if state["n"] > 1:
+                if state["n"] >= 4:
+                    stop.set()
                 raise tap.SandboxUnreachable("sandbox is unreachable (ReadTimeout)")
             return tap.RemoteChunk(True, len(content), next_byte,
                                    content[next_byte:next_byte + max_bytes])
@@ -437,9 +494,13 @@ class ControlPlaneStateTest(unittest.IsolatedAsyncioTestCase):
         result = await tap.export_with_client(
             object(), self.settings, follow=True, poll_interval=0.01,
             progress=lambda e: events.append(e),
-            state_check=self._state(""),
+            state_check=self._state(""),          # 问不出来
+            stop_event=stop,
         )
-        self.assertEqual(events[-1]["reason"], "sandbox_gone")
+        # 被调用方中止，而不是被自行判死
+        self.assertEqual(events[-1]["reason"], "stopped")
+        self.assertGreaterEqual(state["n"], 4)
+        # 已读到的内容必须保留
         self.assertEqual(result.read_bytes(), content)
 
     async def test_state_check_failure_never_propagates(self):

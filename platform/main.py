@@ -21,6 +21,8 @@ from api.routers import wiki, notifications, settings_overview
 from api.routers import public_api
 from api.routers import artifacts
 from api.routers import worker_monitor
+# 沙箱实时日志：按需 attach 运行中任务的沙箱，增量缓存到本地文件
+from api.routers import sandbox_live
 # 导出方式 / 代理来源下拉选项：转发导出服务 (EXPORT_BASE) 的实时接口
 from api.routers import export_meta
 # 检查 settings 目录：如果实际配置文件不存在，从 .example 复制
@@ -59,6 +61,7 @@ app.include_router(instances.key_router)
 app.include_router(queues.router)
 app.include_router(obs.router)
 app.include_router(logs.router)
+app.include_router(sandbox_live.router)
 app.include_router(registrations.router)
 app.include_router(images.router)
 app.include_router(code_repos.router)

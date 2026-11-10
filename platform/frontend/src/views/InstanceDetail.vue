@@ -554,6 +554,22 @@
               </div>
             </div>
 
+            <!-- 浏览区 tab：文件日志 / 沙箱实时（仅运行中的 task 才有「实时」） -->
+            <el-tabs v-model="midTab" class="logc-mid-tabs">
+              <el-tab-pane label="日志" name="file" />
+              <el-tab-pane v-if="liveAvailable" name="live">
+                <template #label>
+                  <el-tooltip placement="top"
+                    content="查看沙箱内正在写入的 run.log。每切换任务需重新点击 —— 跟随期间会持续向沙箱发探测请求">
+                    <span class="live-label">
+                      实时<span :class="['live-dot', { 'live-dot-idle': !liveFollowing }]" />
+                    </span>
+                  </el-tooltip>
+                </template>
+              </el-tab-pane>
+            </el-tabs>
+
+            <div v-show="midTab === 'file'" class="logc-file-wrap">
             <div class="toolbar">
               <el-input v-model="filterKeyword" placeholder="过滤关键词…" clearable style="width:240px" />
               <el-select v-model="logPageSize" style="width:130px" @change="onLogPageSizeChange">
@@ -600,6 +616,30 @@
                   暂无日志
                 </div>
               </template>
+            </div>
+            </div><!-- /midTab === 'file' -->
+
+            <!-- 沙箱实时：内容来自后端按需 attach 后落盘的本地缓存文件 -->
+            <div v-if="midTab === 'live'" class="live-wrap">
+              <div class="toolbar">
+                <!-- 三态要分清：沙箱是否活着(liveAlive) 与 是否在轮询(liveFollowing)
+                     是两件事，任务跑完后沙箱关了但已缓存内容仍可读。 -->
+                <el-tag v-if="!liveAlive" size="small" type="warning">沙箱已关闭</el-tag>
+                <el-tag v-else-if="liveFollowing" size="small" type="success">跟随中</el-tag>
+                <el-tag v-else size="small" type="info">已停止</el-tag>
+                <span class="logc-hint">沙箱内 run.log · 每 2s 增量拉取</span>
+                <el-checkbox v-model="liveAutoScroll" size="small">自动滚动</el-checkbox>
+                <span class="logc-hint" style="margin-left:auto">
+                  已缓存 {{ liveOffset }} 字节
+                </span>
+              </div>
+              <div v-if="liveNote" class="live-note">{{ liveNote }}</div>
+              <div ref="liveContainer" class="log-container">
+                <pre v-if="liveText" class="log-raw">{{ liveText }}</pre>
+                <div v-else class="logc-hint" style="padding:20px;text-align:center">
+                  {{ liveLoading ? '正在连接沙箱…' : '暂无内容' }}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -1257,8 +1297,11 @@ watch(activeTab, (tab) => {
   ensureTabLoaded(tab)
   if (tab === 'logs') {
     nextTick(() => { if (logContainer.value) logContainer.value.addEventListener('scroll', onScroll) })
-  } else if (logContainer.value) {
-    logContainer.value.removeEventListener('scroll', onScroll)
+  } else {
+    if (logContainer.value) logContainer.value.removeEventListener('scroll', onScroll)
+    // 离开日志中心就停掉沙箱实时轮询：它每 2s 一个 exec RPC，
+    // 不能在用户已经切走的情况下继续打沙箱。
+    stopLive()
   }
 })
 
@@ -1984,7 +2027,101 @@ async function loadLogEvents() {
   finally { if (logSource.value === src) eventsLoading.value = false }
 }
 
-// 点击时间线 → 中栏定位。骨架版用关键字定位：把该事件时间戳填进过滤框，
+// ---- 中栏 tab：文件日志 / 沙箱实时 ----
+// 沙箱执行过程中主进程不回传输出（env_id 打出后到任务收尾之间是盲区），
+// 「实时」tab 按需 attach 该 task 的沙箱、增量拉沙箱内 run.log。
+// 只在「运行中」的 task 上出现：有 env_id（沙箱已建）且还没出现 任务执行状态= 行。
+const midTab = ref('file')
+const liveText = ref('')
+const liveOffset = ref(0)
+const liveNote = ref('')
+const liveAlive = ref(true)
+const liveLoading = ref(false)
+const liveAutoScroll = ref(true)
+const liveContainer = ref(null)
+// 是否正在轮询。驱动 tab 上绿点的呼吸/熄灭，让「有没有在打沙箱」可见。
+const liveFollowing = ref(false)
+let liveTimer = null
+
+const isTaskLog = computed(() => /^task-\d+\.log$/.test(logSource.value))
+// eventSummary 由 loadLogEvents 填充，env_id 来自后端 _scan_events 的 summary
+const liveAvailable = computed(() =>
+  isTaskLog.value && !!eventSummary.value.env_id && !eventSummary.value.status
+)
+
+function resetLive() {
+  liveText.value = ''
+  liveOffset.value = 0
+  liveNote.value = ''
+  liveAlive.value = true
+}
+
+async function pollLive() {
+  if (liveLoading.value) return          // 上一轮还没回来就跳过，避免请求堆积
+  const src = logSource.value
+  liveLoading.value = true
+  try {
+    const res = await api.get(`/logs/${id}/sandbox-live/${src}`, {
+      params: { offset: liveOffset.value }, silent: true,
+    })
+    if (logSource.value !== src || midTab.value !== 'live') return
+    if (res.truncated) { liveText.value = '' }   // 远端重建过，清屏重来
+    if (res.text) liveText.value += res.text
+    liveOffset.value = res.next_offset ?? liveOffset.value
+    liveNote.value = res.note || ''
+    liveAlive.value = res.sandbox_alive !== false
+    // 任务已结束：停轮询，并刷新一次事件（让 eventSummary.status 填上），
+    // liveAvailable 随之变 false → watch 把 tab 隐藏并落回「日志」。
+    // 不刷新的话 tab 会一直挂着显示停住的旧内容。
+    if (res.task_running === false) {
+      stopLive()
+      loadLogEvents()
+      return
+    }
+    if (liveAutoScroll.value) {
+      nextTick(() => {
+        const el = liveContainer.value
+        if (el) el.scrollTop = el.scrollHeight
+      })
+    }
+  } catch {
+    liveNote.value = '拉取失败，重试中…'
+  } finally { liveLoading.value = false }
+}
+
+function startLive() {
+  stopLive()
+  liveFollowing.value = true
+  pollLive()
+  liveTimer = setInterval(pollLive, 2000)
+}
+
+function stopLive() {
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null }
+  liveFollowing.value = false
+}
+
+watch(midTab, (tab) => {
+  if (tab === 'live') startLive()
+  else { stopLive(); resetLive() }
+})
+
+// 换 task 就是换沙箱：无条件停掉跟随，不自动续上新沙箱。
+// 刻意要求「每个任务都手动点一次实时」—— 每轮轮询是一个 exec RPC，
+// 自动续上会在用户只是浏览任务列表时悄悄打一串沙箱。
+watch(logSource, () => {
+  stopLive()
+  resetLive()
+  if (midTab.value === 'live') midTab.value = 'file'
+})
+
+// 任务跑完 → tab 消失，落回文件日志（「结束后实时不再显示」）
+watch(liveAvailable, (ok) => {
+  if (!ok && midTab.value === 'live') midTab.value = 'file'
+})
+
+// ---- 右栏时间线：点击事件 → 中栏定位 ----
+// 骨架版用关键字定位：把该事件时间戳填进过滤框，
 // 日志正文随即只剩相关行。比重新按字节游标翻页简单得多，且对用户同样有用。
 function jumpToLine(line) {
   if (!line) return
@@ -2839,6 +2976,7 @@ onUnmounted(() => {
   clearInterval(shallowTimer)
   clearInterval(deepPollTimer)
   stopExportPoll()
+  stopLive()
   if (logContainer.value) logContainer.value.removeEventListener('scroll', onScroll)
 })
 </script>
@@ -3093,6 +3231,33 @@ onUnmounted(() => {
 /* 长行自动换行：日志里常有超长的 JSON/路径，默认 white-space:pre 会把整个
    浏览区撑出横向滚动条，读起来要来回拖。改为保留缩进但允许折行。 */
 .logc-mid .log-raw { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---- 中栏 tab：文件日志 / 沙箱实时 ---- */
+/* .logc-mid 是 flex column，两个 tab 面板都要能吃满剩余高度，
+   否则 .log-container 的 flex:1 没有参照，日志区会塌成 0 高。 */
+.logc-mid-tabs { margin-bottom: 4px; }
+.logc-mid-tabs :deep(.el-tabs__header) { margin-bottom: 0; }
+/* 两个面板都要吃满中栏剩余高度，否则内部 .log-container 的 flex:1
+   没有参照、日志区会塌成 0 高。 */
+.logc-file-wrap, .live-wrap {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+}
+.live-label { display: inline-flex; align-items: center; gap: 5px; }
+/* 呼吸绿点：表示正在跟随沙箱 */
+.live-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #10b981; animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.8); }
+}
+/* 未在跟随：灰点、不呼吸。避免「没在打沙箱却显示绿色心跳」的误导。 */
+.live-dot-idle { background: var(--text-muted, #909399); animation: none; }
+.live-note {
+  margin-bottom: 8px; padding: 6px 10px; border-radius: var(--radius-md);
+  background: #fdf6ec; color: #b88230; font-size: 12px;
+}
 .logc-card {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
   flex-wrap: wrap; padding: 12px 14px; margin-bottom: 12px;

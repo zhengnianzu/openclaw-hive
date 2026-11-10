@@ -181,9 +181,12 @@ start  ->  chunk ...  ->  done
 `done.reason` 取值：
 
 - `complete` —— 快照读完（非 follow）
-- `sandbox_closed` —— 控制面确认沙箱已关闭
-- `sandbox_gone` —— 连不上且控制面未确认，由启发式判定
+- `sandbox_closed` —— 控制面确认沙箱已关闭，且快照已读完
+- `sandbox_closed_incomplete` —— 控制面确认已关闭，但快照没读完；保留已导出字节
 - `stopped` —— 外部 `stop_event` 置位
+
+连不上但控制面**未**确认终态时不会产生 `done` —— 这种情况持续退避重试，
+因为用重试次数推断沙箱死亡会让网络抖动导致日志进程早于沙箱退出。
 
 ## 快照边界
 

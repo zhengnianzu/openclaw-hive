@@ -478,9 +478,12 @@ def _scan_events(log_file: str, max_bytes: int = 8 * 1024 * 1024,
     不适用于它们，用 max_bytes / max_events 双重兜底，避免回传巨量无用数据。
     """
     events: list[dict] = []
+    # env_id 供前端判断「该任务是否还活着、能不能看沙箱实时日志」：
+    # 有 env_id（沙箱已建）且 status 为空（没出现 任务执行状态= 行）== 运行中。
+    # task_records.status 做不到这个判断 —— 运行中和未执行都是 NULL。
     summary: dict = {"status": None, "error_code": None, "total_elapsed": None,
                      "config": None, "framework": None, "started_at": None,
-                     "ended_at": None}
+                     "ended_at": None, "env_id": None}
     in_box = False
     read = 0
     truncated = False
@@ -527,6 +530,7 @@ def _scan_events(log_file: str, max_bytes: int = 8 * 1024 * 1024,
                     summary["started_at"] = lm.group("ts")
                 elif kind == "env_ready":
                     ev["detail"] = f"env_id={groups.get('env', '')}"
+                    summary["env_id"] = groups.get("env") or None
                 elif kind == "stage":
                     ev["detail"] = groups.get("info") or groups.get("port") or ""
                 elif kind == "finalize":
