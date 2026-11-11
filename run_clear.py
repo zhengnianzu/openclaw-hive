@@ -42,6 +42,18 @@ KUBECONFIG_DIR = (
 KUBECTL_TIMEOUT = 180
 
 
+def _prefix_match(sandbox_id: str, prefix: str) -> bool:
+    """判断 sandbox_id 是否以 prefix 开头, 大小写不敏感。
+
+    controlplane 下发 sandbox_id 时会把 prefix 转成小写 (例如配置里写
+    ChanghaoLau2611111441, 集群里实际是 changhaolau2611111441...),
+    用 startswith 直接比会全部漏掉, 表现为"找到 0 个"。
+    """
+    if not prefix:
+        return True
+    return sandbox_id.lower().startswith(prefix.lower())
+
+
 def _kubeconfig_server(path: str) -> str:
     """读取 kubeconfig 里第一个 cluster 的 server, 用于跨文件去重。"""
     try:
@@ -96,7 +108,7 @@ def get_sandbox_ids_from_k8s_old(sandbox_id_prefix, sandbox_namespace, kubeconfi
         sandbox_ids = []
         for line in result.stdout.strip().splitlines():
             pod_name = line.split()[0]
-            if pod_name.startswith(prefix):
+            if pod_name.lower().startswith(prefix.lower()):
                 sandbox_ids.append(pod_name.removeprefix("sandbox-"))
         return sandbox_ids
     except subprocess.TimeoutExpired:
@@ -145,8 +157,8 @@ def get_sandbox_ids_from_k8s(sandbox_id_prefix, sandbox_namespace, kubeconfig=No
             sid = line.strip()
             if not sid:
                 continue
-            # 如果指定了前缀，只保留匹配的
-            if sandbox_id_prefix and not sid.startswith(sandbox_id_prefix):
+            # 如果指定了前缀，只保留匹配的（大小写不敏感，见 _prefix_match）
+            if not _prefix_match(sid, sandbox_id_prefix):
                 continue
             sandbox_ids.append(sid)
         return sandbox_ids
