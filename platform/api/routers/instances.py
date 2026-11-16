@@ -75,6 +75,34 @@ def _apply_timeout_settings(base, max_ttl_second: int) -> tuple[int, int, int]:
             )
     return max_ttl_second, main_timeout, query_timeout
 
+
+def _set_openclaw_main_model(openclaw_cfg: dict, model_id: str) -> None:
+    """同步 OpenClaw 默认模型和显式 main，兼容 10.6 entries 与旧版 list。"""
+    model_ref = f"local/{model_id}"
+    agents = openclaw_cfg.setdefault("agents", {})
+    defaults = agents.setdefault("defaults", {})
+    defaults["model"] = {"primary": model_ref}
+    defaults["models"] = {model_ref: {}}
+
+    entries = agents.get("entries")
+    if isinstance(entries, dict):
+        main = entries.setdefault("main", {})
+        main["model"] = {"primary": model_ref}
+        main["models"] = {model_ref: {}}
+
+    agent_list = agents.get("list")
+    if isinstance(agent_list, list):
+        main = next(
+            (entry for entry in agent_list
+             if isinstance(entry, dict) and entry.get("id") == "main"),
+            None,
+        )
+        if main is None:
+            main = {"id": "main"}
+            agent_list.append(main)
+        main["model"] = {"primary": model_ref}
+        main["models"] = {model_ref: {}}
+
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
 _OCCUPYING_STATUSES = OCCUPYING_STATUSES
 _OCCUPYING_PLACEHOLDERS = ",".join("?" * len(_OCCUPYING_STATUSES))
@@ -1358,8 +1386,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             if models_list:
                 models_list[0]["id"] = req.model_id
                 models_list[0]["name"] = req.model_id
-            openclaw_cfg["agents"]["defaults"]["model"]["primary"] = f"local/{req.model_id}"
-            openclaw_cfg["agents"]["defaults"]["models"] = {f"local/{req.model_id}": {}}
+            _set_openclaw_main_model(openclaw_cfg, req.model_id)
 
         with open(openclaw_path, "w", encoding="utf-8") as f:
             json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)

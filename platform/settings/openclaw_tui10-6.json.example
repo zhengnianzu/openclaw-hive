@@ -1,0 +1,306 @@
+{
+  "meta": {
+    "migrations": {
+      "webhookListeners": true,
+      "modelPolicyAllowlist": true,
+      "utilityModelSeparation": true
+    },
+    "lastTouchedVersion": "2026.10.6"
+  },
+  "plugins": {
+    "enabled": true,
+    "load": {
+      "paths": [
+        "/home/ma-user/xiaoyi-device-env/openclaw-plugin"
+      ]
+    },
+    "entries": {
+      "xiaoyi-device-env": {
+        "enabled": true,
+        "config": {}
+      },
+      "microsoft": {
+        "enabled": false
+      },
+      "web-readability": {
+        "enabled": false
+      },
+      "brave": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "BSAGqO4xyWP9kyBfvitCOw2lT_6T_vb"
+          }
+        }
+      }
+    }
+  },
+  "wizard": {
+    "lastRunAt": "2026-10-23T07:02:16.951Z",
+    "lastRunVersion": "2026.10.6",
+    "lastRunCommand": "doctor",
+    "lastRunMode": "local",
+    "securityAcknowledgedAt": "2026-10-23T07:07:20.721Z",
+    "accessMode": "full"
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "controlUi": { "allowedOrigins": ["null"] },
+    "auth": { "mode": "token", "token": "xxxx" },
+    "tailscale": { "mode": "off" }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    },
+    "entries": {
+      "1password": {
+        "enabled": false
+      },
+      "blogwatcher": {
+        "enabled": false
+      },
+      "blucli": {
+        "enabled": false
+      },
+      "camsnap": {
+        "enabled": false
+      },
+      "coding-agent": {
+        "enabled": false
+      },
+      "eightctl": {
+        "enabled": false
+      },
+      "gemini": {
+        "enabled": false
+      },
+      "gh-issues": {
+        "enabled": false
+      },
+      "gifgrep": {
+        "enabled": false
+      },
+      "github": {
+        "enabled": false
+      },
+      "gog": {
+        "enabled": false
+      },
+      "goplaces": {
+        "enabled": false
+      },
+      "himalaya": {
+        "enabled": false
+      },
+      "mcporter": {
+        "enabled": false
+      },
+      "model-usage": {
+        "enabled": false
+      },
+      "nano-pdf": {
+        "enabled": false
+      },
+      "obsidian": {
+        "enabled": false
+      },
+      "openai-whisper": {
+        "enabled": false
+      },
+      "openai-whisper-api": {
+        "enabled": false
+      },
+      "openhue": {
+        "enabled": false
+      },
+      "oracle": {
+        "enabled": false
+      },
+      "ordercli": {
+        "enabled": false
+      },
+      "sag": {
+        "enabled": false
+      },
+      "sherpa-onnx-tts": {
+        "enabled": false
+      },
+      "songsee": {
+        "enabled": false
+      },
+      "sonoscli": {
+        "enabled": false
+      },
+      "spotify-player": {
+        "enabled": false
+      },
+      "summarize": {
+        "enabled": false
+      },
+      "tmux": {
+        "enabled": false
+      },
+      "trello": {
+        "enabled": false
+      },
+      "xurl": {
+        "enabled": false
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "local": {
+        "baseUrl": "http://115.120.120.64:8082",
+        "apiKey": "sk-xxxxx",
+        "api": "anthropic-messages",
+        "timeoutSeconds": 300000,
+        "models": [
+          {
+            "id": "glm-5.3",
+            "name": "glm-5.3",
+            "api": "anthropic-messages",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 240000,
+            "maxTokens": 64000,
+            "compat": {
+              "maxTokensField": "max_tokens",
+              "supportsPromptCacheKey": true
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "thinkingDefault": "max",
+      "model": {
+        "primary": "local/glm-5.3"
+      },
+      "models": {
+        "local/glm-5.3": {}
+      },
+      "workspace": "/home/ma-user/.openclaw/workspace",
+      "compaction": {
+        "mode": "safeguard",
+        "timeoutSeconds": 1200
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      },
+      "systemAgent": {
+        "agentId": "main"
+      },
+      "heartbeat": {
+        "agentId": "main"
+      }
+    },
+    "ownership": "explicit",
+    "entries": {
+      "main": {
+        "workspace": "/home/ma-user/.openclaw/workspace",
+        "agentDir": "/home/ma-user/.openclaw/agents/main/agent",
+        "model": {
+          "primary": "local/glm-5.3"
+        },
+        "models": {
+          "local/glm-5.3": {}
+        }
+      }
+    }
+  },
+  "talk": {
+    "agentId": "main"
+  },
+  "telemetry": {
+    "enabled": false,
+    "consentedAt": "2026-10-23T07:07:25.219Z"
+  },
+  "tools": {
+    "deny": [
+      "web_search"
+    ],
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "brave",
+        "timeoutSeconds": 600
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "profile": "full",
+    "allow": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "web_fetch",
+      "browser",
+      "canvas",
+      "message",
+      "agents_list",
+      "sessions_list",
+      "sessions_history",
+      "sessions_send",
+      "subagents",
+      "session_status",
+      "memory_get",
+      "memory_search",
+      "sessions_spawn",
+      "sessions_yield",
+      "update_plan",
+      "xiaoyi-device-env",
+      "image_reading",
+      "apply_patch",
+      "create_goal",
+      "get_goal",
+      "update_goal",
+      "cron",
+      "view_push_result",
+      "dir_fetch",
+      "dir_list",
+      "file_fetch",
+      "file_write",
+      "gateway",
+      "nodes",
+      "skill_workshop",
+      "tts"
+    ]
+  },
+  "browser": {
+    "enabled": true,
+    "defaultProfile": "chrome",
+    "headless": true,
+    "noSandbox": true,
+    "attachOnly": false,
+    "ssrfPolicy": {
+      "dangerouslyAllowPrivateNetwork": true
+    },
+    "profiles": {
+      "openclaw": {
+        "cdpPort": 18800
+      },
+      "chrome": {
+        "cdpPort": 9222
+      }
+    }
+  }
+}

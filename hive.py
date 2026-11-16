@@ -52,6 +52,7 @@ from prepare_config import (
     _classify_task_stdout,
     ERROR_CATALOG,
 )
+from utils.throttle import ThrottleController, build_from_config
 from utils.win_util import (
     ps_command,
     ps_copy_skill_command,
@@ -61,6 +62,7 @@ from utils.win_util import (
     _start_jiuwenswarm_gateway_windows,
     _stop_jiuwenswarm_gateway_windows,
     _run_main_script_windows,
+    _read_remote_log,
 )
 # Module-level logger
 logger = get_logger()
@@ -74,6 +76,25 @@ _current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
 # Default timeout for OBS download operations (seconds)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
+THROTTLE_FLOOR = 50
+
+
+@dataclass(frozen=True)
+class TaskOutcome:
+    """单个任务的最终结果，供并发控制器消费。"""
+
+    status: str
+    error_code: str = ""
+    detail: str = ""
+
+
+def _throttle_enabled(run_cfg) -> bool:
+    """只读取 run_config.throttle.enabled；配置缺失或无效时默认关闭。"""
+    try:
+        cfg = run_cfg.get("throttle")
+        return bool(cfg and cfg.get("enabled", False))
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -383,6 +404,7 @@ class OpenClawDistillationTask:
     _start_jiuwenswarm_gateway_windows = _start_jiuwenswarm_gateway_windows
     _stop_jiuwenswarm_gateway_windows = _stop_jiuwenswarm_gateway_windows
     _run_main_script_windows = _run_main_script_windows
+    _read_remote_log = _read_remote_log
 
     def __init__(self, config: TaskConfig):
         self.logger = logger
@@ -1585,11 +1607,10 @@ class OpenClawDistillationTask:
                         f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                     )
 
-    async def run(self, config_file: str, task_idx: int = 0) -> None:
+    async def run(self, config_file: str, task_idx: int = 0) -> TaskOutcome:
         """Run a single distillation task.
 
-        Returns a dict {status, error_code, config, elapsed}
-        for the orchestrator to aggregate per-run stats.
+        Returns a TaskOutcome for the orchestrator and ThrottleController.
         """
         await asyncio.sleep(random.uniform(1, 10))
         start_time = time.perf_counter()
@@ -1698,6 +1719,14 @@ class OpenClawDistillationTask:
                 + " ====="
             )
 
+        return TaskOutcome(
+            status=status,
+            error_code=error_code,
+            # 复用 error_msg: 它是 detail 的超集(HiveError 分支多一个 short 前缀),
+            # 唯一消费方 throttle.record→classify_c003 只做子串匹配, 前缀不影响判定。
+            detail=error_msg,
+        )
+
 
 # ============================================================================
 # Task Orchestration
@@ -1770,7 +1799,8 @@ async def _upload_records_to_obs(config: TaskConfig) -> None:
 async def _worker(
     worker_id: int,
     task_queue: asyncio.Queue,
-    config: TaskConfig
+    config: TaskConfig,
+    throttle: Optional[ThrottleController] = None,
 ) -> None:
     """Worker coroutine that processes tasks from the queue."""
     while True:
@@ -1788,8 +1818,33 @@ async def _worker(
             logger.info(f"===== Worker {worker_id} starting task {task_idx}: {config_name} =====")
             token = _current_task_idx.set(task_idx)
             try:
-                task = OpenClawDistillationTask(config)
-                await task.run(os.path.join(config.task_input_path, config_name), task_idx)
+                async def execute_one() -> TaskOutcome:
+                    # 放在闸门内创建，使每次真正放行时重读 YAML；由此可同步用户
+                    # 调整后的 concurrent_num，同时不会提前创建沙箱。
+                    task = OpenClawDistillationTask(config)
+                    if throttle is not None:
+                        try:
+                            latest_ceiling = int(
+                                task.global_config.run_config.concurrent_num
+                            )
+                            throttle.set_ceiling(latest_ceiling)
+                        except (AttributeError, TypeError, ValueError):
+                            pass
+                    return await task.run(
+                        os.path.join(config.task_input_path, config_name), task_idx
+                    )
+
+                if throttle is None:
+                    await execute_one()
+                else:
+                    async with throttle.slot():
+                        outcome = await execute_one()
+                        # 在 release 唤醒等待 worker 之前先调整 limit。
+                        throttle.record(
+                            outcome.status,
+                            outcome.error_code,
+                            outcome.detail,
+                        )
             finally:
                 _current_task_idx.reset(token)
             logger.info(f"!!!!! Worker {worker_id} finished task {task_idx}: {config_name} !!!!!")
@@ -1949,8 +2004,28 @@ async def run_tasks(
         await task_queue.put((idx, name))
 
     # Run workers
+    throttle: Optional[ThrottleController] = None
+    run_cfg = load_yaml_config(config.run_config_file).run_config
+    if _throttle_enabled(run_cfg):
+        # 熔断参数由 Hive 接入层统一约束；utils/throttle.py 保持原始实现。
+        # 控制器内部仍会执行 min(floor, concurrent_num)，避免小并发被反向抬高。
+        throttle_run_cfg = copy.deepcopy(run_cfg)
+        throttle_run_cfg.throttle["floor"] = THROTTLE_FLOOR
+        throttle = build_from_config(
+            concurrent_num,
+            throttle_run_cfg,
+            logger=logger,
+            state_file=os.path.join(config.task_output_path, "_throttle.json"),
+        )
+        logger.warning(
+            f"[throttle] enabled ceiling={concurrent_num} "
+            f"floor={min(THROTTLE_FLOOR, concurrent_num)} limit={throttle.limit}"
+        )
+    else:
+        logger.info("[throttle] disabled; using fixed concurrency")
+
     workers = [
-        _worker(i, task_queue, config) for i in range(concurrent_num)
+        _worker(i, task_queue, config, throttle) for i in range(concurrent_num)
     ]
     if workers:
         await asyncio.gather(*workers)

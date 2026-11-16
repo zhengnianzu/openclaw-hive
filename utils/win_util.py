@@ -206,6 +206,19 @@ class _DetailResult:
         self.data = {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
 
 
+async def _read_remote_log(self, log_path: str, config_dir: str) -> str:
+    """读回沙箱内 run.log 的**全量**内容, 作为 sandbox_log 落盘。"""
+    try:
+        r = await self.execution_client.extend(args=ExtendExecCommand(
+            command=ps_command(ps_read_file_b64(log_path), config_dir),
+            timeout=180,
+        ).to_dict())
+        text = decode_remote_b64((r.data or {}).get("stdout", "") or "")
+        return text if text else f"<{log_path} 无内容>"
+    except Exception as e:
+        return f"<读取 {log_path} 失败: {type(e).__name__}: {e}>"
+
+
 def _windows_env_assign(self) -> str:
     """把 config 的 sandbox.windows.sandbox.env 拼成 PowerShell 进程级赋值串。
 
@@ -747,8 +760,32 @@ async def _run_main_script_windows(self, config_file: str, task_idx: int) -> Non
             break
         await asyncio.sleep(20)
     else:
-        self.logger.error(f"[S008] harness exceeded timeout ({self.config.main_python_timeout}s)")
-        raise HiveError("S008", detail=f"timeout={self.config.main_python_timeout}s")
+        # 超时就一句 "exceeded timeout" 完全看不出卡在哪 —— 把 run.log 全量打出来,
+        # 看最后一帧停在哪一步、交付件是不是已经生成。读不到只记一行, 不掩盖原始的超时错误。
+        log_text = await self._read_remote_log(log_path, config_dir)
+        _detail = _DetailResult(
+            code=ErrorCode.SUCCESS[0],
+            msg="timeout",
+            exit_code=-1,
+            stdout=log_text or f"<{log_path} 无内容>",
+            stderr="",
+        )
+        _log_sandbox_detail(
+            self.logger,
+            f"harness timeout — {python_file} "
+            f"(timeout={self.config.main_python_timeout}s, run.log={log_path})",
+            _detail,
+            level=logging.ERROR,
+        )
+        self.logger.error(
+            f"[S008] harness exceeded timeout ({self.config.main_python_timeout}s), "
+            f"run.log 见上方"
+        )
+        raise HiveError(
+            "S008",
+            detail=f"harness timeout={self.config.main_python_timeout}s log={log_path}",
+            sandbox_result=_detail,
+        )
 
     # ---- 读 run.log 分类 (与 Linux 分支一致) ----
     # Get-Content -Raw 会把内容按控制台代码页重新编码写回 stdout, 中文必乱;

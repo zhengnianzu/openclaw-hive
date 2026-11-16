@@ -203,6 +203,52 @@ def normalize_base_url(base_url: str, api_kind: str = "openai-completions") -> s
     return base_url
 
 
+def _build_team_style_agent_model(
+    cfg: dict,
+    proto_mcc: dict,
+    proto_mcc_obj: dict,
+) -> dict:
+    """按 team 模式形状构造单个 agent 的内联模型块。
+
+    team 模式(jw_xiaoyi_team.yaml 的 modes.team.<team>.agents.<role>.model)里,
+    每个成员都把**完整**的 model_client_config 内联在自家 model 块中,并配一份
+    model_request_config(含 model 名)。成员之间互不继承,也不依赖 models.defaults
+    的 is_default 落点。这正是"每个 agent 各自绑定自己的模型"的关键:
+    网关侧按 is_default 只认一条默认模型,靠 alias 又要求请求侧透传 model_name,
+    只有内联到 agent 才能让每个 agent 稳定吃到自己的 key。
+
+    Args:
+        cfg: user_proxy_model.json 里该 agent 的 {model, base_url, api_key, api}
+        proto_mcc: 默认模型条目的 model_client_config,用于沿用 timeout 等可选字段
+        proto_mcc_obj: 默认模型条目的 model_config_obj(temperature 等)
+
+    Returns:
+        {"model_client_config": {...}, "model_request_config": {...}}
+    """
+    api_kind = cfg.get("api", "openai-completions")
+    client_provider = "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
+    model_name = cfg["model"]
+    return {
+        "model_client_config": {
+            "api_base": normalize_base_url(cfg["base_url"], api_kind),
+            "api_key": cfg["api_key"],
+            "model_name": model_name,
+            "client_provider": client_provider,
+            "timeout": proto_mcc.get("timeout", 1800),
+            "verify_ssl": proto_mcc.get("verify_ssl", True),
+            "stream_first_chunk_timeout":
+                proto_mcc.get("stream_first_chunk_timeout", 300),
+            "stream_idle_timeout":
+                proto_mcc.get("stream_idle_timeout", 120),
+            "custom_headers": copy.deepcopy(proto_mcc.get("custom_headers", {})),
+        },
+        "model_request_config": {
+            **copy.deepcopy(proto_mcc_obj),
+            "model": model_name,
+        },
+    }
+
+
 def load_yaml_config(config_file: str):
     """Load and return an OmegaConf config object."""
     return OmegaConf.load(config_file)
@@ -557,33 +603,40 @@ def prepare_local_agent_config(
                 )
                 continue
 
+            agent_model = _build_team_style_agent_model(cfg, proto_mcc, proto_mcc_obj)
             api_kind = cfg.get("api", "openai-completions")
             client_provider = (
                 "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
             )
 
+            # (a) models.defaults 追加一条带 alias 的条目:让网关 _model_cache 能用
+            #     别名解析(evaluator 等具名 agent 在请求侧透传 model_name 时命中)。
             defaults.append({
-                "model_client_config": {
-                    "api_base": normalize_base_url(cfg["base_url"], api_kind),
-                    "api_key": cfg["api_key"],
-                    "model_name": cfg["model"],
-                    "client_provider": client_provider,
-                    "timeout": proto_mcc.get("timeout", 1800),
-                    "verify_ssl": proto_mcc.get("verify_ssl", True),
-                    "stream_first_chunk_timeout":
-                        proto_mcc.get("stream_first_chunk_timeout", 300),
-                    "stream_idle_timeout":
-                        proto_mcc.get("stream_idle_timeout", 120),
-                    "custom_headers": copy.deepcopy(proto_mcc.get("custom_headers", {})),
-                },
+                **agent_model,
                 "model_config_obj": copy.deepcopy(proto_mcc_obj),
                 "is_default": False,
                 "alias": agent_name,
             })
+            # (b) 顶层 agents.<name>.model 内联完整模型块:team 模式的多 agent 策略。
+            #     每个 agent 自带 model_client_config + model_request_config,不靠
+            #     is_default 落点、也不靠 alias 猜测,真正做到 per-agent 绑模型。
+            #     已存在同名 agent 条目时只补 model,保留其 workspace/skills 等设置。
+            agents_section = data.setdefault("agents", {})
+            existing = agents_section.get(agent_name)
+            if isinstance(existing, dict):
+                existing.setdefault("model", agent_model)
+            elif existing is None:
+                agents_section[agent_name] = {"model": agent_model}
+            else:
+                logging.warning(
+                    f"jiuwenswarm agent {agent_name} 已是非 dict 形态({type(existing).__name__}),"
+                    f"跳过内联模型绑定"
+                )
+
             taken_names.add(agent_name)
             logging.info(
                 f"Added jiuwenswarm model: alias={agent_name} "
-                f"model={cfg['model']} provider={client_provider}"
+                f"model={cfg['model']} provider={client_provider} (agents.{agent_name}.model 已内联)"
             )
 
         Path(local_path).write_text(
