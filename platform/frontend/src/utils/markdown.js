@@ -38,9 +38,13 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const ratio = Number(alt)
 
   if (alt && Number.isFinite(ratio) && ratio > 0 && ratio <= 1) {
-    token.attrSet('style', `width:${(ratio * 100).toFixed(1)}%`)
-    token.attrSet('data-ratio', String(ratio))
-    token.content = '' // 不要把 "0.62" 显示成替代文本
+    // ratio === 1 是 Milkdown 对「没动过」的图片写的默认值，不是作者的主动选择。
+    // 给它加 width:100% 会让它逃掉 CSS 里的尺寸上限（见 App.vue），
+    // 所以这里只对真正缩放过的图片写 style。
+    if (ratio < 1) {
+      token.attrSet('style', `width:${(ratio * 100).toFixed(1)}%`)
+    }
+    token.content = '' // 不要把 "0.62" / "1.00" 显示成替代文本
   }
   return defaultImage(tokens, idx, options, env, self)
 }
@@ -56,11 +60,11 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
     const m = style.match(/(?:^|;)\s*width\s*:\s*([\d.]+%)\s*(?:;|$)/i)
     if (m) {
       node.setAttribute('style', `width:${m[1]}`)
-      // 比例数字被当作 alt 存着，不要让它残留在 DOM 里
-      if (/^[\d.]+$/.test(node.getAttribute('alt') || '')) node.setAttribute('alt', '')
     } else {
       node.removeAttribute('style')
     }
+    // 比例数字被当作 alt 存着（含没缩放过的 "1.00"），不要让它残留在 DOM 里
+    if (/^[\d.]+$/.test(node.getAttribute('alt') || '')) node.setAttribute('alt', '')
     node.removeAttribute('data-ratio')
   }
   if (node.tagName === 'A') {
