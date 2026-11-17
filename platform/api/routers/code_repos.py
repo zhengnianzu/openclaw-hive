@@ -1,13 +1,19 @@
 import asyncio
 import os
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..core.config import settings
 from ..core.database import get_connection
 from ..core.security import get_current_user, require_operator
-from ..models.code_repo import CodeRepoCreate, CodeRepoInfo
+from ..models.code_repo import (
+    CodeRepoCreate,
+    CodeRepoInfo,
+    CodeRepoTagCreate,
+    CodeRepoTagInfo,
+    CodeRepoUpdate,
+)
 
 router = APIRouter(prefix="/api/code-repos", tags=["code-repos"])
 
@@ -21,9 +27,24 @@ def _obs_dir_name(obs_path: str) -> str:
 
 
 @router.get("", response_model=List[CodeRepoInfo])
-def list_code_repos(user: dict = Depends(get_current_user)):
+def list_code_repos(
+    tag: Optional[str] = Query(None, description="按标签精确筛选"),
+    version: Optional[str] = Query(None, description="按版本模糊搜索"),
+    user: dict = Depends(get_current_user),
+):
+    sql = "SELECT * FROM code_repos"
+    where, params = [], []
+    if tag:
+        where.append("tag = ?")
+        params.append(tag.strip())
+    if version:
+        where.append("version LIKE ?")
+        params.append(f"%{version.strip()}%")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC"
     with get_connection() as conn:
-        rows = conn.execute("SELECT * FROM code_repos ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -37,10 +58,106 @@ def create_code_repo(req: CodeRepoCreate, user: dict = Depends(require_operator)
         if existing:
             raise HTTPException(status_code=400, detail=f"代码仓 {req.name.strip()} 版本 {req.version.strip()} 已存在")
         cursor = conn.execute(
-            "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-            (req.name.strip(), req.obs_path.strip(), req.version.strip(), req.description.strip(), req.main_python_file.strip(), user["username"]),
+            "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, tag, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (req.name.strip(), req.obs_path.strip(), req.version.strip(), req.description.strip(),
+             req.main_python_file.strip(), _check_tag(conn, req.tag), user["username"]),
         )
         row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def _check_tag(conn, value: str) -> str:
+    """标签必须是字典表里已有的值（空串表示未归类）。
+
+    不做「不存在就自动建」—— 否则一个拼写错误会悄悄长出一个新标签，
+    字典表就失去了统一口径的意义。新标签走显式的 POST /tags。
+    """
+    tag = (value or "").strip()
+    if not tag:
+        return ""
+    if not conn.execute("SELECT 1 FROM code_repo_tags WHERE name = ?", (tag,)).fetchone():
+        raise HTTPException(status_code=400, detail=f"标签 {tag} 不存在，请先创建")
+    return tag
+
+
+@router.get("/tags", response_model=List[CodeRepoTagInfo])
+def list_code_repo_tags(user: dict = Depends(get_current_user)):
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM code_repo_tags ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.post("/tags", response_model=CodeRepoTagInfo)
+def create_code_repo_tag(req: CodeRepoTagCreate, user: dict = Depends(require_operator)):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="标签名不能为空")
+    with get_connection() as conn:
+        if conn.execute("SELECT 1 FROM code_repo_tags WHERE name = ?", (name,)).fetchone():
+            raise HTTPException(status_code=400, detail=f"标签 {name} 已存在")
+        cursor = conn.execute(
+            "INSERT INTO code_repo_tags (name, created_by) VALUES (?, ?)",
+            (name, user["username"]),
+        )
+        row = conn.execute("SELECT * FROM code_repo_tags WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return dict(row)
+
+
+@router.delete("/tags/{tag_id}")
+def delete_code_repo_tag(tag_id: int, user: dict = Depends(require_operator)):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM code_repo_tags WHERE id = ?", (tag_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="标签不存在")
+        used = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM code_repos WHERE tag = ?", (row["name"],)
+        ).fetchone()["cnt"]
+        if used:
+            raise HTTPException(status_code=400, detail=f"标签 {row['name']} 仍被 {used} 个代码仓使用，无法删除")
+        conn.execute("DELETE FROM code_repo_tags WHERE id = ?", (tag_id,))
+    return {"detail": "已删除"}
+
+
+@router.patch("/{repo_id}", response_model=CodeRepoInfo)
+def update_code_repo(repo_id: int, req: CodeRepoUpdate, user: dict = Depends(require_operator)):
+    """允许改 obs_path / main_python_file / description / tag，但不允许改 name / version。
+
+    name+version 决定了 code/src/{name}/{version} 与 code/tar/{name}/{version} 两个目录，
+    实例配置里的 main_code_tar 也是这么拼的（见 instances.py 的代码仓分支）。改了会让
+    已经下载/打包好的产物对不上，所以要换名称或版本应当新建一条记录。
+
+    只拼请求里实际给了的字段，避免「只改描述」把 obs_path 一起覆盖掉。
+    """
+    sets, params = [], []
+    if req.obs_path is not None:
+        obs_path = req.obs_path.strip()
+        if not obs_path:
+            raise HTTPException(status_code=400, detail="OBS路径不能为空")
+        sets.append("obs_path = ?")
+        params.append(obs_path)
+    if req.main_python_file is not None:
+        main_py = req.main_python_file.strip()
+        if not main_py:
+            raise HTTPException(status_code=400, detail="入口文件不能为空")
+        sets.append("main_python_file = ?")
+        params.append(main_py)
+    if req.description is not None:
+        sets.append("description = ?")
+        params.append(req.description.strip())
+
+    with get_connection() as conn:
+        if not conn.execute("SELECT 1 FROM code_repos WHERE id = ?", (repo_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="代码仓不存在")
+        if req.tag is not None:
+            sets.append("tag = ?")
+            params.append(_check_tag(conn, req.tag))
+        if sets:
+            conn.execute(
+                f"UPDATE code_repos SET {', '.join(sets)} WHERE id = ?",
+                (*params, repo_id),
+            )
+        row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (repo_id,)).fetchone()
     return dict(row)
 
 

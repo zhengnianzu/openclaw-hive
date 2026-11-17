@@ -971,10 +971,35 @@ def init_db_unlocked():
                 version TEXT NOT NULL DEFAULT 'v1',
                 description TEXT DEFAULT '',
                 main_python_file TEXT DEFAULT 'openclaw_automation.py',
+                -- 所属分支/用途标签（common / xiaoyi / trg …）。名称几乎全是
+                -- openclaw-task，分支信息此前只能靠 version 前缀猜，这里显式存一列。
+                -- 取值来自 code_repo_tags 字典表，空串表示未归类。
+                tag TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT ''
+            );
+
+            -- 标签字典：统一维护可选分支，避免每个人手打出 xiaoyi/xiaoYi/xiao-yi 三种写法
+            CREATE TABLE IF NOT EXISTS code_repo_tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );
         """)
+
+        # 字典表初始只放 common 兜底，其余由运维在页面上按需创建
+        try:
+            conn.execute("INSERT OR IGNORE INTO code_repo_tags (name, created_by) VALUES ('common', 'system')")
+        except Exception:
+            pass
+
+        # migrate: add tag to code_repos
+        # 历史行一律留空 —— 分支归属只有人清楚，按 version 前缀猜容易误标
+        try:
+            conn.execute("ALTER TABLE code_repos ADD COLUMN tag TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
 
         # migrate: add main_python_file to code_repos
         try:
