@@ -45,7 +45,7 @@ PROBE_TIMEOUT = 30.0
 UNREACHABLE_RETRY_DELAY = 2.0
 MAX_UNREACHABLE_RETRY_DELAY = 30.0
 _SAFE_ENV_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
-_LOG_NAMES = {"run.log", "gateway.log"}
+_LOG_NAMES = {"run.log", "gateway.log", "proxy.log"}
 
 
 # 沙箱没了之后 SDK 可能抛自己的类型而不是 httpx 的，按类名识别避免硬依赖。
@@ -487,7 +487,9 @@ def _config_value(config: Any, key: str, default: Any = None) -> Any:
 def _normalise_log_name(log_name: str) -> str:
     canonical = str(log_name or "").strip().lower()
     if canonical not in _LOG_NAMES:
-        raise LogExportError("log_name must be 'run.log' or 'gateway.log'")
+        raise LogExportError(
+            "log_name must be one of 'run.log', 'gateway.log', 'proxy.log'"
+        )
     return canonical
 
 
@@ -516,7 +518,11 @@ def resolve_export_settings(
     home = str(_config_value(sandbox_config, "home", default_home))
     workspace = str(_config_value(sandbox_config, "workspace", path_cls(home, "workspace")))
     workdir = str(_config_value(sandbox_config, "result_workdir", path_cls(workspace, "workdir")))
-    filename_key = "result_log" if log_name == "run.log" else "gateway_log"
+    filename_key = {
+        "run.log": "result_log",
+        "gateway.log": "gateway_log",
+        "proxy.log": "proxy_log",
+    }[log_name]
     default_filename = log_name
     filename = str(_config_value(sandbox_config, filename_key, default_filename))
     remote_path = str(path_cls(workdir, filename))
@@ -794,7 +800,7 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Hive/SDK YAML config")
     parser.add_argument("--env-id", required=True, help="existing sandbox env_id")
     parser.add_argument(
-        "--log", choices=("run.log", "gateway.log"), default="run.log"
+        "--log", choices=("run.log", "gateway.log", "proxy.log"), default="run.log"
     )
     parser.add_argument(
         "--follow", action="store_true",

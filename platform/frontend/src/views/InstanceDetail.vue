@@ -302,6 +302,12 @@
               <el-descriptions :column="2" border size="small">
                 <el-descriptions-item label="起始索引">{{ createParams.start_index ?? 0 }}</el-descriptions-item>
                 <el-descriptions-item label="任务总数">{{ createParams.total_num ? createParams.total_num : '不限' }}</el-descriptions-item>
+                <el-descriptions-item label="沙箱存活时间">
+                  <span v-if="createParams.max_ttl_second">
+                    {{ createParams.max_ttl_second }} 秒（{{ formatDuration(createParams.max_ttl_second) }}）
+                  </span>
+                  <span v-else>-</span>
+                </el-descriptions-item>
                 <el-descriptions-item label="沙箱配置">
                   <template v-if="createParams.sandbox_config_name">
                     {{ createParams.sandbox_config_name }}
@@ -1661,6 +1667,7 @@ const peek = computed(() => {
       cp.sandbox_config_name && `沙箱: ${short(cp.sandbox_config_name, 20)}`,
       cp.total_num ? `任务数: ${cp.total_num}` : '任务数: 不限',
       inst.value.concurrent_num && `并发: ${inst.value.concurrent_num}`,
+      cp.max_ttl_second && `存活: ${formatDuration(cp.max_ttl_second)}`,
     ),
   }
 })

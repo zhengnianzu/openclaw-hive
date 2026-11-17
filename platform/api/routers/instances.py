@@ -75,6 +75,34 @@ def _apply_timeout_settings(base, max_ttl_second: int) -> tuple[int, int, int]:
             )
     return max_ttl_second, main_timeout, query_timeout
 
+
+def _set_openclaw_main_model(openclaw_cfg: dict, model_id: str) -> None:
+    """同步 OpenClaw 默认模型和显式 main，兼容 10.6 entries 与旧版 list。"""
+    model_ref = f"local/{model_id}"
+    agents = openclaw_cfg.setdefault("agents", {})
+    defaults = agents.setdefault("defaults", {})
+    defaults["model"] = {"primary": model_ref}
+    defaults["models"] = {model_ref: {}}
+
+    entries = agents.get("entries")
+    if isinstance(entries, dict):
+        main = entries.setdefault("main", {})
+        main["model"] = {"primary": model_ref}
+        main["models"] = {model_ref: {}}
+
+    agent_list = agents.get("list")
+    if isinstance(agent_list, list):
+        main = next(
+            (entry for entry in agent_list
+             if isinstance(entry, dict) and entry.get("id") == "main"),
+            None,
+        )
+        if main is None:
+            main = {"id": "main"}
+            agent_list.append(main)
+        main["model"] = {"primary": model_ref}
+        main["models"] = {model_ref: {}}
+
 # 占用队列槽位的状态（见 queue_scheduler.OCCUPYING_STATUSES），拼成 SQL 占位符
 _OCCUPYING_STATUSES = OCCUPYING_STATUSES
 _OCCUPYING_PLACEHOLDERS = ",".join("?" * len(_OCCUPYING_STATUSES))
@@ -100,6 +128,7 @@ _PREFIX_LABEL = {"C": "客户端", "S": "服务端", "T": "任务侧", "X": "未
 _ERROR_CODE_DESC = {
     "C001": "extract code failed", "C002": "upload file failed",
     "C003": "environment creation failed", "C004": "agent config write failed",
+    "C005": "llm proxy start failed",
     "S001": "gateway start failed", "S002": "gateway startup timeout",
     "S003": "gateway unexpected output", "S004": "sandbox port-update failed",
     "S005": "skill download failed", "S006": "user profile download failed",
@@ -927,6 +956,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # 任务级开关：hive 上传配置前给模型 key 追加 _<env_id uuid> 后缀。
     # 模板里没有该键，这里显式写入；关闭时写 False，语义与缺失一致。
     base.run_config.task.suffix_api_keys = bool(req.suffix_api_keys)
+    # 与 suffix_api_keys 一样固化进实例快照，Hive 以表单原值作为主 harness
+    # 代理上游的唯一来源，不再反向扫描不同格式的 harness 配置猜测 URL。
+    base.run_config.task.model_base_url = (req.model_base_url or "").strip()
 
     # --- 沙箱配置：把派生文件的沙箱段整段替换进 config.yaml ---
     # 派生文件在 settings/sandbox/<type>_<id>.yaml，其 global/sandbox/sandbox_namespace/s3
@@ -1358,8 +1390,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             if models_list:
                 models_list[0]["id"] = req.model_id
                 models_list[0]["name"] = req.model_id
-            openclaw_cfg["agents"]["defaults"]["model"]["primary"] = f"local/{req.model_id}"
-            openclaw_cfg["agents"]["defaults"]["models"] = {f"local/{req.model_id}": {}}
+            _set_openclaw_main_model(openclaw_cfg, req.model_id)
 
         with open(openclaw_path, "w", encoding="utf-8") as f:
             json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)

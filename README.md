@@ -76,10 +76,34 @@ pip install -r requirements.txt
 | `env_make.runtime_type` | 运行时类型 | `k8s` / `docker` / `local` |
 | `remote_server.user_id` | 用户标识，用于 Pod 命名 | `zx0522claude47` |
 | `run_config.concurrent_num` | 并发数 | Claude 推荐 `100~150` |
+| `run_config.proxy_enable` | 启动 `openclaw-task/llm_proxy_lite` 并保存请求/响应日志；缺省为关闭 | `false` |
+| `run_config.task.model_base_url` | 主 harness 上游；平台创建时自动取前端表单值 | `http://model-host:8082` |
 | `run_config.sandbox.openclaw_start_timeout` | Gateway 启动超时 | 镜像 >0.0.6 设 `80`，旧版设 `10` |
 | `run_config.task.task_input_path` | 任务配置目录 | `uploads/configs` |
 | `run_config.task.main_code_dir` | 源码目录（自动打包） | `openclaw-task` |
 | `run_config.obs.traj_save_path` | OBS 轨迹保存路径 | `openclaw_trajs/traj_0522` |
+
+启用 `run_config.proxy_enable: true` 后，`llm_proxy_lite/` 随 `openclaw-task`
+主代码一起打包、上传和解压，不再单独传输。Hive 会针对每个沙箱生成
+`outputs/<配置名>/sandbox_harness_configs/<env_id>/proxy_config.json`。映射与 Agent
+名称无关，按唯一 `target_ip` 生成 `ip_map1、ip_map2…`，依次分配
+`127.0.0.1:5001、5002…`；相同 `target_ip` 只保留一条映射，上传到
+`workspace/openclaw-task/llm_proxy_lite/proxy_config.json`，并在 Gateway 之前后台
+启动代理。任务收尾时，
+`workspace/openclaw-task/llm_proxy_lite/logs_proxy/` 会随
+现有轨迹上传到同一 OBS 任务目录。代理上游不再扫描 harness 猜测：主 harness
+只使用前端表单固化的 `run_config.task.model_base_url`，user/evaluator 等辅助角色只
+使用 `user_proxy_model.json` 各项的 `base_url`。Hive 先生成唯一
+`target_ip → local_ip` 映射，再对两份配置文件做纯文本替换；文件内所有相同的
+`target_ip` 字符串都会替换为 `http://<local_ip>`。旧配置没有 `proxy_enable` 时
+不执行任何代理逻辑。
+
+代理在沙箱内的实际启动入口为
+`python llm_proxy_lite/app.py --config llm_proxy_lite/proxy_config.json`；Windows
+后台进程创建由 `utils/win_util.py` 负责。单任务执行时，Hive 通过
+`_setup_llm_proxy()` 统一完成“生成并改写任务配置副本 → 生成并上传映射 → 启动
+代理”；后续 Harness/Gateway 按相同规则在该 `env_id` 目录重建副本。主程序结束后，
+`run()` 的统一收尾阶段再把 `llm_proxy_lite/logs_proxy/` 上传到该任务的 OBS 目录。
 
 ### 3. 准备任务数据
 

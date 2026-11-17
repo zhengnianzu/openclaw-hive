@@ -52,15 +52,24 @@ from prepare_config import (
     _classify_task_stdout,
     ERROR_CATALOG,
 )
+from utils.throttle import ThrottleController, build_from_config
+from utils.llm_proxy import (
+    PROXY_CONFIG_NAME,
+    PROXY_DIR_NAME,
+    ProxyConfigError,
+    build_proxy_config_and_rewrite,
+)
 from utils.win_util import (
     ps_command,
     ps_copy_skill_command,
     _setup_windows_obsutil,
+    _start_llm_proxy_windows,
     _windows_env_assign,
     _start_openclaw_gateway_windows,
     _start_jiuwenswarm_gateway_windows,
     _stop_jiuwenswarm_gateway_windows,
     _run_main_script_windows,
+    _read_remote_log,
 )
 # Module-level logger
 logger = get_logger()
@@ -74,6 +83,25 @@ _current_task_idx = contextvars.ContextVar('current_task_idx', default=None)
 # Default timeout for OBS download operations (seconds)
 OBS_DOWNLOAD_TIMEOUT = 1200
 OBS_UPLOAD_TIMEOUT = 900
+THROTTLE_FLOOR = 50
+
+
+@dataclass(frozen=True)
+class TaskOutcome:
+    """单个任务的最终结果，供并发控制器消费。"""
+
+    status: str
+    error_code: str = ""
+    detail: str = ""
+
+
+def _throttle_enabled(run_cfg) -> bool:
+    """只读取 run_config.throttle.enabled；配置缺失或无效时默认关闭。"""
+    try:
+        cfg = run_cfg.get("throttle")
+        return bool(cfg and cfg.get("enabled", False))
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -231,6 +259,7 @@ class SandboxConfig:
     # openclaw用于启动gateway
     openclaw_bash: str = "/usr/local/node24/bin/openclaw"
     gateway_log: str = "gateway.log"
+    proxy_log: str = "proxy.log"
     openclaw_start_timeout: int = 10
     user_proxy_model_local_file: str = "uploads/user_proxy_model.json"
     user_proxy_model_remote_file: str = "configs/user_proxy_model.json"
@@ -278,11 +307,13 @@ class TaskConfig:
     # —— 原始任务配置不被改写。
     query_timeout: int = 0
     openclaw_gateway_timeout: int = 300
-    simple_bash_timeout: int = 10
+    simple_bash_timeout: int = 20
     suffix_api_keys: bool = False  # true: 给模型 key 追加沙箱标识后缀(自部署模型 user_id)
     enable_pip_install: bool = False  # true: 起主脚本前先 pip install -r requirements.txt
     model_api_key: str = ""  # 主 agent 原始 key(平台传入), suffix_api_keys 时在 hive 里打后缀
+    model_base_url: str = ""  # 主 agent 原始 URL（前端表单写入实例 config.yaml）
     harness_md: list = field(default_factory=list)  # 平台选定 harness 配置 md 的本地绝对路径列表
+    proxy_enable: bool = False  # true: 启动 openclaw-task/llm_proxy_lite
     obs_config: ObsBucketConfig = None  # field(default_factory=ObsBucketConfig)
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     run_input_config_files: set = field(default_factory=set)
@@ -378,11 +409,13 @@ class OpenClawDistillationTask:
 
     # Windows 专属方法: 函数体在 utils/win_util.py, 这里挂成类属性让 self 自动绑定。
     _setup_windows_obsutil = _setup_windows_obsutil
+    _start_llm_proxy_windows = _start_llm_proxy_windows
     _windows_env_assign = _windows_env_assign
     _start_openclaw_gateway_windows = _start_openclaw_gateway_windows
     _start_jiuwenswarm_gateway_windows = _start_jiuwenswarm_gateway_windows
     _stop_jiuwenswarm_gateway_windows = _stop_jiuwenswarm_gateway_windows
     _run_main_script_windows = _run_main_script_windows
+    _read_remote_log = _read_remote_log
 
     def __init__(self, config: TaskConfig):
         self.logger = logger
@@ -403,6 +436,8 @@ class OpenClawDistillationTask:
         # 本地配置路径(共享模板)。每个任务复制成独立副本再改写上传, 副本路径由 _prepare_local_configs 生成。
         self.local_config_file: str = self.config.sandbox_config.harness_local_config_file
         self.local_model_config_file: str = self.config.sandbox_config.user_proxy_model_local_file
+        self.local_proxy_config_file: str = ""
+        self.proxy_ports: list[int] = []
 
 
     def _init_config(self, yaml_config: DictConfig) -> DictConfig:
@@ -463,7 +498,7 @@ class OpenClawDistillationTask:
 
     def _prepare_local_configs(self, data_config_file: Optional[str] = None, port: Optional[str] = None) -> None:
         """每个任务复制出两份独立副本(harness 配置 + user_proxy_model.json), 再在副本上
-        打 key 后缀 / 写主 key / 写端口。副本按 env_id 隔离, 无需锁。
+        改写代理 URL / 打 key 后缀 / 写主 key / 写端口。副本按 env_id 隔离, 无需锁。
         """
         env_id = self.client_config.env_make.env_id
         local_dir = Path(self.config.task_output_path) / "sandbox_harness_configs" / env_id
@@ -473,7 +508,24 @@ class OpenClawDistillationTask:
         shutil.copy2(self.config.sandbox_config.harness_local_config_file, self.local_config_file)
         shutil.copy2(self.config.sandbox_config.user_proxy_model_local_file, self.local_model_config_file)
 
-        # 1) user_proxy_model.json 读取再追加后缀(provider 注入前做, 保证注入的 provider 也带后缀)
+        # 1) 可选代理 URL 改写：和 suffix_api_keys 一样只修改当前沙箱副本。
+        if self.config.proxy_enable:
+            self.local_proxy_config_file = str(local_dir / PROXY_CONFIG_NAME)
+            try:
+                proxy_config = build_proxy_config_and_rewrite(
+                    self.local_config_file,
+                    self.local_model_config_file,
+                    self.local_proxy_config_file,
+                    main_base_url=self.config.model_base_url,
+                )
+            except ProxyConfigError as exc:
+                raise HiveError("C005", detail=f"llm proxy config: {exc}") from exc
+            self.proxy_ports = [
+                int(entry["local_ip"].rsplit(":", 1)[1])
+                for entry in proxy_config.values()
+            ]
+
+        # 2) user_proxy_model.json 读取再追加后缀(provider 注入前做, 保证注入的 provider 也带后缀)
         if bool(self.config.suffix_api_keys):
             model_cfg = json.loads(Path(self.local_model_config_file).read_text(encoding="utf-8"))
             for agent in model_cfg.values():
@@ -483,10 +535,7 @@ class OpenClawDistillationTask:
                 json.dumps(model_cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
 
-        # 2) provider 注入 + agent 预注册 + 路径本地化, 全部走 prepare_config
-        #    (openclaw 分支内按 sandbox_type/home 派生, 无后处理)
-        # oc_agent_names: OpenClaw 系 harness 专用, task config 里的 agent 名(host 已注册的
-        # 交给 prepare_config 补进 agents.list), 其余 framework 传空。
+        # 3) provider 注入 + agent 预注册 + 路径本地化, 全部走 prepare_config
         oc_agent_names = (
             self._derive_agent_names(data_config_file)
             if self.config.sandbox_config.harness_type in {"openclaw", "openclaw-tui"}
@@ -503,14 +552,14 @@ class OpenClawDistillationTask:
             oc_agent_names=oc_agent_names,
         )
 
-        # 3) 主 key 后缀: 用「原始 key + 后缀」直接替换文件里出现的原始 key, 不区分 harness
+        # 4) 主 key 后缀: 用「原始 key + 后缀」直接替换文件里出现的原始 key
         if self.model_api_key and bool(self.config.suffix_api_keys):
             suffixed = self.model_api_key + f"_{self.sandbox_suffix}"
             content = Path(self.local_config_file).read_text(encoding="utf-8")
             content = content.replace(self.model_api_key, suffixed)
             Path(self.local_config_file).write_text(content, encoding="utf-8")
 
-        # 4) 端口本地写进 openclaw.json 副本再上传
+        # 5) 端口本地写进 openclaw.json 副本再上传
         if port is not None:
             data = json.loads(Path(self.local_config_file).read_text(encoding="utf-8"))
             if "gateway" in data:
@@ -518,9 +567,38 @@ class OpenClawDistillationTask:
             Path(self.local_config_file).write_text(
                 json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
+
         self.logger.info(
             f"local config copies: agent={self.local_config_file}\nmodel={self.local_model_config_file}"
         )
+
+    async def _upload_proxy_config(self) -> None:
+        """Upload per-sandbox proxy_config.json into the extracted main code."""
+        if not self.config.proxy_enable:
+            return
+        PathCls = (
+            PureWindowsPath
+            if self.config.sandbox_config.sandbox_type == "windows"
+            else PurePosixPath
+        )
+        code_stem = Path(self.config.main_code_tar).stem
+        remote_config = str(PathCls(
+            self.config.sandbox_config.workspace,
+            code_stem,
+            PROXY_DIR_NAME,
+            PROXY_CONFIG_NAME,
+        ))
+        await self._upload_file(
+            "llm proxy config", self.local_proxy_config_file, remote_config
+        )
+
+    async def _setup_llm_proxy(self, data_config_file: str, sandbox_type: str) -> None:
+        """Prepare configs, upload routing and start the optional proxy plugin."""
+        if not self.config.proxy_enable:
+            return
+        await asyncio.to_thread(self._prepare_local_configs, data_config_file, None)
+        await self._upload_proxy_config()
+        await self._start_llm_proxy(sandbox_type)
 
     async def _copy_agent_config(self, data_config_file, port: Optional[str] = None) -> None:
         """复制两份独立副本 → 改写 → 上传 agent config + user_proxy_model。
@@ -562,6 +640,45 @@ class OpenClawDistillationTask:
                             sandbox_result=result)
         self.logger.info("Code extracted successfully")
 
+    async def _start_llm_proxy(self, sandbox_type: str) -> None:
+        """Start openclaw-task's bundled llm_proxy_lite module in the sandbox."""
+        if not self.config.proxy_enable:
+            return
+        if not self.proxy_ports:
+            raise HiveError("C005", detail="llm proxy config has no listener ports")
+
+        workspace = self.config.sandbox_config.workspace
+        PathCls = PureWindowsPath if sandbox_type == "windows" else PurePosixPath
+        code_stem = Path(self.config.main_code_tar).stem
+        project_dir = str(PathCls(workspace, code_stem))
+
+        if sandbox_type == "windows":
+            await self._start_llm_proxy_windows(project_dir)
+            self.logger.info(f"llm proxy ready: ports={self.proxy_ports}")
+            return
+
+        # proxy.log 与 gateway.log 同一待遇: 写到 result_workdir, 供日志导出。
+        workdir = self.config.sandbox_config.result_workdir
+        proxy_log_path = os.path.join(workdir, self.config.sandbox_config.proxy_log)
+        launch_command = [
+            "/bin/bash", "-c",
+            f"cd '{project_dir}' || exit 1; "
+            f"mkdir -p '{workdir}'; "
+            f"nohup python {PROXY_DIR_NAME}/app.py "
+            f"--config '{PROXY_DIR_NAME}/{PROXY_CONFIG_NAME}' "
+            f"> '{proxy_log_path}' 2>&1 &",
+        ]
+
+        launch_result = await self._exec_sandbox(
+            launch_command, self.config.simple_bash_timeout,
+        )
+        launch_data = launch_result.data or {}
+        if (launch_result.code != ErrorCode.SUCCESS[0] or launch_data.get("exit_code") != 0):
+            _log_sandbox_detail(self.logger, "start llm proxy failed", launch_result, level=logging.ERROR)
+            raise HiveError("C005", detail="start llm_proxy_lite", sandbox_result=launch_result)
+        self.logger.info(f"llm proxy ready: ports={self.proxy_ports}")
+
+
     async def _upload_data_config(self, config_file: str, port: Optional[str] = None) -> None:
         """集中改写 task config，保存独立副本后上传沙箱。
 
@@ -596,12 +713,11 @@ class OpenClawDistillationTask:
         ]
         # 去重并保持 harness_md 的配置顺序。
         harness_configs = list(dict.fromkeys(harness_configs))
-        query_agent_names = {
+        query_agent_names = list(dict.fromkeys(
             str(query.get("agent_name") or "").strip()
             for query in (data.get("queries") or [])
-            if isinstance(query, dict)
-        }
-        query_agent_names.discard("")
+            if isinstance(query, dict) and str(query.get("agent_name") or "").strip()
+        ))
         if harness_configs:
             for agent in data.get("agents") or []:
                 if not isinstance(agent, dict):
@@ -652,7 +768,7 @@ class OpenClawDistillationTask:
             f"Patched data config: platform={data['platform']}, "
             f"harness_type={data['harness_type']}, "
             f"harness_md={len(harness_configs)}, "
-            f"query_agents={sorted(query_agent_names)}, port={port or '-'}"
+            f"query_agents={query_agent_names}, port={port or '-'}"
         )
         self.logger.info(
             f"Data config paths: source={Path(config_file).resolve()}, "
@@ -1419,6 +1535,9 @@ class OpenClawDistillationTask:
             (sandbox_cfg.result_workdir, bucket_path),
             (task_logs, bucket_path),
         ]
+        if self.config.proxy_enable:
+            proxy_logs = str(PathCls(sandbox_cfg.workspace, code_stem, "logs_proxy"))
+            uploads.append((proxy_logs, bucket_path))
         uploads += [(ws, bucket_path) for ws in per_agent_workspaces]
 
         if self.config.sandbox_config.harness_type == "hermes":
@@ -1550,6 +1669,9 @@ class OpenClawDistillationTask:
         await self._upload_harness_md(config_file, sandbox_type)
         await self._download_s3_agents(sandbox_type)
         await self._upload_data_config(config_file)
+        # 单一插件阶段：生成任务独立配置副本并替换 URL、生成/上传映射、启动代理。
+        # proxy_enable=false 时整段直接跳过；后续 gateway 按相同规则重建独立副本。
+        await self._setup_llm_proxy(config_file, sandbox_type)
         harness_type = self.config.sandbox_config.harness_type.strip().lower()
         stop_jiuwenswarm = harness_type in _JIUWENSWARM_TYPES
         try:
@@ -1585,11 +1707,10 @@ class OpenClawDistillationTask:
                         f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                     )
 
-    async def run(self, config_file: str, task_idx: int = 0) -> None:
+    async def run(self, config_file: str, task_idx: int = 0) -> TaskOutcome:
         """Run a single distillation task.
 
-        Returns a dict {status, error_code, config, elapsed}
-        for the orchestrator to aggregate per-run stats.
+        Returns a TaskOutcome for the orchestrator and ThrottleController.
         """
         await asyncio.sleep(random.uniform(1, 10))
         start_time = time.perf_counter()
@@ -1698,6 +1819,14 @@ class OpenClawDistillationTask:
                 + " ====="
             )
 
+        return TaskOutcome(
+            status=status,
+            error_code=error_code,
+            # 复用 error_msg: 它是 detail 的超集(HiveError 分支多一个 short 前缀),
+            # 唯一消费方 throttle.record→classify_c003 只做子串匹配, 前缀不影响判定。
+            detail=error_msg,
+        )
+
 
 # ============================================================================
 # Task Orchestration
@@ -1770,7 +1899,8 @@ async def _upload_records_to_obs(config: TaskConfig) -> None:
 async def _worker(
     worker_id: int,
     task_queue: asyncio.Queue,
-    config: TaskConfig
+    config: TaskConfig,
+    throttle: Optional[ThrottleController] = None,
 ) -> None:
     """Worker coroutine that processes tasks from the queue."""
     while True:
@@ -1788,8 +1918,33 @@ async def _worker(
             logger.info(f"===== Worker {worker_id} starting task {task_idx}: {config_name} =====")
             token = _current_task_idx.set(task_idx)
             try:
-                task = OpenClawDistillationTask(config)
-                await task.run(os.path.join(config.task_input_path, config_name), task_idx)
+                async def execute_one() -> TaskOutcome:
+                    # 放在闸门内创建，使每次真正放行时重读 YAML；由此可同步用户
+                    # 调整后的 concurrent_num，同时不会提前创建沙箱。
+                    task = OpenClawDistillationTask(config)
+                    if throttle is not None:
+                        try:
+                            latest_ceiling = int(
+                                task.global_config.run_config.concurrent_num
+                            )
+                            throttle.set_ceiling(latest_ceiling)
+                        except (AttributeError, TypeError, ValueError):
+                            pass
+                    return await task.run(
+                        os.path.join(config.task_input_path, config_name), task_idx
+                    )
+
+                if throttle is None:
+                    await execute_one()
+                else:
+                    async with throttle.slot():
+                        outcome = await execute_one()
+                        # 在 release 唤醒等待 worker 之前先调整 limit。
+                        throttle.record(
+                            outcome.status,
+                            outcome.error_code,
+                            outcome.detail,
+                        )
             finally:
                 _current_task_idx.reset(token)
             logger.info(f"!!!!! Worker {worker_id} finished task {task_idx}: {config_name} !!!!!")
@@ -1949,8 +2104,28 @@ async def run_tasks(
         await task_queue.put((idx, name))
 
     # Run workers
+    throttle: Optional[ThrottleController] = None
+    run_cfg = load_yaml_config(config.run_config_file).run_config
+    if _throttle_enabled(run_cfg):
+        # 熔断参数由 Hive 接入层统一约束；utils/throttle.py 保持原始实现。
+        # 控制器内部仍会执行 min(floor, concurrent_num)，避免小并发被反向抬高。
+        throttle_run_cfg = copy.deepcopy(run_cfg)
+        throttle_run_cfg.throttle["floor"] = THROTTLE_FLOOR
+        throttle = build_from_config(
+            concurrent_num,
+            throttle_run_cfg,
+            logger=logger,
+            state_file=os.path.join(config.task_output_path, "_throttle.json"),
+        )
+        logger.warning(
+            f"[throttle] enabled ceiling={concurrent_num} "
+            f"floor={min(THROTTLE_FLOOR, concurrent_num)} limit={throttle.limit}"
+        )
+    else:
+        logger.info("[throttle] disabled; using fixed concurrency")
+
     workers = [
-        _worker(i, task_queue, config) for i in range(concurrent_num)
+        _worker(i, task_queue, config, throttle) for i in range(concurrent_num)
     ]
     if workers:
         await asyncio.gather(*workers)
@@ -2028,6 +2203,7 @@ def main() -> None:
     print(f"  Start index: {start_index}, Total: {total_num}, Concurrent: {concurrent_num}")
     print(f"  OBS user_config: {run_cfg.obs.user_config_download_path}")
     print(f"  OBS user_profile: {run_cfg.obs.user_profile_download_path}")
+    print(f"  LLM proxy: {'enabled' if bool(run_cfg.get('proxy_enable', False)) else 'disabled'}")
     print(f"  Output dir: {task_dict['task_output_path']}")
     print("=" * 60)
 
@@ -2046,6 +2222,7 @@ def main() -> None:
         ),
         model_api_key=args.model_api_key,
         harness_md=list(run_cfg.get("harness_md") or []),
+        proxy_enable=bool(run_cfg.get("proxy_enable", False)),
     )
 
     asyncio.run(run_tasks(
