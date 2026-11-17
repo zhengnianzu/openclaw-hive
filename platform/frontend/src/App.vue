@@ -273,10 +273,22 @@ body {
   letter-spacing: 0.05em;
   color: var(--text-muted);
 }
+/* 文档里的截图经常是 2x 高分屏原图，直接铺满正文会很突兀。
+   这里给一个默认尺寸上限，细节靠点击放大（MarkdownView 的 lightbox）看。 */
 .markdown-body img {
-  max-width: 100%;
+  max-width: min(100%, 720px);
+  max-height: 420px;
+  width: auto;
   height: auto;
+  object-fit: contain;
   border-radius: var(--radius-sm);
+  cursor: zoom-in;
+}
+/* 作者在编辑器里显式调过比例（alt=0.62 → style="width:62%"）的图片，
+   尊重作者意愿：只按宽度比例走，不再压高度。 */
+.markdown-body img[style*='width'] {
+  max-width: 100%;
+  max-height: none;
 }
 .markdown-body .md-empty {
   color: var(--text-muted);

@@ -1798,13 +1798,13 @@ class OpenClawDistillationTask:
                 self.logger.error(f"save_record failed: {e}\n{traceback.format_exc()}")
 
             # ---- 关闭 execution_client ----
-            # if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
-            #     try:
-            #         await self.execution_client.close()
-            #     except Exception as e:
-            #         self.logger.error(
-            #             f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
-            #         )
+            if self.execution_client is not None and isinstance(self.execution_client, ExecutionClient):
+                try:
+                    await self.execution_client.close()
+                except Exception as e:
+                    self.logger.error(
+                        f"execution_client.close() failed: {e}\n{traceback.format_exc()}"
+                    )
 
             # ---- task-<idx>.log 结尾: 打印任务执行状态 ----
             elapsed = time.perf_counter() - start_time

@@ -128,6 +128,7 @@ _PREFIX_LABEL = {"C": "客户端", "S": "服务端", "T": "任务侧", "X": "未
 _ERROR_CODE_DESC = {
     "C001": "extract code failed", "C002": "upload file failed",
     "C003": "environment creation failed", "C004": "agent config write failed",
+    "C005": "llm proxy start failed",
     "S001": "gateway start failed", "S002": "gateway startup timeout",
     "S003": "gateway unexpected output", "S004": "sandbox port-update failed",
     "S005": "skill download failed", "S006": "user profile download failed",

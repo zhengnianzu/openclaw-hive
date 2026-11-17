@@ -142,3 +142,173 @@ def get_harness_meta(user: dict = Depends(get_current_user)):
         agentConfig={k: v.get("agent_config") for k, v in entries.items()},
         mdFiles={k: md_templates(k) for k in entries},
     )
+
+
+# ---- 模型连通性验证（新建实例页「验证模型」按钮） ----
+#
+# 新建实例时 base_url / key / model_id 填错不会有任何即时反馈，要等沙箱里 harness 真的
+# 去调模型失败才知道，一次无效实例就是一整轮任务白跑。这里用一次最小的真实调用做冒烟探测。
+#
+# 协议与 /v1 的口径沿用 instances.py 里各 harness 的既有约定：
+# openai-completions 带 /v1，anthropic-messages 不带（见 instances.py:1188-1192 等）。
+
+# 探测提示词：只要模型回一个 OK，token 消耗压到最小
+_PROBE_PROMPT = "回复 OK 就行"
+_PROBE_MAX_TOKENS = 16
+# 小于前端 axios 的 30s 超时，保证是后端的报错原文回到页面，而不是 axios 先超时
+_PROBE_TIMEOUT = 20
+# 上游报错体可能很长（网关爱回整页 HTML），原样返回但做长度上限
+_ERROR_MAX_LEN = 4000
+_REPLY_MAX_LEN = 200
+
+
+class ValidateModelRequest(BaseModel):
+    model_base_url: str = ""
+    model_api_key: str = ""
+    model_api_type: str = ""
+    model_id: str = ""
+
+
+class ValidateModelResult(BaseModel):
+    ok: bool = False
+    tried: list[str] = []
+    used: str = ""
+    request_url: str = ""
+    reply: str = ""
+    error: str = ""
+
+
+def _probe_protocols(api_type: str) -> list[str]:
+    """按「API 类型」决定尝试顺序；未指定则先 anthropic 再 openai。
+
+    子串 + 忽略大小写匹配：openjiuwen 的选项值是 Anthropic/OpenAI，其余 harness 是
+    anthropic-messages/openai-completions，用相等判断会把 openjiuwen 误判成未指定。
+    """
+    text = (api_type or "").strip().lower()
+    if "anthropic" in text:
+        return ["anthropic"]
+    if "openai" in text:
+        return ["openai"]
+    return ["anthropic", "openai"]
+
+
+def _redact(text: str, secret: str) -> str:
+    """上游报错体有时会把 key 原样回显，这里脱敏后再返回给前端。"""
+    if not text:
+        return ""
+    if secret and len(secret) >= 8:
+        text = text.replace(secret, secret[:4] + "****" + secret[-4:])
+    elif secret:
+        text = text.replace(secret, "****")
+    if len(text) > _ERROR_MAX_LEN:
+        text = text[:_ERROR_MAX_LEN] + f"\n...(已截断，共 {len(text)} 字符)"
+    return text
+
+
+def _probe_payload(proto: str, base: str, model_id: str, api_key: str) -> tuple:
+    """返回 (url, headers, json_body)。"""
+    body = {
+        "model": model_id,
+        "max_tokens": _PROBE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": _PROBE_PROMPT}],
+    }
+    if proto == "anthropic":
+        return (
+            f"{base}/v1/messages",
+            {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+             "content-type": "application/json"},
+            body,
+        )
+    return (
+        f"{base}/v1/chat/completions",
+        {"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+        body,
+    )
+
+
+def _extract_reply(proto: str, data: dict) -> str:
+    """从响应里取出模型回复文本；取不到就回整个 JSON 的简短形态。"""
+    try:
+        if proto == "anthropic":
+            blocks = data.get("content") or []
+            texts = [b.get("text", "") for b in blocks if isinstance(b, dict)]
+            text = "".join(t for t in texts if t)
+        else:
+            text = (((data.get("choices") or [{}])[0].get("message") or {})
+                    .get("content") or "")
+    except Exception:
+        text = ""
+    if not text:
+        text = json.dumps(data, ensure_ascii=False)
+    text = str(text).strip()
+    return text[:_REPLY_MAX_LEN] if len(text) > _REPLY_MAX_LEN else text
+
+
+@router.post("/validate-model", response_model=ValidateModelResult)
+async def validate_model(req: ValidateModelRequest,
+                         user: dict = Depends(get_current_user)):
+    """用表单里的 base_url/key/model_id 实打一次模型，验证是否可用。
+
+    一律返回 200：前端 axios 对非 2xx 会弹全局 toast（api/index.js），而报错需要内联
+    原样展示，所以成败放在 body 的 ok 字段里。
+    """
+    import httpx
+
+    from ..services.proxy import normalize_base_url
+
+    base_url = (req.model_base_url or "").strip()
+    api_key = (req.model_api_key or "").strip()
+    model_id = (req.model_id or "").strip()
+
+    missing = []
+    if not base_url:
+        missing.append("模型 Base URL")
+    if not api_key:
+        missing.append("模型 API Key")
+    if not model_id:
+        missing.append("模型 ID")
+    if missing:
+        return ValidateModelResult(
+            ok=False,
+            error="请先填写：" + "、".join(missing)
+                  + "\n（套用模板后 API Key 会被清空，需要重新填写或点「新建KEY」）",
+        )
+
+    base = normalize_base_url(base_url)
+    protocols = _probe_protocols(req.model_api_type)
+
+    tried: list[str] = []
+    errors: list[str] = []
+    last_url = ""
+
+    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+        for proto in protocols:
+            tried.append(proto)
+            url, headers, body = _probe_payload(proto, base, model_id, api_key)
+            last_url = url
+            try:
+                resp = await client.post(url, headers=headers, json=body)
+            except Exception as e:
+                errors.append(f"[{proto}] {url}\n{type(e).__name__}: {e}")
+                continue
+
+            if resp.status_code // 100 != 2:
+                errors.append(f"[{proto}] {url}\nHTTP {resp.status_code}\n{resp.text}")
+                continue
+
+            try:
+                data = resp.json()
+            except Exception as e:
+                errors.append(f"[{proto}] {url}\nHTTP {resp.status_code} "
+                              f"响应不是合法 JSON：{type(e).__name__}: {e}\n{resp.text}")
+                continue
+
+            return ValidateModelResult(
+                ok=True, tried=tried, used=proto, request_url=url,
+                reply=_extract_reply(proto, data),
+            )
+
+    return ValidateModelResult(
+        ok=False, tried=tried, request_url=last_url,
+        error=_redact("\n\n".join(errors), api_key),
+    )

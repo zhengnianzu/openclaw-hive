@@ -18,7 +18,7 @@
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
-      <el-table :data="filteredImages" v-loading="loading" stripe style="width:100%" border>
+      <el-table :data="pagedImages" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="name" label="镜像名称" min-width="160" />
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
@@ -29,29 +29,42 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="os" label="操作系统" width="120" align="center">
+        <el-table-column prop="os" label="操作系统" width="110" align="center">
           <template #default="{ row }">
-            <!-- 运维可直接在列表里改：历史镜像的 os 是按名称回填的，个别需要人工纠正 -->
-            <el-select
-              v-if="authStore.isOperator"
-              :model-value="row.os || 'linux'"
-              size="small"
-              style="width:96px"
-              @change="val => handleOsChange(row, val)"
-            >
-              <el-option v-for="o in OS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-            </el-select>
-            <el-tag v-else :type="osTagType(row.os)" size="small">{{ osLabel(row.os) }}</el-tag>
+            <el-tag :type="osTagType(row.os)" size="small">{{ osLabel(row.os) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="remark" label="备注" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.remark">{{ row.remark }}</span>
+            <span v-else class="remark-empty">—</span>
           </template>
         </el-table-column>
         <el-table-column prop="created_by" label="注册人" width="120" />
         <el-table-column prop="created_at" label="注册时间" width="180" />
-        <el-table-column label="操作" width="100" align="center" v-if="authStore.isOperator">
+        <el-table-column label="操作" width="150" align="center" fixed="right" v-if="authStore.isOperator">
           <template #default="{ row }">
-            <el-button type="danger" text size="small" @click="handleDelete(row)">删除</el-button>
+            <div class="op-cell">
+              <el-button size="small" type="primary" @click="openEdit(row)">编辑</el-button>
+              <el-dropdown trigger="click" @command="cmd => handleMore(cmd, row)">
+                <el-button size="small">更多<el-icon style="margin-left:2px"><ArrowDown /></el-icon></el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="delete" style="color:#f56c6c">删除</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </div>
           </template>
         </el-table-column>
       </el-table>
+    </div>
+
+    <div class="pagination-bar">
+      <span class="total-text">共 {{ filteredImages.length }} 条</span>
+      <el-pagination v-model:current-page="currentPage" v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50]" :total="filteredImages.length"
+        layout="sizes, prev, pager, next" background />
     </div>
 
     <el-dialog v-model="dialogVisible" title="注册镜像" width="520px" destroy-on-close>
@@ -73,17 +86,55 @@
             <el-radio v-for="o in OS_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-form-item label="备注">
+          <el-input
+            v-model="form.remark"
+            type="textarea"
+            :rows="2"
+            placeholder="可选：该镜像相对上一版的改进点"
+          />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="handleCreate" :loading="creating">注册</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="editVisible" title="编辑镜像" width="520px" destroy-on-close>
+      <el-form :model="editForm" label-width="120px">
+        <el-form-item label="镜像名称" required>
+          <el-input v-model="editForm.name" placeholder="例如：hermes-0.16" />
+        </el-form-item>
+        <el-form-item label="镜像地址">
+          <!-- 只读：实例与配置模板引用的是地址，改了会对不上历史任务 -->
+          <el-input :model-value="editForm.address" disabled />
+          <div class="form-hint">镜像地址不可修改</div>
+        </el-form-item>
+        <el-form-item label="操作系统" required>
+          <el-radio-group v-model="editForm.os">
+            <el-radio v-for="o in OS_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="备注">
+          <el-input
+            v-model="editForm.remark"
+            type="textarea"
+            :rows="3"
+            placeholder="该镜像相对上一版的改进点"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="editVisible = false">取消</el-button>
+        <el-button type="primary" @click="handleUpdate" :loading="updating">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -93,9 +144,13 @@ const authStore = useAuthStore()
 const harnessStore = useHarnessStore()
 const loading = ref(false)
 const creating = ref(false)
+const updating = ref(false)
 const dialogVisible = ref(false)
+const editVisible = ref(false)
 const typeFilter = ref('')
 const osFilter = ref('')
+const currentPage = ref(1)
+const pageSize = ref(10)
 const images = ref([])
 
 const OS_OPTIONS = [
@@ -103,7 +158,9 @@ const OS_OPTIONS = [
   { value: 'windows', label: 'Windows' },
 ]
 
-const form = ref({ name: '', address: '', harness_type: 'openclaw', os: 'linux' })
+const form = ref({ name: '', address: '', harness_type: 'openclaw', os: 'linux', remark: '' })
+// 编辑弹窗的表单。address 只读展示，不随保存提交。
+const editForm = ref({ id: null, name: '', address: '', os: 'linux', remark: '' })
 
 function harnessColor(type) { return harnessStore.color(type) }
 function harnessTagStyle(type) { return harnessStore.tagStyle(type) }
@@ -124,6 +181,19 @@ const filteredImages = computed(() => {
   )
 })
 
+const pagedImages = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredImages.value.slice(start, start + pageSize.value)
+})
+
+// 换筛选条件或每页条数时回到第一页，否则会停在一个空页上
+watch([typeFilter, osFilter, pageSize], () => { currentPage.value = 1 })
+// 删除导致当前页越界时回退（例如在最后一页删掉唯一一条）
+watch(() => filteredImages.value.length, (n) => {
+  const maxPage = Math.max(1, Math.ceil(n / pageSize.value))
+  if (currentPage.value > maxPage) currentPage.value = maxPage
+})
+
 async function loadImages() {
   loading.value = true
   try {
@@ -141,20 +211,46 @@ async function handleCreate() {
     await api.post('/images', form.value)
     ElMessage.success('镜像注册成功')
     dialogVisible.value = false
-    form.value = { name: '', address: '', harness_type: 'openclaw', os: 'linux' }
+    form.value = { name: '', address: '', harness_type: 'openclaw', os: 'linux', remark: '' }
+    // 后端按 created_at DESC 排序，新镜像在第一页；留在原页会看不到刚注册的那条
+    currentPage.value = 1
     loadImages()
   } finally { creating.value = false }
 }
 
-async function handleOsChange(row, os) {
-  const prev = row.os
-  row.os = os  // 乐观更新，失败再回滚，避免下拉闪回
-  try {
-    await api.patch(`/images/${row.id}`, { os })
-    ElMessage.success(`已标记为 ${osLabel(os)}`)
-  } catch (e) {
-    row.os = prev  // 失败提示由 api 拦截器统一弹，这里只回滚
+function openEdit(row) {
+  editForm.value = {
+    id: row.id,
+    name: row.name,
+    address: row.address,
+    os: row.os || 'linux',
+    remark: row.remark || '',
   }
+  editVisible.value = true
+}
+
+async function handleUpdate() {
+  const f = editForm.value
+  if (!f.name.trim()) {
+    ElMessage.warning('请填写镜像名称')
+    return
+  }
+  updating.value = true
+  try {
+    // 不传 address —— 后端也不接受，地址是实例/模板的引用标识
+    await api.patch(`/images/${f.id}`, {
+      name: f.name.trim(),
+      os: f.os,
+      remark: f.remark.trim(),
+    })
+    ElMessage.success('已保存')
+    editVisible.value = false
+    loadImages()
+  } finally { updating.value = false }
+}
+
+function handleMore(cmd, row) {
+  if (cmd === 'delete') handleDelete(row)
 }
 
 async function handleDelete(row) {
@@ -186,5 +282,18 @@ onMounted(() => { harnessStore.load(); loadImages() })
   display: flex;
   gap: 12px;
   margin-bottom: 16px;
+}
+.pagination-bar { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
+.total-text { color: var(--text-muted); font-size: 13px; }
+/* 操作区：强制不换行，否则「更多」下拉会被挤到第二行、撑高整行 */
+.op-cell { display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: nowrap; white-space: nowrap; }
+.remark-empty {
+  color: #999;
+}
+.form-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin-top: 4px;
 }
 </style>
