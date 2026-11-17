@@ -143,7 +143,9 @@
           <el-tab-pane label="属性" name="info" />
         </el-tabs>
 
-        <div class="aw-body" :class="{ 'is-full': full, 'is-frame': isFrameBody }" v-loading="previewLoading">
+        <div class="aw-body"
+          :class="{ 'is-full': full, 'is-frame': isFrameBody, 'is-fill': isFillBody }"
+          v-loading="previewLoading">
           <template v-if="tab === 'preview'">
             <!-- office 的失败态由下面的分支单独渲染（要带「重试」），不能在这里先吃掉 -->
             <div v-if="previewError && kind !== 'office'" class="aw-notice">
@@ -207,35 +209,11 @@
 
             <pre v-else-if="kind === 'text'" class="aw-text">{{ text }}</pre>
 
-            <!-- JSONL：每行一个 JSON 对象，逐条渲染成 block。
-                 默认只出前 5 条，滚动到底/点按钮再追加 —— 单行可达十几万字符，
-                 一次全展开会让浏览器卡死。 -->
-            <div v-else-if="kind === 'jsonl'" class="aw-jsonl">
-              <div v-if="jsonlState && !jsonlState.ok" class="aw-json-warn">
-                {{ jsonlState.error }}
-              </div>
-              <template v-else>
-                <div class="aw-jsonl-head">
-                  <span>共 {{ jsonlState.total }} 条</span>
-                  <span v-if="jsonlState.bad" class="aw-jsonl-bad">
-                    {{ jsonlState.bad }} 条解析失败（按原文显示）
-                  </span>
-                  <span v-if="jsonlState.truncated">内容被截断，仅解析前 5000 条</span>
-                </div>
-                <div v-for="b in jsonlBlocks" :key="b.idx" class="aw-jsonl-block">
-                  <div class="aw-jsonl-idx">
-                    #{{ b.idx + 1 }}
-                    <span v-if="!b.ok" class="aw-jsonl-bad">非 JSON，原文</span>
-                  </div>
-                  <pre class="aw-json-body" v-html="b.html" />
-                </div>
-                <div v-if="jsonlHasMore" class="aw-jsonl-more">
-                  <el-button size="small" @click="jsonlMore">
-                    加载更多（已显示 {{ jsonlBlocks.length }} / {{ jsonlState.blocks.length }}）
-                  </el-button>
-                </div>
-              </template>
-            </div>
+            <!-- JSONL：左侧记录索引 + 右侧单条详情（Tree / Raw）。
+                 几千条、单行十几万字符的 trajectory.jsonl 用纵向平铺既找不到
+                 东西也滚不动，改成浏览器式双栏，任何时刻只渲染一条记录。 -->
+            <JsonlViewer v-else-if="kind === 'jsonl'" :key="selected.rel"
+              :text="text" :truncated="textTruncated" :total-chars="textTotalChars" />
 
             <div v-else-if="kind === 'table'" class="aw-table-wrap">
               <el-table v-if="tableRows.length" :data="tableRows" size="small"
@@ -298,11 +276,12 @@ import { Folder, Document, Search, Refresh, Box } from '@element-plus/icons-vue'
 import api from '../api'
 import MarkdownView from './MarkdownView.vue'
 import TrajBlocks from './TrajBlocks.vue'
+import JsonlViewer from './JsonlViewer.vue'
 import { detectTrajKind, parseTrajectory } from '../utils/trajectory.js'
 import {
   fmtSize, fmtTime, groupOfEntry, groupLabel, previewKindOf,
   GROUPS, collectLocalRefs, rewriteLocalRefs,
-  formatJson, highlightJson, parseJsonl,
+  formatJson, highlightJson,
 } from '../utils/artifacts'
 
 const props = defineProps({
@@ -406,6 +385,13 @@ const trajBlocks = computed(() => {
 // JSON / JSONL 渲染 —— 「解析器没认出来」不该表现成一片空白。
 const isTrajView = computed(() => !!trajInfo.value && trajBlocks.value.length > 0)
 
+// JSONL 的双栏视图要自己管两条滚动条（左列表 / 右详情），外层必须让出确定高度
+// 并关掉自身滚动，否则外层滚动条和内部的会打架。排除轨迹视图与空文件：
+// 那两种情况走的是别的分支，仍需要外层正常滚动与内边距。
+const isFillBody = computed(() =>
+  tab.value === 'preview' && !previewError.value
+  && kind.value === 'jsonl' && !isTrajView.value && !isEmptyText.value)
+
 const trajHeader = computed(() => {
   if (!isTrajView.value) return ''
   const role = trajInfo.value.role === 'evaluator' ? 'evaluator' : 'assistant'
@@ -420,35 +406,9 @@ const trajTruncNote = computed(() => {
     : '文件过大，仅解析已加载部分，完整内容请下载'
 })
 
-// ── JSONL 预览：逐行解析 + 分块懒加载 ──────────────────────────────────────
-// 默认只渲染前 JSONL_PAGE 条。trajectory.jsonl 单行可达十几万字符，
-// 一次全展开会让浏览器卡死 —— 用户通常只需要看开头几条确认结构。
-const JSONL_PAGE = 5
-const jsonlLimit = ref(JSONL_PAGE)
-const jsonlState = computed(() =>
-  (kind.value === 'jsonl' ? parseJsonl(text.value) : null))
-// 已展开的块（含高亮后的 HTML）。每条 block 单独 highlight，
-// 避免把几百条拼成一个巨大字符串再正则扫一遍。
-const jsonlBlocks = computed(() => {
-  const st = jsonlState.value
-  if (!st) return []
-  return st.blocks.slice(0, jsonlLimit.value).map(b => ({
-    idx: b.idx,
-    ok: b.ok,
-    html: highlightJson(b.text),
-  }))
-})
-const jsonlHasMore = computed(() => {
-  const st = jsonlState.value
-  return !!st && st.blocks.length > jsonlLimit.value
-})
-function jsonlMore() {
-  const st = jsonlState.value
-  if (!st) return
-  jsonlLimit.value = Math.min(st.blocks.length, jsonlLimit.value + JSONL_PAGE * 4)
-}
-// 切换文件时重置展开进度，否则上一个文件的展开量会带过来
-watch(() => selected.value?.rel, () => { jsonlLimit.value = JSONL_PAGE })
+// ── JSONL 预览 ─────────────────────────────────────────────────────────────
+// 渲染全部交给 JsonlViewer（左索引 + 右详情双栏）。这里只负责把文本和截断
+// 口径传下去，并用 :key="selected.rel" 保证换文件时组件整体重建。
 
 // CSV/TSV 表格预览：只做朴素切分（带引号的复杂 CSV 交给下载后处理，
 // 这里是为了「扫一眼」而不是替代 Excel）
@@ -1106,6 +1066,7 @@ onBeforeUnmount(() => { stopPoll(); revokeBlob(); clearPdfCache() })
    高度」的标准写法，iframe 的 100% 才有参照。 */
 .aw-body { flex: 1 1 auto; height: 0; min-height: 0; overflow: auto; padding: 12px 14px; }
 .aw-body.is-frame { overflow: hidden; padding: 0; }
+.aw-body.is-fill { overflow: hidden; padding: 0; }
 .aw-body.is-full { position: fixed; inset: 0; z-index: 2000; background: #fff; padding: 12px; }
 .aw-body.is-full.is-frame { padding: 0; }
 /* office 预览多包了一层 div：不给它高度的话，里面 iframe 的 height:100% 无处可依，
@@ -1138,26 +1099,8 @@ onBeforeUnmount(() => { stopPoll(); revokeBlob(); clearPdfCache() })
   color: #8a6d1f; background: #fdf6e3; border: 1px solid #f2e3b3;
 }
 
-/* JSONL：每条一个 block，块间留白 + 左侧序号，便于对照「第几条」。 */
-.aw-jsonl { display: flex; flex-direction: column; gap: 12px; }
-.aw-jsonl-head {
-  display: flex; gap: 14px; flex-wrap: wrap;
-  font-size: 12px; color: #6e83a1;
-}
-.aw-jsonl-bad { color: #d68e1b; }
-.aw-jsonl-block {
-  border: 1px solid #e6ecf5; border-radius: 8px; overflow: hidden;
-}
-.aw-jsonl-idx {
-  display: flex; gap: 8px; align-items: center;
-  padding: 4px 10px; font-size: 11px; color: #7b899b;
-  background: #f7f9fd; border-bottom: 1px solid #e6ecf5;
-}
-/* block 内的 pre 去掉圆角与最小高度，由外层圆角统一裁切 */
-.aw-jsonl-block .aw-json-body {
-  border-radius: 0; min-height: 0; max-height: 480px;
-}
-.aw-jsonl-more { display: flex; justify-content: center; padding: 4px 0 8px; }
+/* JSONL：渲染在 JsonlViewer 内部（双栏各自滚动），外层只负责让出确定高度、
+   关掉自身滚动与内边距。样式随组件走，这里不再有 .aw-jsonl-* 规则。 */
 .aw-markdown {
   /* MarkdownView 渲染的是文档正文：深色 <pre> 显然不合适，用白底卡片 + 全局
      .markdown-body 排版（样式在 App.vue 全局段，scoped 命不中 v-html 内容）。 */

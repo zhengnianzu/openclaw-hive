@@ -185,6 +185,190 @@ export function parseJsonl(raw, maxLines = JSONL_MAX_LINES) {
   }
 }
 
+// ── JSONL 记录索引（浏览器式预览） ─────────────────────────────────────────
+// parseJsonl 给的是「一条一个 pretty-print 字符串」，够纵向平铺，但不够做
+// 左侧索引列表：要标签、要摘要、要能搜索，还要保留解析后的值给结构树用。
+// parseJsonlRecords 在同一次扫描里把这些一并产出，避免组件再遍历一遍。
+
+// 标签字段按优先级取第一个命中的字符串值。顺序是经验排的：
+// type/role 最常见（OpenAI 风格消息、轨迹事件流都用），event/kind 次之，
+// name/action 放最后 —— 它们在带 type 的记录里通常是**工具名**而不是记录类型，
+// 只有在没有更靠前的字段时才拿来当标签。
+const LABEL_KEYS = ['type', 'role', 'event', 'kind', 'name', 'action']
+
+// 摘要字段：挑人能读的那一个，而不是第一个字符串字段（那常常是 id）。
+const SUMMARY_KEYS = ['content', 'text', 'message', 'summary', 'description', 'title']
+
+const SUMMARY_MAX = 80
+// 搜索只扫每行前 4000 字符：单行可达十几万字符，全量 includes 在几千条上
+// 会把输入框卡住。前 4 KB 足以覆盖字段名和开头的内容。
+const SEARCH_SCAN = 4000
+
+// 把任意值压成一行可读文本（用于摘要）：换行/连续空白折叠成单空格。
+function flatten(s) {
+  return String(s).replace(/\s+/g, ' ').trim()
+}
+
+function clip(s, n) {
+  const t = flatten(s)
+  return t.length > n ? `${t.slice(0, n)}…` : t
+}
+
+// 从一个值里掏出「像正文」的字符串。content 既可能是裸字符串，也可能是
+// OpenAI 风格的 parts 数组（[{type:'text',text:'…'}]），两种都要认。
+function textish(v) {
+  if (typeof v === 'string') return v
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const t = textish(item)
+      if (t) return t
+    }
+    return ''
+  }
+  if (isPlainObj(v)) {
+    for (const k of ['text', 'content', 'message']) {
+      if (typeof v[k] === 'string' && v[k]) return v[k]
+    }
+  }
+  return ''
+}
+
+function isPlainObj(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+function labelOf(value) {
+  if (!isPlainObj(value)) return ''
+  for (const k of LABEL_KEYS) {
+    const v = value[k]
+    // 只认短字符串：name 字段有时是一整段描述，当标签会把列表撑变形
+    if (typeof v === 'string' && v && v.length <= 40) return v
+  }
+  return ''
+}
+
+function summaryOf(value, raw) {
+  if (isPlainObj(value)) {
+    for (const k of SUMMARY_KEYS) {
+      const t = textish(value[k])
+      if (t) return clip(t, SUMMARY_MAX)
+    }
+    // 没有正文字段（tool_call 这类纯结构记录很常见）：列顶层键名而不是
+    // 原始 JSON —— `{"type":"tool_call","name":"browser.…` 这种转义串既占
+    // 两行又读不出重点，`type · name · args` 反而一眼看出这条有什么。
+    const keys = Object.keys(value)
+    if (keys.length) return clip(keys.slice(0, 8).join(' · '), SUMMARY_MAX)
+  }
+  // 数组/标量/解析失败的行：退回原文，至少能看出这条长什么样
+  return clip(raw, SUMMARY_MAX)
+}
+
+/**
+ * 逐行解析 JSONL，并为每条产出索引列表所需的元信息。
+ *
+ * 与 parseJsonl 的区别：这里额外带 value（解析后的值，给结构树）、raw（原行）、
+ * bytes、label、summary、searchText。text 字段与 parseJsonl 一致（pretty-print
+ * 后的字符串，Raw 模式直接用）。
+ *
+ * @returns {{ok:boolean, records:Array, total:number, bad:number, truncated:boolean, error?:string}}
+ */
+export function parseJsonlRecords(raw, maxLines = JSONL_MAX_LINES) {
+  const src = String(raw || '')
+  if (!src.trim()) {
+    return { ok: false, records: [], total: 0, bad: 0, truncated: false, error: '空文件' }
+  }
+  const lines = src.split(/\r?\n/).filter(l => l.trim())
+  const limit = Math.min(lines.length, maxLines)
+  const records = []
+  let bad = 0
+  for (let i = 0; i < limit; i += 1) {
+    const line = lines[i]
+    let value = null
+    let ok = true
+    let text = line
+    try {
+      value = JSON.parse(line)
+      text = JSON.stringify(value, null, 2)
+    } catch {
+      ok = false
+      bad += 1
+      value = null
+    }
+    const label = ok ? labelOf(value) : ''
+    records.push({
+      idx: i,
+      ok,
+      value,
+      raw: line,
+      text,
+      bytes: line.length,
+      label,
+      summary: summaryOf(value, line),
+      searchText: `${label} ${line.slice(0, SEARCH_SCAN)}`.toLowerCase(),
+    })
+  }
+  return {
+    ok: records.length > 0,
+    records,
+    total: lines.length,
+    bad,
+    truncated: lines.length > maxLines,
+  }
+}
+
+// ── JSON 结构树 ────────────────────────────────────────────────────────────
+// 把一个值摊成「可直接渲染一层」的节点。递归交给组件（JsonTree.vue 自调用），
+// 这里只负责判定类型、数children、以及长字符串的截断策略。
+
+// 超过这个长度的字符串默认折叠。800 字符约等于预览框里 6–8 行，
+// 足够看清开头在讲什么，又不会把一条 248 KB 的 content 整个灌进 DOM。
+export const STRING_PREVIEW = 800
+
+export function valueType(v) {
+  if (v === null) return 'null'
+  if (Array.isArray(v)) return 'array'
+  const t = typeof v
+  return t === 'object' ? 'object' : t   // string / number / boolean / object / array / null
+}
+
+/**
+ * 摊开一层：对象 → 按键，数组 → 按下标。非容器返回空数组。
+ * @returns {Array<{key:string, value:*, type:string, isContainer:boolean,
+ *                  childCount:number, isLong:boolean, preview:string, full:string}>}
+ */
+export function jsonTreeNodes(value) {
+  if (!isPlainObj(value) && !Array.isArray(value)) return []
+  const entries = Array.isArray(value)
+    ? value.map((v, i) => [String(i), v])
+    : Object.entries(value)
+  return entries.map(([key, v]) => {
+    const type = valueType(v)
+    const isContainer = type === 'object' || type === 'array'
+    const full = type === 'string' ? v : ''
+    const isLong = type === 'string' && v.length > STRING_PREVIEW
+    return {
+      key,
+      value: v,
+      type,
+      isContainer,
+      childCount: isContainer
+        ? (type === 'array' ? v.length : Object.keys(v).length)
+        : 0,
+      isLong,
+      preview: isLong ? full.slice(0, STRING_PREVIEW) : full,
+      full,
+    }
+  })
+}
+
+// 容器节点折叠时显示的占位：`{ … } (3 fields)` / `[ … ] (5 items)`
+export function containerHint(node) {
+  if (!node.isContainer) return ''
+  return node.type === 'array'
+    ? `[ … ] (${node.childCount} items)`
+    : `{ … } (${node.childCount} fields)`
+}
+
 // 目录在前、按名升序（沿用 OutputViewer.vue 的排序规则）
 export function sortEntries(entries) {
   const arr = [...(entries || [])]
