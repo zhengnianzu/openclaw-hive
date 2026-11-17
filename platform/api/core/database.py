@@ -957,6 +957,9 @@ def init_db_unlocked():
                 -- 运行该镜像的操作系统：linux | windows。绝大多数镜像是 linux，
                 -- 所以默认 linux，Windows 镜像在注册时显式选择。
                 os TEXT NOT NULL DEFAULT 'linux',
+                -- 该镜像相对上一版的改进点。名称/地址里只有版本号，看不出改了什么，
+                -- 所以单独留一列让运维写明，选镜像时能看到。
+                remark TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );
@@ -991,6 +994,14 @@ def init_db_unlocked():
                 "UPDATE images SET os='windows' "
                 "WHERE LOWER(name) LIKE '%windows%' OR LOWER(address) LIKE '%windows%'"
             )
+
+        # migrate: add remark to images
+        # 历史行拿默认空串即可 —— 改进点只有人知道，没法从名称/地址推断，
+        # 所以不做回填，由运维在列表里逐条补填。
+        try:
+            conn.execute("ALTER TABLE images ADD COLUMN remark TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
 
         # migrate: add default_skills to task_registrations
         try:

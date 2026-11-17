@@ -5,11 +5,12 @@ tags:
 - wiki
 - 入门
 summary: 平台批跑管线的任务配置说明，参考模板，用户使用平台批跑之前，请先核查对比任务配置
-is_pinned: true
+is_pinned: false
 sort_order: 10
 author: admin
+updated_by: admin
 created_at: '2026-10-24T11:41:31.284404'
-updated_at: '2026-10-24T11:41:31.284404'
+updated_at: '2026-11-16T20:29:17.637619'
 ---
 
 <https://wiki.huawei.com/domains/164849/wiki/339683/WIKI2026080312129526>

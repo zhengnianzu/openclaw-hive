@@ -219,9 +219,13 @@
           <el-form-item label="镜像名称">
             <el-select v-model="form.image_name" filterable allow-create default-first-option
               placeholder="选择或输入镜像地址" style="width:100%" clearable>
-              <el-option v-for="img in imageList" :key="img.id" :label="img.name" :value="img.address">
-                <span>{{ img.name }}</span>
-                <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
+              <el-option v-for="img in imageList" :key="img.id" :label="img.name" :value="img.address"
+                :style="img.remark ? 'height:auto;line-height:1.5;padding-top:6px;padding-bottom:6px' : ''">
+                <div>
+                  <span>{{ img.name }}</span>
+                  <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
+                </div>
+                <div v-if="img.remark" style="color:#999;font-size:12px;line-height:1.3;white-space:normal">{{ img.remark }}</div>
               </el-option>
             </el-select>
           </el-form-item>
