@@ -18,7 +18,7 @@
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
-      <el-table :data="filteredImages" v-loading="loading" stripe style="width:100%" border>
+      <el-table :data="pagedImages" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="name" label="镜像名称" min-width="160" />
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
@@ -58,6 +58,13 @@
           </template>
         </el-table-column>
       </el-table>
+    </div>
+
+    <div class="pagination-bar">
+      <span class="total-text">共 {{ filteredImages.length }} 条</span>
+      <el-pagination v-model:current-page="currentPage" v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50]" :total="filteredImages.length"
+        layout="sizes, prev, pager, next" background />
     </div>
 
     <el-dialog v-model="dialogVisible" title="注册镜像" width="520px" destroy-on-close>
@@ -127,7 +134,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
@@ -142,6 +149,8 @@ const dialogVisible = ref(false)
 const editVisible = ref(false)
 const typeFilter = ref('')
 const osFilter = ref('')
+const currentPage = ref(1)
+const pageSize = ref(10)
 const images = ref([])
 
 const OS_OPTIONS = [
@@ -172,6 +181,19 @@ const filteredImages = computed(() => {
   )
 })
 
+const pagedImages = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredImages.value.slice(start, start + pageSize.value)
+})
+
+// 换筛选条件或每页条数时回到第一页，否则会停在一个空页上
+watch([typeFilter, osFilter, pageSize], () => { currentPage.value = 1 })
+// 删除导致当前页越界时回退（例如在最后一页删掉唯一一条）
+watch(() => filteredImages.value.length, (n) => {
+  const maxPage = Math.max(1, Math.ceil(n / pageSize.value))
+  if (currentPage.value > maxPage) currentPage.value = maxPage
+})
+
 async function loadImages() {
   loading.value = true
   try {
@@ -190,6 +212,8 @@ async function handleCreate() {
     ElMessage.success('镜像注册成功')
     dialogVisible.value = false
     form.value = { name: '', address: '', harness_type: 'openclaw', os: 'linux', remark: '' }
+    // 后端按 created_at DESC 排序，新镜像在第一页；留在原页会看不到刚注册的那条
+    currentPage.value = 1
     loadImages()
   } finally { creating.value = false }
 }
@@ -259,6 +283,8 @@ onMounted(() => { harnessStore.load(); loadImages() })
   gap: 12px;
   margin-bottom: 16px;
 }
+.pagination-bar { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
+.total-text { color: var(--text-muted); font-size: 13px; }
 /* 操作区：强制不换行，否则「更多」下拉会被挤到第二行、撑高整行 */
 .op-cell { display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: nowrap; white-space: nowrap; }
 .remark-empty {
