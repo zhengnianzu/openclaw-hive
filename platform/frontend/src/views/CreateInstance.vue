@@ -137,10 +137,42 @@
           </el-form-item>
 
           <el-form-item label="模型 ID">
-            <el-input v-model="form.model_id" :placeholder="form.harness_type === 'claude-code' ? '例如：claude-opus-4-7-thinking' : '例如：claude-opus-4-7-thinking'">
-              <template v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" #prepend>local/</template>
-            </el-input>
+            <div style="display:flex;gap:8px;width:100%">
+              <el-input v-model="form.model_id" style="flex:1" :placeholder="form.harness_type === 'claude-code' ? '例如：claude-opus-4-7-thinking' : '例如：claude-opus-4-7-thinking'">
+                <template v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" #prepend>local/</template>
+              </el-input>
+              <el-button :loading="validating" @click="validateModel">验证模型</el-button>
+            </div>
             <div v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
+            <div style="font-size:12px;color:#999;margin-top:4px">
+              用上面的 Base URL / API Key / 模型 ID 实打一次最小请求。指定了「API 类型」就按它调，
+              未指定则先试 Anthropic，不通再试 OpenAI
+            </div>
+
+            <!-- 结果内联展示：报错要原样可见，所以用 pre 而不是 el-alert 的 title -->
+            <el-alert v-if="validateResult && validateResult.ok" type="success" :closable="false"
+              show-icon style="margin-top:8px">
+              <template #title>
+                验证通过（{{ validateResult.used === 'anthropic' ? 'Anthropic Messages' : 'OpenAI Completions' }}）
+              </template>
+              <div style="font-size:12px;word-break:break-all">
+                <div>请求地址：{{ validateResult.request_url }}</div>
+                <div v-if="validateResult.reply">模型回复：{{ validateResult.reply }}</div>
+              </div>
+            </el-alert>
+
+            <el-alert v-else-if="validateResult" type="error" :closable="false"
+              show-icon style="margin-top:8px">
+              <template #title>验证失败</template>
+              <div style="font-size:12px">
+                <div v-if="validateResult.tried && validateResult.tried.length"
+                  style="margin-bottom:4px;word-break:break-all">
+                  已尝试：{{ validateResult.tried.join(' → ') }}
+                  <template v-if="validateResult.request_url"> · {{ validateResult.request_url }}</template>
+                </div>
+                <pre style="white-space:pre-wrap;word-break:break-all;margin:0;font-size:12px">{{ validateResult.error }}</pre>
+              </div>
+            </el-alert>
           </el-form-item>
         </el-tab-pane>
 
@@ -462,6 +494,33 @@ const queueList = ref([])
 const sandboxList = ref([])
 const queuePickerVisible = ref(false)
 
+// 「验证模型」按钮状态。validateResult 为 null = 还没验证过（不渲染结果区）
+const validating = ref(false)
+const validateResult = ref(null)
+
+// 实打一次模型调用验证连通性。后端一律返回 200，成败看 body.ok；
+// 带 silent 让 api/index.js 不弹全局 toast —— 报错要内联原样展示。
+async function validateModel() {
+  validating.value = true
+  validateResult.value = null
+  try {
+    validateResult.value = await api.post('/harness-meta/validate-model', {
+      model_base_url: form.value.model_base_url || '',
+      model_api_key: form.value.model_api_key || '',
+      model_api_type: form.value.model_api_type || '',
+      model_id: form.value.model_id || '',
+    }, { silent: true })
+  } catch (e) {
+    // 网络层/鉴权异常也内联显示，口径与后端返回的失败一致
+    validateResult.value = {
+      ok: false, tried: [], request_url: '',
+      error: e.response?.data?.detail || e.message || '请求失败',
+    }
+  } finally {
+    validating.value = false
+  }
+}
+
 async function loadSandboxConfigs() {
   try {
     sandboxList.value = await api.get('/sandbox-configs', { params: { enabled_only: true } })
@@ -558,6 +617,7 @@ function applyTemplate(tpl) {
   form.value.image_name = tpl.image_name || ''
   form.value.code_repo_id = tpl.code_repo_id || null
   form.value.model_api_key = ''
+  validateResult.value = null
   try {
     const tplAgents = JSON.parse(tpl.agents_json || '[]')
     if (tplAgents.length > 0) {
@@ -624,6 +684,7 @@ function onHarnessChange() {
   form.value.harness_config_id = null
   form.value.harness_config_version_id = null
   versionList.value = []
+  validateResult.value = null
   loadImages()
   loadHarnessConfigs()
 }
