@@ -346,6 +346,15 @@
 
     <!-- OBS Browser Dialog -->
     <el-dialog v-model="obsVisible" title="选择OBS目录" width="700px" destroy-on-close>
+      <!-- 路径输入框：可手工改、可全选复制（面包屑是按钮，选不中文本）。
+           回车或点「加载」即跳转；与 TaskRegister/CodeManagement 的对话框一致。 -->
+      <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+        <el-input v-model="obsCurrentPath" placeholder="OBS 路径" size="small"
+          @keyup.enter="loadObsDir" spellcheck="false">
+          <template #prepend>路径</template>
+        </el-input>
+        <el-button size="small" @click="loadObsDir" :loading="obsLoading">加载</el-button>
+      </div>
       <div style="margin-bottom:12px">
         <el-breadcrumb separator="/">
           <el-breadcrumb-item v-for="(seg, idx) in pathSegments" :key="idx"
@@ -728,18 +737,38 @@ const pathSegments = computed(() => {
   return ['', ...p.split('/').filter(Boolean)]
 })
 
+// 以字段里已填的路径为浏览起点（与 TaskRegister/CodeManagement 的行为一致）。
+// 注意本页字段存的是 stripBucket 后的相对路径（见 confirmObsSelect），
+// 必须 joinBucket 还原成 obs:// 全路径才能交给 /obs/list。
 function openObsBrowser(field) {
   obsTargetField = field
-  obsCurrentPath.value = obsBucket()
+  const current = String(form.value[field] || '').trim()
+  obsCurrentPath.value = current ? joinBucket(current) : obsBucket()
+  obsItems.value = []
   obsVisible.value = true
   loadObsDir()
 }
 
+// 起点可能是用户手打的、OBS 上并不存在的路径 —— obsutil 会非零退出，
+// 后端转成 500（api/routers/obs.py）。这时退回桶根重列，而不是让对话框空着。
 async function loadObsDir() {
+  // 输入框是可编辑的，手打的值可能缺桶前缀/缺尾斜杠/带多余空格。
+  // 统一经 stripBucket→joinBucket 归一化，顺带让面包屑能正确分段。
+  obsCurrentPath.value = joinBucket(stripBucket(String(obsCurrentPath.value || '').trim()))
   obsLoading.value = true
   try {
-    const res = await api.get('/obs/list', { params: { path: obsCurrentPath.value } })
+    const res = await api.get('/obs/list', { params: { path: obsCurrentPath.value }, silent: true })
     obsItems.value = res.items
+  } catch (e) {
+    const atRoot = obsCurrentPath.value === obsBucket()
+    if (!atRoot) {
+      ElMessage.warning(`路径 ${stripBucket(obsCurrentPath.value) || '/'} 无法浏览，已回到桶根`)
+      obsCurrentPath.value = obsBucket()
+      obsLoading.value = false
+      return loadObsDir()
+    }
+    obsItems.value = []
+    ElMessage.error(e.response?.data?.detail || e.message || 'OBS 列目录失败')
   } finally { obsLoading.value = false }
 }
 

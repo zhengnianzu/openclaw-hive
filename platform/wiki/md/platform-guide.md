@@ -200,10 +200,10 @@ Harness 类型
 ### 4.1 新建队列
 在高级配置中，可以选择 **任务队列**，用来让多个任务按顺序串行执行：一个跑完，下一个自动开始，不用自己盯着。
 
-![alt text](e06180fe-2398-4908-a580-0f0c818fa50c.png)
+![alt text](/api/wiki/assets/7268ad0971944b6db79dd72d9c61d641.webp)
 
 ### 4.2 插队
-![alt text](7573662c-76e0-45f1-9771-605f49107f30.png)
+![alt text](/api/wiki/assets/357f0486084b4af2b35ef1a6181c4312.webp)
 队列里如果有任务想插队到最优先的放行位置，可以点击插队，操作入口如下：
 
 | 位置 | 操作 |
@@ -219,20 +219,22 @@ Harness 类型
 
 
 ## 6. 镜像管理
-![alt text](image.png)
+![alt text](/api/wiki/assets/a5e309761f224a7aa80281cf358cc0c1.webp)
 
-| 镜像系列 | 描述 | 系统 | 
+| harness类型 | 镜像 | 描述 | 
 |---|---|---|
-| multiharness:26.xx.x | **multiharness:后跟日期的，基础镜像版本**：包含openclaw2026.6.6、hermes0.18.2、claude-code2.1.22、opencode1.18.18、codex0.147.0、pi0.84.3、grok1.0.5、dsh0.1.1-rc.2，且默认包含serper技能 | linux |
+| openclaw2026.6.6、hermes0.18.2、claude-code2.1.22、opencode1.18.18、codex0.147.0、pi0.84.3、grok1.0.5、dsh0.1.1-rc.2 | multiharness:26.11.4 （**multiharness:后跟日期的，基础镜像版本**）| 默认包含serper技能 |
 | multiharness-no-serper:26.xx.x | 移除所有harness的默认serper技能，skill泛化专用 | linux | 
-| openclaw:26.10.6xx | 专属harness名称开头，则是专属镜像，如openclaw2026.10.6专属镜像，默认带serper | linux | 
+| openclaw26.10.6版本 | openclaw:26.10.6-20261102 | linux | 
+| jiuwenswarm:dev-stable-2026.10.23v1 | jiuwenswarm-dev专属镜像，默认带serper | 
+| jiuwenswarm:xiaoyi-2026.11.2 | jiuwenswarm-xiaoyi专属镜像，默认带serper | 
 | lego-preset-v2 | lego专属镜像，万轶维护 | linux |
 | xiaoyiclaw:0.0.x | xiaoyiclaw 专属镜像， 曹子轩维护 | linux | 
 | windows-xxx | windows镜像 | windows | 
 
 
 ## 7. 代码管理
-![alt text](image-1.png)
+![alt text](/api/wiki/assets/5842ae4be0da4df5b94236ac4a76db43.webp)
 | 代码仓 | 描述 |
 |---|---|
 | openclaw-task/v1117 | **主代码仓版本**：选择最新日期的 | 
