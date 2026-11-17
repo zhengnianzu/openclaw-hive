@@ -956,6 +956,10 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # 任务级开关：hive 上传配置前给模型 key 追加 _<env_id uuid> 后缀。
     # 模板里没有该键，这里显式写入；关闭时写 False，语义与缺失一致。
     base.run_config.task.suffix_api_keys = bool(req.suffix_api_keys)
+    # 本地代理开关：hive 读 run_config.proxy_enable（默认 False），
+    # 控制沙箱内是否启动 openclaw-task/llm_proxy_lite。create_params 由
+    # req.model_dump() 自动带上，详情页可直接展示。
+    base.run_config.proxy_enable = bool(req.proxy_enable)
     # 与 suffix_api_keys 一样固化进实例快照，Hive 以表单原值作为主 harness
     # 代理上游的唯一来源，不再反向扫描不同格式的 harness 配置猜测 URL。
     base.run_config.task.model_base_url = (req.model_base_url or "").strip()

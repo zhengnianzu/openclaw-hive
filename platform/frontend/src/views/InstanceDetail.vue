@@ -332,6 +332,11 @@
                     {{ createParams.suffix_api_keys ? '已开启' : '未开启' }}
                   </el-tag>
                 </el-descriptions-item>
+                <el-descriptions-item label="启动本地代理">
+                  <el-tag size="small" :type="createParams.proxy_enable ? 'success' : 'info'">
+                    {{ createParams.proxy_enable ? '已开启' : '未开启' }}
+                  </el-tag>
+                </el-descriptions-item>
                 <el-descriptions-item label="资源池">
                   <span v-if="inst.sandbox_namespace"><code>{{ inst.sandbox_namespace }}</code></span>
                   <span v-else>-</span>

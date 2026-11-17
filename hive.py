@@ -64,6 +64,7 @@ from utils.win_util import (
     ps_copy_skill_command,
     _setup_windows_obsutil,
     _start_llm_proxy_windows,
+    _gen_proxy_summary_windows,
     _windows_env_assign,
     _start_openclaw_gateway_windows,
     _start_jiuwenswarm_gateway_windows,
@@ -410,6 +411,7 @@ class OpenClawDistillationTask:
     # Windows 专属方法: 函数体在 utils/win_util.py, 这里挂成类属性让 self 自动绑定。
     _setup_windows_obsutil = _setup_windows_obsutil
     _start_llm_proxy_windows = _start_llm_proxy_windows
+    _gen_proxy_summary_windows = _gen_proxy_summary_windows
     _windows_env_assign = _windows_env_assign
     _start_openclaw_gateway_windows = _start_openclaw_gateway_windows
     _start_jiuwenswarm_gateway_windows = _start_jiuwenswarm_gateway_windows
@@ -678,6 +680,39 @@ class OpenClawDistillationTask:
             raise HiveError("C005", detail="start llm_proxy_lite", sandbox_result=launch_result)
         self.logger.info(f"llm proxy ready: ports={self.proxy_ports}")
 
+    async def _gen_proxy_summary(self, sandbox_type: str, project_dir: str) -> None:
+        """主脚本结束后、上传 OBS 前生成 llm_proxy_lite 用量统计。
+
+        这是全链路唯一正确时机: harness 已结束(proxy 停止写入)、沙箱还活着;
+        harness 崩溃/超时时 openclaw-task 侧收尾不会执行, 由这里的兜底覆盖。
+        统计脚本读 cwd 相对路径 logs_proxy/traj, 必须 cd 到项目目录跑;
+        输出写 logs_proxy/proxy_summary.txt, 随该目录整传进 OBS。
+        尽力而为: 失败只告警, 不抛错, 不影响轨迹上传。
+        """
+        try:
+            if sandbox_type == "windows":
+                await self._gen_proxy_summary_windows(project_dir)
+                return
+            stats_cmd = [
+                "/bin/bash", "-c",
+                f"cd '{project_dir}' && "
+                f"mkdir -p logs_proxy && "
+                f"python llm_proxy_lite/print_stats_summary.py "
+                f"> logs_proxy/proxy_summary.txt 2>&1",
+            ]
+            stats_result = await self._exec_sandbox(
+                stats_cmd, max(self.config.simple_bash_timeout, 120)
+            )
+            stats_data = stats_result.data or {}
+            if stats_result.code != ErrorCode.SUCCESS[0] or stats_data.get("exit_code") != 0:
+                self.logger.warning(
+                    "[proxy_summary] 统计脚本执行失败(不影响上传): "
+                    f"code={stats_result.code} exit={stats_data.get('exit_code')}"
+                )
+            else:
+                self.logger.info("[proxy_summary] 用量统计已写入 logs_proxy/proxy_summary.txt")
+        except Exception as e:
+            self.logger.warning(f"[proxy_summary] 执行异常(不影响上传): {e}")
 
     async def _upload_data_config(self, config_file: str, port: Optional[str] = None) -> None:
         """集中改写 task config，保存独立副本后上传沙箱。
@@ -1536,6 +1571,10 @@ class OpenClawDistillationTask:
             (task_logs, bucket_path),
         ]
         if self.config.proxy_enable:
+            # 用量统计: 时机/路径/尽力而为语义见 _gen_proxy_summary 注释
+            await self._gen_proxy_summary(
+                sandbox_type, str(PathCls(sandbox_cfg.workspace, code_stem))
+            )
             proxy_logs = str(PathCls(sandbox_cfg.workspace, code_stem, "logs_proxy"))
             uploads.append((proxy_logs, bucket_path))
         uploads += [(ws, bucket_path) for ws in per_agent_workspaces]

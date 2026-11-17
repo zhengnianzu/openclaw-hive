@@ -286,6 +286,13 @@
             </div>
           </el-form-item>
 
+          <el-form-item label="启动本地代理">
+            <el-switch v-model="form.proxy_enable" active-text="开启" inactive-text="关闭" />
+            <div style="font-size:12px;color:#999;margin-top:4px">
+              开启后沙箱内启动本地代理：模型流量经本地端口转发并记录轨迹日志。默认关闭
+            </div>
+          </el-form-item>
+
           <el-form-item label="代码仓">
             <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
               <el-option v-for="repo in codeRepoList" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
@@ -456,6 +463,7 @@ const form = ref({
   max_ttl_second: 36000,
   model_api_key: '', model_base_url: '', model_api_type: '', model_id: '',
   suffix_api_keys: true,
+  proxy_enable: false,
   user_proxy_model_name: '', user_proxy_api_key: '', user_proxy_base_url: '',
   harness_type: 'openclaw',
   code_repo_id: null,
