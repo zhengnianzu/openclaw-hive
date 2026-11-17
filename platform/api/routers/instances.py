@@ -955,6 +955,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # 任务级开关：hive 上传配置前给模型 key 追加 _<env_id uuid> 后缀。
     # 模板里没有该键，这里显式写入；关闭时写 False，语义与缺失一致。
     base.run_config.task.suffix_api_keys = bool(req.suffix_api_keys)
+    # 与 suffix_api_keys 一样固化进实例快照，Hive 以表单原值作为主 harness
+    # 代理上游的唯一来源，不再反向扫描不同格式的 harness 配置猜测 URL。
+    base.run_config.task.model_base_url = (req.model_base_url or "").strip()
 
     # --- 沙箱配置：把派生文件的沙箱段整段替换进 config.yaml ---
     # 派生文件在 settings/sandbox/<type>_<id>.yaml，其 global/sandbox/sandbox_namespace/s3

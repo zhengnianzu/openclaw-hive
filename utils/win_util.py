@@ -26,6 +26,8 @@ from execution_client.core.error_code import ErrorCode
 from execution_client.core.utils import generate_random_port
 from execution_client.models.request import ExtendExecCommand
 
+from utils.llm_proxy import PROXY_CONFIG_NAME, PROXY_DIR_NAME
+
 
 def ps_command(script: str, remote: str) -> list[str]:
     """把一段 PowerShell 脚本包成 -EncodedCommand 的 exec 命令列表。
@@ -305,6 +307,52 @@ async def _setup_windows_obsutil(self) -> None:
         )
     finally:
         os.unlink(tar_local)
+
+
+async def _start_llm_proxy_windows(
+    self,
+    project_dir: str,
+) -> None:
+    """Start the bundled LLM proxy inside a Windows sandbox.
+    """
+    proxy_dir = str(PureWindowsPath(project_dir, PROXY_DIR_NAME))
+    # proxy.log 与 gateway.log 同一待遇: 写到 result_workdir, 供日志导出。
+    workdir = self.config.sandbox_config.result_workdir.replace("\\", "/")
+
+    ps_dir = proxy_dir.replace("'", "''")
+    ps_project = project_dir.replace("'", "''")
+    ps_workdir = workdir.replace("'", "''")
+    # run.cmd 承载重定向
+    launch_script = (
+        f"Set-Location -LiteralPath '{ps_project}'; "
+        f"New-Item -ItemType Directory -Force '{ps_workdir}' | Out-Null; "
+        "$q=[char]34; "
+        f"$bat='@echo off'+[Environment]::NewLine"
+        f"+'cd /d '+$q+'{ps_project}'+$q+[Environment]::NewLine"
+        f"+'python {PROXY_DIR_NAME}\\app.py --config {PROXY_DIR_NAME}\\{PROXY_CONFIG_NAME}"
+        f" 1> {workdir}\\proxy.log 2>&1'+[Environment]::NewLine; "
+        f"Set-Content -Path '{ps_workdir}\\llm_proxy.cmd' -Value $bat -Encoding ASCII; "
+        f"Start-Process cmd.exe -ArgumentList '/d /c {workdir}\\llm_proxy.cmd' "
+        "-WindowStyle Hidden | Out-Null; "
+        "Write-Output 'llm-proxy-started'"
+    )
+    launch_command = ps_command(launch_script, ps_dir.replace("\\", "/"))
+    launch_result = await self._exec_sandbox(
+        launch_command, self.config.simple_bash_timeout,
+    )
+    launch_data = launch_result.data or {}
+    if (
+        launch_result.code != ErrorCode.SUCCESS[0]
+        or launch_data.get("exit_code") != 0
+    ):
+        _log_sandbox_detail(
+            self.logger, "start llm proxy failed", launch_result,
+            level=logging.ERROR,
+        )
+        raise HiveError(
+            "C005", detail="start llm_proxy_lite",
+            sandbox_result=launch_result,
+        )
 
 
 async def _start_openclaw_gateway_windows(self, config_file: str) -> None:

@@ -380,6 +380,17 @@ def prepare_local_agent_config(
         data = json.loads(Path(local_path).read_text(encoding="utf-8"))
         providers = data.setdefault("providers", {})
 
+        # 注入 agent 的 contextWindow/maxTokens 与主 agent(模板里已有的
+        # provider 模型条目)保持一致, 模板改参后这里自动跟随, 不用同步改代码;
+        # 模板里找不到带该字段的条目时, 退回历史默认值。
+        main_model = next(
+            (m for p in providers.values() if isinstance(p, dict)
+             for m in p.get("models", []) if isinstance(m, dict) and "contextWindow" in m),
+            {},
+        )
+        context_window = main_model.get("contextWindow", 200000)
+        max_tokens = main_model.get("maxTokens", 131072)
+
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
@@ -406,9 +417,9 @@ def prepare_local_agent_config(
                             "name": model_name,
                             "reasoning": False,
                             "input": ["text"],
-                            "contextWindow": 200000,
-                            "maxTokens": 327680,
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                            "contextWindow": context_window,
+                            "maxTokens": max_tokens,
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, # pi 会拿会话的 usage 统计，乘以单价
                         }
                     ],
                 }
@@ -811,6 +822,7 @@ ERROR_CATALOG: dict = {
     "C002": "upload file failed",
     "C003": "environment creation failed",
     "C004": "agent config write failed",
+    "C005": "llm proxy start failed",
     # -- Server / sandbox-side (S0xx) --
     "S001": "gateway start failed",
     "S002": "gateway startup timeout",
@@ -880,6 +892,7 @@ ERROR_POLICY: dict = {
     # -- 应快速失败: 配置/环境错误 --
     "C001": {"policy": POLICY_FAIL_FAST},
     "C004": {"policy": POLICY_FAIL_FAST},
+    "C005": {"policy": POLICY_FAIL_FAST},
     "S003": {"policy": POLICY_FAIL_FAST},
 
     # -- 任务侧正常损耗 --
