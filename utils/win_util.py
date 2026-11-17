@@ -355,6 +355,37 @@ async def _start_llm_proxy_windows(
         )
 
 
+async def _gen_proxy_summary_windows(self, project_dir: str) -> None:
+    """在 Windows 沙箱内生成 llm_proxy_lite 用量统计(logs_proxy/proxy_summary.txt)。
+
+    统计脚本读 cwd 相对路径 logs_proxy/traj, 必须 cd 到项目目录跑。
+    尽力而为: 失败只告警, 不抛错, 不影响后续轨迹上传。
+    """
+    ps_project = project_dir.replace("'", "''")
+    config_dir = str(PureWindowsPath(
+        self.config.sandbox_config.harness_sandbox_config_file
+    ).parent).replace("\\", "/")
+    stats_cmd = ps_command(
+        f"Set-Location -LiteralPath '{ps_project}'; "
+        f"New-Item -ItemType Directory -Force logs_proxy | Out-Null; "
+        f"python llm_proxy_lite\\print_stats_summary.py "
+        f"> logs_proxy/proxy_summary.txt 2>&1; "
+        "Write-Output 'HIVE_PROXY_SUMMARY_DONE'",
+        config_dir,
+    )
+    stats_result = await self._exec_sandbox(
+        stats_cmd, max(self.config.simple_bash_timeout, 120)
+    )
+    stats_data = stats_result.data or {}
+    if stats_result.code != ErrorCode.SUCCESS[0] or stats_data.get("exit_code") != 0:
+        self.logger.warning(
+            "[proxy_summary] 统计脚本执行失败(不影响上传): "
+            f"code={stats_result.code} exit={stats_data.get('exit_code')}"
+        )
+    else:
+        self.logger.info("[proxy_summary] 用量统计已写入 logs_proxy/proxy_summary.txt")
+
+
 async def _start_openclaw_gateway_windows(self, config_file: str) -> None:
     """在 Windows 沙箱里启动 OpenClaw gateway (PowerShell -EncodedCommand 版)。
 
