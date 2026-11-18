@@ -1076,14 +1076,30 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if not os.path.exists(hermes_template):
             hermes_template = os.path.join(settings.SETTINGS_DIR, "hermes_config.yaml")
         hermes_omega = OmegaConf.load(hermes_template)
+        hermes_model = hermes_omega.setdefault("model", OmegaConf.create({}))
+        hermes_provider_name = str(hermes_model.get("provider") or "custom")
+        hermes_providers = hermes_omega.setdefault(
+            "providers", OmegaConf.create({})
+        )
+        if hermes_provider_name not in hermes_providers:
+            hermes_providers[hermes_provider_name] = OmegaConf.create({})
+        hermes_provider = hermes_providers[hermes_provider_name]
 
         if req.model_id:
-            hermes_omega.model.default = req.model_id
-            hermes_omega.model.model = req.model_id
+            hermes_model["default"] = req.model_id
+            hermes_provider["default_model"] = req.model_id
+        if req.model_api_type == "anthropic-messages":
+            hermes_provider["transport"] = "anthropic_messages"
+        elif req.model_api_type == "openai-completions":
+            hermes_provider["transport"] = "chat_completions"
         if req.model_base_url:
-            hermes_omega.model.base_url = req.model_base_url
+            # hermes 两种可选协议都要求 providers.<name>.api 带 /v1 后缀。
+            base_url = req.model_base_url.strip().rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            hermes_provider["api"] = base_url
         if req.model_api_key:
-            hermes_omega.model.api_key = req.model_api_key
+            hermes_provider["api_key"] = req.model_api_key
 
         OmegaConf.save(hermes_omega, hermes_config_path)
     elif req.harness_type == "claude-code":
@@ -1094,7 +1110,11 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             cc_cfg = json.load(f)
 
         if req.model_base_url:
-            cc_cfg["env"]["ANTHROPIC_BASE_URL"] = req.model_base_url
+            # claude-code 固定使用 Anthropic，ANTHROPIC_BASE_URL 不带 /v1 后缀。
+            base_url = req.model_base_url.strip().rstrip("/")
+            if base_url.endswith("/v1"):
+                base_url = base_url.removesuffix("/v1").rstrip("/")
+            cc_cfg["env"]["ANTHROPIC_BASE_URL"] = base_url
         if req.model_api_key:
             cc_cfg["env"]["ANTHROPIC_AUTH_TOKEN"] = req.model_api_key
         if req.model_id:
@@ -1113,6 +1133,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_id:
             openjiuwen_cfg["default"]["model"] = req.model_id
         if req.model_base_url:
+            # openjiuwen 沿用前端填写的 base_url，不在实例创建阶段修改后缀。
             openjiuwen_cfg["default"]["base_url"] = req.model_base_url
         if req.model_api_key:
             openjiuwen_cfg["default"]["api_key"] = req.model_api_key
@@ -1154,8 +1175,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         main_opts = providers[main_provider_key].setdefault("options", {})
         if req.model_base_url:
-            # opencode 要求 baseURL 带 /v1 后缀
-            base_url = req.model_base_url.rstrip("/")
+            # opencode 要求 provider options.baseURL 带 /v1 后缀。
+            base_url = req.model_base_url.strip().rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url += "/v1"
             main_opts["baseURL"] = base_url
@@ -1231,12 +1252,16 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_api_type:
             prov["api"] = req.model_api_type
         if req.model_base_url:
-            # pi 要求 openai-completions 带 /v1 后缀, anthropic-messages 不带
-            base_url = req.model_base_url.rstrip("/")
-            if prov["api"] == "openai-completions" and not base_url.endswith("/v1"):
-                base_url += "/v1"
-            if prov["api"] == "anthropic-messages" and base_url.endswith("/v1"):
-                base_url = base_url[:-3].rstrip("/")
+            # pi: OpenAI Completions 带 /v1，Anthropic Messages 不带 /v1。
+            base_url = req.model_base_url
+            if prov.get("api") == "openai-completions":
+                base_url = base_url.strip().rstrip("/")
+                if not base_url.endswith("/v1"):
+                    base_url += "/v1"
+            elif prov.get("api") == "anthropic-messages":
+                base_url = base_url.strip().rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url.removesuffix("/v1").rstrip("/")
             prov["baseUrl"] = base_url
         
         if req.model_id:
@@ -1258,14 +1283,26 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         with open(grok_template, "rb") as f:
             grok_cfg = tomllib.load(f)
 
-        # 新版 grok_config.toml 将模型配置放在 [model.default-model] 下
-        model_section = grok_cfg.setdefault("model", {}).setdefault("default-model", {})
+        # [models].default 保存活动模型配置名，例如 default-model 对应
+        # [model.default-model]；不要把活动配置名永久写死。
+        active_model_name = str(
+            grok_cfg.setdefault("models", {}).get("default") or "default-model"
+        )
+        grok_cfg["models"].setdefault("default", active_model_name)
+        model_section = grok_cfg.setdefault("model", {}).setdefault(
+            active_model_name, {}
+        )
         if req.model_id:
             model_section["model"] = req.model_id
             model_section["name"] = req.model_id
+        if req.model_api_type in {"anthropic-messages", "openai-completions"}:
+            model_section["api_backend"] = {
+                "anthropic-messages": "messages",
+                "openai-completions": "chat_completions",
+            }[req.model_api_type]
         if req.model_base_url:
-            # grok 要求 base_url 带 /v1 后缀
-            base_url = req.model_base_url.rstrip("/")
+            # grok 要求活动模型配置的 base_url 带 /v1 后缀。
+            base_url = req.model_base_url.strip().rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url += "/v1"
             model_section["base_url"] = base_url
@@ -1300,12 +1337,16 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_api_type:
             prov["api"] = req.model_api_type
         if req.model_base_url:
-            # dsh 要求 openai-completions 带 /v1 后缀, anthropic-messages 不带
-            base_url = req.model_base_url.rstrip("/")
-            if prov["api"] == "openai-completions" and not base_url.endswith("/v1"):
-                base_url += "/v1"
-            if prov["api"] == "anthropic-messages" and base_url.endswith("/v1"):
-                base_url = base_url[:-3].rstrip("/")
+            # dsh: OpenAI Completions 带 /v1，Anthropic Messages 不带 /v1。
+            base_url = req.model_base_url
+            if prov.get("api") == "openai-completions":
+                base_url = base_url.strip().rstrip("/")
+                if not base_url.endswith("/v1"):
+                    base_url += "/v1"
+            elif prov.get("api") == "anthropic-messages":
+                base_url = base_url.strip().rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url.removesuffix("/v1").rstrip("/")
             prov["baseURL"] = base_url
         if req.model_id:
             models_list = prov.get("models")
@@ -1371,12 +1412,9 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 "Anthropic" if "anthropic" in req.model_api_type.lower() else "OpenAI"
             )
         if req.model_base_url:
-            # jiuwenswarm 按 client_provider 归一化: openai 补 /v1, anthropic 去 /v1
-            base_url = req.model_base_url.rstrip("/")
-            if str(mcc.get("client_provider") or "").lower() == "anthropic":
-                if base_url.endswith("/v1"):
-                    base_url = base_url[:-3]
-            elif not base_url.endswith("/v1"):
+            # jiuwenswarm 两种可选协议都要求 api_base 带 /v1 后缀。
+            base_url = req.model_base_url.strip().rstrip("/")
+            if not base_url.endswith("/v1"):
                 base_url += "/v1"
             mcc["api_base"] = base_url
 
@@ -1393,7 +1431,12 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.model_api_key:
             openclaw_cfg["models"]["providers"]["local"]["apiKey"] = req.model_api_key
         if req.model_base_url:
-            openclaw_cfg["models"]["providers"]["local"]["baseUrl"] = req.model_base_url
+            provider = openclaw_cfg["models"]["providers"]["local"]
+            # openclaw/openclaw-tui 两种可选协议都要求 baseUrl 带 /v1 后缀。
+            base_url = req.model_base_url.strip().rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            provider["baseUrl"] = base_url
         if req.model_api_type:
             openclaw_cfg["models"]["providers"]["local"]["api"] = req.model_api_type
             models_list = openclaw_cfg["models"]["providers"]["local"]["models"]
@@ -1419,7 +1462,18 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 raise ValueError("申请接口未返回 api_key，请检查 key_gen.yaml 配置与响应字段")
             if req.harness_type == "hermes" and os.path.exists(hermes_config_path):
                 hermes_omega = OmegaConf.load(hermes_config_path)
-                hermes_omega.model.api_key = req.model_api_key
+                hermes_model = hermes_omega.setdefault(
+                    "model", OmegaConf.create({})
+                )
+                hermes_provider_name = str(
+                    hermes_model.get("provider") or "custom"
+                )
+                hermes_providers = hermes_omega.setdefault(
+                    "providers", OmegaConf.create({})
+                )
+                if hermes_provider_name not in hermes_providers:
+                    hermes_providers[hermes_provider_name] = OmegaConf.create({})
+                hermes_providers[hermes_provider_name]["api_key"] = req.model_api_key
                 OmegaConf.save(hermes_omega, hermes_config_path)
             elif req.harness_type == "claude-code" and os.path.exists(cc_settings_path):
                 with open(cc_settings_path, "r", encoding="utf-8") as f:
@@ -1466,7 +1520,14 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 import tomli_w
                 with open(grok_path, "rb") as f:
                     grok_cfg = tomllib.load(f)
-                grok_cfg.setdefault("model", {}).setdefault("default-model", {})["api_key"] = req.model_api_key
+                active_model_name = str(
+                    grok_cfg.setdefault("models", {}).get("default")
+                    or "default-model"
+                )
+                grok_cfg["models"].setdefault("default", active_model_name)
+                grok_cfg.setdefault("model", {}).setdefault(
+                    active_model_name, {}
+                )["api_key"] = req.model_api_key
                 with open(grok_path, "wb") as f:
                     tomli_w.dump(grok_cfg, f)
             elif req.harness_type == "dsh" and os.path.exists(dsh_path):
@@ -1539,6 +1600,15 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
         if req.user_proxy_base_url:
             sim["base_url"] = req.user_proxy_base_url
         user_proxy_cfg["user_simulator"] = sim
+
+    # 所有创建路径（agents 新格式、旧字段、模板默认值）都从这里统一收口。
+    # user_simulator URL 固定规范为带 /v1。
+    simulator_cfg = user_proxy_cfg.get("user_simulator")
+    if isinstance(simulator_cfg, dict) and simulator_cfg.get("base_url"):
+        base_url = simulator_cfg["base_url"].strip().rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url += "/v1"
+        simulator_cfg["base_url"] = base_url
 
     with open(user_proxy_path, "w", encoding="utf-8") as f:
         json.dump(user_proxy_cfg, f, indent=2, ensure_ascii=False)

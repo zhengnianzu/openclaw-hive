@@ -193,16 +193,6 @@ def adapt_layout_for_windows(layout: dict, win_home: str) -> dict:
     return out
 
 
-def normalize_base_url(base_url: str, api_kind: str = "openai-completions") -> str:
-    """按 api_kind 归一化 base_url 的 /v1 后缀。"""
-    base_url = base_url.rstrip("/")
-    if api_kind == "openai-completions" and not base_url.endswith("/v1"):
-        base_url += "/v1"
-    if api_kind == "anthropic-messages" and base_url.endswith("/v1"):
-        base_url = base_url.removesuffix("/v1")
-    return base_url
-
-
 def _build_team_style_agent_model(
     cfg: dict,
     proto_mcc: dict,
@@ -230,7 +220,7 @@ def _build_team_style_agent_model(
     model_name = cfg["model"]
     return {
         "model_client_config": {
-            "api_base": normalize_base_url(cfg["base_url"], api_kind),
+            "api_base": cfg["base_url"],
             "api_key": cfg["api_key"],
             "model_name": model_name,
             "client_provider": client_provider,
@@ -335,9 +325,9 @@ def prepare_local_agent_config(
             model_name = cfg["model"]
             api_key = cfg["api_key"]
             api_kind = cfg.get("api", "openai-completions")
-            base_url = cfg["base_url"].rstrip('/')
-            if not base_url.endswith('/v1'):
-                base_url = base_url + "/v1"
+            base_url = cfg["base_url"].strip().rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
 
             if provider_key not in providers:
                 npm_pkg = ("@ai-sdk/openai-compatible"
@@ -404,7 +394,15 @@ def prepare_local_agent_config(
             provider_key = cfg["provider"]
             model_name = cfg["model"]
             api_kind = cfg.get("api", "openai-completions")
-            base_url = normalize_base_url(cfg["base_url"], api_kind)
+            base_url = cfg["base_url"]
+            if api_kind == "openai-completions":
+                base_url = base_url.strip().rstrip("/")
+                if not base_url.endswith("/v1"):
+                    base_url += "/v1"
+            elif api_kind == "anthropic-messages":
+                base_url = base_url.strip().rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url.removesuffix("/v1").rstrip("/")
 
             if provider_key not in providers:
                 providers[provider_key] = {
@@ -461,6 +459,7 @@ def prepare_local_agent_config(
                 )
                 continue
 
+            # Responses 不在本次统一规范化范围内，保留 Codex 原有的 /v1 行为。
             base_url = cfg["base_url"].rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url = base_url + "/v1"
@@ -505,10 +504,17 @@ def prepare_local_agent_config(
                 )
                 continue
 
-            base_url = cfg["base_url"].rstrip("/")
+            base_url = cfg["base_url"].strip().rstrip("/")
             if not base_url.endswith("/v1"):
-                base_url = base_url + "/v1"
+                base_url += "/v1"
             api_key = cfg["api_key"]
+            api_backend = {
+                "anthropic-messages": "messages",
+                "openai-completions": "chat_completions",
+            }.get(cfg.get("api"))
+            api_backend_line = (
+                f'api_backend = "{api_backend}"\n' if api_backend else ""
+            )
 
             block = (
                 f"[model.{provider_key}]\n"
@@ -516,6 +522,7 @@ def prepare_local_agent_config(
                 f'name      = "{cfg.get("model")}"\n'
                 f'base_url  = "{base_url}"\n'
                 f'api_key   = "{api_key}"\n'
+                f'{api_backend_line}'
             )
             new_blocks.append(block)
             logging.info(f"Added grok provider: {provider_key} (agent={agent_name})")
@@ -544,7 +551,15 @@ def prepare_local_agent_config(
             provider_key = cfg["provider"]
             providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
             api_kind = cfg.get("api", "openai-completions")
-            base_url = normalize_base_url(cfg["base_url"], api_kind)
+            base_url = cfg["base_url"]
+            if api_kind == "openai-completions":
+                base_url = base_url.strip().rstrip("/")
+                if not base_url.endswith("/v1"):
+                    base_url += "/v1"
+            elif api_kind == "anthropic-messages":
+                base_url = base_url.strip().rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url.removesuffix("/v1").rstrip("/")
             api_key = cfg["api_key"]
             model_name = cfg["model"]
             credentials = data.get("credentials") or {}
@@ -614,8 +629,12 @@ def prepare_local_agent_config(
                 )
                 continue
 
-            agent_model = _build_team_style_agent_model(cfg, proto_mcc, proto_mcc_obj)
             api_kind = cfg.get("api", "openai-completions")
+            base_url = cfg["base_url"].strip().rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            cfg["base_url"] = base_url
+            agent_model = _build_team_style_agent_model(cfg, proto_mcc, proto_mcc_obj)
             client_provider = (
                 "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
             )
@@ -690,9 +709,12 @@ def prepare_local_agent_config(
             api_kind = cfg.get("api") or "anthropic-messages"
             provider_key = cfg["provider"]
             model_ref = f"{provider_key}/{cfg['model']}"
+            base_url = cfg["base_url"].strip().rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
 
             providers[provider_key] = {
-                "baseUrl": cfg["base_url"],
+                "baseUrl": base_url,
                 "apiKey": cfg["api_key"],
                 "api": api_kind,
                 "timeoutSeconds": 300000,
