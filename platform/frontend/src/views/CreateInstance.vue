@@ -108,13 +108,20 @@
 
           <el-form-item :label="form.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key'">
             <div style="display:flex;gap:8px;width:100%">
-              <!-- show-password：新建KEY 后完整 key 会填进这个框，不隐藏就等于明文摊在页面上
-                   （下面那行掩码预览本就是配合隐藏输入框用的）。与其余 key 输入框口径一致。 -->
-              <el-input v-model="form.model_api_key" placeholder="留空使用模板默认值" style="flex:1" show-password />
+              <!-- key 只写不回显：已设置时输入框只显示掩码且不可编辑（无 show-password 眼睛），
+                   避免原文出现在屏幕/截图/录屏里。原文只存在 form 里随创建请求提交。
+                   未设置时可正常手工粘贴（线上 17% 的实例是粘贴已有 key，不能只留「新建KEY」）；
+                   要换 key 先点「清除」。 -->
+              <el-input v-if="form.model_api_key" :model-value="maskKey(form.model_api_key)"
+                style="flex:1" readonly />
+              <el-input v-else v-model="keyDraft['']" placeholder="留空使用模板默认值"
+                style="flex:1" type="password" autocomplete="off"
+                @blur="commitKeyDraft('')" @keyup.enter="commitKeyDraft('')" />
+              <el-button v-if="form.model_api_key" @click="clearKey('')">清除</el-button>
               <el-button type="primary" @click="openKeyDialog('harness')">新建KEY</el-button>
             </div>
             <div v-if="form.model_api_key" style="font-size:12px;color:#999;margin-top:4px">
-              {{ form.model_api_key.length > 8 ? form.model_api_key.slice(0, 4) + '****' + form.model_api_key.slice(-4) : '' }}
+              已设置 Key，仅显示掩码；需更换请点「清除」后重新粘贴或新建
             </div>
           </el-form-item>
 
@@ -204,11 +211,17 @@
 
               <el-form-item label="模型 API Key">
                 <div style="display:flex;gap:8px;width:100%">
-                  <el-input v-model="ag.api_key" placeholder="留空使用模板默认值" style="flex:1" show-password />
+                  <!-- 与主 Agent 的 key 框同口径：已设置只显示掩码、不回显原文、无眼睛图标 -->
+                  <el-input v-if="ag.api_key" :model-value="maskKey(ag.api_key)"
+                    style="flex:1" readonly />
+                  <el-input v-else v-model="keyDraft[idx]" placeholder="留空使用模板默认值"
+                    style="flex:1" type="password" autocomplete="off"
+                    @blur="commitKeyDraft(idx)" @keyup.enter="commitKeyDraft(idx)" />
+                  <el-button v-if="ag.api_key" @click="clearKey(idx)">清除</el-button>
                   <el-button type="primary" @click="openKeyDialog('agent', idx)">新建KEY</el-button>
                 </div>
                 <div v-if="ag.api_key" style="font-size:12px;color:#999;margin-top:4px">
-                  {{ ag.api_key.length > 8 ? ag.api_key.slice(0, 4) + '****' + ag.api_key.slice(-4) : '' }}
+                  已设置 Key，仅显示掩码；需更换请点「清除」
                 </div>
               </el-form-item>
 
@@ -407,6 +420,33 @@ const keyForm = ref({
 })
 let keyTarget = { type: 'harness', agentIdx: -1 }
 
+// Key 掩码：与后端 services/secrets.py 的 mask_secret 及 InstanceDetail 的 maskKey
+// 规则对齐（4 + *** + 4，短值整体打码，不留短 key 泄漏口）。
+function maskKey(key) {
+  if (!key) return ''
+  if (key.length <= 8) return '****'
+  return key.slice(0, 4) + '***' + key.slice(-4)
+}
+
+// Key 录入用的临时缓冲：主 Agent 用 '', 各 agent 用其下标。
+// 不直接 v-model 到 form.*_api_key —— 那样第一个字符一落进去就会把输入框切成
+// 「已设置」的只读掩码态，后面的字符没法再输。改成失焦/回车时一次性提交。
+const keyDraft = ref({})
+
+function commitKeyDraft(slot) {
+  const v = String(keyDraft.value[slot] || '').trim()
+  if (!v) return
+  if (slot === '') form.value.model_api_key = v
+  else form.value.agents[slot].api_key = v
+  keyDraft.value[slot] = ''
+}
+
+function clearKey(slot) {
+  if (slot === '') form.value.model_api_key = ''
+  else form.value.agents[slot].api_key = ''
+  keyDraft.value[slot] = ''
+}
+
 function openKeyDialog(type = 'harness', agentIdx = -1) {
   keyTarget = { type, agentIdx }
   const now = new Date()
@@ -443,7 +483,7 @@ async function generateApiKey() {
       form.value.invite_code = keyForm.value.invite_code
     }
     localStorage.setItem('last_invite_code', keyForm.value.invite_code)
-    ElMessage.success(`API Key 已生成: ${res.api_key.slice(0, 4)}****${res.api_key.slice(-4)}`)
+    ElMessage.success(`API Key 已生成并填入：${maskKey(res.api_key)}（原文不回显）`)
     keyDialogVisible.value = false
   } catch {
     // error already shown by api interceptor

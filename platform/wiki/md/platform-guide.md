@@ -223,14 +223,18 @@ Harness 类型
 
 | harness类型 | 镜像 | 描述 | 
 |---|---|---|
-| openclaw2026.6.6、hermes0.18.2、claude-code2.1.22、opencode1.18.18、codex0.147.0、pi0.84.3、grok1.0.5、dsh0.1.1-rc.2 | multiharness:26.11.4 （**multiharness:后跟日期的，基础镜像版本**）| 默认包含serper技能 |
-| multiharness-no-serper:26.xx.x | 移除所有harness的默认serper技能，skill泛化专用 | linux | 
-| openclaw26.10.6版本 | openclaw:26.10.6-20261102 | linux | 
-| jiuwenswarm:dev-stable-2026.10.23v1 | jiuwenswarm-dev专属镜像，默认带serper | 
-| jiuwenswarm:xiaoyi-2026.11.2 | jiuwenswarm-xiaoyi专属镜像，默认带serper | 
-| lego-preset-v2 | lego专属镜像，万轶维护 | linux |
-| xiaoyiclaw:0.0.x | xiaoyiclaw 专属镜像， 曹子轩维护 | linux | 
-| windows-xxx | windows镜像 | windows | 
+| openclaw2026.6.6、hermes0.18.2、claude-code2.1.22、opencode1.18.18、codex0.147.0、pi0.84.3、grok1.0.5、dsh0.1.1-rc.2 | multiharness:26.11.4 （**主镜像**）| 默认包含serper技能，日期更新版本 |
+| 多harness（同上） | multiharness-no-serper:26.11.12 | 移除所有harness的默认serper技能，skill泛化专用 | 
+| 多harness（同上） | windows:default-20261010 | 通用windows镜像|
+| openclaw26.10.6（专用） | openclaw:26.10.6-20261102 | openclaw-tui的linux镜像 | 
+| jiuwenswarm-dev 10.23版本 | jiuwenswarm:dev-stable-2026.10.23v1 | jiuwenswarm-dev专属镜像，默认带serper | 
+| jiuwenswarm-dev 10.23版本 | windows-jiuwenswarm-dev-stable-0.2.3-20261102 | windwos镜像 | 
+| jiuwenswarm-xiaoyi 11.2版本 | jiuwenswarm:xiaoyi-2026.11.2 | jiuwenswarm-xiaoyi专属镜像，默认带serper | 
+| jiuwenswarm-xiaoyi 11.2版本 | windows-jiuwenswarm-xiaoyi-toc-stable-20261103-fix1 | windows镜像 | 
+| lego-preset-v2 | lego专属镜像 | 万轶维护linux |
+| xiaoyiclaw:0.0.x | xiaoyiclaw 专属镜像  | 曹子轩维护linux | 
+| xiaoyiwork（基于jiuwenswarm-xiaoyi） | xiaoyiwork:windows-jiuwenswarm-toc-stable-20261110 | windows镜像 | 
+
 
 
 ## 7. 代码管理
