@@ -1,9 +1,21 @@
 model:
-  default: claude-opus-4-7-thinking
-  model: claude-opus-4-7-thinking
-  provider: custom  
-  base_url: xxx
-  api_key: xxx
+  default: deepseek-v4-flash
+  provider: custom
+
+providers:
+  custom:
+    api: https://api.deepseek.com/v1
+    api_key: sk-xxxxx
+    transport: chat_completions
+    default_model: deepseek-v4-flash
+
+  # Anthropic Messages
+  my-anthropic:
+    api: https://api.deepseek.com/v1
+    api_key: sk-xxxxxx
+    transport: anthropic_messages
+    default_model: deepseek-v4-flash
+
 terminal:
   backend: local
   cwd: .

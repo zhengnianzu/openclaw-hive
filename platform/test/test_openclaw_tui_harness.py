@@ -109,6 +109,14 @@ class TestOpenclawTuiHarness(unittest.TestCase):
             self.assertIn("main-provider", result["models"]["providers"])
             self.assertIn("eval-provider", result["models"]["providers"])
             self.assertNotIn("sim-provider", result["models"]["providers"])
+            self.assertEqual(
+                result["models"]["providers"]["main-provider"]["baseUrl"],
+                "https://main.example/v1",
+            )
+            self.assertEqual(
+                result["models"]["providers"]["eval-provider"]["baseUrl"],
+                "https://eval.example/v1",
+            )
 
             agents = {entry["id"]: entry for entry in result["agents"]["list"]}
             self.assertEqual(
