@@ -13,8 +13,9 @@ description = "Optional"
 api_key = "sk-xxxxx"
 temperature = 0.7
 top_p = 0.95
-max_completion_tokens = 327680
+max_completion_tokens = 131072
 context_window = 200000
+api_backend = "messages"
 
 [models]
 default = "default-model"
