@@ -130,6 +130,11 @@
     </div>
 
     <div class="filter-bar">
+      <!-- 序号搜索：序号列是后端持久 seq，口头/截图常用「第 2794 条」指认实例，
+           给一个直接跳到该条的入口。支持精确号（2794）与多个号（2794,2800 / 空格分隔）；
+           非数字字符忽略，输入为空等于不筛选。放在最左边，与序号列的位置对应。 -->
+      <el-input v-model="seqSearch" placeholder="序号" clearable size="default"
+        style="width:120px" prefix-icon="Search" />
       <el-select v-model="statusFilter" placeholder="状态" size="default" style="width:140px">
         <el-option label="全部" value="" />
         <el-option label="运行中" value="running" />
@@ -366,6 +371,7 @@ const instances = ref([])
 const loading = ref(false)
 const timeEstimates = ref({})
 const prepareProgress = ref({})
+const seqSearch = ref('')
 const statusFilter = ref('')
 const queueFilter = ref('')
 const queueOptions = ref([])
@@ -561,6 +567,16 @@ function onQueueFilterInput(val) {
 
 const filteredInstances = computed(() => {
   let list = instances.value
+  // 序号筛选：放在最前面，命中集通常只有一条，后面的筛选几乎不用再过数据。
+  // 按「整号精确匹配」而不是子串 —— 子串会让搜 279 同时出 2794/1279，
+  // 而序号的使用场景就是「我要看第 2794 条」。支持逗号/空格分隔多个号。
+  if (seqSearch.value.trim()) {
+    const wanted = new Set(
+      seqSearch.value.split(/[\s,，]+/).map(s => Number(s)).filter(n => Number.isInteger(n) && n > 0)
+    )
+    // 全是非数字（比如只敲了个空格或字母）时不筛选，避免「输入没反应却清空列表」
+    if (wanted.size) list = list.filter(i => wanted.has(Number(i.seq)))
+  }
   if (statusFilter.value) list = list.filter(i => i.status === statusFilter.value)
   if (queueFilter.value) {
     list = queueFilter.value === '__none__'
@@ -602,7 +618,7 @@ const pagedInstances = computed(() => {
 
 // 筛选/每页条数变化时回到第一页；当前页因数据减少而越界时也回退，避免停在空白页
 watch([statusFilter, queueFilter, harnessFilter, imageFilter, imageOsFilter,
-       userFilter, dateRange, nameSearch, pageSize], () => {
+       userFilter, dateRange, nameSearch, seqSearch, pageSize], () => {
   if (restoring) return
   currentPage.value = 1
   syncQuery()
@@ -626,6 +642,7 @@ function syncQuery() {
   if (userFilter.value) q.user = userFilter.value
   if (dateRange.value && dateRange.value.length === 2) q.date = dateRange.value.join(',')
   if (nameSearch.value) q.q = nameSearch.value
+  if (seqSearch.value.trim()) q.seq = seqSearch.value.trim()
   if (currentPage.value > 1) q.page = String(currentPage.value)
   if (pageSize.value !== 20) q.size = String(pageSize.value)
   router.replace({ query: q })
@@ -641,6 +658,7 @@ function restoreFromQuery() {
   if (q.user) userFilter.value = String(q.user)
   if (q.date) dateRange.value = String(q.date).split(',')
   if (q.q) nameSearch.value = String(q.q)
+  if (q.seq) seqSearch.value = String(q.seq)
   if (q.page) currentPage.value = Number(q.page) || 1
   if (q.size) pageSize.value = Number(q.size) || 20
   restoring = false
