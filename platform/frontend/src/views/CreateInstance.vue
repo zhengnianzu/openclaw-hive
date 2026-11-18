@@ -148,7 +148,7 @@
               <el-input v-model="form.model_id" style="flex:1" :placeholder="form.harness_type === 'claude-code' ? '例如：claude-opus-4-7-thinking' : '例如：claude-opus-4-7-thinking'">
                 <template v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" #prepend>local/</template>
               </el-input>
-              <el-button :loading="validating" @click="validateModel">验证模型</el-button>
+              <el-button :loading="validatingSlot['']" @click="validateModel('')">验证模型</el-button>
             </div>
             <div v-if="['openclaw','openclaw-tui'].includes(form.harness_type)" style="font-size:12px;color:#999;margin-top:4px">同时更新 agents.defaults.model.primary 和 models[0].id/name</div>
             <div style="font-size:12px;color:#999;margin-top:4px">
@@ -156,30 +156,7 @@
               未指定则先试 Anthropic，不通再试 OpenAI
             </div>
 
-            <!-- 结果内联展示：报错要原样可见，所以用 pre 而不是 el-alert 的 title -->
-            <el-alert v-if="validateResult && validateResult.ok" type="success" :closable="false"
-              show-icon style="margin-top:8px">
-              <template #title>
-                验证通过（{{ validateResult.used === 'anthropic' ? 'Anthropic Messages' : 'OpenAI Completions' }}）
-              </template>
-              <div style="font-size:12px;word-break:break-all">
-                <div>请求地址：{{ validateResult.request_url }}</div>
-                <div v-if="validateResult.reply">模型回复：{{ validateResult.reply }}</div>
-              </div>
-            </el-alert>
-
-            <el-alert v-else-if="validateResult" type="error" :closable="false"
-              show-icon style="margin-top:8px">
-              <template #title>验证失败</template>
-              <div style="font-size:12px">
-                <div v-if="validateResult.tried && validateResult.tried.length"
-                  style="margin-bottom:4px;word-break:break-all">
-                  已尝试：{{ validateResult.tried.join(' → ') }}
-                  <template v-if="validateResult.request_url"> · {{ validateResult.request_url }}</template>
-                </div>
-                <pre style="white-space:pre-wrap;word-break:break-all;margin:0;font-size:12px">{{ validateResult.error }}</pre>
-              </div>
-            </el-alert>
+            <ValidateModelResult :result="validateResults['']" />
           </el-form-item>
         </el-tab-pane>
 
@@ -238,7 +215,15 @@
               </el-form-item>
 
               <el-form-item label="模型 ID">
-                <el-input v-model="ag.model" placeholder="例如：gemini-3-flash-preview" />
+                <div style="display:flex;gap:8px;width:100%">
+                  <el-input v-model="ag.model" style="flex:1" placeholder="例如：gemini-3-flash-preview" />
+                  <el-button :loading="validatingSlot[idx]" @click="validateModel(idx)">验证模型</el-button>
+                </div>
+                <div style="font-size:12px;color:#999;margin-top:4px">
+                  用该 agent 的 Base URL / API Key / 模型 ID 实打一次最小请求（base_url 带 /v1 也能识别）
+                </div>
+
+                <ValidateModelResult :result="validateResults[idx]" />
               </el-form-item>
             </el-tab-pane>
           </el-tabs>
@@ -400,6 +385,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import QueuePicker from '../components/QueuePicker.vue'
+import ValidateModelResult from '../components/ValidateModelResult.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 import { obsBucket, stripBucket, joinBucket } from '../api/obsConfig'
@@ -539,6 +525,14 @@ function removeAgentTab(tabName) {
   if (parseInt(activeAgentTab.value) >= form.value.agents.length) {
     activeAgentTab.value = String(form.value.agents.length - 1)
   }
+  // splice 会让后面的 agent 下标整体前移，按下标键控的验证结果/录入缓冲就对不上人了
+  // （agent2 的结果会显示在 agent1 底下）。索引变动后一律丢弃，重新验证即可。
+  for (const k of Object.keys(validateResults.value)) {
+    if (k !== '') delete validateResults.value[k]
+  }
+  for (const k of Object.keys(keyDraft.value)) {
+    if (k !== '') delete keyDraft.value[k]
+  }
 }
 
 const imageList = ref([])
@@ -551,30 +545,48 @@ const queueList = ref([])
 const sandboxList = ref([])
 const queuePickerVisible = ref(false)
 
-// 「验证模型」按钮状态。validateResult 为 null = 还没验证过（不渲染结果区）
-const validating = ref(false)
-const validateResult = ref(null)
+// 「验证模型」按钮状态。按槽位键控：'' = 主 Agent（Harness配置），
+// 数字下标 = 用户模拟配置里的第 N 个 agent。值为 null/undefined = 还没验证过。
+const validatingSlot = ref({})
+const validateResults = ref({})
 
 // 实打一次模型调用验证连通性。后端一律返回 200，成败看 body.ok；
 // 带 silent 让 api/index.js 不弹全局 toast —— 报错要内联原样展示。
-async function validateModel() {
-  validating.value = true
-  validateResult.value = null
+//
+// 主 Agent 与 agent 的字段名不同（model_base_url/model_id vs base_url/model），
+// 这里统一映射成后端的入参名。agent 的 base_url 本就带 /v1，后端会先剥再按协议拼，
+// 不需要前端特殊处理。
+async function validateModel(slot = '') {
+  const src = slot === ''
+    ? {
+        base_url: form.value.model_base_url,
+        api_key: form.value.model_api_key,
+        api_type: form.value.model_api_type,
+        model_id: form.value.model_id,
+      }
+    : {
+        base_url: form.value.agents[slot]?.base_url,
+        api_key: form.value.agents[slot]?.api_key,
+        api_type: form.value.agents[slot]?.api,
+        model_id: form.value.agents[slot]?.model,
+      }
+  validatingSlot.value[slot] = true
+  validateResults.value[slot] = null
   try {
-    validateResult.value = await api.post('/harness-meta/validate-model', {
-      model_base_url: form.value.model_base_url || '',
-      model_api_key: form.value.model_api_key || '',
-      model_api_type: form.value.model_api_type || '',
-      model_id: form.value.model_id || '',
+    validateResults.value[slot] = await api.post('/harness-meta/validate-model', {
+      model_base_url: src.base_url || '',
+      model_api_key: src.api_key || '',
+      model_api_type: src.api_type || '',
+      model_id: src.model_id || '',
     }, { silent: true })
   } catch (e) {
     // 网络层/鉴权异常也内联显示，口径与后端返回的失败一致
-    validateResult.value = {
+    validateResults.value[slot] = {
       ok: false, tried: [], request_url: '',
       error: e.response?.data?.detail || e.message || '请求失败',
     }
   } finally {
-    validating.value = false
+    validatingSlot.value[slot] = false
   }
 }
 
@@ -674,7 +686,7 @@ function applyTemplate(tpl) {
   form.value.image_name = tpl.image_name || ''
   form.value.code_repo_id = tpl.code_repo_id || null
   form.value.model_api_key = ''
-  validateResult.value = null
+  validateResults.value = {}
   try {
     const tplAgents = JSON.parse(tpl.agents_json || '[]')
     if (tplAgents.length > 0) {
@@ -741,7 +753,7 @@ function onHarnessChange() {
   form.value.harness_config_id = null
   form.value.harness_config_version_id = null
   versionList.value = []
-  validateResult.value = null
+  validateResults.value = {}
   loadImages()
   loadHarnessConfigs()
 }
