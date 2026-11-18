@@ -118,6 +118,16 @@ _STATUS_CACHE_TTL = 5
 _analyze_cache = {}
 _ANALYZE_CACHE_TTL = 10
 
+# _ensure_task_records 在请求路径上同步补齐缺行的任务数上限。
+# _compute_analyze 冷扫是 NFS 上逐个读 task-N.log，几千任务的实例要十几秒，
+# 不能让详情页请求顶着这个延迟；超过上限的实例交给后台 refresher / 离线 worker。
+_ENSURE_RESCAN_MAX_TASKS = 200
+
+# _refresh_running_once 每轮最多重扫几个「缺行」的终态实例。
+# 补行要冷扫实例的全部 task-N.log，单个大实例十几秒；存量修复会一次性把上千个
+# 实例标成待补，不限流首轮预热就卡死。超额的下轮继续，最终收敛。
+_TERMINAL_RESCAN_PER_ROUND = 20
+
 # 与 _analyze_cache 同一时刻写入：config_path -> error_tree(list)
 # 携带异常的一级分类(C/S/T/X)汇总 + 具体错误码明细，供前端折叠展示
 _analyze_tree_cache = {}
@@ -2963,6 +2973,8 @@ def _refresh_running_once():
         （任务的完成是在这里被发现的，所以队列续跑必须挂在这个返回上。）
     """
     queues_to_schedule = set()
+    # 本轮已做过「终态补行重扫」的实例数，受 _TERMINAL_RESCAN_PER_ROUND 限额
+    n_rescanned = 0
     try:
         with get_connection() as conn:
             rows = conn.execute(
@@ -3010,21 +3022,45 @@ def _refresh_running_once():
                 # 队列续跑：本实例刚跑完，放行同队列的下一排队任务
                 if prev_status in ("running", "preparing") and inst.get("queue_id"):
                     queues_to_schedule.add(inst["queue_id"])
-                # 终态最后同步：在线同步只在 running 期间跑，完成那一刻/运行窗口内漏跑的
-                # 实例 task_records 会永久缺行。task_done_sync=0 的终态实例在此补网——
-                # 仅当 task_records 整体为空(0 行)时才需要 full 重扫；行已完整的实例
-                # 直接置位，避免对海量历史终态实例全量重扫。写库成功才置位，否则下轮
-                # refresher 重试（任务日志已定稿，增量扫描 changed 为空集，故 full=True
-                # 全量写一次，ON CONFLICT 幂等）。
-                gap = 0
+                # 终态最后同步：在线同步只在 running 期间跑（8s 轮询），完成那一刻/
+                # 运行窗口内漏跑的实例 task_records 会永久缺行。task_done_sync=0 的
+                # 终态实例在此补网（任务日志已定稿，增量扫描 changed 为空集，故
+                # full=True 全量写一次，ON CONFLICT 幂等）。
+                #
+                # 判据是「行数 < total_tasks」而不是原来的「整表为空(0 行)」：
+                # 后者只兜住「一行都没写」的极端情况，兜不住**部分缺行**。实测
+                # 实例 2611180957-600430452611180957-9213（#2794）最后一个任务
+                # 10:16:11 收尾、实例 10:16:15 转终态，只差 4s < 8s 轮询间隔，
+                # 最后一轮没捕获到 task-2 的日志 → 库里 2 行、磁盘 3 个成功日志，
+                # 而 gap==2 非 0 → 跳过重扫 + 无条件置位，永久封死（首页 DONE 列
+                # 显示 2/3）。离线 worker 也救不回来：它只取「有未分级行」的实例，
+                # 而缺的那行压根不存在。
+                #
+                # 性能约束不变：have >= expected 的实例一次 COUNT 就结束，不重扫
+                # —— 这是原来写 ==0 的本意，海量历史终态实例不受影响。
+                #
+                # 每轮重扫配额：补行要 _compute_analyze 冷扫整个实例的 task-N.log
+                # （NFS 上几千任务要十几秒）。存量修复会一次性把上千个实例的
+                # task_done_sync 置回 0（见 fix_missing_task_rows.py），不限流的话
+                # 首轮预热（_bg_refresh_loop 启动时同步跑一轮）会卡到后端起不来。
+                # 超配额的本轮跳过且**不置位**，下一轮继续，最终全部收敛。
                 with get_connection() as conn:
-                    gap = conn.execute(
+                    have = conn.execute(
                         "SELECT COUNT(*) FROM task_records WHERE instance_id=?",
                         (inst["id"],),
                     ).fetchone()[0]
-                if gap == 0:
+                expected = inst.get("total_tasks") or 0
+                if have == 0 or have < expected:
+                    if n_rescanned >= _TERMINAL_RESCAN_PER_ROUND:
+                        continue  # 配额用尽：留 task_done_sync=0，下轮再补
+                    n_rescanned += 1
                     _compute_analyze(inst["config_path"], inst["total_tasks"])
                     _sync_task_records(inst["id"], inst["config_path"], True)
+                # 置位：补过一次就不再重试。
+                # 为什么不「补到位才置位」：很多实例磁盘上本来就没有 total_tasks 个
+                # 日志（中途 kill、任务未派发），留 0 会让 refresher 每轮对它们
+                # 全量重扫，永不收敛。补一次已经覆盖「日志在盘上但没写进库」这个
+                # 真实缺口；日志本身不存在的缺口归离线 worker 的 OBS 补全处理。
                 with get_connection() as conn:
                     conn.execute(
                         "UPDATE task_instances SET task_done_sync=1 WHERE id=?",
@@ -3402,7 +3438,17 @@ async def list_task_records(
 
 
 async def _ensure_task_records(instance_id: str, config_path: str, status: str, total_tasks: int):
-    """确保 task_records 已填充：running 每次刷新；非 running 且 0 行时兜底同步一次。"""
+    """确保 task_records 已填充：running 每次刷新；非 running 且**缺行**时兜底同步一次。
+
+    缺行判据是「行数 < total_tasks」而不是「0 行」：后者兜不住部分缺行
+    （见 _refresh_running_once 终态分支的长注释 —— 最后一个任务收尾紧贴实例
+    转终态时，8s 在线轮询会漏掉它，库里行数少于磁盘日志数）。
+
+    这是**请求路径**，_compute_analyze 冷扫一个几千任务的实例要十几秒（NFS 上
+    读几千个 task-N.log），所以对大实例不在这里补 —— 交给后台 refresher /
+    离线 worker。只有小实例（任务数 <= _ENSURE_RESCAN_MAX_TASKS）才同步补齐，
+    保证「点开详情页就能看到正确的 DONE」这个高频场景不退化。
+    """
     if status == "running":
         try:
             await async_execute(_sync_task_records, instance_id, config_path)
@@ -3412,10 +3458,13 @@ async def _ensure_task_records(instance_id: str, config_path: str, status: str, 
     existing = await async_query_one(
         "SELECT COUNT(*) AS n FROM task_records WHERE instance_id=?", (instance_id,)
     )
-    if not existing or existing["n"] == 0:
+    have = existing["n"] if existing else 0
+    expected = total_tasks or 0
+    missing = have < expected and expected <= _ENSURE_RESCAN_MAX_TASKS
+    if have == 0 or missing:
         try:
             await async_execute(_compute_analyze, config_path, total_tasks)
-            # 兜底填充：非 running 且 0 行，需全量写入（此时 changed 可能为空集）
+            # 兜底填充：非 running 且缺行，需全量写入（此时 changed 可能为空集）
             await async_execute(_sync_task_records, instance_id, config_path, True)
         except Exception:
             pass

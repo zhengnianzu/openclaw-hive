@@ -311,6 +311,16 @@ OTHER_INDEXES = (
     ("idx_task_records_scanned",
      "CREATE INDEX IF NOT EXISTS idx_task_records_scanned "
      "ON task_records(instance_id) WHERE task_done IS NOT NULL"),
+    # 浅层 worker 挑实例的「有行还没判过 DONE」那一支：
+    #   WHERE EXISTS (SELECT 1 FROM task_records WHERE instance_id=? AND task_done IS NULL)
+    # 需要它的原因：在线终态同步补出来的行只带 status、task_done 为 NULL，worker
+    # 必须能发现这些实例才能回填 DONE 标记（否则首页 DONE 列永久少一行）。
+    # 上面两个部分索引（task_done=1 / IS NOT NULL）谓词都不匹配 IS NULL，于是走
+    # idx_task_records_inst 全扫，实测这一支单独就 5.47s —— 整条挑实例查询从
+    # 0.4s 涨到 11.5s，而 worker 每轮都要跑一次。同谓词部分索引只收未判过的行。
+    ("idx_task_records_unscanned",
+     "CREATE INDEX IF NOT EXISTS idx_task_records_unscanned "
+     "ON task_records(instance_id) WHERE task_done IS NULL"),
     # 详情页成功率趋势图：WHERE instance_id=? AND finished_at IS NOT NULL
     # ORDER BY finished_at。部分索引只收已回填的行 —— 只补最近 100 个实例，
     # 其余 1100 万行 finished_at 为 NULL、不进索引（实测建索引 0.99s）。

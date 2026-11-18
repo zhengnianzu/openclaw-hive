@@ -200,6 +200,25 @@ def _pick_running_instances(conn) -> list[dict]:
         "WHERE EXISTS ("
         "    SELECT 1 FROM task_records tr "
         "    WHERE tr.instance_id = ti.id AND tr.traj_level IS NULL) "
+        # 或者**缺行**：task_records 行数少于 total_tasks。
+        # 为什么要这一支：上面的判据只看「已有行里有没有未分级的」，看不见
+        # 「整行都没写进来」的缺口。实例 #2794（codex 管线测试）磁盘上 3 个任务
+        # 全成功，但最后一个任务收尾只比实例转终态早 4s，被 8s 在线轮询漏掉 →
+        # 库里 2 行、且这 2 行都已分级(L0/L1) → EXISTS 判据为假 → 实例压根不入队，
+        # 缺的那行永远补不回来，首页 DONE 列显示 2/3。
+        # 入队后由 _seed_task_records_from_logs 从本地日志补行（零 OBS 成本）。
+        "   OR (COALESCE(ti.total_tasks, 0) > 0 AND ("
+        "        SELECT COUNT(*) FROM task_records tr2 "
+        "        WHERE tr2.instance_id = ti.id) < ti.total_tasks) "
+        # 或者有行还没判过 DONE 标记（task_done IS NULL）。
+        # 需要这一支是因为在线终态同步（instances.py 终态分支）补出来的行只带
+        # status，task_done 恒为 NULL（_sync_task_records 不写该列，那是 worker 的活）。
+        # 补完行之后 COUNT 已等于 total_tasks、且各行可能都已分级，上面两支判据都为假
+        # → 实例不入队 → 新补的行 task_done 永远是 NULL，首页 DONE 列照旧少一。
+        # _scan_done_marks 只读「task_done IS NULL」那几行的日志，成本正比于增量。
+        "   OR EXISTS ("
+        "        SELECT 1 FROM task_records tr3 "
+        "        WHERE tr3.instance_id = ti.id AND tr3.task_done IS NULL) "
         "ORDER BY "
         # 1) 点击登记的置顶
         "  CASE WHEN EXISTS (SELECT 1 FROM shallow_requests sr "
@@ -596,13 +615,16 @@ def _logs_dir(inst: dict) -> str:
     return candidates[-1]
 
 
-def _scan_done_for_running(inst: dict) -> int:
+def _scan_done_marks(inst: dict) -> int:
     """只扫「task_records.task_done IS NULL」的那些 config 对应的日志，回填 DONE 标记。
 
     为什么单独一个函数、而不是复用 _read_task_log_map：
     _read_task_log_map 会遍历整个 logs 目录（运行中的实例可能有 1.8 万个文件），
     每轮都全量扫一遍太贵。这里先用 SQL 查出还没判过的行（通常只有本轮新增的几十上百条），
     只读这些 task-<idx>.log，成本正比于增量。
+
+    对所有状态都调用（原名 _scan_done_for_running，当时只在 running 分支用）：
+    终态实例也需要——在线终态同步补出来的行只带 status，task_done 为 NULL。
 
     返回本轮判定成功的行数。
     """
@@ -1065,13 +1087,29 @@ def _insert_task_record_placeholder(inst: dict, config_name: str, meta: dict,
 
 
 def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
-    """处理一个实例的浅层队列：finished/stopped 从 OBS 轨迹补全（快路径，不慢路径下载）；
+    """处理一个实例的浅层队列：completed/finished/stopped 从 OBS 轨迹补全（快路径，不慢路径下载）；
     running/preparing 分级 task_records 未回填行（仅一次，不做 stale 回收）。"""
-    if inst["status"] in ("finished", "stopped"):
-        # finished/stopped：实例已结束轨迹不变，补全从 OBS 轨迹快路径补齐在线竞态漏写的行。
+    if inst["status"] in ("completed", "finished", "stopped"):
+        # 已结束：实例轨迹不变，补全从本地日志 + OBS 轨迹快路径补齐在线竞态漏写的行。
         # 补全已覆盖全部 OBS 轨迹（有 tsr 分级 / 无 tsr 占位），直接 return，不落通用 pending
         # 逻辑——通用分支对无 tsr 行会走 _load_per_task_entries 慢路径下载整轨迹。
+        #
+        # completed 也要走这里：它和 finished 一样是终态（都不再产出），但原来只判
+        # ("finished","stopped")，正常跑完的实例落到下面的 running 通用分支 ——
+        # 那条路只给**已有行**分级，从不补建缺失行。实例 #2794 就是这样卡住的：
+        # 状态 completed、磁盘 3 个成功日志、库里 2 行，两条补全路径都不覆盖它。
+        # _backfill_finished_tasks 开头的 _seed_task_records_from_logs 正是补这种行的
+        # （纯本地读 task-*.log，零 OBS 成本），且无缺口时直接返回，不会多花 OBS 往返。
         n_backfilled = _backfill_finished_tasks(inst, origin, obsutil)
+        # 终态实例也要扫 DONE 标记。_seed_task_records_from_logs 只对「它自己这轮
+        # 新建/发现的 config」写 task_done；而在线终态同步（instances.py 终态分支）
+        # 补出来的行只带 status、task_done 为 NULL（_sync_task_records 不写该列）。
+        # 不在这里扫，那些行的 task_done 就永远是 NULL，首页 DONE 列照旧少一。
+        # 只读「task_done IS NULL」那几行的日志，成本正比于增量，不是全量。
+        try:
+            _scan_done_marks(inst)
+        except Exception as e:
+            print(f"    [warn] {inst['id']} 扫 DONE 标记失败: {e}", flush=True)
         return {"n_processed": n_backfilled, "n_failed": 0}
 
     rows = _level_rows_for_instance(inst)
@@ -1081,7 +1119,7 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
     # 它内部只扫「task_records 里 task_done IS NULL」的 config —— 已判过的不重扫，
     # 所以每轮成本正比于本轮新增的日志数，不是全量。
     try:
-        _scan_done_for_running(inst)
+        _scan_done_marks(inst)
     except Exception as e:
         print(f"    [warn] {inst['id']} 扫 DONE 标记失败: {e}", flush=True)
 
@@ -1127,7 +1165,7 @@ def _process_instance(inst: dict, origin: str, obsutil: str) -> dict:
     # 跑完后的那一轮被分级一次，既不会漏也不会空转。
     #
     # 注意只在 running 时收紧：preparing 也走这个分支（还没开始跑，同样没有轨迹），
-    # 但 stopped/finished 已在上面的分支返回。
+    # 但终态实例（completed/finished/stopped）已在上面的分支返回。
     if is_running and _complete_set:
         pending = [r for r in pending if _is_complete(r["config_name"])]
 
@@ -1898,9 +1936,12 @@ def _run_once(obsutil: str, origin: str,
         for inst in insts:
             if instance_id and inst["id"] != instance_id:
                 continue
-            # 每轮预算：finished/stopped 补全（_backfill_finished_tasks 枚举 OBS）有配额，
-            # 跑满后本轮的 finished/stopped 全部跳过（running/preparing 不受限）。
-            if (inst["status"] in ("finished", "stopped")
+            # 每轮预算：终态实例补全（_backfill_finished_tasks 枚举 OBS）有配额，
+            # 跑满后本轮的终态实例全部跳过（running/preparing 不受限）。
+            # 状态集合与 _process_instance 的补全分支、下面的计数分支保持一致 ——
+            # 原来这里漏了 completed，而下面累加 n_backfilled_inst 的分支却把它
+            # 计入配额，两边不一致。
+            if (inst["status"] in ("completed", "finished", "stopped")
                     and n_backfilled_inst >= BACKFILL_MAX_INSTANCES_PER_ROUND):
                 continue
             try:
