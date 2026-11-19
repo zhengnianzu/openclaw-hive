@@ -15,16 +15,36 @@
           </div>
         </div>
       </div>
-      <div v-if="authStore.isOperator" style="display:flex;gap:8px">
-        <el-button v-if="exp.status === 'paused'" @click="act('resume')">
-          <el-icon><VideoPlay /></el-icon> 恢复调度
-        </el-button>
-        <el-button v-else @click="act('pause')">
-          <el-icon><VideoPause /></el-icon> 暂停调度
-        </el-button>
-        <el-button type="danger" plain @click="act('cancel')">
-          <el-icon><CircleClose /></el-icon> 取消实验
-        </el-button>
+      <div v-if="authStore.isOperator" style="display:flex;gap:8px;align-items:center">
+        <!-- 所有动作统一收进「更多」：这一页的按钮不该有一排，主次不分容易误点。
+             「更多」上带角标提示有多少个失败任务可重跑。 -->
+        <el-dropdown trigger="click" @command="cmd => handleMore(cmd)">
+          <el-button>
+            更多<el-icon style="margin-left:4px"><ArrowDown /></el-icon>
+            <span v-if="exp.failed_arms" class="btn-badge">{{ exp.failed_arms }}</span>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="start"
+                :disabled="!exp.queue_id || (!exp.startable_arms && exp.status !== 'paused')">
+                {{ exp.status === 'paused' ? '继续执行' : '启动队列' }}
+              </el-dropdown-item>
+              <el-dropdown-item command="rerun" :disabled="!exp.failed_arms">
+                重跑失败<span v-if="exp.failed_arms" class="menu-count">（{{ exp.failed_arms }}）</span>
+              </el-dropdown-item>
+              <el-dropdown-item command="copy" divided>复制实验</el-dropdown-item>
+              <el-dropdown-item command="pause" :disabled="exp.status === 'paused'" divided>
+                暂停调度
+              </el-dropdown-item>
+              <el-dropdown-item command="resume" :disabled="exp.status !== 'paused'">
+                恢复调度
+              </el-dropdown-item>
+              <el-dropdown-item command="cancel" divided>
+                取消实验（停止全部任务）
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </div>
 
@@ -59,46 +79,9 @@
             :status="exp.progress_percent >= 100 ? 'success' : undefined" />
         </div>
 
+        <!-- 任务列表并入执行概览：一屏看完「这批跑得怎么样 + 每个子任务怎么样」 -->
         <el-table :data="items" size="small" border style="width:100%;margin-top:20px">
-          <el-table-column label="Harness" min-width="200">
-            <template #default="{row}">
-              <el-tag :style="harnessStore.tagStyle(row.harness_type)" size="small">
-                {{ harnessStore.label(row.harness_type) }}
-              </el-tag>
-              <span style="margin-left:8px">{{ row.arm_label }}</span>
-              <span v-if="row.repeat_idx > 1" class="muted"> · 第{{ row.repeat_idx }}轮</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="任务进度" min-width="200">
-            <template #default="{row}">
-              <div v-if="row.create_error" class="err">创建失败</div>
-              <template v-else>
-                <div class="muted">{{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}</div>
-                <el-progress :percentage="row.progress_percent" :stroke-width="8" :show-text="false" />
-              </template>
-            </template>
-          </el-table-column>
-          <el-table-column label="状态" width="100" align="center">
-            <template #default="{row}">
-              <el-tag v-if="row.status" size="small" :type="instStatusType(row.status)">{{ row.status }}</el-tag>
-              <span v-else>—</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="DONE" width="90" align="center">
-            <template #default="{row}">{{ row.done_tasks }}</template>
-          </el-table-column>
-          <el-table-column label="失败" width="90" align="center">
-            <template #default="{row}">
-              <span :style="{color: row.failed_tasks ? '#f56c6c' : ''}">{{ row.failed_tasks }}</span>
-            </template>
-          </el-table-column>
-        </el-table>
-      </el-tab-pane>
-
-      <!-- ============ 任务列表 ============ -->
-      <el-tab-pane label="任务列表" name="tasks">
-        <el-table :data="items" size="small" border style="width:100%">
-          <el-table-column label="子任务" min-width="260">
+          <el-table-column label="任务名称" min-width="230">
             <template #default="{row}">
               <el-link v-if="row.instance_id" type="primary"
                 @click="router.push(`/instance/${row.instance_id}`)">
@@ -106,32 +89,76 @@
               </el-link>
               <span v-else class="err">创建失败</span>
               <div v-if="row.create_error" class="err-detail">{{ row.create_error }}</div>
+              <div v-else-if="row.repeat_idx > 1" class="muted" style="font-size:12px">
+                第{{ row.repeat_idx }}轮
+              </div>
             </template>
           </el-table-column>
-          <el-table-column label="Harness" width="150">
+
+          <el-table-column label="Harness 类型" width="140">
             <template #default="{row}">
               <el-tag :style="harnessStore.tagStyle(row.harness_type)" size="small">
-                {{ row.arm_label || harnessStore.label(row.harness_type) }}
+                {{ harnessStore.label(row.harness_type) }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="状态" width="110" align="center">
+
+          <el-table-column label="Harness 配置" min-width="170" show-overflow-tooltip>
+            <template #default="{row}">
+              <div>{{ row.arm_label || '—' }}</div>
+              <div v-if="row.sim_label" class="muted" style="font-size:12px">
+                模拟：{{ row.sim_label }}
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="任务进度" min-width="190">
+            <template #default="{row}">
+              <div v-if="row.create_error" class="err">创建失败</div>
+              <template v-else>
+                <div class="muted">
+                  {{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}
+                  <span v-if="row.failed_tasks" style="color:#f56c6c">（失败 {{ row.failed_tasks }}）</span>
+                </div>
+                <el-progress :percentage="row.progress_percent" :stroke-width="8" :show-text="false" />
+              </template>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="状态" width="100" align="center">
             <template #default="{row}">
               <el-tag v-if="row.status" size="small" :type="instStatusType(row.status)">{{ row.status }}</el-tag>
               <span v-else>—</span>
             </template>
           </el-table-column>
-          <el-table-column label="完成 / 总数" width="130" align="center">
-            <template #default="{row}">{{ row.completed_tasks }} / {{ row.total_tasks }}</template>
-          </el-table-column>
-          <el-table-column label="失败" width="80" align="center" prop="failed_tasks" />
-          <el-table-column label="队列" width="160" show-overflow-tooltip prop="queue_id" />
-          <el-table-column label="操作" width="160" fixed="right">
+
+          <el-table-column label="DONE" width="80" align="center" prop="done_tasks" />
+
+          <el-table-column label="操作" width="250" fixed="right">
             <template #default="{row}">
               <template v-if="row.instance_id">
-                <el-button size="small" @click="router.push(`/instance/${row.instance_id}`)">详情</el-button>
+                <!-- 三个按钮必须 nowrap 且左对齐：默认 el-button 之间有 margin-left，
+                     宽度不足时会被挤成两行。「更多」按钮还带图标，更容易撑破。 -->
+                <div class="row-ops">
                 <el-button size="small"
                   @click="router.push(`/instance/${row.instance_id}?tab=logs`)">日志</el-button>
+                <el-button size="small"
+                  @click="router.push(`/instance/${row.instance_id}`)">详情</el-button>
+                <el-dropdown trigger="click" @command="cmd => onRowCommand(cmd, row)"
+                  v-if="authStore.isOperator">
+                  <el-button size="small">更多<el-icon style="margin-left:2px"><ArrowDown /></el-icon></el-button>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="start" :disabled="!['created','stopped'].includes(row.status)">
+                        启动任务
+                      </el-dropdown-item>
+                      <el-dropdown-item command="stop" :disabled="!['running','preparing'].includes(row.status)">
+                        停止任务
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+                </div>
               </template>
             </template>
           </el-table-column>
@@ -225,24 +252,146 @@
           :page-size="matrix.page_size" :current-page="matrix.page" @current-change="loadMatrix" />
       </el-tab-pane>
 
-      <!-- ============ 实验配置 ============ -->
-      <el-tab-pane label="实验配置" name="config">
-        <el-descriptions :column="2" border size="small">
-          <el-descriptions-item label="实验 ID">{{ exp.id }}</el-descriptions-item>
-          <el-descriptions-item label="创建人">{{ exp.created_by }}</el-descriptions-item>
-          <el-descriptions-item label="创建时间">{{ exp.created_at }}</el-descriptions-item>
-          <el-descriptions-item label="测试集">{{ exp.test_set_name }}</el-descriptions-item>
-          <el-descriptions-item label="OBS 路径" :span="2">{{ exp.test_set_path }}</el-descriptions-item>
-          <el-descriptions-item label="样本数">{{ exp.sample_total }}</el-descriptions-item>
-          <el-descriptions-item label="重复次数">{{ exp.repeat_times }}</el-descriptions-item>
-          <el-descriptions-item label="调度策略">{{ exp.schedule_mode }}</el-descriptions-item>
-          <el-descriptions-item label="并发上限">{{ exp.max_concurrent }}</el-descriptions-item>
-          <el-descriptions-item label="队列">{{ exp.queue_id || '（每臂独立）' }}</el-descriptions-item>
-          <el-descriptions-item label="描述" :span="2">{{ exp.description || '—' }}</el-descriptions-item>
-        </el-descriptions>
+      <!-- ============ 详情 ============ -->
+      <el-tab-pane label="详情" name="config">
+        <!-- 顶部四个数据块：一眼看清规模与健康度 -->
+        <div class="detail-stats">
+          <div class="dstat">
+            <div class="dstat-icon purple"><el-icon><Files /></el-icon></div>
+            <div>
+              <div class="dstat-k">子任务数</div>
+              <div class="dstat-v">{{ exp.arm_count }}</div>
+            </div>
+          </div>
+          <div class="dstat">
+            <div class="dstat-icon green"><el-icon><CircleCheck /></el-icon></div>
+            <div>
+              <div class="dstat-k">已完成</div>
+              <div class="dstat-v">{{ completedArms }}</div>
+            </div>
+          </div>
+          <div class="dstat">
+            <div class="dstat-icon red"><el-icon><CircleClose /></el-icon></div>
+            <div>
+              <div class="dstat-k">失败数</div>
+              <div class="dstat-v">{{ exp.failed_arms || 0 }}</div>
+            </div>
+          </div>
+          <div class="dstat">
+            <div class="dstat-icon blue"><el-icon><Timer /></el-icon></div>
+            <div>
+              <div class="dstat-k">队列并发</div>
+              <div class="dstat-v">{{ exp.max_concurrent }}</div>
+            </div>
+          </div>
+        </div>
 
-        <h4 style="margin:20px 0 8px">公共任务参数<span class="muted">（密钥已脱敏）</span></h4>
-        <pre class="params">{{ prettyParams }}</pre>
+        <!-- 基础信息 -->
+        <section class="dsec">
+          <div class="dsec-head"><el-icon><Document /></el-icon><h4>基础信息</h4></div>
+          <el-descriptions :column="2" border size="small" class="dinfo">
+            <el-descriptions-item label="实验 ID">{{ exp.id }}</el-descriptions-item>
+            <el-descriptions-item label="创建人">{{ exp.created_by || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="创建时间">{{ exp.created_at }}</el-descriptions-item>
+            <el-descriptions-item label="测试集">{{ exp.test_set_name || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="样本数">{{ exp.sample_total }}</el-descriptions-item>
+            <el-descriptions-item label="重复次数">{{ exp.repeat_times }}</el-descriptions-item>
+            <el-descriptions-item label="队列名称">{{ exp.queue_name || exp.queue_id || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="队列并发">{{ exp.max_concurrent }}</el-descriptions-item>
+            <el-descriptions-item label="长尾跳过">
+              {{ exp.tail_skip_enabled ? `开启（${exp.tail_skip_percent}%）` : '关闭' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="描述">{{ exp.description || '—' }}</el-descriptions-item>
+          </el-descriptions>
+        </section>
+
+        <!-- 配置摘要 -->
+        <section class="dsec">
+          <div class="dsec-head">
+            <el-icon><Files /></el-icon><h4>配置摘要</h4>
+            <span class="muted">本次批量实验的核心配置概览</span>
+          </div>
+          <div class="summary-grid">
+            <div class="sm-item">
+              <div class="sm-icon"><el-icon><Box /></el-icon></div>
+              <div class="sm-body">
+                <div class="sm-k">Harness 组合</div>
+                <div class="sm-v">{{ harnessSummary.text }}</div>
+              </div>
+              <span class="sm-count">{{ harnessSummary.count }} 个</span>
+            </div>
+            <div class="sm-item">
+              <div class="sm-icon"><el-icon><Cpu /></el-icon></div>
+              <div class="sm-body">
+                <div class="sm-k">主力模型</div>
+                <div class="sm-v">{{ modelSummary.text }}</div>
+              </div>
+              <span class="sm-count">{{ modelSummary.count }} 个</span>
+            </div>
+            <div class="sm-item">
+              <div class="sm-icon"><el-icon><User /></el-icon></div>
+              <div class="sm-body">
+                <div class="sm-k">用户模拟</div>
+                <div class="sm-v">{{ simSummary }}</div>
+              </div>
+            </div>
+            <div class="sm-item">
+              <div class="sm-icon"><el-icon><RefreshRight /></el-icon></div>
+              <div class="sm-body">
+                <div class="sm-k">重复次数</div>
+                <div class="sm-v">{{ exp.repeat_times }}</div>
+              </div>
+            </div>
+            <div class="sm-item">
+              <div class="sm-icon"><el-icon><VideoPlay /></el-icon></div>
+              <div class="sm-body">
+                <div class="sm-k">跳过策略</div>
+                <div class="sm-v">{{ exp.tail_skip_enabled ? `长尾跳过（${exp.tail_skip_percent}%）` : '不跳过' }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 公共任务参数 -->
+        <section class="dsec">
+          <div class="dsec-head">
+            <el-icon><Setting /></el-icon><h4>公共任务参数</h4>
+            <span class="muted">任务级公共配置，包含 Harness、模型、沙箱等参数</span>
+          </div>
+          <div class="param-wrap">
+            <div class="param-nav">
+              <div v-for="g in paramGroups" :key="g.key" class="pnav-item"
+                :class="{ active: activeGroup === g.key }" @click="activeGroup = g.key">
+                <div class="pnav-icon"><el-icon><component :is="g.icon" /></el-icon></div>
+                <div class="pnav-body">
+                  <div class="pnav-t">{{ g.title }}</div>
+                  <div class="pnav-s">{{ g.desc }}</div>
+                </div>
+                <el-icon class="pnav-arrow"><ArrowRight /></el-icon>
+              </div>
+            </div>
+            <div class="param-body">
+              <div class="param-body-head">
+                <span class="code-mark">{{ activeGroupMeta.title }}</span>
+                <el-button size="small" @click="copyParams">
+                  <el-icon style="margin-right:4px"><CopyDocument /></el-icon>复制
+                </el-button>
+              </div>
+              <el-table :data="activeGroupMeta.rows" size="small" border class="param-table"
+                :empty-text="'暂无数据'">
+                <el-table-column v-for="c in activeGroupMeta.columns" :key="c.prop"
+                  :prop="c.prop" :label="c.label" :width="c.width"
+                  :min-width="c.minWidth || 120" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span :class="{ 'cell-empty': isEmpty(row[c.prop]) }">
+                      {{ formatParam(row[c.prop]) }}
+                    </span>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </div>
+          </div>
+        </section>
       </el-tab-pane>
     </el-tabs>
   </div>
@@ -253,7 +402,9 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Back, VideoPlay, VideoPause, CircleClose, CircleCheck, QuestionFilled,
+  Back, VideoPlay, VideoPause, CircleClose, CircleCheck, QuestionFilled, ArrowDown,
+  RefreshRight, Files, Timer, Document, Box, Cpu, User, Setting, ArrowRight,
+  CopyDocument, ArrowUp, Tickets, MagicStick,
 } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
@@ -283,18 +434,313 @@ let timer = null
 
 const settled = computed(() => (exp.value.completed || 0) + (exp.value.failed || 0))
 
+// params_json 里存的是创建时的完整参数（密钥已脱敏），此前端只做展示分组。
+const parsedParams = computed(() => {
+  try { return JSON.parse(exp.value.params_json || '{}') } catch { return {} }
+})
+
 const prettyParams = computed(() => {
   try { return JSON.stringify(JSON.parse(exp.value.params_json || '{}'), null, 2) }
   catch { return exp.value.params_json || '{}' }
 })
 
+// ---- 详情 tab：配置摘要 + 参数分组 ----
+const activeGroup = ref('harness')
+
+// harness_config_id / version_id → 可读名称。
+// params_json 里存的是 ID，直接展示用户看不懂，所以进页面时拉一次映射表。
+const cfgNames = ref({})      // { [config_id]: '方案名' }
+const verNames = ref({})      // { [version_id]: 'v1.2' }
+const sandboxList = ref([])   // 沙箱配置列表，用于把 sandbox_config_id 显示成名称
+
+// 已完成子任务数 = 总数 - 失败 - 运行中 - 待启动（负值兜底为 0）
+const completedArms = computed(() => Math.max(
+  0,
+  (exp.value.arm_count || 0)
+    - (exp.value.failed_arms || 0)
+    - (exp.value.active_arms || 0)
+    - (exp.value.startable_arms || 0),
+))
+
+const arms = computed(() => parsedParams.value.arms || [])
+
+// Harness 组合：按 harness_type 去重，保留出现顺序
+const harnessSummary = computed(() => {
+  const seen = []
+  for (const a of arms.value) {
+    const t = a.harness_type || ''
+    if (t && !seen.includes(t)) seen.push(t)
+  }
+  return {
+    count: seen.length,
+    text: seen.map(t => harnessStore.label(t)).join('、') || '—',
+  }
+})
+
+// 主力模型：跨臂按 model_id 去重（同一模型配在不同 harness 下只算一个）
+const modelSummary = computed(() => {
+  const seen = []
+  for (const a of arms.value) {
+    const m = (a.model_id || '').trim()
+    if (m && !seen.includes(m)) seen.push(m)
+  }
+  // 臂上没配模型时回落到 common 的兜底值
+  if (!seen.length) {
+    const fallback = (parsedParams.value.model_id || '').trim()
+    if (fallback) seen.push(fallback)
+  }
+  return { count: seen.length, text: seen.join('、') || '—' }
+})
+
+const simSummary = computed(() => {
+  const sims = parsedParams.value.sim_arms || []
+  const labels = sims.map(s => s.label).filter(Boolean)
+  if (labels.length) return labels.join('、')
+  const agents = sims.flatMap(s => s.agents || [])
+  const names = agents.map(a => a.name || a.model).filter(Boolean)
+  if (names.length) return [...new Set(names)].join('、')
+  return '模板默认'
+})
+
+// 参数分组与创建页的五个 Tab 一一对应：Harness 类型 / Harness 配置 /
+// 用户模拟配置 / 批量任务配置 / 高级配置。
+// 数据源是 params_json.blocks —— 矩阵的原始二维结构（Harness 块 × 块内模型），
+// 不是摊平后的 arms。展开成子任务配置是后端在建任务时才做的，
+// 这里必须还原原始配置，否则「2 个 Harness × 2 个模型」会显示成 4 个重复项。
+const paramGroups = computed(() => {
+  const p = parsedParams.value
+  const blocks = Array.isArray(p.blocks) ? p.blocks : []
+
+  // 老实验没有 blocks（只存了摊平后的 arms），按 harness 三件套归组还原成块。
+  // 不做归组的话「GLM 配在 Claude Code 和 Codex 下」会显示成两个独立块，
+  // 看起来就像重复配置了两次。
+  const blockList = blocks.length ? blocks : (() => {
+    const byKey = new Map()
+    for (const a of arms.value) {
+      const key = `${a.harness_type}|${a.harness_config_id}|${a.harness_config_version_id}`
+      if (!byKey.has(key)) {
+        byKey.set(key, {
+          harness_type: a.harness_type,
+          harness_config_id: a.harness_config_id,
+          harness_config_version_id: a.harness_config_version_id,
+          label: a.harness_config_id ? '' : (a.label || ''),
+          image_name: a.image_name,
+          sandbox_config_id: a.sandbox_config_id,
+          models: [],
+        })
+      }
+      if (a.model_id || a.model_base_url) {
+        byKey.get(key).models.push({
+          model_id: a.model_id,
+          model_base_url: a.model_base_url,
+          model_api_key: a.model_api_key,
+          model_api_type: a.model_api_type,
+        })
+      }
+    }
+    return [...byKey.values()]
+  })()
+
+  // ---- Harness 类型：一行一个 Harness 块（不按模型展开） ----
+  const harnessCols = [
+    { prop: 'harness_type', label: 'Harness 类型', minWidth: 150 },
+    { prop: 'config_name', label: '配置方案', minWidth: 180 },
+    { prop: 'version_name', label: '版本', minWidth: 120 },
+    { prop: 'image_name', label: '镜像名称', minWidth: 200 },
+    { prop: 'sandbox_name', label: '沙箱配置', minWidth: 160 },
+  ]
+  // ID 一律映射成实际名称：用户看不懂数字 ID。
+  // 映射表拉不到时（接口失败/已删除的方案）退回显示 ID，至少不至于是空白。
+  const cfgName = id => cfgNames.value[id] || (id != null ? `#${id}` : null)
+  const verName = id => verNames.value[id] || (id != null ? `#${id}` : null)
+  const sandboxName = id => {
+    const s = (sandboxList.value || []).find(x => x.id === id)
+    return s ? (s.name || s.pool_name || `#${id}`) : (id != null ? `#${id}` : null)
+  }
+
+  const harnessRows = blockList.map(b => ({
+    harness_type: harnessStore.label(b.harness_type),
+    config_name: cfgName(b.harness_config_id),
+    version_name: verName(b.harness_config_version_id),
+    image_name: b.image_name ?? p.image_name ?? null,
+    sandbox_name: sandboxName(b.sandbox_config_id ?? p.sandbox_config_id),
+  }))
+
+  // ---- Harness 配置：一行一个模型，带所属 Harness 以区分归属 ----
+  const modelCols = [
+    { prop: 'model_id', label: '模型 ID', minWidth: 180 },
+    { prop: 'model_api_type', label: 'API 类型', minWidth: 130 },
+    { prop: 'model_base_url', label: 'Base URL', minWidth: 240 },
+    { prop: 'model_api_key', label: 'API Key', minWidth: 150 },
+  ]
+  // 按 model_id 去重：同一模型配在多个 Harness 下只列一次，
+  // 这张表回答的是「这次实验用了哪几个模型」。
+  const modelSeen = new Map()
+  for (const b of blockList) {
+    const models = (b.models || []).length
+      ? b.models
+      : [{ model_id: p.model_id || '模板默认', model_api_type: p.model_api_type,
+           model_base_url: p.model_base_url, model_api_key: p.model_api_key }]
+    for (const m of models) {
+      const mid = (m.model_id || '').trim()
+      if (mid && !modelSeen.has(mid)) {
+        modelSeen.set(mid, {
+          model_id: mid,
+          model_api_type: m.model_api_type,
+          model_base_url: m.model_base_url,
+          model_api_key: m.model_api_key,
+        })
+      }
+    }
+  }
+  const modelRows = [...modelSeen.values()]
+
+  // 用户模拟：sim_arms 里的 agents 摊平成行；没有分轴时回落到 common.agents
+  const simList = (p.sim_arms && p.sim_arms.length)
+    ? p.sim_arms.flatMap(s => s.agents || [])
+    : (p.agents || [])
+  const agentCols = [
+    { prop: 'name', label: 'Agent 名称', minWidth: 130 },
+    { prop: 'model', label: '模型 ID', minWidth: 160 },
+    { prop: 'api', label: 'API 类型', minWidth: 120 },
+    { prop: 'base_url', label: 'Base URL', minWidth: 220 },
+    { prop: 'provider', label: 'Provider', minWidth: 110 },
+    { prop: 'api_key', label: 'API Key', minWidth: 130 },
+  ]
+  const agentRows = simList.map((a, i) => ({
+    name: a.name || `agent${i + 1}`,
+    model: a.model,
+    api: a.api,
+    base_url: a.base_url,
+    provider: a.provider,
+    api_key: a.api_key,
+  }))
+
+  const kvCols = [
+    { prop: 'k', label: '参数', minWidth: 190 },
+    { prop: 'v', label: '值', minWidth: 260 },
+  ]
+
+  return [
+    {
+      key: 'harness', title: 'Harness 类型',
+      icon: Box,
+      columns: harnessCols,
+      rows: harnessRows,
+      data: blockList.map(b => ({
+        harness_type: b.harness_type,
+        harness_config_id: b.harness_config_id,
+        harness_config_version_id: b.harness_config_version_id,
+        label: b.label,
+        image_name: b.image_name ?? p.image_name ?? null,
+        sandbox_config_id: b.sandbox_config_id ?? p.sandbox_config_id ?? null,
+      })),
+    },
+    {
+      key: 'hconfig', title: 'Harness 配置',
+      icon: Cpu,
+      columns: modelCols,
+      rows: modelRows,
+      data: blockList.map(b => ({
+        label: b.label,
+        harness_type: b.harness_type,
+        models: (b.models || []).map(m => ({
+          model_id: m.model_id,
+          model_base_url: m.model_base_url,
+          model_api_key: m.model_api_key,
+          model_api_type: m.model_api_type,
+        })),
+      })),
+    },
+    {
+      key: 'sim', title: '用户模拟配置',
+      icon: User,
+      columns: agentCols,
+      rows: agentRows,
+      data: simList.map(a => ({
+        name: a.name, model: a.model, base_url: a.base_url,
+        api_key: a.api_key, api: a.api, provider: a.provider,
+      })),
+    },
+    {
+      key: 'batch', title: '批量任务配置',
+      icon: Tickets,
+      columns: kvCols,
+      rows: [
+        { k: '队列名称', v: exp.value.queue_name || exp.value.queue_id || null },
+        { k: '队列并发', v: exp.value.max_concurrent },
+        { k: '长尾跳过', v: exp.value.tail_skip_enabled ? `开启（${exp.value.tail_skip_percent}%）` : '关闭' },
+        { k: '重复次数', v: exp.value.repeat_times },
+        { k: '独立并发数', v: p.concurrent_num },
+      ],
+      data: {
+        queue_name: exp.value.queue_name || exp.value.queue_id,
+        max_concurrent: exp.value.max_concurrent,
+        tail_skip_enabled: exp.value.tail_skip_enabled,
+        tail_skip_percent: exp.value.tail_skip_percent,
+        repeat_times: exp.value.repeat_times,
+        concurrent_num: p.concurrent_num,
+      },
+    },
+    {
+      key: 'adv', title: '高级配置',
+      icon: MagicStick,
+      columns: kvCols,
+      rows: [
+        { k: '沙箱最大存活（秒）', v: p.max_ttl_second },
+        { k: '起始索引', v: p.start_index },
+        { k: 'API Key 加沙箱后缀', v: p.suffix_api_keys },
+        { k: '启动本地代理', v: p.proxy_enable },
+        { k: '代码仓 ID', v: p.code_repo_id },
+        { k: '轨迹保存路径', v: p.traj_save_path },
+      ],
+      data: {
+        max_ttl_second: p.max_ttl_second,
+        start_index: p.start_index,
+        suffix_api_keys: p.suffix_api_keys,
+        proxy_enable: p.proxy_enable,
+        code_repo_id: p.code_repo_id,
+        traj_save_path: p.traj_save_path,
+      },
+    },
+  ]
+})
+
+const activeGroupMeta = computed(
+  () => paramGroups.value.find(g => g.key === activeGroup.value) || paramGroups.value[0],
+)
+
+const activeJson = computed(() => {
+  const g = activeGroupMeta.value
+  if (!g) return prettyParams.value
+  try { return JSON.stringify(g.data, null, 2) } catch { return '{}' }
+})
+
+const isEmpty = v => v === null || v === undefined || v === ''
+
+function formatParam(v) {
+  if (v === null || v === undefined || v === '') return '—'
+  if (typeof v === 'boolean') return v ? '开启' : '关闭'
+  return v
+}
+
+async function copyParams() {
+  try {
+    await navigator.clipboard.writeText(activeJson.value)
+    ElMessage.success('已复制到剪贴板')
+  } catch { ElMessage.warning('复制失败，请手动选择文本') }
+}
+
 const STATUS_LABEL = {
   created: '待开始', running: '运行中', paused: '已暂停',
   completed: '已完成', cancelled: '已取消',
+  // failed 是由子任务状态推导出来的（见后端 _derive_status），
+  // 库里原本没有这个取值，漏登记就会裸露成英文。
+  failed: '有失败',
 }
 const STATUS_TYPE = {
   created: 'info', running: 'success', paused: 'warning',
-  completed: '', cancelled: 'danger',
+  completed: '', cancelled: 'danger', failed: 'danger',
 }
 const statusLabel = s => STATUS_LABEL[s] || s || '—'
 const statusType = s => STATUS_TYPE[s] ?? 'info'
@@ -389,6 +835,69 @@ function onTabChange(name) {
 // 终态实验不再轮询：数据不会再变，白耗请求
 const isActive = computed(() => ['created', 'running', 'paused'].includes(exp.value.status))
 
+// 子任务行内操作（启动/停止单个任务），与任务详情页的按钮同义
+async function onRowCommand(cmd, row) {
+  if (!row.instance_id) return
+  const label = cmd === 'start' ? '启动' : '停止'
+  try {
+    await ElMessageBox.confirm(`${label}任务「${row.instance_name || row.instance_id}」？`,
+      label + '确认', { type: 'warning' })
+  } catch { return }
+  try {
+    if (cmd === 'start') await api.post(`/instances/${row.instance_id}/start`)
+    else await api.post(`/instances/${row.instance_id}/stop`)
+    ElMessage.success(`已${label}`)
+    loadMain()
+  } catch { /* interceptor */ }
+}
+
+const acting = ref('')
+
+// 整批启动：把队列里待启动的子任务全部入队（与列表页同一个后端接口）
+async function startQueue() {
+  if (!exp.value.queue_id) return
+  const paused = exp.value.status === 'paused'
+  try {
+    await ElMessageBox.confirm(
+      paused
+        ? `继续执行？将解除暂停并放行排队中的子任务。`
+        : `启动队列「${exp.value.queue_name || exp.value.queue_id}」？待启动的子任务会按顺序入队。`,
+      paused ? '继续执行' : '启动队列', { type: 'info' })
+  } catch { return }
+  acting.value = 'start'
+  try {
+    const res = await api.post(`/queues/${encodeURIComponent(exp.value.queue_id)}/start-all`)
+    ElMessage.success(res.message || '已启动')
+    loadMain()
+  } catch { /* interceptor */ } finally { acting.value = '' }
+}
+
+// 重跑失败：只重新拉起 status='failed' 的子任务，成功的和没跑的不动
+async function rerunFailed() {
+  try {
+    await ElMessageBox.confirm(
+      `重跑全部失败任务？\n只重新拉起已失败的子任务，成功跑完的不会被重跑。`,
+      '重跑失败', { type: 'warning' })
+  } catch { return }
+  acting.value = 'rerun'
+  try {
+    const res = await api.post(`/batch-experiments/${batchId}/rerun-failed`)
+    if (res.errors && res.errors.length) ElMessage.warning(res.message)
+    else ElMessage.success(res.message || '已重跑')
+    loadMain()
+  } catch { /* interceptor */ } finally { acting.value = '' }
+}
+
+function handleMore(cmd) {
+  if (cmd === 'start') return startQueue()
+  if (cmd === 'rerun') return rerunFailed()
+  if (cmd === 'copy') {
+    // 与列表页一致：跳新建页预填，让用户补 key 后再建
+    return router.push({ path: '/batch/new', query: { copy_from: batchId } })
+  }
+  return act(cmd)
+}
+
 async function act(cmd) {
   const confirms = {
     cancel: '取消实验？将停止所有未完成的子任务。',
@@ -407,8 +916,33 @@ watch(isActive, v => {
   if (!v && timer) { clearInterval(timer); timer = null }
 })
 
+// 拉 harness 方案与版本名，供详情页把 ID 显示成名字。失败不阻塞页面。
+async function loadHarnessNames() {
+  try {
+    const configs = await api.get('/harness-configs', { silent: true })
+    const map = {}
+    for (const cfg of configs || []) map[cfg.id] = cfg.name
+    cfgNames.value = map
+
+    const versions = {}
+    await Promise.all((configs || []).map(async cfg => {
+      try {
+        const list = await api.get(`/harness-configs/${cfg.id}/versions`, { silent: true })
+        for (const v of list || []) versions[v.id] = v.version
+      } catch { /* 单个方案拉不到就跳过后面的映射 */ }
+    }))
+    verNames.value = versions
+  } catch { /* 保持空映射，页面上退回显示 ID */ }
+
+  try {
+    const list = await api.get('/sandbox-configs', { silent: true })
+    sandboxList.value = list || []
+  } catch { sandboxList.value = [] }
+}
+
 onMounted(async () => {
   harnessStore.load()
+  loadHarnessNames()
   loading.value = true
   await loadMain()
   loading.value = false
@@ -447,5 +981,124 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
   background: var(--bg-primary); border: 1px solid var(--border-color);
   border-radius: 6px; padding: 12px; font-size: 12px;
   max-height: 360px; overflow: auto; margin: 0;
+}
+.row-ops {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+.row-ops :deep(.el-button + .el-button) { margin-left: 0; }
+.btn-badge {
+  display: inline-block;
+  margin-left: 6px;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: #f56c6c;
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+.menu-count { color: #f56c6c; }
+
+/* ===== 详情 tab ===== */
+.detail-stats {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 14px; margin: 4px 0 18px;
+}
+.dstat {
+  display: flex; align-items: center; gap: 14px;
+  border: 1px solid var(--border-color); border-radius: 10px;
+  padding: 16px 18px; background: var(--bg-primary);
+}
+.dstat-icon {
+  width: 42px; height: 42px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; flex: 0 0 auto;
+}
+.dstat-icon.purple { background: rgba(139, 92, 246, .12); color: #8b5cf6; }
+.dstat-icon.green  { background: rgba(16, 185, 129, .12); color: #10b981; }
+.dstat-icon.red    { background: rgba(245, 108, 108, .12); color: #f56c6c; }
+.dstat-icon.blue   { background: rgba(59, 130, 246, .12); color: #3b82f6; }
+.dstat-k { font-size: 12px; color: var(--text-muted); }
+.dstat-v { font-size: 24px; font-weight: 700; line-height: 1.25; }
+
+.dsec {
+  border: 1px solid var(--border-color); border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 16px; background: var(--bg-primary);
+}
+.dsec-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 14px; color: var(--text-secondary);
+}
+.dsec-head h4 { margin: 0; font-size: 14px; color: var(--text-primary); }
+.dsec-head .muted { font-weight: 400; }
+.dinfo :deep(.el-descriptions__label) { width: 110px; }
+
+.summary-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+}
+.sm-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px; border-radius: 8px;
+  background: rgba(139, 92, 246, .06);
+  border: 1px solid rgba(139, 92, 246, .14);
+}
+.sm-icon { color: #8b5cf6; font-size: 18px; flex: 0 0 auto; }
+.sm-body { min-width: 0; flex: 1; }
+.sm-k { font-size: 12px; color: var(--text-muted); }
+.sm-v {
+  font-size: 13px; font-weight: 600; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sm-count {
+  flex: 0 0 auto; font-size: 12px; font-weight: 600;
+  color: #8b5cf6; background: rgba(139, 92, 246, .14);
+  border-radius: 10px; padding: 1px 9px;
+}
+
+.param-wrap { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+.param-nav { display: flex; flex-direction: column; gap: 8px; }
+.pnav-item {
+  display: flex; align-items: center; gap: 10px; cursor: pointer;
+  padding: 11px 12px; border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  transition: border-color .15s, background .15s;
+}
+.pnav-item:hover { border-color: #8b5cf6; }
+.pnav-item.active {
+  border-color: #8b5cf6;
+  background: rgba(139, 92, 246, .08);
+}
+.pnav-icon {
+  width: 32px; height: 32px; border-radius: 8px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(139, 92, 246, .12); color: #8b5cf6;
+}
+.pnav-body { min-width: 0; flex: 1; }
+.pnav-t { font-size: 13px; font-weight: 600; }
+.pnav-s {
+  font-size: 11px; color: var(--text-muted); margin-top: 1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pnav-arrow { color: var(--text-muted); font-size: 12px; flex: 0 0 auto; }
+
+.param-body { min-width: 0; }
+.param-body-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.code-mark { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.param-table { margin-top: 2px; }
+.cell-empty { color: var(--text-muted); }
+
+@media (max-width: 900px) {
+  .detail-stats { grid-template-columns: repeat(2, 1fr); }
+  .param-wrap { grid-template-columns: 1fr; }
 }
 </style>

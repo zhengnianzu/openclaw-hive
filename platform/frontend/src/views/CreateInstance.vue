@@ -888,18 +888,25 @@ onMounted(async () => {
         } catch {}
       }
 
-      // 2. 再用登记字段覆盖（登记优先级更高）
-      form.value.name = `${reg.task_name}-${reg.requester || 'task'}`
+      // 2. 再用数据集字段覆盖（数据集优先级更高）
+      // 名称不再拼 requester：需求方字段已从数据集界面移除，老数据的 requester
+      // 可能是空串，拼出来会变成「任务名- 」，看起来像缺了半截。
+      form.value.name = reg.task_name
       form.value.task_name = `${genTaskId()}${rand}`
-      form.value.harness_type = reg.harness_type || 'openclaw'
       form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
       form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
       form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
       form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
       form.value.default_skills = reg.default_skills || ''
-      form.value.total_num = reg.data_total || 0
-      if (reg.model_name) form.value.model_id = reg.model_name
-      if (reg.base_url) form.value.model_base_url = reg.base_url
+      // 轨迹保存路径：数据集里留空表示「由后端按 harness + task_name 自动生成」，
+      // 此时不要写入空串，保持表单默认（自动生成）语义。
+      if (reg.traj_save_path) {
+        form.value.traj_save_path = stripObsPrefix(reg.traj_save_path)
+      }
+      // total_num 不再从数据集取：数据集已不填「数据总量」，留 0 让启动准备阶段
+      // 按下载到本地的实际文件数统计（instances._prepare_instance 里 total_num<=0
+      // 时取 available）。
+      form.value.total_num = 0
 
       // 3. 用登记的 agent 信息覆盖模板中的 agents
       if (reg.eval_model_name && form.value.agents.length > 0) {
@@ -921,9 +928,9 @@ onMounted(async () => {
         }
         form.value.agents = agents
       }
-      ElMessage.info('已从任务登记预填配置')
+      ElMessage.info('已从数据集预填配置')
     } catch {
-      ElMessage.warning('无法加载登记信息')
+      ElMessage.warning('无法加载数据集信息')
     }
   }
   loadImages()

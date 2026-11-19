@@ -1050,6 +1050,15 @@ def init_db_unlocked():
         except Exception:
             pass
 
+        # migrate: add traj_save_path to task_registrations
+        # 与既有的 traj_path 是两回事：traj_path 是跑完之后回填的「产出轨迹在哪」，
+        # 由列表页手工编辑；traj_save_path 是数据集预设的「轨迹往哪存」，
+        # 对应创建任务实例表单里的「轨迹保存路径」，留空则由后端自动生成。
+        try:
+            conn.execute("ALTER TABLE task_registrations ADD COLUMN traj_save_path TEXT DEFAULT ''")
+        except Exception:
+            pass
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS config_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1647,6 +1656,34 @@ def init_db_unlocked():
             CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON batch_experiment_items(batch_id);
             CREATE INDEX IF NOT EXISTS idx_batch_item_inst  ON batch_experiment_items(instance_id);
         """)
+
+        # 批量实验的展示序号：按创建时间升序分配（最早=1），创建后永不变。
+        # 与 task_instances.seq 同款：删除会留空洞，这是「稳定」的代价。
+        try:
+            conn.execute("ALTER TABLE batch_experiments ADD COLUMN seq INTEGER")
+        except Exception:
+            pass
+        try:
+            conn.execute("""
+                UPDATE batch_experiments SET seq = (
+                    SELECT COUNT(*) FROM batch_experiments b2
+                     WHERE b2.created_at <= batch_experiments.created_at
+                ) WHERE seq IS NULL
+            """)
+        except Exception:
+            pass
+
+        # 用户模拟臂（批量实验的第二矩阵轴）。建表语句里不加、改用 ALTER —— 上面的
+        # CREATE TABLE 是 IF NOT EXISTS，对已存在的表不会补列，线上库早就建过了。
+        # 单独 try 各一条：第二条在历史库上也要能独立跑成。
+        for _stmt in (
+            "ALTER TABLE batch_experiment_items ADD COLUMN sim_label TEXT DEFAULT ''",
+            "ALTER TABLE batch_experiment_items ADD COLUMN sim_idx INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                conn.execute(_stmt)
+            except Exception:
+                pass
 
         # 队列暂停位。批量实验的「暂停调度」靠它实现：置 1 后队列不再放行新任务，
         # **已经 running 的不打断**（这是最符合直觉的暂停语义）。

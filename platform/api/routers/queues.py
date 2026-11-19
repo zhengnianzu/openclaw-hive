@@ -451,6 +451,13 @@ async def start_all_queue_tasks(
     if not starters:
         return {"message": f"队列 '{queue_id}' 没有可启动的任务", "started_count": 0}
 
+    # 队列若处于暂停态（批量实验的「暂停调度」置的位），调度器额度恒为 0，
+    # 任务转成 queued 也一个都放行不了 —— 看起来就像「启动按钮没反应」。
+    # 这里顺手清掉暂停位：用户点「启动队列」的意图就是让它跑起来。
+    await async_db_execute(
+        "UPDATE task_queues SET paused = 0 WHERE id = ?", (queue_id,)
+    )
+
     # 统一置为 queued，再交给调度器 —— 调度器本身会保证串行（只放行队首）。
     # 这样启动路径与单个「启动」完全一致，不需要两套逻辑。
     await async_db_execute(

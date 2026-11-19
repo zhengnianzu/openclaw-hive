@@ -12,7 +12,6 @@
         <el-menu-item index="/batch">
           <el-icon><Histogram /></el-icon>
           <span>批量实验</span>
-          <el-tag size="small" type="danger" effect="dark" class="nav-badge">新</el-tag>
         </el-menu-item>
         <el-menu-item v-if="authStore.isOperator" index="/analytics">
           <el-icon><DataAnalysis /></el-icon>
@@ -24,7 +23,7 @@
         </el-menu-item>
         <el-menu-item index="/registrations">
           <el-icon><Document /></el-icon>
-          <span>任务登记</span>
+          <span>数据集管理</span>
         </el-menu-item>
         <el-menu-item index="/wiki">
           <el-icon><Reading /></el-icon>
