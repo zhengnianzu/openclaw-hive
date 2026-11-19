@@ -152,7 +152,7 @@ updated_at: '2026-11-16T20:11:26'
 
 ![alt text](/api/wiki/assets/c930f0a5c5584f16a02b220a02f65843.webp)
 
-## 3. 配置 Harness
+## 3. Harness 配置管理
 
 ### 3.1 三层关系
 
@@ -193,6 +193,10 @@ Harness 类型
 选择 Harness 类型 → 选择方案 → 进入工作台 → 修改文件 → 保存 → 创建新版本 → 发布
 ```
 
+### 3.3 现有配置说明
+
+
+
 ## 4. 队列管理
 
 > 指导文档：<http://115.120.48.151:8087/#/wiki/queue-usage>
@@ -214,11 +218,8 @@ Harness 类型
 - 取消插队后，任务回到它原本的名次（插队只改优先级，从来没动过入队序号）。
 - 任务被重新「启动」时，插队标记会被清空，按正常流程排到队尾。
 
-## 5. Harness 配置管理
 
-
-
-## 6. 镜像管理
+## 5. 镜像管理
 ![alt text](/api/wiki/assets/a5e309761f224a7aa80281cf358cc0c1.webp)
 
 | harness类型 | 镜像 | 描述 | 
@@ -237,14 +238,54 @@ Harness 类型
 
 
 
-## 7. 代码管理
+## 6. 代码管理
 ![alt text](/api/wiki/assets/5842ae4be0da4df5b94236ac4a76db43.webp)
 | 代码仓 | 描述 |
 |---|---|
 | openclaw-task/v1117 | **主代码仓版本**：选择最新日期的 | 
 | openclaw-task/test-jiuwenswarm-serper | test代码仓，测试用 | 
 | openclaw-task/xiaoyiclaw-pangu-v4 | xiaoyiclaw专属代码仓，曹子轩维护 | 
-| openclaw-task/trg0249_261112_fix2 | trg专属代码仓，万轶维护 | 
+| openclaw-task/trg0249_261112_fix2 | trg专属代码仓，万轶维护 | k\
+
+
+## 7. Evaluator配置
+在task-00000.json中添加如下内容：
+```json
+{
+"agents": [
+    {
+      "name": "main",
+      "config": ["SOUL.md", "AGENT.md", "IDENTITY.md", "USER.md"],
+      "skills": [],
+      "system_prompt": "You are a helpful AI assistant. Answer questions clearly and concisely in Chinese."
+    },
+    {
+      "name": "evaluator",   // 新增 evaluator agent配置，可自定义所需skill和md文件
+      "config": [],
+      "skills": [],
+      "system_prompt": null
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main",
+      "text": "请解释什么是快速排序算法，给出时间复杂度分析，并用Python写一个实现。",
+      "session_name": "eval_test",
+      "timeout": 3600,
+      "use_simulator": true,        // 是否开启多轮对话
+      "evaluate": {                 // 新增 evaluate 字典 ----> 启用 evaluator 配置
+        "agent_name": "evaluator",  // 必须预先定义在agent列表中
+        "eval_step": 1,             // 评估步长，多少轮评估一次
+        "to_simulator": true,       // 是否利用evaluator的结果
+        "rubrics_ref": "simple_eval_rubrics.json#/rubrics", // rubrics门禁引用
+        "scoring_ref": "simple_eval_rubrics.json#/scoring"  // 权重分数引用
+      }
+    }
+  ]
+}
+
+``` 
+
 
 ## 参考资料
 

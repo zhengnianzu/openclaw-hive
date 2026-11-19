@@ -16,6 +16,8 @@ from api.core.database import init_db, init_db_lock, init_db_unlocked, get_conne
 from api.core.security import get_current_user, get_password_hash
 from api.routers import auth, instances, obs, logs, registrations, images, code_repos, config_templates, harness_configs, harness_meta, queues, sandbox_configs
 from api.routers import batch_output, resource_pools, stats
+# 批量实验：同一测试集 × N 个 Harness 的横向评测，复用 instances + 队列调度
+from api.routers import batch_experiments
 from api.routers import task_export
 from api.routers import wiki, notifications, settings_overview
 from api.routers import public_api
@@ -76,6 +78,9 @@ app.include_router(resource_pools.router)
 app.include_router(stats.router)
 # 批跑作业「输出」页（task_records + task_traj_records；worker 独立进程，不起 co-routine）
 app.include_router(batch_output.router)
+# 批量实验（独立入口）：实验配置 → 任务矩阵 → 执行监控 → 结果对比。
+# 子任务就是普通 task_instances，创建后与手工建的任务完全无差别。
+app.include_router(batch_experiments.router)
 app.include_router(task_export.router)
 # 文档中心（Wiki）：管理员手写更新说明，可关联配置实体、发布为全局通知
 app.include_router(wiki.router)

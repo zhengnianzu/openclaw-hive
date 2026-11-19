@@ -78,6 +78,10 @@ def slot_condition_sql(placeholders: str) -> str:
 
     阈值下限 1：并发 10、阈值 5% 时乘积只有 0.5，严格小于会永远等不到；
     兜底成 1 保证任何配置下「剩余 1 个任务」时都能触发。
+
+    暂停（q.paused=1）：额度直接归零，队列不再放行任何新任务。**已经
+    preparing/running 的任务不受影响** —— 暂停只挡住「放行」这一个动作，
+    不打断在跑的活。批量实验的「暂停调度」就是据此实现的。
     """
     global_max = global_max_concurrent()
     window = """EXISTS (
@@ -93,7 +97,8 @@ def slot_condition_sql(placeholders: str) -> str:
          WHERE o.queue_id = task_instances.queue_id
            AND o.status IN ({placeholders})
     ) < COALESCE((
-        SELECT min({global_max}, max(1, COALESCE(q.max_concurrent, 1)))
+        SELECT CASE WHEN COALESCE(q.paused, 0) = 1 THEN 0 ELSE
+               min({global_max}, max(1, COALESCE(q.max_concurrent, 1)))
                + (
                    CASE
                      WHEN COALESCE(q.tail_skip_enabled, 0) = 1 AND {window}
@@ -101,6 +106,7 @@ def slot_condition_sql(placeholders: str) -> str:
                      ELSE 0
                    END
                  )
+               END
           FROM task_queues q
          WHERE q.id = task_instances.queue_id
     ), 1)"""

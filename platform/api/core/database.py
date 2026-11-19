@@ -1594,6 +1594,69 @@ def init_db_unlocked():
         except Exception:
             pass
 
+        # 批量实验：一次实验 = 同一测试集 × N 个 Harness（× 重复次数）。
+        #
+        # 执行层完全复用现有的 task_instances + 队列调度：一个 instance 本来就是
+        # 「一个 Harness 跑完整个测试集」（task_input_path 下每个 json 一条样本），
+        # 所以批量实验只是「把 N 个 instance 编成一组 + 聚合对比」，不碰调度器。
+        #
+        # **刻意不在 task_instances 上加 batch_id 列**：归属关系只存在 items 表一处，
+        # 避免两处真相不一致（首页要打「批量」标记时用 idx_batch_item_inst 反查）。
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS batch_experiments (
+                id              TEXT PRIMARY KEY,         -- Batch-YYYYMMDD-NNN
+                name            TEXT NOT NULL,
+                description     TEXT DEFAULT '',
+                registration_id INTEGER,                  -- 测试集 = task_registrations.id
+                -- 创建时快照：登记后续被改（换 OBS 路径/改样本数）不应影响已建实验，
+                -- 否则对比页的分母会在实验跑到一半时变掉。
+                test_set_path   TEXT DEFAULT '',
+                test_set_name   TEXT DEFAULT '',
+                sample_total    INTEGER DEFAULT 0,
+                repeat_times    INTEGER NOT NULL DEFAULT 1,
+                schedule_mode   TEXT NOT NULL DEFAULT 'shared',  -- shared|isolated|serial
+                queue_id        TEXT,                    -- shared/serial 下 N 个子任务共用
+                max_concurrent  INTEGER DEFAULT 20,
+                status          TEXT NOT NULL DEFAULT 'created',
+                                -- created|running|paused|completed|cancelled
+                -- 公共创建参数快照（InstanceCreate 的公共字段）。key 类字段入库前脱敏，
+                -- 真实 key 只在创建瞬间透传给 create_instance，不落这里。
+                params_json     TEXT DEFAULT '{}',
+                created_by      TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at      TIMESTAMP,
+                finished_at     TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_batch_exp_status ON batch_experiments(status);
+            CREATE INDEX IF NOT EXISTS idx_batch_exp_created ON batch_experiments(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS batch_experiment_items (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id      TEXT NOT NULL,
+                -- 对应的 task_instances.id。创建失败时为 NULL，失败原因写 create_error：
+                -- 单个子任务建不出来不应该让整个实验回滚（N 可能上百）。
+                instance_id   TEXT,
+                harness_type  TEXT NOT NULL,
+                harness_config_id         INTEGER,
+                harness_config_version_id INTEGER,
+                arm_label     TEXT DEFAULT '',
+                repeat_idx    INTEGER NOT NULL DEFAULT 1,
+                create_error  TEXT,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON batch_experiment_items(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_batch_item_inst  ON batch_experiment_items(instance_id);
+        """)
+
+        # 队列暂停位。批量实验的「暂停调度」靠它实现：置 1 后队列不再放行新任务，
+        # **已经 running 的不打断**（这是最符合直觉的暂停语义）。
+        # 不能用「把 max_concurrent 改成 0」代替：effective_concurrent() 的下限是 1。
+        # 顺带给队列管理页白送一个「暂停队列」能力。
+        try:
+            conn.execute("ALTER TABLE task_queues ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+
         # 补统计信息 + 回收 WAL。
         #
         # ANALYZE：全库从未跑过，sqlite_stat1 不存在 → 优化器无法评估部分索引的

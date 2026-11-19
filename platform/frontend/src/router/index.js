@@ -12,6 +12,11 @@ const routes = [
       { path: 'analytics', name: 'Analytics', component: () => import('../views/Analytics.vue'), meta: { operatorOnly: true } },
       { path: 'create', name: 'Create', component: () => import('../views/CreateInstance.vue') },
       { path: 'queues', name: 'Queues', component: () => import('../views/Queues.vue'), meta: { operatorOnly: true } },
+      // 批量实验：同一测试集 × N 个 Harness 的横向评测。
+      // batch/new 必须排在 batch/:id 之前，否则 "new" 会被当成实验 id（同 wiki 的坑）。
+      { path: 'batch', name: 'BatchList', component: () => import('../views/BatchList.vue') },
+      { path: 'batch/new', name: 'BatchCreate', component: () => import('../views/BatchCreate.vue'), meta: { operatorOnly: true } },
+      { path: 'batch/:id', name: 'BatchDetail', component: () => import('../views/BatchDetail.vue') },
       { path: 'instance/:id', name: 'InstanceDetail', component: () => import('../views/InstanceDetail.vue') },
       // 日志/输出已合并进 InstanceDetail 的 tab，旧链接重定向过去
       { path: 'logs/:id', redirect: to => ({ path: `/instance/${to.params.id}`, query: { tab: 'logs' } }) },
