@@ -160,10 +160,16 @@
                   <div class="field">
                     <label class="lbl">镜像名称</label>
                     <el-select v-model="curArm.image_name" filterable allow-create clearable
-                      default-first-option placeholder="留空用 Harness 模板默认镜像" style="width:100%">
+                      default-first-option placeholder="留空用 Harness 模板默认镜像" style="width:100%"
+                      @blur="normalizeImageName(curArm)"
+                      @change="v => onImageChange(v, curArm)">
                       <el-option v-for="img in imageList" :key="img.id"
                         :label="`${img.name}（${img.os}）`" :value="img.address" />
                     </el-select>
+                    <div v-if="curArm.image_name && !isValidImage(curArm.image_name)"
+                      class="hint danger">
+                      镜像未在镜像库中注册，请从下拉选择已有镜像，或先到「镜像管理」登记
+                    </div>
                   </div>
 
                   <div class="field">
@@ -500,6 +506,14 @@
                 <div class="hint">从测试集的第几条开始跑</div>
               </div>
               <div class="field">
+                <label class="lbl">任务总数</label>
+                <el-input-number v-model="form.common.total_num" :min="0" />
+                <div class="hint">
+                  每个子任务跑几条。<b>0 表示按测试集样本数</b>（{{ sampleTotal }} 条）；
+                  填正数则只跑前 N 条，用于小样本冒烟或截断长数据集
+                </div>
+              </div>
+              <div class="field">
                 <label class="lbl">代码仓</label>
                 <el-select v-model="form.common.code_repo_id" placeholder="选择代码仓（可选）"
                   style="width:100%" clearable>
@@ -599,8 +613,8 @@
                 </tbody>
               </table>
               <div class="hint" style="margin-top:10px">
-                行 = Harness 配置（每个模型一行），列 = Harness 类型。勾选单元格 = 一个可执行的子任务；
-                每个子任务再 × {{ form.repeat_times }} 次重复，完整跑一遍 {{ sampleTotal }} 条样本。
+                行 = 模型，列 = Harness 类型。勾选单元格 = 一个可执行的子任务；
+                每个子任务再 × {{ form.repeat_times }} 次重复，完整跑一遍 {{ effectiveSampleTotal }} 条样本。
                 共 <b>{{ matrixRows.length }}</b> 个组合。用户模拟配置是通用配置，对各列一视同仁，不额外乘。
               </div>
             </template>
@@ -857,6 +871,7 @@ const form = ref({
     image_name: '',
     max_ttl_second: 36000,
     start_index: 0,
+    total_num: 0,
     traj_save_path: '',
     model_api_key: '',
     model_base_url: '',
@@ -904,10 +919,16 @@ const selectedReg = computed(() =>
 const sampleTotal = computed(() => selectedReg.value?.data_total || 0)
 
 const modelCount = computed(() => form.value.models.length)
+// 每个子任务实际跑几条：任务总数 0 = 按测试集样本数；>0 = 按填的值截断。
+// 与后端 create_experiment 里的 limit_num 同一口径，否则预览的执行规模会对不上。
+const effectiveSampleTotal = computed(() => {
+  const n = Number(form.value.common.total_num) || 0
+  return n > 0 ? Math.min(n, sampleTotal.value || n) : sampleTotal.value
+})
 // 矩阵两条轴：Harness 数 × 模型数；用户模拟与高级配置是通用配置，不进乘法
 const subtaskCount = computed(() =>
   form.value.harnesses.length * modelCount.value * form.value.repeat_times)
-const totalTasks = computed(() => subtaskCount.value * sampleTotal.value)
+const totalTasks = computed(() => subtaskCount.value * effectiveSampleTotal.value)
 
 function agentsLabel() {
   const names = (form.value.agents || []).map(x => (x.name || '').trim()).filter(Boolean)
@@ -968,7 +989,7 @@ const taskPreview = computed(() => {
         label: a.label,
         model_id: a.model_id || '兜底',
         repeat_idx: r,
-        sample_total: sampleTotal.value,
+        sample_total: effectiveSampleTotal.value,
       })
       if (out.length >= PREVIEW_LIMIT) return out
     }
@@ -1038,6 +1059,9 @@ const blockingIssues = computed(() => {
     if (!a.harness_type) issues.push(`${no} 未选择 Harness 类型`)
     if (a.harness_config_id == null) issues.push(`${no} 未选择执行方案`)
     if (a.harness_config_version_id == null) issues.push(`${no} 未选择配置版本`)
+    if (a.image_name && !isValidImage(a.image_name)) {
+      issues.push(`${no} 的镜像「${a.image_name}」未在镜像库中注册，请从下拉选择或先到「镜像管理」登记`)
+    }
   })
   form.value.models.forEach((m, mi) => {
     if (!(m.model_id || '').trim()) issues.push(`第 ${mi + 1} 个模型未填模型 ID`)
@@ -1135,6 +1159,43 @@ const keyDraft = ref({})
 
 // 用户模拟配置里当前查看的 agent 卡片下标
 const selectedAgentTab = ref(0)
+
+// ---------- 镜像名称校正 ----------
+// imageList 里：name = 短名（如 multiharness:26.9.24v1），address = 完整地址
+// 两个查找表：短名 → 地址、地址 → 短名
+const imgNameToAddr = computed(() => {
+  const m = {}
+  for (const img of imageList.value) m[img.name] = img.address
+  return m
+})
+const imgAddrSet = computed(() => new Set(imageList.value.map(i => i.address)))
+
+// 传入的值是否合法（在镜像库里注册过）
+function isValidImage(v) {
+  if (!v) return true  // 空 = 留空，合法
+  return imgAddrSet.value.has(v) || !!imgNameToAddr.value[v]
+}
+
+// 把短名归一成完整地址；已是完整地址不变；查不到的保留原值（让 hint 提示）
+function resolveImageAddr(v) {
+  if (!v) return v
+  if (imgAddrSet.value.has(v)) return v
+  return imgNameToAddr.value[v] || v
+}
+
+function normalizeImageName(arm) {
+  if (!arm || !arm.image_name) return
+  const resolved = resolveImageAddr(arm.image_name)
+  if (resolved !== arm.image_name) {
+    arm.image_name = resolved
+  }
+}
+
+// @change 时立刻尝试归一（下拉选时值就是 address，手打时走归一）
+function onImageChange(v, arm) {
+  if (!arm) return
+  arm.image_name = resolveImageAddr(v || '')
+}
 
 // ---------- 新建 KEY 弹窗（与单任务同口径） ----------
 const keyDialogVisible = ref(false)

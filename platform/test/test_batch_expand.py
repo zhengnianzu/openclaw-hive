@@ -208,6 +208,35 @@ class CreateValidationTest(unittest.TestCase):
         for a in saved["arms"]:
             self.assertNotEqual(a["model_api_key"], "sk-plain-0123456789")
 
+    def test_total_num_defaults_to_sample_total_and_can_be_capped(self):
+        """common.total_num=0 → 用登记样本数；>0 → 按它截断（不是「不限制」）。"""
+        import asyncio
+        from unittest import mock
+
+        seen = []
+
+        async def _fake_create(req_obj, _user):
+            seen.append(req_obj.total_num)
+            inst = mock.Mock()
+            inst.id = f"inst-{req_obj.name}"
+            return inst
+
+        def _run(**common_over):
+            seen.clear()
+            req = _req(models=[{"model_id": "glm-5.3"}],
+                       common=common_over or {})
+            with mock.patch("api.routers.instances.create_instance", _fake_create):
+                return asyncio.run(be.create_experiment(
+                    req, {"username": "u", "role": "operator"}))
+
+        # 登记 data_total = 3 → 每个子任务跑 3 条
+        _run()
+        self.assertEqual(seen, [3, 3])
+
+        # 显式任务总数 1 → 截断到 1 条
+        _run(total_num=1)
+        self.assertEqual(seen, [1, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

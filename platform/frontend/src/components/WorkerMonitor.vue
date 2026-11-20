@@ -339,6 +339,9 @@ const WORKER_COLOR = {
   'shallow-realtime': '#dc2626',
   'shallow-auto': '#2a78d6',
   'deep-realtime': '#d97706',
+  'proxy-tracker': '#0891b2',
+  'proxy-realtime': '#059669',
+  'proxy-auto': '#7c3aed',
   // 旧进程名（升级期间仍能看到历史心跳曲线）
   'shallow-local': '#60a5fa',
   'shallow-obs': '#0d9488',
@@ -351,6 +354,9 @@ const WORKER_LABEL = {
   'shallow-realtime': '实时分析（点击）',
   'shallow-auto': '背景分析（全量）',
   'deep-realtime': '实时下载（点击）',
+  'proxy-tracker': '代理用量发现',
+  'proxy-realtime': '代理用量采集（实时）',
+  'proxy-auto': '代理用量采集（批量）',
   // 旧名
   'shallow-local': '本地 DONE(旧)',
   'shallow-obs': 'OBS 定级(旧)',

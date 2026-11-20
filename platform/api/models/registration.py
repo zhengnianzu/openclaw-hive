@@ -22,7 +22,8 @@ class RegistrationCreate(BaseModel):
     eval_config_api: str = ""
     default_skills: str = ""
     traj_save_path: str = ""
-    config_template_id: Optional[int] = None
+    remark: str = ""
+    # config_template_id 已废弃，DB 列保留但不再由 API 写入
 
 
 class RegistrationUpdate(BaseModel):
@@ -47,11 +48,12 @@ class RegistrationUpdate(BaseModel):
     eval_config_api: Optional[str] = None
     default_skills: Optional[str] = None
     traj_save_path: Optional[str] = None
-    config_template_id: Optional[int] = None
+    remark: Optional[str] = None
 
 
 class RegistrationInfo(BaseModel):
     id: int
+    seq: Optional[int] = 0
     created_at: str
     created_by: str
     task_name: str
@@ -79,4 +81,7 @@ class RegistrationInfo(BaseModel):
     eval_config_api: str = ""
     default_skills: str = ""
     traj_save_path: str = ""
-    config_template_id: Optional[int] = None
+    remark: str = ""
+    count_status: str = ""
+    count_error: str = ""
+    counted_at: Optional[str] = None

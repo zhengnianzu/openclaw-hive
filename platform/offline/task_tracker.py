@@ -125,7 +125,8 @@ def _head_hash(path: str, n: int = 128) -> str:
         return ""
 
 
-def read_new_lines(conn, instance_id: str, path: str) -> list[str]:
+def read_new_lines(conn, instance_id: str, path: str,
+                   state_table: str = "tracker_state") -> list[str]:
     """从上次的 offset 开始读新增行，返回非空行列表；同时把新 offset 落库。
 
     调用方负责 commit（本函数不提交），以便和投递放进同一个事务。
@@ -133,6 +134,14 @@ def read_new_lines(conn, instance_id: str, path: str) -> list[str]:
     重置 offset 的两个条件（任一成立）：
       1. inode 变了 —— 文件被删除后重建（complete.jsonl 不会，但失败重跑时会）
       2. 文件头指纹变了 —— 原地 truncate 重写（failed.jsonl 每轮结束都会重写）
+
+    state_table：水位表名，默认 `tracker_state`。
+
+    **多个消费者读同一个文件时必须各用一张表**。水位键是
+    (instance_id, file_path)，本来就不区分「谁在读」—— 浅层 tracker 和
+    proxy_tracker 读的是同一份 complete.jsonl，共用 tracker_state 会让先跑的
+    那个把 offset 推到头，后跑的整段读不到（实测 proxy_tracker 首跑只捞到
+    4 行，而实际有上千行）。proxy_tracker 传自己的 `proxy_tracker_state`。
     """
     try:
         st = os.stat(path)
@@ -140,7 +149,7 @@ def read_new_lines(conn, instance_id: str, path: str) -> list[str]:
         return []
 
     row = conn.execute(
-        "SELECT inode, offset, head_hash FROM tracker_state "
+        f"SELECT inode, offset, head_hash FROM {state_table} "
         "WHERE instance_id=? AND file_path=?",
         (instance_id, path),
     ).fetchone()
@@ -172,7 +181,8 @@ def read_new_lines(conn, instance_id: str, path: str) -> list[str]:
         offset += consumed
 
     conn.execute(
-        "INSERT INTO tracker_state (instance_id, file_path, inode, offset, head_hash, updated_at) "
+        f"INSERT INTO {state_table} "
+        "(instance_id, file_path, inode, offset, head_hash, updated_at) "
         "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP) "
         "ON CONFLICT(instance_id, file_path) DO UPDATE SET "
         "  inode=excluded.inode, offset=excluded.offset, "

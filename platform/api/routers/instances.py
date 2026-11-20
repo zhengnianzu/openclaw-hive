@@ -587,6 +587,28 @@ def _image_name_map() -> dict:
     return _IMAGE_NAME_CACHE
 
 
+def _normalize_image_name(image: str) -> str:
+    """把镜像短名归一化成完整地址。
+
+    前端下拉里存的是 `address`（完整路径），但 `allow-create` 允许手填，
+    复制实验时从旧 `params_json` 还原也可能带短名（如 `multiharness:26.9.24v1`）。
+    短名写进 `config.yaml` 后沙箱认不出来，所以这里按 `images` 表反查：
+      - 传进来就是完整地址（在 address → name 映射里命中）→ 原样返回
+      - 传进来是短名（在 name → address 反向映射里命中）→ 换成完整地址
+      - 完全查不到（手填了乱值）→ 原样返回（后续沙箱拉镜像自然报错，不在这里遮掩）
+    """
+    img = (image or "").strip()
+    if not img:
+        return img
+    addr_to_name = _image_name_map()
+    # 已经是完整地址
+    if img in addr_to_name:
+        return img
+    # 是短名 → 反向查
+    name_to_addr = {v: k for k, v in addr_to_name.items()}
+    return name_to_addr.get(img, img)
+
+
 def _image_display_name(address: str) -> str:
     """镜像展示名：优先注册短名，未注册的回退地址末段（repo:tag）。"""
     if not address:
@@ -995,22 +1017,31 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # --- 镜像：独立于沙箱配置，只写当前实例 ---
     # 无论有没有选沙箱配置，都按生效的 sandbox key 改写本实例 config.yaml，
     # 不动任何模板/派生文件（选沙箱配置时该 key 由派生文件决定，否则取模板自带的）。
-    sandbox_configs.apply_image(base, req.image_name or "")
+    # 归一化：前端下拉存的是完整地址，但 allow-create 允许手填、复制实验从老
+    # params_json 还原时也可能带短名（如 multiharness:26.9.24v1）。短名写进
+    # config.yaml 后沙箱拉不到镜像，所以这里按 images 表反查成完整地址。
+    _img_req = _normalize_image_name(req.image_name or "")
+    if _img_req != (req.image_name or ""):
+        logger.info(f"实例 {req.name} 镜像短名归一化: {req.image_name!r} → {_img_req!r}")
+    sandbox_configs.apply_image(base, _img_req)
     # 三层超时全部由沙箱 TTL 派生，不依赖任务 configs 内容，创建阶段即是终值，
     # 启动准备阶段不再重算（因此用户手改实例 config.yaml 的超时能保留下来）。
     _apply_timeout_settings(base, max_ttl_second)
 
+    # 写入 config.yaml 的路径必须是相对路径（不含 obs://bucket/）。
+    # 前端统一改为存完整路径后，这里需要剥桶名；历史相对路径剥完不变。
+    from ..services.obs_path import strip_bucket as _strip_obs
     if req.skill_dir:
-        base.run_config.obs.skill_download_path = req.skill_dir
+        base.run_config.obs.skill_download_path = _strip_obs(req.skill_dir)
     if req.default_skills:
         base.run_config.obs.default_skills = [s.strip() for s in req.default_skills.split(",") if s.strip()]
     if req.agent_dir:
-        base.run_config.obs.agents_download_path = req.agent_dir
+        base.run_config.obs.agents_download_path = _strip_obs(req.agent_dir)
     if req.user_config_dir:
-        base.run_config.obs.user_config_download_path = req.user_config_dir
+        base.run_config.obs.user_config_download_path = _strip_obs(req.user_config_dir)
     if req.user_profile_dir:
-        base.run_config.obs.user_profile_download_path = req.user_profile_dir
-    effective_traj_save_path = (req.traj_save_path or "").strip()
+        base.run_config.obs.user_profile_download_path = _strip_obs(req.user_profile_dir)
+    effective_traj_save_path = _strip_obs((req.traj_save_path or "").strip())
     if not effective_traj_save_path:
         traj_prefix = harness_meta.traj_prefix(req.harness_type)
         effective_traj_save_path = f"{traj_prefix}/traj_{req.task_name}"
@@ -1865,9 +1896,13 @@ async def _prepare_instance(instance_id: str, inst: dict):
     # --- 下载用户配置（全局缓存，相同路径不重复下载） ---
     user_config_dir = create_params.get("user_config_dir", "")
     if user_config_dir:
-        # 使用全局共享目录缓存 OBS 下载，路径作为 key
-        cache_key_path = user_config_dir.strip("/").replace("/", "__")
-        global_configs_cache = os.path.join(settings.HIVE_ROOT, "platform", "downloads", "configs", cache_key_path)
+        # 路径可能带 obs:// 前缀（路径统一改造后），这里归一成相对路径作为缓存 key
+        from ..services.obs_path import strip_bucket as _strip_obs_path
+        from ..services.sample_count import dataset_cache_dir
+        user_config_dir_rel = _strip_obs_path(user_config_dir)
+        # 与「重新统计」共用同一份本地缓存：统计过的数据集直接命中，跳过 OBS 下载。
+        # 缓存根在 OUTPUT_CACHE/dataset/（与产物缓存 OUTPUT_CACHE/<batch>/<leaf> 同根）。
+        global_configs_cache = dataset_cache_dir(user_config_dir_rel)
         configs_dir = os.path.join(instance_dir, "configs")
 
         if os.path.isdir(global_configs_cache) and os.listdir(global_configs_cache):
@@ -1881,7 +1916,7 @@ async def _prepare_instance(instance_id: str, inst: dict):
         else:
             # 首次下载到全局缓存目录
             os.makedirs(global_configs_cache, exist_ok=True)
-            obs_src = f"{base.s3.bucket_name}/{user_config_dir}"
+            obs_src = f"{base.s3.bucket_name}/{user_config_dir_rel}"
             if not obs_src.endswith("/"):
                 obs_src += "/"
             returncode, stdout, stderr = await _async_subprocess_run(

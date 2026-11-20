@@ -33,6 +33,14 @@ TASK_DATA_SCHEMA = "taskdata"
 # （仅 2167 行，且是在线路径的核心，留在主库最省事）。
 TASK_DATA_TABLES = ("task_records", "task_traj_records")
 
+# 代理用量的两张表。行数不大（每 task 一行 / 每 task×模型一行），但**同样放在
+# task_data.db**：写入者是离线 proxy_worker，与两张巨表同源同频；放主库反而会让
+# 它的 WAL checkpoint 变大，而主库要留给在线路径（见上面分库的说明）。
+# 单独列出来是为了让 qualify_task_data_ddl 也能给它们的 DDL 加 schema 前缀。
+PROXY_DATA_TABLES = ("task_proxy_usage", "task_proxy_model_usage", "task_proxy_queue")
+# DDL 改写 / 存在性检查要覆盖的全部搬家表。
+TASK_DATA_ALL_TABLES = TASK_DATA_TABLES + PROXY_DATA_TABLES
+
 
 def get_task_data_path():
     """两张巨表所在的库文件路径。默认 <主库同级>/database/task_data.db。
@@ -93,10 +101,10 @@ def qualify_task_data_ddl(sql: str, schema: str) -> str:
     out = re.sub(
         r"\b(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)(IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)",
         lambda m: (f"{m.group(1)}{m.group(2) or ''}{schema}.{m.group(3)} ON {m.group(4)}"
-                   if m.group(4) in TASK_DATA_TABLES
+                   if m.group(4) in TASK_DATA_ALL_TABLES
                    else m.group(0)),
         out, flags=re.IGNORECASE)
-    for t in TASK_DATA_TABLES:
+    for t in TASK_DATA_ALL_TABLES:
         # 其余语句（CREATE TABLE / ALTER TABLE / INSERT INTO / FROM / UPDATE）
         # 把前缀加在表名上。关键字与表名之间可能夹着 `IF NOT EXISTS` ——
         # 必须一起匹配，否则这条最危险的 DDL 恰好漏掉，在 main 里建出空表
@@ -756,6 +764,105 @@ def ensure_traj_extra_columns() -> None:
             print(f"[db] {table} 补列失败（worker 可能仍能用已有列）: {str(e)[:150]}")
 
 
+PROXY_TABLES_DDL = """
+    CREATE TABLE IF NOT EXISTS task_proxy_usage (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id     TEXT NOT NULL,
+        traj_name       TEXT NOT NULL,
+        config_name     TEXT,
+        calls_total     INTEGER DEFAULT 0,
+        calls_success   INTEGER DEFAULT 0,
+        calls_error     INTEGER DEFAULT 0,
+        tok_in          INTEGER DEFAULT 0,
+        tok_out         INTEGER DEFAULT 0,
+        tok_total       INTEGER DEFAULT 0,
+        models          TEXT,
+        first_call_ts   TEXT,
+        last_call_ts    TEXT,
+        source_mtime    REAL,
+        source_lines    INTEGER,
+        computed_at     REAL,
+        UNIQUE(instance_id, traj_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS task_proxy_model_usage (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id  TEXT NOT NULL,
+        traj_name    TEXT NOT NULL,
+        model        TEXT NOT NULL,
+        calls        INTEGER DEFAULT 0,
+        calls_error  INTEGER DEFAULT 0,
+        tok_in       INTEGER DEFAULT 0,
+        tok_out      INTEGER DEFAULT 0,
+        UNIQUE(instance_id, traj_name, model)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_proxy_usage_inst ON task_proxy_usage(instance_id);
+    CREATE INDEX IF NOT EXISTS idx_proxy_model_inst ON task_proxy_model_usage(instance_id);
+
+    -- 采集队列：proxy_tracker 发现「已完成 task」后投一行，两个 proxy_worker 按车道领取。
+    --
+    -- 为什么不复用 shallow_queue：两者粒度虽同为 config 级，但浅层队列背着三套
+    -- 互不相干的状态机（local/obs/artifact），代理采集一样都用不上；塞进去会让
+    -- task_tracker 的 ON CONFLICT 语义被污染，且每条浅层 SQL 都要多背一列噪音。
+    --
+    -- priority 是**车道号**而非「用户点过」：
+    --   90 = 实时车道（实例 running/preparing，task 刚完成，用户在等）
+    --    0 = 背景车道（已结束实例的历史回填）
+    -- 两个 worker 按 [90, ∞) / [0, 90) 区间领取，CAS 保证互不重叠。
+    CREATE TABLE IF NOT EXISTS task_proxy_queue (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id  TEXT NOT NULL,
+        traj_name    TEXT NOT NULL,              -- OBS task 叶子目录（config 名去 .json）
+        config_name  TEXT,
+        priority     INTEGER NOT NULL DEFAULT 0,
+        state        TEXT NOT NULL DEFAULT 'queued',  -- queued/claimed/done/skipped
+        claimed_by   TEXT,
+        claimed_at   REAL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        note         TEXT,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(instance_id, traj_name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_proxy_queue_claim
+        ON task_proxy_queue(state, priority DESC, id);
+    CREATE INDEX IF NOT EXISTS idx_proxy_queue_inst
+        ON task_proxy_queue(instance_id);
+
+    -- proxy_tracker 的增量水位。结构与 tracker_state 相同，但**必须分开一张表**：
+    -- 水位键是 (instance_id, file_path)，不区分读取者，而 proxy_tracker 与浅层
+    -- task_tracker 读的是同一份 complete.jsonl / failed.jsonl。共用 tracker_state
+    -- 时先跑的那个会把 offset 推到头，后跑的整段读不到（实测只捞到 4 行）。
+    CREATE TABLE IF NOT EXISTS proxy_tracker_state (
+        instance_id TEXT NOT NULL,
+        file_path   TEXT NOT NULL,
+        inode       INTEGER,
+        offset      INTEGER NOT NULL DEFAULT 0,
+        head_hash   TEXT,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (instance_id, file_path)
+    );
+"""
+
+
+def ensure_proxy_tables() -> None:
+    """代理用量两表的幂等建表。**不改已有表、不搬数据**，可每次启动都跑。
+
+    与 ensure_traj_extra_columns 同样的理由：offline/proxy_worker.py 是独立进程，
+    从不调用 init_db()，只靠 uvicorn 启动时迁移。若只重启 worker 而不重启 API，
+    表还不存在，worker 的 UPSERT 会整轮失败且症状只是一句「本轮异常」。
+    """
+    try:
+        with get_connection() as conn:
+            conn.executescript(qualify_task_data_ddl(PROXY_TABLES_DDL,
+                                                    task_data_schema(conn)))
+            conn.commit()
+    except Exception as e:
+        print(f"[db] 代理用量表创建失败: {str(e)[:150]}")
+
+
+
 def init_db_unlocked():
     """建表+迁移主体。**调用方必须已经持有 init_db_lock()**。
 
@@ -1059,6 +1166,29 @@ def init_db_unlocked():
         except Exception:
             pass
 
+        # migrate: add remark, seq, count_status, count_error, counted_at to task_registrations
+        for _col in [
+            "remark TEXT NOT NULL DEFAULT ''",
+            "seq INTEGER",
+            "count_status TEXT NOT NULL DEFAULT ''",
+            "count_error TEXT NOT NULL DEFAULT ''",
+            "counted_at TIMESTAMP",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE task_registrations ADD COLUMN {_col}")
+            except Exception:
+                pass
+        # 回填 seq：按 created_at 升序分配，只跑一次（已有 seq 的行跳过）。
+        try:
+            conn.execute("""
+                UPDATE task_registrations SET seq = (
+                    SELECT COUNT(*) FROM task_registrations t2
+                     WHERE t2.created_at <= task_registrations.created_at
+                ) WHERE seq IS NULL
+            """)
+        except Exception:
+            pass
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS config_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1274,6 +1404,21 @@ def init_db_unlocked():
         # 状态机，且两者下载到同一个 task 目录，拆两张表等于把同一模式写两遍。
         # 保留一行 DROP 让老库自愈；新库从未建过该表，DROP IF EXISTS 无副作用。
         conn.execute("DROP TABLE IF EXISTS task_artifacts")
+
+        # 代理用量（创建参数「启动本地代理」开启后，沙箱 logs_proxy/traj/index.jsonl 的聚合）。
+        #
+        # 数据来源与写入口径见 offline/proxy_worker.py：只读本地缓存盘上的 index.jsonl，
+        # 零 obsutil。两张表都在 task_data.db（理由见 PROXY_DATA_TABLES 的注释）。
+        #
+        # 为什么按 traj 而不是按 config 落行：index.jsonl 是按 task 目录（= OBS 叶子）
+        # 分开写的一份文件，一个 traj 一份；config 与 traj 在个别 harness 下不是一一对应。
+        # config_name 只作为便于 join task_traj_records 的冗余列保留。
+        #
+        # source_mtime / source_lines 是**增量判据**：index.jsonl 在实例运行中只增不改，
+        # mtime 和行数都没变就说明自上次采集以来没有新调用，worker 直接跳过（绝大多数行
+        # 每轮都走这条零成本路径）。行数变少说明重跑覆盖，按从头重算处理。
+        conn.executescript(qualify_task_data_ddl(
+            PROXY_TABLES_DDL, task_data_schema(conn)))
 
         # Worker 心跳（资源看板「调度监控」）。
         # 之前 worker 跑起来在界面上完全不可见：只有 pid 文件、且日志只在有产出时才打印

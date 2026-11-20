@@ -53,7 +53,15 @@ def _strip_bucket(path: str) -> str:
     与前端 stripBucket 行为对齐：实例的 user_config_dir 存的是不带桶前缀的
     相对路径（create_instance 里会自己拼 base.s3.bucket_name）。登记表里的
     task_path_obs 可能带 obs:// 前缀，直接灌进去会变成双重桶名。
+
+    此函数已被 api/services/obs_path.strip_bucket 取代，保留本地副本以免调用处误删。
     """
+    from ..services.obs_path import strip_bucket as _sb
+    return _sb(path)
+
+
+def _strip_bucket_legacy(path: str) -> str:
+    """旧版实现，仅供内部参考，不再调用。"""
     p = str(path or "").strip()
     if p.startswith("obs://"):
         p = p[len("obs://"):]
@@ -681,6 +689,12 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
         )
     sample_total = int(reg.get("data_total") or 0)
 
+    # 每个子任务跑几条：默认沿用登记样本数（批量实验的既有口径）。
+    # common.total_num > 0 时按它截断 —— 小样本冒烟、或长数据集分期跑。
+    # 不做「0 = 不限制」：那会让进度分母退回实际文件数，与实验页展示的任务总数对不上。
+    req_total = int(req.common.total_num or 0)
+    limit_num = req_total if req_total > 0 else sample_total
+
     # OBS 目录由登记带出，不接受前端传入 —— 同一份数据集在不同实验里口径必须一致。
     # default_skills 是逗号分隔的技能名，不是路径，别 strip_bucket。
     obs_from_reg = {
@@ -695,7 +709,8 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
     # 直接原样套给 N 个子任务会让它们全部写进同一个 OBS 目录、轨迹互相覆盖
     # （与 task_name 必须唯一是同一类问题）。留空则完全交给后端按
     # {harness}_trajs/traj_{task_name} 自动生成。
-    traj_prefix = (reg.get("traj_save_path") or "").strip().rstrip("/")
+    # traj_save_path 可能带 obs:// 前缀（路径统一改造后），这里剥离后再当前缀用
+    traj_prefix = _strip_bucket((reg.get("traj_save_path") or "")).strip().rstrip("/")
 
     # 矩阵的两条轴在这里展开：Harness 列表 × 模型列表 → 一个组合一个臂。
     # 前端提交的是两条独立的列表（harnesses / models），不是压平后的 arms ——
@@ -820,7 +835,10 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
                     "harness_type": arm.harness_type,
                     "harness_config_id": arm.harness_config_id,
                     "harness_config_version_id": arm.harness_config_version_id,
-                    "total_num": sample_total,
+                    # 任务总数：默认取登记样本数；common.total_num > 0 时按它截断
+                    # （小样本冒烟 / 长数据集分期跑）。0 不表示「不限制」—— 那样
+                    # 进度分母会退回实际文件数，与详情页的任务总数对不上。
+                    "total_num": limit_num,
                     "queue_id": qid,
                     # 测试集与 OBS 目录由登记决定，不接受前端传入
                     **obs_from_reg,

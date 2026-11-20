@@ -66,6 +66,10 @@
           placeholder="自动生成：{harness}_trajs/traj_{task_name}" />
       </el-form-item>
 
+      <el-form-item label="备注">
+        <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="可选，对该数据集的说明" />
+      </el-form-item>
+
       <el-form-item>
         <el-button type="primary" :loading="submitting" @click="handleSubmit">提交</el-button>
       </el-form-item>
@@ -134,6 +138,7 @@ const form = ref({
   task_path_obs: '',
   user_folder_obs: '',
   traj_save_path: '',
+  remark: '',
 })
 
 async function handleSubmit() {
@@ -237,6 +242,7 @@ onMounted(async () => {
         task_path_obs: reg.task_path_obs || '',
         user_folder_obs: reg.user_folder_obs || '',
         traj_save_path: reg.traj_save_path || '',
+        remark: reg.remark || '',
       }
       ElMessage.info('已从已有数据集复制，请修改后提交')
     } catch {

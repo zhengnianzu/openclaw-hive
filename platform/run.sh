@@ -285,6 +285,66 @@ stop_shallow_query() {
     _stop_pidfile shallow_query.pid "shallow-query"
 }
 
+# proxy tracker + 双车道 worker（代理用量采集链路）。
+# proxy_tracker：每 10s 增量读 complete.jsonl，把新完成的 task 投进 task_proxy_queue；
+# proxy_realtime：领实时车道(priority≥90)，定向拉取 OBS 上的 index.jsonl 并解析入库；
+# proxy_auto：领背景车道(priority<90)，历史实例回填，60s 一轮。
+# proxy_worker（无 --lane）保留，只扫本地缓存，用于 --backfill 与排障。
+start_proxy_tracker() {
+    if [ -f proxy_tracker.pid ] && kill -0 "$(cat proxy_tracker.pid)" 2>/dev/null; then
+        echo "proxy-tracker 已在运行 (PID: $(cat proxy_tracker.pid))"
+        return
+    fi
+    rm -f proxy_tracker.pid
+    nohup $PYTHON offline/proxy_tracker.py > proxy_tracker.log 2>&1 &
+    echo $! > proxy_tracker.pid
+    echo "proxy-tracker 已启动 (PID: $(cat proxy_tracker.pid))"
+}
+stop_proxy_tracker() {
+    _stop_pidfile proxy_tracker.pid "proxy-tracker"
+}
+
+start_proxy_realtime() {
+    if [ -f proxy_realtime.pid ] && kill -0 "$(cat proxy_realtime.pid)" 2>/dev/null; then
+        echo "proxy-realtime 已在运行 (PID: $(cat proxy_realtime.pid))"
+        return
+    fi
+    rm -f proxy_realtime.pid
+    nohup $PYTHON offline/proxy_worker.py --lane realtime > proxy_realtime.log 2>&1 &
+    echo $! > proxy_realtime.pid
+    echo "proxy-realtime 已启动 (PID: $(cat proxy_realtime.pid))"
+}
+stop_proxy_realtime() {
+    _stop_pidfile proxy_realtime.pid "proxy-realtime"
+}
+
+start_proxy_auto() {
+    if [ -f proxy_auto.pid ] && kill -0 "$(cat proxy_auto.pid)" 2>/dev/null; then
+        echo "proxy-auto 已在运行 (PID: $(cat proxy_auto.pid))"
+        return
+    fi
+    rm -f proxy_auto.pid
+    nohup $PYTHON offline/proxy_worker.py --lane auto > proxy_auto.log 2>&1 &
+    echo $! > proxy_auto.pid
+    echo "proxy-auto 已启动 (PID: $(cat proxy_auto.pid))"
+}
+stop_proxy_auto() {
+    _stop_pidfile proxy_auto.pid "proxy-auto"
+}
+start_proxy_worker() {
+    if [ -f proxy_worker.pid ] && kill -0 "$(cat proxy_worker.pid)" 2>/dev/null; then
+        echo "proxy-worker 已在运行 (PID: $(cat proxy_worker.pid))"
+        return
+    fi
+    rm -f proxy_worker.pid
+    nohup $PYTHON offline/proxy_worker.py > proxy_worker.log 2>&1 &
+    echo $! > proxy_worker.pid
+    echo "proxy-worker 已启动 (PID: $(cat proxy_worker.pid))"
+}
+stop_proxy_worker() {
+    _stop_pidfile proxy_worker.pid "proxy-worker"
+}
+
 # auto-tracker：历史实例的发现投递（背景车道）。
 # task_tracker 是纯点击驱动,没点过的实例一行都不投 —— 实测全库 2126 个已结束实例
 # 只有 16 个被跟踪,243 个实例共 301 万行永远等不到分析,而 shallow-auto 全程闲着。
@@ -443,6 +503,9 @@ case "$ACTION" in
         start_shallow_auto
         start_shallow_query
         start_realtime_worker
+        start_proxy_tracker
+        start_proxy_realtime
+        start_proxy_auto
 
         # 启动 Nginx（如果已安装）
         if command -v nginx &> /dev/null; then
@@ -483,6 +546,9 @@ case "$ACTION" in
         stop_shallow_auto
         stop_shallow_query
         stop_realtime_worker
+        stop_proxy_tracker
+        stop_proxy_realtime
+        stop_proxy_auto
         stop_shallow_local
         stop_shallow_obs
         stop_worker
@@ -513,6 +579,9 @@ case "$ACTION" in
         stop_shallow_auto
         stop_shallow_query
         stop_realtime_worker
+        stop_proxy_tracker
+        stop_proxy_realtime
+        stop_proxy_auto
         stop_shallow_local
         stop_shallow_obs
         stop_worker
@@ -538,6 +607,9 @@ case "$ACTION" in
         start_shallow_auto
         start_shallow_query
         start_realtime_worker
+        start_proxy_tracker
+        start_proxy_realtime
+        start_proxy_auto
 
         if command -v nginx &> /dev/null; then
             NGINX_CONF="$SCRIPT_DIR/nginx.conf"
@@ -562,7 +634,7 @@ case "$ACTION" in
 
     # 单个 worker 的实时日志。这 4 个就是当前架构的全部常驻进程。
     #   ./run.sh logs-tracker | logs-rt | logs-auto | logs-dl
-    logs-tracker|logs-atracker|logs-rt|logs-auto|logs-dl|logs-query)
+    logs-tracker|logs-atracker|logs-rt|logs-auto|logs-dl|logs-query|logs-proxy|logs-proxy-tracker|logs-proxy-rt|logs-proxy-auto)
         case "$ACTION" in
             logs-tracker) _f=tracker.log;          _n="tracker（发现投递/点击）" ;;
             logs-atracker) _f=auto_tracker.log;    _n="auto-tracker（历史实例投递）" ;;
@@ -570,6 +642,10 @@ case "$ACTION" in
             logs-auto)    _f=shallow_auto.log;     _n="shallow-auto（背景分析/全量）" ;;
             logs-dl)      _f=realtime_worker.log;  _n="deep-realtime（实时下载/交付物）" ;;
             logs-query)   _f=shallow_query.log;     _n="shallow-query（任务描述回填）" ;;
+            logs-proxy)   _f=proxy_worker.log;      _n="proxy-worker（本地扫描/回填）" ;;
+            logs-proxy-tracker) _f=proxy_tracker.log; _n="proxy-tracker（发现投递）" ;;
+            logs-proxy-rt)      _f=proxy_realtime.log; _n="proxy-realtime（实时车道）" ;;
+            logs-proxy-auto)    _f=proxy_auto.log;    _n="proxy-auto（背景车道）" ;;
         esac
         if [ -f "$_f" ]; then
             echo "=== $_n → $_f ==="
@@ -651,6 +727,9 @@ case "$ACTION" in
         _ws shallow_auto.pid     "shallow-auto（背景分析/全量）"      shallow_auto.log
         _ws shallow_query.pid    "shallow-query（任务描述回填）"      shallow_query.log
         _ws realtime_worker.pid  "deep-realtime（实时下载）"         realtime_worker.log
+        _ws proxy_tracker.pid    "proxy-tracker（代理用量发现）"     proxy_tracker.log
+        _ws proxy_realtime.pid   "proxy-realtime（实时车道采集）"     proxy_realtime.log
+        _ws proxy_auto.pid       "proxy-auto（背景车道采集）"        proxy_auto.log
 
         # 旧进程：正常应全部「未运行」。还在跑说明升级时漏停，会和新进程抢队列。
         for _pf in worker.pid deep_worker.pid shallow_local.pid shallow_obs.pid; do
@@ -686,6 +765,9 @@ case "$ACTION" in
         start_shallow_auto
         start_shallow_query
         start_realtime_worker
+        start_proxy_tracker
+        start_proxy_realtime
+        start_proxy_auto
         ;;
 
     worker-stop)
@@ -711,6 +793,9 @@ case "$ACTION" in
         start_shallow_auto
         start_shallow_query
         start_realtime_worker
+        start_proxy_tracker
+        start_proxy_realtime
+        start_proxy_auto
         ;;
 
     shallow-start|shallow-stop|shallow-restart)
@@ -734,6 +819,16 @@ case "$ACTION" in
             query-start) start_shallow_query ;;
             query-stop)  stop_shallow_query ;;
             query-restart) stop_shallow_query; sleep 1; start_shallow_query ;;
+        esac
+        ;;
+    proxy-start|proxy-stop|proxy-restart)
+        case "$ACTION" in
+            proxy-start) start_proxy_tracker; start_proxy_realtime; start_proxy_auto ;;
+            proxy-stop)  stop_proxy_tracker; stop_proxy_realtime; stop_proxy_auto ;;
+            proxy-restart)
+                stop_proxy_tracker; stop_proxy_realtime; stop_proxy_auto
+                sleep 1
+                start_proxy_tracker; start_proxy_realtime; start_proxy_auto ;;
         esac
         ;;
     atracker-start|atracker-stop|atracker-restart)
@@ -829,6 +924,7 @@ case "$ACTION" in
         echo "  logs-auto        shallow-auto 背景分析     → shallow_auto.log"
         echo "  logs-dl          deep-realtime 实时下载    → realtime_worker.log"
         echo "  logs-query       shallow-query 任务描述回填 → shallow_query.log"
+        echo "  logs-proxy       proxy-worker 代理用量采集 → proxy_worker.log"
         echo "  shallow-logs     四个一起看（tail -f 全部，自动打文件名分隔）"
         echo "                   也可写 ./run.sh shallow logs [tracker|rt|auto|dl]"
         echo "  worker-status    四个 worker 的 PID/运行时长 + 各自日志尾部"

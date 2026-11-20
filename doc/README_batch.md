@@ -99,6 +99,20 @@ Harness 列表 × 模型列表 × 重复次数 × 用户模拟轴（可选）
 
 前端提交时同时发 `harnesses` + `models` + 摊平后的 `arms`（兼容字段）。
 
+### 4.1 任务总数（`common.total_num`）
+
+每个子任务的取数条数：
+
+```python
+req_total = int(req.common.total_num or 0)
+limit_num = req_total if req_total > 0 else sample_total   # sample_total = 登记的 data_total
+```
+
+- `0` → 沿用登记的 `data_total`（批量实验的既有口径）
+- `>0` → 截断到前 N 条，配合 `start_index` 实现「从第几条开始取几条」
+- **不做「0 = 不限制」**：`create_instance` 里 `total_num=0` 会让 `_prepare_instance` 按实际文件数统计总任务数，进度分母随之漂移，与实验页展示的固定分母对不上。单任务页的 0 语义是「不限制」，批量里刻意不沿用。
+- 前端 `effectiveSampleTotal` 用同一规则算「总执行实例数」预览，避免页面数字与落库值不一致。
+
 ---
 
 ## 5. 调度与并发

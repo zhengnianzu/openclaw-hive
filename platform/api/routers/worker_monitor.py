@@ -33,6 +33,10 @@ WORKER_PID_FILES = {
     "shallow-realtime": "shallow_realtime.pid",    # 实时分析（用户点击，两阶段）
     "shallow-auto": "shallow_auto.pid",            # 背景分析（全量，最新优先）
     "deep-realtime": "realtime_worker.pid",        # 实时下载（点击的交付物）
+    # 代理用量采集链路（三进程）
+    "proxy-tracker": "proxy_tracker.pid",          # 增量发现完成 task → 投队列
+    "proxy-realtime": "proxy_realtime.pid",        # 实时车道：拉 OBS + 解析入库
+    "proxy-auto": "proxy_auto.pid",                # 背景车道：历史回填
     # 旧进程名：保留以便升级期间仍能看到它们的状态与历史心跳。
     # shallow-local / shallow-obs 已被 shallow-realtime/auto 取代（按阶段拆 → 按场景拆），
     # shallow（--shallow-only）与 deep（--deep-only）是更早的单体循环。
@@ -48,6 +52,9 @@ WORKER_LABEL = {
     "shallow-realtime": "实时分析（点击）",
     "shallow-auto": "背景分析（全量）",
     "deep-realtime": "实时下载（点击）",
+    "proxy-tracker": "代理用量发现",
+    "proxy-realtime": "代理用量采集（实时）",
+    "proxy-auto": "代理用量采集（批量）",
     # 旧名
     "shallow-local": "本地 DONE（旧）",
     "shallow-obs": "OBS 定级（旧）",

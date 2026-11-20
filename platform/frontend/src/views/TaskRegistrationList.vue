@@ -11,11 +11,24 @@
 
     <div class="glass-card" style="padding:0;overflow:hidden">
     <el-table :data="registrations" v-loading="loading" stripe style="width:100%" border>
+      <el-table-column prop="seq" label="序号" width="70" resizable />
       <el-table-column prop="created_at" label="创建时间" width="160" resizable />
       <el-table-column prop="task_name" label="任务名称" min-width="160" show-overflow-tooltip resizable />
       <el-table-column prop="created_by" label="创建人" width="100" resizable />
       <el-table-column prop="task_path_obs" label="用户Config目录" min-width="220"
         show-overflow-tooltip resizable />
+      <el-table-column label="样本数" width="110" align="center">
+        <template #default="{row}">
+          <span v-if="row.count_status === 'counting'" class="count-cell">
+            <el-icon class="loading-icon"><Loading /></el-icon>统计中
+          </span>
+          <el-tooltip v-else-if="row.count_status === 'error'" :content="row.count_error || '统计失败'" placement="top">
+            <span class="count-cell error" @click="recount(row)">失败，点击重试</span>
+          </el-tooltip>
+          <span v-else>{{ row.data_total || 0 }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="remark" label="备注" min-width="160" show-overflow-tooltip resizable />
       <el-table-column label="操作" width="220" fixed="right">
         <template #default="{row}">
           <div style="display:flex;align-items:center;gap:4px">
@@ -26,7 +39,7 @@
               <template #dropdown>
                 <el-dropdown-menu>
                   <el-dropdown-item command="copy">复制</el-dropdown-item>
-                  <el-dropdown-item v-if="row.status === 'pending'" command="execute">执行</el-dropdown-item>
+                  <el-dropdown-item command="recount">重新统计</el-dropdown-item>
                   <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
@@ -40,6 +53,7 @@
     <!-- 详情弹窗 -->
     <el-dialog v-model="detailVisible" title="数据集详情" width="650px">
       <el-descriptions :column="1" border v-if="currentReg">
+        <el-descriptions-item label="序号">{{ currentReg.seq || '-' }}</el-descriptions-item>
         <el-descriptions-item label="任务名称">{{ currentReg.task_name }}</el-descriptions-item>
         <el-descriptions-item label="创建人">{{ currentReg.created_by }}</el-descriptions-item>
         <el-descriptions-item label="创建时间">{{ currentReg.created_at }}</el-descriptions-item>
@@ -49,6 +63,8 @@
         <el-descriptions-item label="用户Config目录">{{ currentReg.task_path_obs || '-' }}</el-descriptions-item>
         <el-descriptions-item label="用户Profile目录">{{ currentReg.user_folder_obs || '-' }}</el-descriptions-item>
         <el-descriptions-item label="轨迹保存路径">{{ currentReg.traj_save_path || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="备注">{{ currentReg.remark || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="样本数">{{ currentReg.data_total || 0 }}</el-descriptions-item>
       </el-descriptions>
     </el-dialog>
 
@@ -76,6 +92,9 @@
         <el-form-item label="轨迹保存路径">
           <el-input v-model="editForm.traj_save_path" />
         </el-form-item>
+        <el-form-item label="备注">
+          <el-input v-model="editForm.remark" type="textarea" :rows="2" />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="editVisible = false">取消</el-button>
@@ -86,17 +105,15 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, ArrowDown } from '@element-plus/icons-vue'
+import { Plus, ArrowDown, Loading } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
-import { useHarnessStore } from '../stores/harness'
 
 const router = useRouter()
 const authStore = useAuthStore()
-const harnessStore = useHarnessStore()
 const registrations = ref([])
 const loading = ref(false)
 
@@ -104,9 +121,12 @@ const detailVisible = ref(false)
 const currentReg = ref(null)
 
 const editVisible = ref(false)
-const editForm = ref({ task_name: '', skill_dir_obs: '', default_skills: '', agent_dir_obs: '', task_path_obs: '', user_folder_obs: '', traj_save_path: '' })
+const editForm = ref({ task_name: '', skill_dir_obs: '', default_skills: '', agent_dir_obs: '', task_path_obs: '', user_folder_obs: '', traj_save_path: '', remark: '' })
 const editLoading = ref(false)
 let editingId = null
+
+// 统计中的行需要轮询。离开页面时清掉。
+let pollTimer = null
 
 async function loadRegistrations() {
   loading.value = true
@@ -115,6 +135,23 @@ async function loadRegistrations() {
   } finally {
     loading.value = false
   }
+  schedulePoll()
+}
+
+function schedulePoll() {
+  if (pollTimer) clearInterval(pollTimer)
+  const hasCounting = registrations.value.some(r => r.count_status === 'counting')
+  if (!hasCounting) return
+  pollTimer = setInterval(async () => {
+    try {
+      const fresh = await api.get('/registrations')
+      registrations.value = fresh
+      if (!fresh.some(r => r.count_status === 'counting')) {
+        clearInterval(pollTimer)
+        pollTimer = null
+      }
+    } catch { /* ignore */ }
+  }, 5000)
 }
 
 function showDetail(row) {
@@ -132,6 +169,7 @@ function openEditDialog(row) {
     task_path_obs: row.task_path_obs || '',
     user_folder_obs: row.user_folder_obs || '',
     traj_save_path: row.traj_save_path || '',
+    remark: row.remark || '',
   }
   editVisible.value = true
 }
@@ -150,26 +188,44 @@ async function saveEdit() {
 
 async function deleteReg(row) {
   await ElMessageBox.confirm('确认删除该数据集？', '提示', { type: 'warning' })
-  await api.delete(`/registrations/${row.id}`)
-  ElMessage.success('已删除')
-  loadRegistrations()
+  try {
+    await api.delete(`/registrations/${row.id}`)
+    ElMessage.success('已删除')
+    loadRegistrations()
+  } catch (e) {
+    const detail = e.response?.data?.detail || e.message || '删除失败'
+    ElMessage.error(detail)
+  }
+}
+
+async function recount(row) {
+  try {
+    await api.post(`/registrations/${row.id}/count-sample`)
+    ElMessage.success('已触发重新统计')
+    loadRegistrations()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '触发失败')
+  }
 }
 
 function handleCommand(cmd, row) {
   const actions = {
     copy: () => router.push(`/task-register?copy_from=${row.id}`),
-    execute: () => {
-      router.push(`/create?from_registration=${row.id}`)
-    },
+    recount: () => recount(row),
     delete: () => deleteReg(row),
   }
   actions[cmd]?.()
 }
 
-onMounted(() => { harnessStore.load(); loadRegistrations() })
+onMounted(() => { loadRegistrations() })
+onBeforeUnmount(() => { if (pollTimer) clearInterval(pollTimer) })
 </script>
 
 <style scoped>
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 h2 { color: var(--text-primary); font-size: 24px; font-weight: 700; }
+.count-cell { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary, #909399); }
+.count-cell.error { color: var(--el-color-danger, #f56c6c); cursor: pointer; }
+.loading-icon { animation: spin 1s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 </style>

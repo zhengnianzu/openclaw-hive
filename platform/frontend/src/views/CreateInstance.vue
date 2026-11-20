@@ -47,6 +47,13 @@
 
       <el-tabs v-model="activeTab" style="margin-top:8px">
         <el-tab-pane label="OBS配置" name="obs">
+          <div class="reg-load-bar">
+            <span class="reg-load-hint">可手工填写 OBS 目录，或从已有数据集一次性带入</span>
+            <el-button type="primary" plain size="small" @click="openRegDialog">
+              <el-icon><FolderOpened /></el-icon>&nbsp;从数据集加载
+            </el-button>
+          </div>
+
           <el-form-item label="技能目录">
             <el-input v-model="form.skill_dir" placeholder="skills/260325/skill_localize/skills_library">
               <template #append>
@@ -376,6 +383,23 @@
       <template #footer>
         <el-button @click="obsVisible = false">取消</el-button>
         <el-button type="primary" @click="confirmObsSelect">选择当前目录</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 从数据集加载 OBS 配置 -->
+    <el-dialog v-model="regDialogVisible" title="从数据集加载 OBS 配置" width="480px">
+      <el-select v-model="selectedRegId" filterable style="width:100%" placeholder="选择数据集">
+        <el-option
+          v-for="r in regList" :key="r.id"
+          :label="`#${r.seq || r.id}  ${r.task_name}（${r.data_total || 0} 条）`"
+          :value="r.id" />
+      </el-select>
+      <div style="margin-top:8px;font-size:12px;color:#999">
+        只覆盖 OBS 目录字段，不改实例名称、模型和 Agent 配置。
+      </div>
+      <template #footer>
+        <el-button @click="regDialogVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!selectedRegId" @click="confirmRegSelect">确认带入</el-button>
       </template>
     </el-dialog>
   </div>
@@ -718,6 +742,39 @@ async function loadCodeRepos() {
   } catch { codeRepoList.value = [] }
 }
 
+// --- 从数据集加载 ---
+const regList = ref([])
+const regDialogVisible = ref(false)
+const selectedRegId = ref(null)
+
+async function openRegDialog() {
+  try { regList.value = await api.get('/registrations') } catch { regList.value = [] }
+  selectedRegId.value = null
+  regDialogVisible.value = true
+}
+
+function confirmRegSelect() {
+  const reg = regList.value.find(r => r.id === selectedRegId.value)
+  if (!reg) { regDialogVisible.value = false; return }
+  applyRegistration(reg)
+  regDialogVisible.value = false
+  ElMessage.success('已从数据集带入 OBS 配置')
+}
+
+// 只覆盖 OBS 目录字段，不动实例名 / 模型 / agents 等。
+// 实例表单存相对路径（剥桶名），登记表存完整路径，这里统一剥一层。
+// from_registration 路由分支和「从数据集加载」弹窗共用。
+function applyRegistration(reg) {
+  if (reg.task_name && !form.value.name) form.value.name = reg.task_name
+  form.value.user_config_dir = stripBucket(reg.task_path_obs || '')
+  form.value.skill_dir = stripBucket(reg.skill_dir_obs || '')
+  form.value.agent_dir = stripBucket(reg.agent_dir_obs || '')
+  form.value.user_profile_dir = stripBucket(reg.user_folder_obs || '')
+  form.value.default_skills = reg.default_skills || ''
+  if (reg.traj_save_path) form.value.traj_save_path = stripBucket(reg.traj_save_path)
+  form.value.total_num = 0
+}
+
 // Base URL 候选：后端按归一化地址聚合历史用量并补上代理名（/export-meta/base-urls）。
 // 取不到就留空数组——下拉是 allow-create 的，没候选也能照常手填。
 async function loadBaseUrls() {
@@ -767,13 +824,7 @@ async function handleCreate() {
   }
   creating.value = true
   try {
-    const res = await api.post('/instances', form.value)
-    const fromRegistration = route.query.from_registration
-    if (fromRegistration && res.id) {
-      try {
-        await api.put(`/registrations/${fromRegistration}/link?instance_id=${res.id}`)
-      } catch { /* non-critical */ }
-    }
+    await api.post('/instances', form.value)
     ElMessage.success('创建成功')
     router.push('/dashboard')
   } finally { creating.value = false }
@@ -841,8 +892,9 @@ function navigateTo(idx) {
 }
 
 function confirmObsSelect() {
-  const relative = stripBucket(obsCurrentPath.value)
-  form.value[obsTargetField] = relative
+  // 实例表单存相对路径（剥桶名），与 config.yaml 里 *_download_path 的口径一致。
+  // 登记表存完整路径，浏览器内部用完整路径，这里落地时统一剥一层。
+  form.value[obsTargetField] = stripBucket(obsCurrentPath.value)
   obsVisible.value = false
 }
 
@@ -876,58 +928,9 @@ onMounted(async () => {
   } else if (fromRegistration) {
     try {
       const reg = await api.get(`/registrations/${fromRegistration}`)
-      const stripObsPrefix = p => stripBucket(p)
       const rand = String(Math.floor(Math.random() * 10000)).padStart(4, '0')
-
-      // 1. 先加载配置模板（兜底）
-      const templateId = reg.config_template_id || route.query.template_id
-      if (templateId) {
-        try {
-          const tpl = await api.get(`/config-templates/${templateId}`)
-          if (tpl) applyTemplate(tpl)
-        } catch {}
-      }
-
-      // 2. 再用数据集字段覆盖（数据集优先级更高）
-      // 名称不再拼 requester：需求方字段已从数据集界面移除，老数据的 requester
-      // 可能是空串，拼出来会变成「任务名- 」，看起来像缺了半截。
-      form.value.name = reg.task_name
+      applyRegistration(reg)
       form.value.task_name = `${genTaskId()}${rand}`
-      form.value.user_config_dir = stripObsPrefix(reg.task_path_obs)
-      form.value.skill_dir = stripObsPrefix(reg.skill_dir_obs)
-      form.value.agent_dir = stripObsPrefix(reg.agent_dir_obs)
-      form.value.user_profile_dir = stripObsPrefix(reg.user_folder_obs)
-      form.value.default_skills = reg.default_skills || ''
-      // 轨迹保存路径：数据集里留空表示「由后端按 harness + task_name 自动生成」，
-      // 此时不要写入空串，保持表单默认（自动生成）语义。
-      if (reg.traj_save_path) {
-        form.value.traj_save_path = stripObsPrefix(reg.traj_save_path)
-      }
-      // total_num 不再从数据集取：数据集已不填「数据总量」，留 0 让启动准备阶段
-      // 按下载到本地的实际文件数统计（instances._prepare_instance 里 total_num<=0
-      // 时取 available）。
-      form.value.total_num = 0
-
-      // 3. 用登记的 agent 信息覆盖模板中的 agents
-      if (reg.eval_model_name && form.value.agents.length > 0) {
-        form.value.agents[0].model = reg.eval_model_name
-      }
-      if (reg.eval_config_model) {
-        const evaluator = form.value.agents.find(a => a.name === 'evaluator')
-        if (evaluator) {
-          evaluator.model = reg.eval_config_model
-        } else {
-          form.value.agents.push({ name: 'evaluator', model: reg.eval_config_model, base_url: '', api_key: '', api: '', provider: '', invite_code: '' })
-        }
-      }
-
-      if (!form.value.agents || form.value.agents.length === 0) {
-        const agents = [{ name: 'user_simulator', model: reg.eval_model_name || '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }]
-        if (reg.eval_config_model) {
-          agents.push({ name: 'evaluator', model: reg.eval_config_model, base_url: '', api_key: '', api: '', provider: '', invite_code: '' })
-        }
-        form.value.agents = agents
-      }
       ElMessage.info('已从数据集预填配置')
     } catch {
       ElMessage.warning('无法加载数据集信息')
@@ -956,5 +959,20 @@ onMounted(async () => {
 /* 任务标识等较长的表单标签不换行, 保持一行显示 */
 :deep(.el-form-item__label) {
   white-space: nowrap;
+}
+.reg-load-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--el-fill-color-extra-light, #f9fafb);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: 6px;
+}
+.reg-load-hint {
+  font-size: 12px;
+  color: var(--text-secondary, #909399);
 }
 </style>

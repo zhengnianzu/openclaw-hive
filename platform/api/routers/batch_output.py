@@ -395,7 +395,12 @@ async def shallow_tasks(
 
     from_sql = ("FROM task_records tr "
                 "LEFT JOIN task_traj_records ttr "
-                "  ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name")
+                "  ON ttr.instance_id = tr.instance_id AND ttr.config_name = tr.config_name "
+                "LEFT JOIN task_proxy_usage tpu "
+                "  ON tpu.instance_id = tr.instance_id "
+                "  AND tpu.traj_name = CASE WHEN tr.config_name LIKE '%.json' "
+                "      THEN SUBSTR(tr.config_name, 1, LENGTH(tr.config_name)-5) "
+                "      ELSE tr.config_name END")
     total_row = await async_query_one(
         f"SELECT COUNT(*) AS n {from_sql} WHERE {where_sql}", tuple(params)
     )
@@ -410,7 +415,11 @@ async def shallow_tasks(
         # 用 COALESCE 优先取 task_records（本地日志口径最准），回退到 ttr。
         f"SELECT tr.task_idx, tr.config_name, tr.traj_level, tr.status, tr.error_code, "
         f"tr.error_category, tr.eval_score, tr.eval_completion, tr.gate, "
-        f"COALESCE(tr.task_done, ttr.task_done) AS task_done, ttr.has_eval "
+        f"COALESCE(tr.task_done, ttr.task_done) AS task_done, ttr.has_eval, "
+        f"tpu.calls_total AS proxy_calls, tpu.calls_success AS proxy_calls_success, "
+        f"tpu.calls_error AS proxy_calls_error, tpu.tok_in AS proxy_tok_in, "
+        f"tpu.tok_out AS proxy_tok_out, tpu.tok_total AS proxy_tok_total, "
+        f"tpu.models AS proxy_models "
         f"{from_sql} WHERE {where_sql} ORDER BY tr.{col} {direction} LIMIT ? OFFSET ?",
         tuple(params) + (page_size, offset),
     )
@@ -895,6 +904,77 @@ async def get_proxy_config(instance_id: str, user: dict = Depends(get_current_us
         "started_at": inst.get("started_at") or "",
         "stopped_at": inst.get("stopped_at") or "",
         "rows": rows,
+    }
+
+
+@router.get("/{instance_id}/proxy-usage")
+async def get_proxy_usage(instance_id: str, user: dict = Depends(get_current_user)):
+    """本地代理（llm_proxy_lite）的模型用量面板。
+
+    数据由 offline/proxy_worker.py 从沙箱产物里的 `logs_proxy/traj/index.jsonl`
+    聚合而来（读本地缓存盘，零 obsutil），落在 task_proxy_usage /
+    task_proxy_model_usage 两张表。这里只做只读汇总。
+
+    proxy_enable=false 的实例不会有数据 —— 返回 proxy_enable=false + summary=null，
+    前端据此整块隐藏。已开启但 worker 还没采到（产物未下载）时 summary 同样是 null，
+    但 computed_at 也为 null，前端显示「等待采集」而不是「无数据」。
+    """
+    inst = _get_instance(instance_id)
+    proxy_enable = False
+    try:
+        if inst.get("create_params"):
+            proxy_enable = bool(json.loads(inst["create_params"]).get("proxy_enable"))
+    except (ValueError, TypeError):
+        proxy_enable = False
+
+    if not proxy_enable:
+        return {"instance_id": instance_id, "proxy_enable": False,
+                "summary": None, "by_model": [], "by_traj": [], "computed_at": None}
+
+    usage = await async_query(
+        "SELECT * FROM task_proxy_usage WHERE instance_id=? ORDER BY traj_name",
+        (instance_id,))
+    model_rows = await async_query(
+        "SELECT model, SUM(calls) AS calls, SUM(calls_error) AS calls_error, "
+        "       SUM(tok_in) AS tok_in, SUM(tok_out) AS tok_out "
+        "FROM task_proxy_model_usage WHERE instance_id=? "
+        "GROUP BY model ORDER BY tok_in + tok_out DESC", (instance_id,))
+
+    if not usage:
+        return {"instance_id": instance_id, "proxy_enable": True,
+                "summary": None, "by_model": [], "by_traj": [], "computed_at": None}
+
+    # 汇总按 traj 相加：同一实例可能有多个 traj（多 query / 多 config）
+    summary = {
+        "calls_total": sum(int(r["calls_total"] or 0) for r in usage),
+        "calls_success": sum(int(r["calls_success"] or 0) for r in usage),
+        "calls_error": sum(int(r["calls_error"] or 0) for r in usage),
+        "tok_in": sum(int(r["tok_in"] or 0) for r in usage),
+        "tok_out": sum(int(r["tok_out"] or 0) for r in usage),
+    }
+    summary["tok_total"] = summary["tok_in"] + summary["tok_out"]
+
+    return {
+        "instance_id": instance_id,
+        "proxy_enable": True,
+        "summary": summary,
+        "by_model": [
+            {"model": r["model"], "calls": int(r["calls"] or 0),
+             "calls_error": int(r["calls_error"] or 0),
+             "tok_in": int(r["tok_in"] or 0), "tok_out": int(r["tok_out"] or 0),
+             "tok_total": int(r["tok_in"] or 0) + int(r["tok_out"] or 0)}
+            for r in model_rows
+        ],
+        "by_traj": [
+            {"traj_name": r["traj_name"], "config_name": r["config_name"],
+             "calls_total": int(r["calls_total"] or 0),
+             "calls_error": int(r["calls_error"] or 0),
+             "tok_in": int(r["tok_in"] or 0), "tok_out": int(r["tok_out"] or 0),
+             "tok_total": int(r["tok_total"] or 0),
+             "computed_at": r["computed_at"]}
+            for r in usage
+        ],
+        "computed_at": max((r["computed_at"] or 0) for r in usage) or None,
     }
 
 

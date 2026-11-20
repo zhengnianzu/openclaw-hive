@@ -117,6 +117,12 @@ class BatchCommonParams(BaseModel):
     max_ttl_second: int = 36000
     start_index: int = 0
 
+    # 每个子任务取测试集里的前几条。0 = 沿用登记的样本数 data_total
+    # （批量实验的既有行为）；>0 = 只跑前 N 条，用于小样本冒烟或截断长数据集。
+    # 注意与单任务的 total_num=0 语义不同：单任务 0 是「不限制」，批量里
+    # 不限条数会让进度分母退回实际文件数，与「任务总数」列的展示口径不一致。
+    total_num: int = 0
+
     # 留空即由后端按 {harness}_trajs/traj_{task_name} 生成，而 task_name 已按
     # (臂, 模拟臂, 轮次) 唯一，所以不配也不会串路径。
     traj_save_path: str = ""

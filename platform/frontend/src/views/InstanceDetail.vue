@@ -757,6 +757,86 @@
           <el-empty v-else description="暂无模型配置信息" :image-size="40" />
         </el-card>
 
+        <!-- 代理用量：本地代理（llm_proxy_lite）的模型调用统计。
+             数据由 offline/proxy_worker.py 从沙箱产物 logs_proxy/traj/index.jsonl 聚合，
+             只在创建参数「启动本地代理」开启时存在。 -->
+        <el-card v-if="proxyUsageEnabled" style="margin-bottom:16px" v-loading="proxyUsageLoading">
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span>代理用量
+                <span style="color:var(--text-muted);font-weight:400;font-size:12px">
+                  沙箱 logs_proxy 采集
+                </span>
+              </span>
+              <span style="color:var(--text-muted);font-size:12px">
+                {{ proxyUsage && proxyUsage.computed_at ? `采集于 ${fmtEpoch(proxyUsage.computed_at)}` : '' }}
+              </span>
+            </div>
+          </template>
+          <template v-if="proxyUsage && proxyUsage.summary">
+            <div class="proxy-stat-row">
+              <div class="proxy-stat">
+                <span class="proxy-stat-label">总调用</span>
+                <span class="proxy-stat-value">{{ proxyUsage.summary.calls_total }}</span>
+              </div>
+              <div class="proxy-stat">
+                <span class="proxy-stat-label">成功 / 失败</span>
+                <span class="proxy-stat-value">
+                  {{ proxyUsage.summary.calls_success }}
+                  <span v-if="proxyUsage.summary.calls_error > 0" style="color:#f56c6c">
+                    / {{ proxyUsage.summary.calls_error }}
+                  </span>
+                </span>
+              </div>
+              <div class="proxy-stat">
+                <span class="proxy-stat-label">成功调用率</span>
+                <span class="proxy-stat-value"
+                  :style="{ color: proxyUsage.summary.calls_error === 0 ? '#67c23a'
+                    : (proxyUsage.summary.calls_success / proxyUsage.summary.calls_total >= 0.9 ? '#e6a23c' : '#f56c6c') }">
+                  {{ proxyUsage.summary.calls_total > 0
+                    ? Math.round(proxyUsage.summary.calls_success / proxyUsage.summary.calls_total * 100) + '%'
+                    : '—' }}
+                </span>
+              </div>
+              <div class="proxy-stat">
+                <span class="proxy-stat-label">输入 Tokens</span>
+                <span class="proxy-stat-value">{{ fmtTokens(proxyUsage.summary.tok_in) }}</span>
+              </div>
+              <div class="proxy-stat">
+                <span class="proxy-stat-label">输出 Tokens</span>
+                <span class="proxy-stat-value">{{ fmtTokens(proxyUsage.summary.tok_out) }}</span>
+              </div>
+              <div class="proxy-stat">
+                <span class="proxy-stat-label">总计 Tokens</span>
+                <span class="proxy-stat-value">{{ fmtTokens(proxyUsage.summary.tok_total) }}</span>
+              </div>
+            </div>
+            <el-table v-if="proxyUsage.by_model.length" :data="proxyUsage.by_model" size="small" style="width:100%">
+              <el-table-column prop="model" label="模型" min-width="200" show-overflow-tooltip>
+                <template #default="{ row }">
+                  <span style="font-family:monospace;font-size:12px">{{ row.model }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="calls" label="调用次数" width="100" align="right" />
+              <el-table-column label="失败" width="80" align="right">
+                <template #default="{ row }">
+                  <span :style="row.calls_error ? 'color:#f56c6c' : 'color:#c0c4cc'">{{ row.calls_error || '—' }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="输入" width="140" align="right">
+                <template #default="{ row }">{{ fmtTokens(row.tok_in) }}</template>
+              </el-table-column>
+              <el-table-column label="输出" width="140" align="right">
+                <template #default="{ row }">{{ fmtTokens(row.tok_out) }}</template>
+              </el-table-column>
+              <el-table-column label="合计" width="140" align="right">
+                <template #default="{ row }"><strong>{{ fmtTokens(row.tok_total) }}</strong></template>
+              </el-table-column>
+            </el-table>
+          </template>
+          <el-empty v-else :description="proxyUsage ? '尚无采集数据（等待 worker 处理本地交付物）' : '加载中…'" :image-size="40" />
+        </el-card>
+
         <!-- 对话导出弹窗：填入导出名称（默认任务名）+ 导出方式下拉 → 提交 -->
         <el-dialog v-model="exportDialogVisible" title="对话导出" width="480px" append-to-body>
           <el-form label-width="90px" size="small">
@@ -954,6 +1034,47 @@
             <el-table-column prop="eval_score" label="评分" min-width="110" align="right" sortable="custom">
               <template #default="{ row }">
                 <span :style="{ color: scoreColor(row.eval_score) }">{{ fmtScore(row.eval_score) }}</span>
+              </template>
+            </el-table-column>
+            <!-- 代理用量四列：仅对开启本地代理的实例显示，数据来自 task_proxy_usage -->
+            <el-table-column v-if="proxyUsageEnabled" label="输入 Tokens" min-width="130" align="right" sortable="custom" prop="proxy_tok_in">
+              <template #header>
+                <span>输入 Tokens <span style="color:var(--text-muted);font-size:10px;font-weight:400">🌐</span></span>
+              </template>
+              <template #default="{ row }">
+                <span v-if="row.proxy_calls" style="font-variant-numeric:tabular-nums">{{ fmtTokens(row.proxy_tok_in) }}</span>
+                <span v-else style="color:var(--text-muted)">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="proxyUsageEnabled" label="输出 Tokens" min-width="130" align="right" sortable="custom" prop="proxy_tok_out">
+              <template #header>
+                <span>输出 Tokens <span style="color:var(--text-muted);font-size:10px;font-weight:400">🌐</span></span>
+              </template>
+              <template #default="{ row }">
+                <span v-if="row.proxy_calls" style="font-variant-numeric:tabular-nums">{{ fmtTokens(row.proxy_tok_out) }}</span>
+                <span v-else style="color:var(--text-muted)">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="proxyUsageEnabled" label="次数" min-width="80" align="right" sortable="custom" prop="proxy_calls">
+              <template #header>
+                <span>次数 <span style="color:var(--text-muted);font-size:10px;font-weight:400">🌐</span></span>
+              </template>
+              <template #default="{ row }">
+                <span v-if="row.proxy_calls" style="font-variant-numeric:tabular-nums">{{ row.proxy_calls }}</span>
+                <span v-else style="color:var(--text-muted)">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="proxyUsageEnabled" label="成功率" min-width="90" align="right" prop="proxy_calls">
+              <template #header>
+                <span>成功率 <span style="color:var(--text-muted);font-size:10px;font-weight:400">🌐</span></span>
+              </template>
+              <template #default="{ row }">
+                <template v-if="row.proxy_calls">
+                  <span :style="{ color: (row.proxy_calls_error || 0) === 0 ? '#67c23a' : (row.proxy_calls_success / row.proxy_calls >= 0.9 ? '#e6a23c' : '#f56c6c') }">
+                    {{ Math.round((row.proxy_calls_success / row.proxy_calls) * 100) }}%
+                  </span>
+                </template>
+                <span v-else style="color:var(--text-muted)">—</span>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="130" align="center" fixed="right">
@@ -1242,7 +1363,7 @@ function ensureTabLoaded(tab) {
     loadTaskLogFiles(); loadTaskStatusMap(); loadLogs(); loadLogEvents()
     if (!(overview.value.error_tree || []).length) loadData(true)
   }
-  else if (tab === 'outputs') { loadShallow(false); loadArtifactProgress(); loadProxyConfig(); setTimeout(refreshProxyExportStatus, 500) }
+  else if (tab === 'outputs') { loadShallow(false); loadArtifactProgress(); loadProxyConfig(); loadProxyUsage(); setTimeout(refreshProxyExportStatus, 500) }
   // 队列 tab 不单独拉：loadData() 末尾会调 loadQueueInfo()。但切到该 tab 时
   // 不能干等下一次 10s 轮询，这里直接触发一次，插队按钮/名次才不会延迟 10 秒才出来。
   else if (tab === 'queue') { loadQueueInfo() }
@@ -2786,10 +2907,42 @@ const proxyLoading = ref(false)
 const proxyStartedAt = ref('')
 const proxyStoppedAt = ref('')
 const exportingProxy = ref(false)
+// 代理用量（logs_proxy 采集）。proxyUsageEnabled 取接口回传的 proxy_enable ——
+// 未开启代理的实例整块卡片隐藏，而不是显示一个空表。
+const proxyUsage = ref(null)
+const proxyUsageEnabled = ref(false)
+const proxyUsageLoading = ref(false)
 
 function fmtProxyTime(t) {
   if (!t) return '—'
   return String(t).replace('T', ' ').slice(0, 19)
+}
+
+// 千分位，token 量级动辄百万，裸数字读不出来
+function fmtTokens(n) {
+  const v = Number(n || 0)
+  return v.toLocaleString('en-US')
+}
+
+// computed_at 是后端 time.time() 的 epoch 秒（浮点），不是 ISO 串 ——
+// 直接丢给 fmtProxyTime 会渲染成 "1763..." 这样的一串数字。
+function fmtEpoch(t) {
+  const v = Number(t || 0)
+  if (!v) return '—'
+  const d = new Date(v * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+       + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+async function loadProxyUsage() {
+  proxyUsageLoading.value = true
+  try {
+    const res = await api.get(`/instances/${id}/proxy-usage`)
+    proxyUsageEnabled.value = !!res.proxy_enable
+    proxyUsage.value = res.proxy_enable ? res : null
+  } catch { /* interceptor 已提示；静默保持上次 */ }
+  finally { proxyUsageLoading.value = false }
 }
 
 async function loadProxyConfig() {
@@ -3130,6 +3283,7 @@ watch(activeTab, (tab) => {
     if (!shallowTimer) shallowTimer = setInterval(() => loadShallow(false), 10000)
     loadArtifactProgress()
     loadProxyConfig()  // 切回输出 tab 刷新模型配置面板
+    loadProxyUsage()   // 代理用量（logs_proxy 采集，仅开启本地代理的实例有）
     setTimeout(refreshProxyExportStatus, 500)
   } else {
     if (shallowTimer) { clearInterval(shallowTimer); shallowTimer = null }
@@ -3535,6 +3689,22 @@ onUnmounted(() => {
 }
 .failed-bar {
   background: #f56c6c;
+}
+
+/* 代理用量统计行：5 个等宽卡片，token 用等宽数字对齐 */
+.proxy-stat-row {
+  display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px;
+}
+.proxy-stat {
+  flex: 1 1 140px; display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 14px; border-radius: 6px; background: var(--bg-subtle, #f7f8fa);
+}
+.proxy-stat-label {
+  font-size: 12px; color: var(--text-muted);
+}
+.proxy-stat-value {
+  font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
 }
 .funnel-bar-label {
   font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
