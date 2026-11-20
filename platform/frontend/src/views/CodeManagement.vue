@@ -10,12 +10,6 @@
       </div>
     </div>
 
-    <el-alert type="info" :closable="false" style="margin-bottom:12px">
-      <template #title>版本命名规范（新版本请以 <code>v + 完整日期</code> 命名）</template>
-      推荐规则：符合上述命名格式（兼容旧格式）的启用版本中取日期最新的一条；其他分支 / 自定义版本仍在下拉可选，但不参与推荐。<br>
-      <b>停用</b>只影响创建页下拉可见性，存量实例不受影响。
-    </el-alert>
-
     <div class="filter-bar">
       <el-input v-model="versionQuery" placeholder="搜索版本" clearable size="default" style="width:220px"
         @keyup.enter="applyFilters" @clear="applyFilters">
@@ -25,8 +19,11 @@
         @change="applyFilters">
         <el-option v-for="t in tags" :key="t.id" :label="t.name" :value="t.name" />
       </el-select>
+      <el-select v-model="creatorFilter" placeholder="创建者" clearable filterable size="default" style="width:160px">
+        <el-option v-for="c in creatorOptions" :key="c" :label="c" :value="c" />
+      </el-select>
       <el-button @click="applyFilters">搜索</el-button>
-      <el-button v-if="versionQuery || tagFilter" text @click="resetFilters">重置</el-button>
+      <el-button v-if="versionQuery || tagFilter || creatorFilter" text @click="resetFilters">重置</el-button>
     </div>
 
     <div class="glass-card" style="padding:0;overflow:hidden">
@@ -46,7 +43,12 @@
             <span v-else class="muted">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="启用" width="90" align="center" resizable>
+        <el-table-column label="默认" width="80" align="center" resizable>
+          <template #default="{row}">
+            <el-switch :model-value="row.is_default === true" @change="v => setDefaultRepo(row, v)" />
+          </template>
+        </el-table-column>
+        <el-table-column label="启用" width="80" align="center" resizable>
           <template #default="{row}">
             <el-switch :model-value="row.enabled !== false" @change="v => toggleEnabled(row, v)" />
           </template>
@@ -109,6 +111,10 @@
             <el-option v-for="t in tags" :key="t.id" :label="t.name" :value="t.name" />
           </el-select>
           <div class="field-hint">标签用来标记所属分支/用途；新标签请先用右上角「管理标签」创建</div>
+        </el-form-item>
+        <el-form-item label="设为默认">
+          <el-switch v-model="createForm.is_default" />
+          <div class="field-hint">全局唯一：设为默认后原默认代码仓自动取消；高级配置选完 harness 后自动填入</div>
         </el-form-item>
         <el-form-item label="描述">
           <el-input v-model="createForm.description" type="textarea" :rows="2" placeholder="可选描述" />
@@ -261,7 +267,11 @@ const creatingTag = ref(false)
 
 const createVisible = ref(false)
 const creating = ref(false)
-const createForm = ref({ name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'harness_automation.py', tag: '' })
+const createForm = ref({ name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'harness_automation.py', tag: '', is_default: false })
+const creatorFilter = ref('')
+const creatorOptions = computed(() =>
+  [...new Set((repos.value || []).map(r => r.created_by).filter(Boolean))].sort()
+)
 
 const editVisible = ref(false)
 const updating = ref(false)
@@ -272,9 +282,12 @@ const detail = ref({})
 const detailStatus = ref(null)
 const detailStatusLoading = ref(false)
 
+const creatorFiltered = computed(() =>
+  !creatorFilter.value ? repos.value : repos.value.filter(r => r.created_by === creatorFilter.value)
+)
 const pagedRepos = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
-  return repos.value.slice(start, start + pageSize.value)
+  return creatorFiltered.value.slice(start, start + pageSize.value)
 })
 
 // 换每页条数时回到第一页，否则会停在一个空页上
@@ -286,14 +299,25 @@ watch(() => repos.value.length, (n) => {
 })
 
 // 启用开关: 只影响创建页下拉可见性; 存量实例引用的是版本快照, 不受影响
+// 行内切换默认代码仓(与启用开关同款交互): 全局唯一,
+// 后端设新默认时自动清旧默认, 这里本地同步其他行的标记免整页刷新。
+async function setDefaultRepo(row, v) {
+  try {
+    await api.patch(`/code-repos/${row.id}`, { is_default: v })
+    row.is_default = v
+    if (v) {
+      repos.value.forEach(r => { if (r.id !== row.id) r.is_default = false })
+    }
+    ElMessage.success(v ? `已设为默认：${row.name} / ${row.version}` : '已取消默认')
+  } catch { ElMessage.error('切换失败') }
+}
+
 async function toggleEnabled(row, v) {
   try {
     await api.patch(`/code-repos/${row.id}`, { enabled: v })
     row.enabled = v
     ElMessage.success(v ? '已启用' : '已停用（创建页不再列出）')
-  } catch (e) {
-    ElMessage.error('切换失败')
-  }
+  } catch { ElMessage.error('切换失败') }
 }
 
 async function loadRepos() {
@@ -328,6 +352,7 @@ function applyFilters() {
 function resetFilters() {
   versionQuery.value = ''
   tagFilter.value = ''
+  creatorFilter.value = ''
   applyFilters()
 }
 

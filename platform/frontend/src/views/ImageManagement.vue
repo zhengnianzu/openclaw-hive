@@ -7,14 +7,6 @@
       </el-button>
     </div>
 
-    <el-alert type="info" :closable="false" style="margin-bottom:12px">
-      <template #title>镜像命名规范（名称中请携带日期）</template>
-      支持三种写法：<code>26.11.4</code>（年.月.日）、<code>20261102</code>（年月日连写）、
-      <code>jiuwenswarm:dev-stable-2026.10.23v1</code>（任意位置含日期即可）。<br>
-      推荐规则：当前 Harness 有专属镜像时优先推荐专属里日期最新的，否则推荐通用（如 multiharness 主镜像）里日期最新的；
-      名称中无日期的镜像不参与日期排序，按注册时间兜底。<b>停用</b>只影响创建页下拉可见性，存量实例不受影响。
-    </el-alert>
-
     <div class="filter-bar">
       <el-select v-model="typeFilter" placeholder="Harness 类型" clearable size="default" style="width:160px">
         <el-option label="通用" value="common" />
@@ -30,10 +22,12 @@
         <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="name" label="镜像名称" min-width="160" />
         <el-table-column prop="address" label="镜像地址" min-width="360" show-overflow-tooltip />
-        <el-table-column prop="harness_type" label="Harness 类型" width="130" align="center">
+        <el-table-column label="Harness 映射" min-width="200" align="center">
           <template #default="{ row }">
-            <el-tag :style="harnessTagStyle(row.harness_type)" size="small">
-              {{ harnessLabel(row.harness_type) }}
+            <el-tag v-for="ht in (row.harness_types || [])" :key="ht"
+              :style="harnessTagStyle(ht)" size="small" style="margin:2px"
+              :effect="(row.defaults || []).includes(ht) ? 'dark' : 'light'">
+              {{ harnessLabel(ht) }}{{ (row.defaults || []).includes(ht) ? ' ★' : '' }}
             </el-tag>
           </template>
         </el-table-column>
@@ -48,7 +42,7 @@
             <span v-else class="remark-empty">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="启用" width="90" align="center">
+        <el-table-column label="启用" width="80" align="center">
           <template #default="{ row }">
             <el-switch :model-value="row.enabled !== false" @change="v => toggleEnabled(row, v)" />
           </template>
@@ -88,11 +82,16 @@
         <el-form-item label="镜像地址" required>
           <el-input v-model="form.address" placeholder="例如：swr.cn-southwest-2.myhuaweicloud.com/rl_team/hermes:0.16.0" />
         </el-form-item>
-        <el-form-item label="Harness 类型" required>
-          <el-select v-model="form.harness_type" style="width:100%">
-            <el-option label="通用" value="common" />
+        <el-form-item label="Harness 映射" required>
+          <el-select v-model="form.harness_types" multiple style="width:100%" placeholder="可多选">
             <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
+            <el-option label="通用（common 兜底）" value="common" />
           </el-select>
+          <div class="form-hint">一个镜像可映射多个 harness；设为默认后，对应 harness 原默认镜像自动取消</div>
+        </el-form-item>
+        <el-form-item label="设为默认镜像">
+          <el-switch v-model="form.is_default" />
+          <div class="form-hint">对其映射的每个 harness 唯一：同一 harness 只有一个默认镜像</div>
         </el-form-item>
         <el-form-item label="操作系统" required>
           <el-radio-group v-model="form.os">
@@ -123,6 +122,18 @@
           <!-- 只读：实例与配置模板引用的是地址，改了会对不上历史任务 -->
           <el-input :model-value="editForm.address" disabled />
           <div class="form-hint">镜像地址不可修改</div>
+        </el-form-item>
+        <el-form-item label="Harness 映射" required>
+          <el-select v-model="editForm.harness_types" multiple style="width:100%">
+            <el-option v-for="t in harnessStore.types" :key="t" :label="harnessStore.label(t)" :value="t" />
+            <el-option label="通用（common 兜底）" value="common" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="设为默认镜像">
+          <el-switch v-model="editForm.is_default" />
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="editForm.enabled" />
         </el-form-item>
         <el-form-item label="操作系统" required>
           <el-radio-group v-model="editForm.os">
@@ -171,9 +182,9 @@ const OS_OPTIONS = [
   { value: 'windows', label: 'Windows' },
 ]
 
-const form = ref({ name: '', address: '', harness_type: 'openclaw', os: 'linux', remark: '' })
+const form = ref({ name: '', address: '', harness_types: ['openclaw'], is_default: false, os: 'linux', remark: '' })
 // 编辑弹窗的表单。address 只读展示，不随保存提交。
-const editForm = ref({ id: null, name: '', address: '', os: 'linux', remark: '' })
+const editForm = ref({ id: null, name: '', address: '', harness_types: [], is_default: false, enabled: true, os: 'linux', remark: '' })
 
 function harnessColor(type) { return harnessStore.color(type) }
 function harnessTagStyle(type) { return harnessStore.tagStyle(type) }
@@ -189,7 +200,7 @@ function osTagType(os) {
 
 const filteredImages = computed(() => {
   return images.value.filter(i =>
-    (!typeFilter.value || i.harness_type === typeFilter.value) &&
+    (!typeFilter.value || (i.harness_types || []).includes(typeFilter.value)) &&
     (!osFilter.value || (i.os || 'linux') === osFilter.value)
   )
 })
@@ -213,9 +224,7 @@ async function toggleEnabled(row, v) {
     await api.patch(`/images/${row.id}`, { enabled: v })
     row.enabled = v
     ElMessage.success(v ? '已启用' : '已停用（创建页不再列出）')
-  } catch (e) {
-    ElMessage.error('切换失败')
-  }
+  } catch { ElMessage.error('切换失败') }
 }
 
 async function loadImages() {
@@ -235,7 +244,7 @@ async function handleCreate() {
     await api.post('/images', form.value)
     ElMessage.success('镜像注册成功')
     dialogVisible.value = false
-    form.value = { name: '', address: '', harness_type: 'openclaw', os: 'linux', remark: '' }
+    form.value = { name: '', address: '', harness_types: ['openclaw'], is_default: false, os: 'linux', remark: '' }
     // 后端按 created_at DESC 排序，新镜像在第一页；留在原页会看不到刚注册的那条
     currentPage.value = 1
     loadImages()
@@ -247,6 +256,9 @@ function openEdit(row) {
     id: row.id,
     name: row.name,
     address: row.address,
+    harness_types: [...(row.harness_types || [])],
+    is_default: (row.defaults || []).length > 0,
+    enabled: row.enabled !== false,
     os: row.os || 'linux',
     remark: row.remark || '',
   }
@@ -266,6 +278,9 @@ async function handleUpdate() {
       name: f.name.trim(),
       os: f.os,
       remark: f.remark.trim(),
+      harness_types: f.harness_types,
+      is_default: f.is_default,
+      enabled: f.enabled,
     })
     ElMessage.success('已保存')
     editVisible.value = false

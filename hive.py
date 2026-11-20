@@ -857,12 +857,18 @@ class OpenClawDistillationTask:
         await self._copy_agent_config(config_file, port=port)
         await self._upload_data_config(config_file, port=port)
 
+        def _cleanup_cmd() -> list:
+            # 残留清理必须单独立一次 exec
+            return [
+                "/bin/bash", "-c",
+                "pkill -f '[o]penclaw gateway' 2>/dev/null; sleep 1; echo CLEANED"
+            ]
+
         def _launch_cmd() -> list:
-            # 启动前清残留(固定端口的代价: 上一轮没死干净的进程会占住端口)
+            # 启动命令本身不含 pkill, 无自杀风险
             return [
                 "/bin/bash", "-c",
                 f"mkdir -p {self.config.sandbox_config.result_workdir} && "
-                f"pkill -f 'openclaw gateway' 2>/dev/null; sleep 1; "
                 f"nohup {self.config.sandbox_config.openclaw_bash} gateway --port {port} "
                 f"> {gateway_log_path} 2>&1 & echo LAUNCHED"
             ]
@@ -886,6 +892,16 @@ class OpenClawDistillationTask:
                 raise HiveError("S002", detail=f"{max_wait}s port={port}")
 
             if not launched:
+                # 先清残留(独立 exec, 防自杀), 再启动
+                cleanup_result = await self._exec_sandbox(
+                    _cleanup_cmd(), self.config.simple_bash_timeout
+                )
+                cleanup_data = cleanup_result.data or {}
+                if cleanup_result.code != ErrorCode.SUCCESS[0] or cleanup_data.get("exit_code") != 0:
+                    self.logger.warning(
+                        f"[S001] gateway 残留清理异常(忽略, 继续启动): "
+                        f"code={cleanup_result.code} exit={cleanup_data.get('exit_code')}"
+                    )
                 result = await self._exec_sandbox(
                     _launch_cmd(), self.config.simple_bash_timeout
                 )

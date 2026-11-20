@@ -270,7 +270,7 @@
               <el-option v-for="img in imageOptions" :key="img.id" :label="img.name" :value="img.address"
                 :style="img.remark ? 'height:auto;line-height:1.5;padding-top:6px;padding-bottom:6px' : ''">
                 <div>
-                  <el-tag v-if="img.address === recommendedImageAddress" size="small" type="success" effect="light" style="margin-right:6px">推荐</el-tag>
+                  <el-tag v-if="img.address === defaultImageAddress" size="small" type="success" effect="light" style="margin-right:6px">推荐</el-tag>
                   <span>{{ img.name }}</span>
                   <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
                 </div>
@@ -297,7 +297,7 @@
             <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
               <el-option v-for="repo in codeRepoOptions" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
                 <span>
-                  <el-tag v-if="repo.id === recommendedRepoId" size="small" type="success" effect="light" style="margin-right:6px">推荐</el-tag>{{ repo.name }} / {{ repo.version }}
+                  <el-tag v-if="repo.id === defaultRepoId" size="small" type="success" effect="light" style="margin-right:6px">默认</el-tag>{{ repo.name }} / {{ repo.version }}
                 </span>
                 <span style="float:right;color:#999;font-size:12px">{{ repo.obs_path.length > 40 ? '...' + repo.obs_path.slice(-40) : repo.obs_path }}</span>
               </el-option>
@@ -541,31 +541,9 @@ function removeAgentTab(tabName) {
 
 const imageList = ref([])
 
-// ============ 启用过滤 + 最新日期推荐 ============
-// 从版本/镜像名里抽日期, 三种形态: 20261102 / 26.11.4 / v1117(月日)。
-// 抽不出返回 null, 排序兜底用 created_at(注册时间)。
-function extractDate(token) {
-  const s = String(token || '')
-  let m = /(20\d{2})(\d{2})(\d{2})/.exec(s)
-  if (m) return new Date(+m[1], +m[2] - 1, +m[3]).getTime()
-  m = /(\d{2})\.(\d{1,2})\.(\d{1,2})/.exec(s)
-  if (m) return new Date(2000 + +m[1], +m[2] - 1, +m[3]).getTime()
-  m = /v?(\d{2})(\d{2})\b/.exec(s)
-  if (m) {
-    const now = new Date()
-    return new Date(now.getFullYear(), +m[1] - 1, +m[2]).getTime()
-  }
-  return null
-}
-function _dateKey(token, createdAt) {
-  const d = extractDate(token)
-  if (d != null) return d
-  return new Date(createdAt || 0).getTime() || 0
-}
-
-// 镜像下拉: 只列启用的, 按所选沙箱配置的 os 过滤(未选沙箱配置/过滤后为空则不过滤)。
-// 推荐规则: 该 harness 有专属镜像 -> 专属里日期最新; 否则 common(主镜像)里日期最新。
-// 只打标不自动选中 —— 留空仍走 harness 模板默认镜像。
+// ============ 启用过滤 + os 过滤 + 默认(推荐) ============
+// 镜像下拉: 只列启用的, 按所选沙箱配置的 os 过滤(未选/过滤后为空则不过滤)。
+// 默认镜像 = 该 harness 映射里 is_default 的; 无则 common 默认; 都无则不标。
 const imageOptions = computed(() => {
   let list = (imageList.value || []).filter(i => i.enabled !== false)
   const sb = (sandboxList.value || []).find(s => s.id === form.value.sandbox_config_id)
@@ -573,46 +551,43 @@ const imageOptions = computed(() => {
     const filtered = list.filter(i => i.os === sb.sandbox_type)
     if (filtered.length) list = filtered
   }
-  if (!list.length) return list
-  const recommended = recommendedImageAddress.value
-  if (!recommended) return list
-  return [...list.filter(i => i.address === recommended), ...list.filter(i => i.address !== recommended)]
+  const def = defaultImageAddress.value
+  if (!def) return list
+  return [...list.filter(i => i.address === def), ...list.filter(i => i.address !== def)]
 })
 
-const recommendedImageAddress = computed(() => {
+const defaultImageAddress = computed(() => {
   const list = (imageList.value || []).filter(i => i.enabled !== false)
-  if (!list.length) return ''
-  const dedicated = list.filter(i => i.harness_type === form.value.harness_type)
-  const pool = dedicated.length ? dedicated : list.filter(i => i.harness_type === 'common')
-  if (!pool.length) return ''
-  // os 偏好: 选了沙箱配置按其系统; 未选默认 linux 优先(linux > windows)。
-  // 偏好系内无镜像时回退另一系, 避免推荐指向不在下拉里的地址。
-  const sb = (sandboxList.value || []).find(s => s.id === form.value.sandbox_config_id)
-  const preferOs = sb ? sb.sandbox_type : 'linux'
-  const osPool = pool.filter(i => (i.os || 'linux') === preferOs)
-  const finalPool = osPool.length ? osPool : pool
-  return finalPool.reduce((a, b) => (_dateKey(b.name, b.created_at) > _dateKey(a.name, a.created_at) ? b : a)).address
+  const ht = form.value.harness_type
+  const hit = list.find(i => (i.defaults || []).includes(ht))
+  if (hit) return hit.address
+  const common = list.find(i => (i.defaults || []).includes('common'))
+  return common ? common.address : ''
 })
 
-// 代码仓下拉: 只列启用的; 推荐只认「v+完整日期」命名的最新一条(默认推荐),
-// 其他分支/自定义版本仍在可选列表(兼容自定义分支开发)但不参与推荐。只打标不自动选中。
+// 代码仓下拉: 只列启用的; 默认代码仓置顶打标。
 const codeRepoOptions = computed(() => {
   const list = (codeRepoList.value || []).filter(r => r.enabled !== false)
-  const rec = recommendedRepoId.value
-  if (!rec) return list
-  return [...list.filter(r => r.id === rec), ...list.filter(r => r.id !== rec)]
+  const d = defaultRepoId.value
+  if (!d) return list
+  return [...list.filter(r => r.id === d), ...list.filter(r => r.id !== d)]
 })
 
-const recommendedRepoId = computed(() => {
-  // 参与推荐的版本格式: 新命名 v+完整日期(v20261117), 兼容旧格式 v+月日(v1117,
-  // 年份取当前年)。其余分支/自定义版本(xiaoyiclaw_v42、test-* 等)不参与推荐,
-  // 但仍在下拉可选。新旧格式按解析出的日期统一比较, 取最新。
-  const pool = (codeRepoList.value || []).filter(
-    r => r.enabled !== false && /^(v20\d{6}|v\d{4})$/.test(String(r.version || '').trim())
-  )
-  if (!pool.length) return null
-  return pool.reduce((a, b) => (extractDate(b.version) > extractDate(a.version) ? b : a)).id
+const defaultRepoId = computed(() => {
+  const d = (codeRepoList.value || []).find(r => r.enabled !== false && r.is_default)
+  return d ? d.id : null
 })
+
+// harness 切换后自动填默认镜像/代码仓(可手动改选其他); suppressDefaultFill
+// 用于复制实例场景 —— 保留源实例的选择不被覆盖。
+let suppressDefaultFill = false
+function applyDefaults() {
+  if (suppressDefaultFill) { suppressDefaultFill = false; return }
+  const addr = defaultImageAddress.value
+  if (addr) form.value.image_name = addr
+  const rid = defaultRepoId.value
+  if (rid) form.value.code_repo_id = rid
+}
 const baseUrlOptions = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
@@ -760,8 +735,9 @@ function applyTemplate(tpl) {
   form.value.invite_code = tpl.invite_code || ''
   form.value.model_api_type = tpl.model_api_type || ''
   if (tpl.model_id) form.value.model_id = tpl.model_id
-  form.value.image_name = tpl.image_name || ''
-  form.value.code_repo_id = tpl.code_repo_id || null
+  // 模板配置优先; 未配置时回落 harness 默认镜像/默认代码仓(而非清空)
+  form.value.image_name = tpl.image_name || defaultImageAddress.value || ''
+  form.value.code_repo_id = tpl.code_repo_id || defaultRepoId.value || null
   form.value.model_api_key = ''
   validateResults.value = {}
   try {
@@ -785,6 +761,7 @@ async function loadImages() {
   try {
     imageList.value = await api.get('/images', { params: { harness_type: form.value.harness_type } })
   } catch { imageList.value = [] }
+  applyDefaults()
 }
 
 async function loadCodeRepos() {
@@ -826,7 +803,9 @@ function queryAgentBaseUrls(queryString, cb) {
 }
 
 function onHarnessChange() {
+  suppressDefaultFill = false  // 用户显式切换 harness, 恢复默认自动填
   form.value.image_name = ''
+  form.value.code_repo_id = null
   form.value.harness_config_id = null
   form.value.harness_config_version_id = null
   versionList.value = []
@@ -931,6 +910,8 @@ onMounted(async () => {
       // 直接回填会让复制出的任务带着掩码当 key 去跑。
       const params = await api.get(`/instances/${copyFrom}/create-params/full`)
       Object.assign(form.value, params)
+      // 复制保留源实例的镜像/代码仓选择: 压制下一次默认自动填
+      suppressDefaultFill = true
       // 历史实例的 suffix_api_keys 统一是 false（迁移默认值），直接继承会让
       // 「复制」出来的新任务默认关闭后缀。复制时回到当前默认值，用户仍可手动改。
       form.value.suffix_api_keys = true

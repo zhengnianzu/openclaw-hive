@@ -58,13 +58,21 @@ def create_code_repo(req: CodeRepoCreate, user: dict = Depends(require_operator)
         if existing:
             raise HTTPException(status_code=400, detail=f"代码仓 {req.name.strip()} 版本 {req.version.strip()} 已存在")
         cursor = conn.execute(
-            "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, tag, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, tag, is_default, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
             (req.name.strip(), req.obs_path.strip(), req.version.strip(), req.description.strip(),
              req.main_python_file.strip(), _check_tag(conn, req.tag), user["username"]),
         )
+        if req.is_default:
+            _set_default_repo(conn, cursor.lastrowid)
         row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (cursor.lastrowid,)).fetchone()
     return dict(row)
+
+
+def _set_default_repo(conn, repo_id: int) -> None:
+    """全局默认代码仓唯一: 设新默认前先清掉旧默认。"""
+    conn.execute("UPDATE code_repos SET is_default = 0 WHERE is_default = 1 AND id != ?", (repo_id,))
+    conn.execute("UPDATE code_repos SET is_default = 1 WHERE id = ?", (repo_id,))
 
 
 def _check_tag(conn, value: str) -> str:
@@ -160,6 +168,11 @@ def update_code_repo(repo_id: int, req: CodeRepoUpdate, user: dict = Depends(req
                 f"UPDATE code_repos SET {', '.join(sets)} WHERE id = ?",
                 (*params, repo_id),
             )
+        if req.is_default is not None:
+            if req.is_default:
+                _set_default_repo(conn, repo_id)
+            else:
+                conn.execute("UPDATE code_repos SET is_default = 0 WHERE id = ?", (repo_id,))
         row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (repo_id,)).fetchone()
     return dict(row)
 
