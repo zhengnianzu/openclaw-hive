@@ -1527,10 +1527,16 @@ async function submit() {
 }
 
 // 复制实验 → 打开本页并预填（?copy_from=Batch-xxx）。
-// 不直接后台建：复制出来的 key 一定是空的，得让用户看见并补填后再提交。
+// 走 /params/full（operator 限定）而不是 GET /{id}：后者的 params_json 里 key
+// 已脱敏成 sk-l****nDEj，回填进去会让新任务带着假 key 去跑（静默失败）。
+// 明文取自源子任务的 create_params，见后端 _restore_params_secrets。
 async function prefillFromCopy(batchId) {
   try {
-    const src = await api.get(`/batch-experiments/${batchId}`)
+    // 名称/描述/队列/重复次数仍在实验本体上，参数矩阵（含 key）走 /full
+    const [src, full] = await Promise.all([
+      api.get(`/batch-experiments/${batchId}`),
+      api.get(`/batch-experiments/${batchId}/params/full`),
+    ])
     // 去掉旧的「（副本）」后缀再拼，避免复制多次后变成「xxx（副本）（副本）」。
     const baseName = (src.name || '').replace(/（副本）$/, '')
     form.value.name = `${baseName}（副本）`
@@ -1545,8 +1551,8 @@ async function prefillFromCopy(batchId) {
 
     // 还原 Harness 块：优先用 params_json.blocks（原始二维结构，块 × 模型），
     // 老实验没有 blocks 时才退回摊平的 arms 并按 harness 三件套归组。
-    let saved = {}
-    try { saved = JSON.parse(src.params_json || '{}') } catch { saved = {} }
+    let saved = (full && full.params) || {}
+    if (typeof saved !== 'object') saved = {}
 
     const newBlock = (b = {}) => ({
       _uid: uid(), harness_type: b.harness_type || '',
@@ -1560,7 +1566,8 @@ async function prefillFromCopy(batchId) {
     const newModel = (m = {}) => ({
       _uid: uid(), model_id: m.model_id || '',
       model_base_url: m.model_base_url || '',
-      model_api_key: '',            // 脱敏值不可复用，留空让用户重填
+      // 已经是源子任务的明文 key，直接回填；取不到时才为空（回落模板默认值）
+      model_api_key: m.model_api_key || '',
       model_api_type: m.model_api_type || '',
     })
 
@@ -1594,11 +1601,13 @@ async function prefillFromCopy(batchId) {
       if (Array.isArray(common.agents)) {
         form.value.agents = common.agents.map(a => ({
           name: a.name || '', model: a.model || '', provider: a.provider || '',
-          base_url: a.base_url || '', api_key: '', api: a.api || '', invite_code: '',
+          base_url: a.base_url || '',
+          // 与模型 key 同源：后端已按 agent 名字从子任务 create_params 还原明文
+          api_key: a.api_key || '', api: a.api || '', invite_code: a.invite_code || '',
         }))
       }
     }
-    ElMessage.info('已从已有实验预填配置，请补填模型 Key 后创建')
+    ElMessage.info('已从已有实验预填配置（Key 已继承，仅显示掩码）；需要更换请点各字段的「清除」后重填')
   } catch {
     ElMessage.warning('无法加载源实验配置')
   }

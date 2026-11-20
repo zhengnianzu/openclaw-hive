@@ -140,10 +140,12 @@ def _expand_blocks(req) -> list:
 def _masked_params(params: dict) -> dict:
     """实验参数入库前脱敏。真实 key 只在创建瞬间透传给 create_instance。
 
-    key 有三个藏身处，漏一个就是明文落库：
+    四处藏身处，漏一个就是明文落库：
       common.model_api_key / common.agents[].api_key
-      arms[].model_api_key          （模型参数已按臂下沉）
-      sim_arms[].agents[].api_key   （第二轴）
+      arms[].model_api_key               （模型参数已按臂下沉）
+      blocks[].models[].model_api_key    （原始二维结构，_expand_blocks 直接读它，
+                                          漏了这条 = 复制功能读不到 key，同时明文入库）
+      sim_arms[].agents[].api_key        （第二轴）
     """
     d = json.loads(json.dumps(params))  # 深拷贝，别改到调用方的对象
     if d.get("model_api_key"):
@@ -152,10 +154,156 @@ def _masked_params(params: dict) -> dict:
     for arm in d.get("arms") or []:
         if isinstance(arm, dict) and arm.get("model_api_key"):
             arm["model_api_key"] = _mask_secret(arm["model_api_key"])
+    for blk in d.get("blocks") or []:
+        if not isinstance(blk, dict):
+            continue
+        for m in blk.get("models") or []:
+            if isinstance(m, dict) and m.get("model_api_key"):
+                m["model_api_key"] = _mask_secret(m["model_api_key"])
     for sim in d.get("sim_arms") or []:
         if isinstance(sim, dict):
             _mask_agents(sim.get("agents"))
     return d
+
+
+def _norm_base_url(v: str) -> str:
+    """base_url 归一化，只为「能不能撞上同一条」做比对，不改写实际取值。
+
+    只去空白与尾斜杠：openclaw 的 baseUrl 必须带 /v1、claude-code 的
+    ANTHROPIC_BASE_URL 必须不带 —— 两种写法都合法，所以不能像 create_instance
+    那样补/剥 /v1，否则同一端点在两个臂上会被归一成不同字符串而撞不上。
+    """
+    return str(v or "").strip().rstrip("/")
+
+
+def _norm_model_id(v: str) -> str:
+    """模型 ID 归一化。取 `@` 前的本体，兼容带版本后缀的写法（如 `glm-5.3@zhipu`）。"""
+    return str(v or "").strip().split("@", 1)[0].strip()
+
+
+def _restore_params_secrets(batch_id: str, params: dict) -> dict:
+    """把实验参数里被脱敏的 key 换成源子任务的明文。
+
+    params_json 入库前过了 _masked_params，里面的 `sk-l****nDEj` 直接拿去建任务
+    会带着一串假 key 静默失败。真 key 一直在 task_instances.create_params 里存着
+    明文（只有 /create-params 接口层做掩码），所以按子任务取回来即可 ——
+    不需要放宽入库脱敏。
+
+    匹配键：
+      模型 → (harness_type, harness_config_id, harness_config_version_id,
+              归一化 model_id, 归一化 model_base_url)
+             撞不上时退回「同 harness 三件套 + 同 model_id」（base_url 被改写过的旧实验）
+      agent → name
+
+    查不到的位置留空而不是抛错：前端「留空继承兜底值」的语义仍然成立，
+    一个配了奇怪 base_url 的臂不该让整次复制失败。create_params 损坏的行跳过。
+    """
+    out = json.loads(json.dumps(params or {}))  # 深拷贝
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT i.harness_type, i.harness_config_id,
+                      i.harness_config_version_id, i.sim_idx,
+                      t.create_params
+                 FROM batch_experiment_items i
+                 JOIN task_instances t ON t.id = i.instance_id
+                WHERE i.batch_id = ? AND t.create_params IS NOT NULL
+                ORDER BY i.sim_idx, i.id""",
+            (batch_id,),
+        ).fetchall()
+
+    model_keys: dict[tuple, str] = {}
+    model_keys_loose: dict[tuple, str] = {}
+    agent_keys: dict[str, str] = {}
+
+    for row in rows:
+        try:
+            cp = json.loads(row["create_params"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(cp, dict):
+            continue
+
+        key = (cp.get("model_api_key") or "").strip()
+        if key:
+            trio = (row["harness_type"], row["harness_config_id"],
+                    row["harness_config_version_id"])
+            mid = _norm_model_id(cp.get("model_id"))
+            full = trio + (mid, _norm_base_url(cp.get("model_base_url")))
+            loose = trio + (mid,)
+            # setdefault：同一配置建了多个重复轮次时，保留第一把（同一把 key 的
+            # 概率极高，重复覆盖只是让结果不确定）。
+            model_keys.setdefault(full, key)
+            model_keys_loose.setdefault(loose, key)
+
+        for ag in cp.get("agents") or []:
+            if not isinstance(ag, dict):
+                continue
+            name = (ag.get("name") or "").strip()
+            if name and (ag.get("api_key") or "").strip():
+                agent_keys.setdefault(name, ag["api_key"].strip())
+
+    def _lookup(trio, model_id, base_url) -> str:
+        mid = _norm_model_id(model_id)
+        return (model_keys.get(trio + (mid, _norm_base_url(base_url)))
+                or model_keys_loose.get(trio + (mid,))
+                or "")
+
+    def _resolved(cur, found: str) -> str:
+        """该位置的最终 key：能还原就用明文，否则掩码必须清掉。
+
+        留着 `sk-l****6789` 会让复制出来的子任务带着假 key 去跑 —— 静默失败、
+        不报错，比留空（回落模板默认值）更糟。非掩码值（真 key / 空）原样保留。
+        """
+        if not cur:
+            return cur
+        if "****" not in str(cur):
+            return cur
+        return found or ""
+
+    # --- 模型 key：blocks（前端还原矩阵的原始结构）与 arms（展开后的臂）都要填 ---
+    for blk in out.get("blocks") or []:
+        if not isinstance(blk, dict):
+            continue
+        trio = (blk.get("harness_type"), blk.get("harness_config_id"),
+                blk.get("harness_config_version_id"))
+        for m in blk.get("models") or []:
+            if not isinstance(m, dict):
+                continue
+            k = _lookup(trio, m.get("model_id"), m.get("model_base_url"))
+            m["model_api_key"] = _resolved(m.get("model_api_key"), k)
+
+    for arm in out.get("arms") or []:
+        if not isinstance(arm, dict):
+            continue
+        trio = (arm.get("harness_type"), arm.get("harness_config_id"),
+                arm.get("harness_config_version_id"))
+        k = _lookup(trio, arm.get("model_id"), arm.get("model_base_url"))
+        arm["model_api_key"] = _resolved(arm.get("model_api_key"), k)
+
+    # 兜底模型（common）：老实验的模型参数只存在 common 里（没有 blocks/arms 的
+    # 模型字段），那里的 key 也同样是掩码。用源实例里的任意一把补上 —— 同一实验的
+    # 臂模型与 common 兜底模型是同一个的概率极高，留一把掩码比留空更糟。
+    # 原本就没有这个字段时不要凭空新增（空 params 应原样返回 {}）。
+    if "model_api_key" in out:
+        out["model_api_key"] = _resolved(
+            out.get("model_api_key"), next(iter(model_keys.values()), ""))
+
+    # --- agent key：结果写回 agents / sim_arms[].agents[] ---
+    def _fill_agents(agents) -> None:
+        for ag in agents or []:
+            if not isinstance(ag, dict):
+                continue
+            name = (ag.get("name") or "").strip()
+            ag["api_key"] = _resolved(ag.get("api_key"),
+                                      agent_keys.get(name, ""))
+
+    _fill_agents(out.get("agents"))
+    for sim in out.get("sim_arms") or []:
+        if isinstance(sim, dict):
+            _fill_agents(sim.get("agents"))
+
+    return out
 
 
 def _sim_label(sim, sim_idx: int) -> str:
@@ -383,6 +531,25 @@ def list_experiments(
 def get_experiment(batch_id: str, user: dict = Depends(get_current_user)):
     row = _get_batch(batch_id)
     return _build_info(row, _aggregate_rows([batch_id]))
+
+
+@router.get("/{batch_id}/params/full")
+def get_params_full(batch_id: str, user: dict = Depends(require_operator)):
+    """「复制实验」专用：返回含完整 API Key 的实验参数，仅 operator/admin 可调。
+
+    与注册表 / 实例两侧的口径一致：普通接口（GET /{batch_id}）里的 params_json
+    是脱敏的掩码，照抄去建任务会带着假 key 静默失败，所以复制这条路径必须给原文。
+    不是放宽入库脱敏 —— 明文取自源子任务的 task_instances.create_params
+    （见 _restore_params_secrets），params_json 本身仍然只存掩码。
+    """
+    row = _get_batch(batch_id)
+    try:
+        params = json.loads(row.get("params_json") or "{}")
+    except (ValueError, TypeError):
+        params = {}
+    if not isinstance(params, dict):
+        params = {}
+    return {"params": _restore_params_secrets(batch_id, params)}
 
 
 @router.get("/{batch_id}/items", response_model=list[BatchItemInfo])
@@ -801,10 +968,10 @@ def delete_experiment(batch_id: str, user: dict = Depends(require_operator)):
 async def copy_experiment(batch_id: str, user: dict = Depends(require_operator)):
     """复制实验：按原参数重建一份新的实验（含子任务）。
 
-    key 类字段在入库时已脱敏（见 _masked_params），所以复制出来的子任务**不能**
-    沿用快照里的 key —— 那样会拿一串 `sk-x***7890` 去跑。这里保留 key 以外的
-    全部参数，key 留空让后端回落到 harness 模板默认值；需要 key 的实验请在
-    复制后到新建页重新填。
+    key 类字段在 params_json 里是脱敏的掩码（见 _masked_params），照着复制会拿
+    一串 `sk-x***7890` 去跑。所以这里先把掩码换成源子任务的明文 key
+    （_restore_params_secrets 从 task_instances.create_params 取回），
+    复制出来的实验沿用同一把 key；取不到的位置留空，回落到 harness 模板默认值。
     """
     row = _get_batch(batch_id)
     with get_connection() as conn:
@@ -821,13 +988,15 @@ async def copy_experiment(batch_id: str, user: dict = Depends(require_operator))
         saved = json.loads(row.get("params_json") or "{}")
     except (ValueError, TypeError):
         saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    # 先还原 key，后面 strips 出来的 arms/blocks/common 就都带着可用 key 了。
+    saved = _restore_params_secrets(batch_id, saved)
     saved_arms = saved.get("arms") or []
 
     def _strip_keys(d: dict) -> dict:
-        out = {k: v for k, v in d.items() if k not in ("_uid", "_key")}
-        if out.get("model_api_key"):
-            out["model_api_key"] = ""
-        return out
+        """去掉前端临时字段。key 保留 —— 已在上面的 _restore_params_secrets 换成明文。"""
+        return {k: v for k, v in d.items() if k not in ("_uid", "_key")}
 
     arms = [_strip_keys(a) for a in saved_arms if isinstance(a, dict)]
     if not arms:
@@ -841,15 +1010,11 @@ async def copy_experiment(batch_id: str, user: dict = Depends(require_operator))
     # blocks 也一起带过去：/copy 端点走的是 create_experiment，那边优先用 blocks，
     # 少了它就会退回摊平的 arms，复制出来的实验会丢失原始二维结构。
     blocks = [b for b in (saved.get("blocks") or []) if isinstance(b, dict)]
-    for b in blocks:
-        for m in (b.get("models") or []):
-            if isinstance(m, dict) and m.get("model_api_key"):
-                m["model_api_key"] = ""
 
     common = {k: v for k, v in saved.items()
               if k not in ("arms", "sim_arms", "blocks")}
     if isinstance(common.get("agents"), list):
-        common["agents"] = [dict(a, api_key="") if isinstance(a, dict) else a
+        common["agents"] = [dict(a) if isinstance(a, dict) else a
                             for a in common["agents"]]
 
     with get_connection() as conn:
