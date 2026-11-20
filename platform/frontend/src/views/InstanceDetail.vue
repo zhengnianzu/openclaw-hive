@@ -75,14 +75,24 @@
               <template #header>
                 <span class="sec-head"><el-icon class="sec-head-icon"><Postcard /></el-icon>实例信息</span>
               </template>
-              <el-descriptions :column="1" border>
-                <el-descriptions-item label="实例ID">{{ inst.id }}</el-descriptions-item>
+              <el-descriptions :column="1" border label-width="112px" class="info-desc">
+                <!-- 窄栏里长文本折行会把整张卡撑高、也不方便扫读：
+                     只显示固定字符数，点击弹窗看全文（弹窗里可复制） -->
+                <el-descriptions-item label="实例ID">
+                  <span class="clip-text" :title="inst.id" @click="openFullText('实例ID', inst.id)">
+                    {{ clipText(inst.id, 24) }}
+                  </span>
+                </el-descriptions-item>
                 <el-descriptions-item label="状态"><el-tag :type="statusColor(inst.status)">{{ statusText(inst.status) }}</el-tag></el-descriptions-item>
                 <el-descriptions-item v-if="inst.error_summary" label="失败原因">
                   <span style="color:#ef4444;white-space:pre-wrap;word-break:break-all">{{ inst.error_summary }}</span>
                 </el-descriptions-item>
                 <el-descriptions-item label="PID">{{ inst.pid || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="配置文件">{{ inst.config_path }}</el-descriptions-item>
+                <el-descriptions-item label="配置文件">
+                  <span class="clip-text" :title="inst.config_path" @click="openFullText('配置文件路径', inst.config_path)">
+                    {{ clipText(inst.config_path, 24) }}
+                  </span>
+                </el-descriptions-item>
                 <el-descriptions-item label="并发数">{{ inst.concurrent_num }}</el-descriptions-item>
                 <el-descriptions-item label="创建时间">{{ inst.created_at }}</el-descriptions-item>
                 <el-descriptions-item label="启动时间">{{ inst.started_at || '-' }}</el-descriptions-item>
@@ -216,6 +226,17 @@
             </el-card>
           </el-col>
         </el-row>
+
+        <!-- 长文本详情：实例 ID、配置文件路径这类值在卡片里截断，这里看全文 -->
+        <el-dialog v-model="fullTextOpen" :title="fullTextTitle" width="720px"
+          top="18vh" append-to-body destroy-on-close>
+          <div class="full-text">{{ fullTextValue }}</div>
+          <template #footer>
+            <el-button size="small" @click="copyFullText">复制</el-button>
+            <el-button size="small" type="primary" @click="fullTextOpen = false">关闭</el-button>
+          </template>
+        </el-dialog>
+
         <el-card class="sec-card" style="margin-top:20px" v-if="Object.keys(createParams).length">
           <template #header>
             <span class="sec-head"><el-icon class="sec-head-icon"><Setting /></el-icon>创建参数</span>
@@ -1738,6 +1759,32 @@ const paramGroups = computed(() => {
   ]
 })
 
+// 卡片里放不下的长文本（实例 ID、配置路径）：只显示固定字符数，
+// 点击走弹窗看全文，避免在窄栏里折成两三行把整张卡撑高。
+const fullTextOpen = ref(false)
+const fullTextTitle = ref('')
+const fullTextValue = ref('')
+
+function clipText(v, n = 24) {
+  const s = v == null ? '' : String(v)
+  return s.length > n ? `${s.slice(0, n)}…` : s
+}
+
+function openFullText(title, value) {
+  fullTextTitle.value = title
+  fullTextValue.value = value == null || value === '' ? '-' : String(value)
+  fullTextOpen.value = true
+}
+
+async function copyFullText() {
+  try {
+    await navigator.clipboard.writeText(fullTextValue.value)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选择复制')
+  }
+}
+
 async function copyTrajPath() {
   try {
     await navigator.clipboard.writeText(trajSaveFullPath.value)
@@ -3235,6 +3282,16 @@ onUnmounted(() => {
   padding: 24px 12px; text-align: center;
   font-size: 12px; color: var(--text-muted); line-height: 1.6;
 }
+/* 实例信息：左侧标签定宽且不折行；长文本只显示固定字符数，点击看全文 */
+.info-desc :deep(.el-descriptions__label) { white-space: nowrap; }
+.clip-text { cursor: pointer; border-bottom: 1px dashed var(--border-color); }
+.clip-text:hover { color: var(--accent-purple); border-bottom-color: var(--accent-purple); }
+.full-text {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  white-space: pre-wrap; word-break: break-all; line-height: 1.7;
+  color: var(--text-primary);
+}
+
 /* 配置信息三栏：三张卡等高，避免内容长短不同导致底部参差 */
 .cfg-row { align-items: stretch; }
 .cfg-row > .el-col > .el-card { height: 100%; }
