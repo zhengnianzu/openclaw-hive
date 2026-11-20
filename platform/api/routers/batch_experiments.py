@@ -98,13 +98,40 @@ def _mask_agents(agents) -> None:
             ag["api_key"] = _mask_secret(ag["api_key"])
 
 
-def _expand_blocks(req) -> list:
-    """把矩阵的原始二维结构展开成一组臂（一个模型一个臂）。
+def _expand_arms(req) -> list:
+    """把矩阵的两条轴展开成一组臂（一个 Harness × 一个模型 = 一个臂）。
 
-    优先级：blocks > arms。blocks 为空时直接用旧客户端传来的 arms，保持兼容。
-    块内模型列表为空 → 该 Harness 退化成一臂、吃 common 的兜底模型
-    （label 用块的展示名，便于详情页区分）。
+    优先级：
+      1. harnesses × models —— 新形状，纯正交笛卡尔积。每个模型在每个 Harness
+         上各跑一个子任务，label 拼上 Harness 名以便对比页每列唯一可辨。
+      2. blocks（旧形状）—— 块内自带模型，逐块展开；块内模型为空则该块退化成
+         一臂，吃 common 的兜底模型。
+      3. arms —— 旧客户端直接传摊平结果。
+
+    model_base_url 原样传递，不做 /v1 规整：claude-code 会剥、openclaw 会补，
+    由 create_instance 按各自 harness 的规则解析，所以同一个模型可以同时给
+    任意几个 Harness 用。
     """
+    if req.harnesses and req.models:
+        out = []
+        for h in req.harnesses:
+            harness_label = h.label or h.harness_type
+            for m in req.models:
+                out.append(BatchArm(
+                    harness_type=h.harness_type,
+                    harness_config_id=h.harness_config_id,
+                    harness_config_version_id=h.harness_config_version_id,
+                    label=(f"{harness_label} · {m.model_id}"
+                           if m.model_id else harness_label),
+                    model_id=m.model_id,
+                    model_base_url=m.model_base_url,
+                    model_api_key=m.model_api_key,
+                    model_api_type=m.model_api_type,
+                    image_name=h.image_name,
+                    sandbox_config_id=h.sandbox_config_id,
+                ))
+        return out
+
     if not req.blocks:
         return req.arms
 
@@ -140,11 +167,12 @@ def _expand_blocks(req) -> list:
 def _masked_params(params: dict) -> dict:
     """实验参数入库前脱敏。真实 key 只在创建瞬间透传给 create_instance。
 
-    四处藏身处，漏一个就是明文落库：
+    五处藏身处，漏一个就是明文落库：
       common.model_api_key / common.agents[].api_key
       arms[].model_api_key               （模型参数已按臂下沉）
-      blocks[].models[].model_api_key    （原始二维结构，_expand_blocks 直接读它，
-                                          漏了这条 = 复制功能读不到 key，同时明文入库）
+      models[].model_api_key             （矩阵的模型轴）
+      blocks[].models[].model_api_key    （旧形状；漏了这条 = 复制功能读不到 key，
+                                          同时明文入库）
       sim_arms[].agents[].api_key        （第二轴）
     """
     d = json.loads(json.dumps(params))  # 深拷贝，别改到调用方的对象
@@ -154,6 +182,9 @@ def _masked_params(params: dict) -> dict:
     for arm in d.get("arms") or []:
         if isinstance(arm, dict) and arm.get("model_api_key"):
             arm["model_api_key"] = _mask_secret(arm["model_api_key"])
+    for m in d.get("models") or []:
+        if isinstance(m, dict) and m.get("model_api_key"):
+            m["model_api_key"] = _mask_secret(m["model_api_key"])
     for blk in d.get("blocks") or []:
         if not isinstance(blk, dict):
             continue
@@ -214,6 +245,10 @@ def _restore_params_secrets(batch_id: str, params: dict) -> dict:
 
     model_keys: dict[tuple, str] = {}
     model_keys_loose: dict[tuple, str] = {}
+    # 模型轴的 key 与 Harness 无关（同一个模型可以跑在任意几个 Harness 上），
+    # 所以另建一份不带 harness 三件套的查找表。
+    axis_keys: dict[tuple, str] = {}
+    axis_keys_loose: dict[tuple, str] = {}
     agent_keys: dict[str, str] = {}
 
     for row in rows:
@@ -235,6 +270,8 @@ def _restore_params_secrets(batch_id: str, params: dict) -> dict:
             # 概率极高，重复覆盖只是让结果不确定）。
             model_keys.setdefault(full, key)
             model_keys_loose.setdefault(loose, key)
+            axis_keys.setdefault((mid, _norm_base_url(cp.get("model_base_url"))), key)
+            axis_keys_loose.setdefault((mid,), key)
 
         for ag in cp.get("agents") or []:
             if not isinstance(ag, dict):
@@ -261,7 +298,15 @@ def _restore_params_secrets(batch_id: str, params: dict) -> dict:
             return cur
         return found or ""
 
-    # --- 模型 key：blocks（前端还原矩阵的原始结构）与 arms（展开后的臂）都要填 ---
+    # --- 模型 key：models（模型轴）、blocks（旧形状）与 arms（展开后的臂）都要填 ---
+    for m in out.get("models") or []:
+        if not isinstance(m, dict):
+            continue
+        mid = _norm_model_id(m.get("model_id"))
+        base = _norm_base_url(m.get("model_base_url"))
+        k = axis_keys.get((mid, base)) or axis_keys_loose.get((mid,), "")
+        m["model_api_key"] = _resolved(m.get("model_api_key"), k)
+
     for blk in out.get("blocks") or []:
         if not isinstance(blk, dict):
             continue
@@ -609,8 +654,13 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
     """
     if req.queue.max_concurrent < 1:
         raise HTTPException(status_code=400, detail="队列并发量至少为 1")
-    if not req.arms:
+    if not (req.harnesses or req.blocks or req.arms):
         raise HTTPException(status_code=400, detail="至少选择一个 Harness")
+    # 模型轴不许为空：一个「不知道测哪个模型」的实验没有意义，而已有的空模型
+    # 分支会静默退化成模板占位模型（claude-opus-4-7-thinking / token=keys），
+    # 跑出来的数据不可用。旧形状（blocks 内嵌 models 或直接给 arms）不要求它。
+    if (req.harnesses or req.models) and not req.models:
+        raise HTTPException(status_code=400, detail="至少配置一个模型")
     if req.repeat_times < 1:
         raise HTTPException(status_code=400, detail="重复次数至少为 1")
 
@@ -647,10 +697,10 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
     # {harness}_trajs/traj_{task_name} 自动生成。
     traj_prefix = (reg.get("traj_save_path") or "").strip().rstrip("/")
 
-    # 矩阵的两个维度在这里才展开：Harness 块 × 块内模型 → 一个配置一个臂。
-    # 前端提交的是原始二维结构（blocks），不是压平后的 arms —— 这样
-    # params_json 能保留原始配置，详情页才还原得出「两个 Harness、两个模型」。
-    arms = _expand_blocks(req)
+    # 矩阵的两条轴在这里展开：Harness 列表 × 模型列表 → 一个组合一个臂。
+    # 前端提交的是两条独立的列表（harnesses / models），不是压平后的 arms ——
+    # 这样 params_json 能保留原始配置，详情页才还原得出「两个 Harness、两个模型」。
+    arms = _expand_arms(req)
 
     # sim_arms 为空 → 第二轴退化成长度 1（用 [None] 占位），子任务吃 harness
     # 模板自带的 user_proxy_model.json。这是旧客户端行为，必须保持。
@@ -706,7 +756,12 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
              max_concurrent, "created",
              json.dumps(_masked_params({
                  **common,
+                 # 两条轴的原始列表：详情页/复制页靠它还原「哪几个 Harness、
+                 # 哪几个模型」，而不是从摊平的 arms 反推。
+                 "harnesses": [h.model_dump() for h in req.harnesses],
+                 "models": [m.model_dump() for m in req.models],
                  "arms": [a.model_dump() for a in arms],
+                 # 旧形状只在旧客户端提交时才有内容
                  "blocks": [b.model_dump() for b in req.blocks],
                  "sim_arms": [s.model_dump() for s in req.sim_arms],
              }), ensure_ascii=False),
@@ -1007,12 +1062,17 @@ async def copy_experiment(batch_id: str, user: dict = Depends(require_operator))
             "label": it["arm_label"] or it["harness_type"],
         } for it in (dict(r) for r in items)]
 
-    # blocks 也一起带过去：/copy 端点走的是 create_experiment，那边优先用 blocks，
-    # 少了它就会退回摊平的 arms，复制出来的实验会丢失原始二维结构。
+    # 两条正交轴原样带过去：新形状直接用 harnesses + models，旧形状才有 blocks。
+    # 少了它们 create_experiment 会退回摊平的 arms，把「Harness × 模型」的原始
+    # 结构丢掉，详情页就还原不出是哪几个 Harness 配了哪几个模型。
+    harnesses = [_strip_keys(h) for h in (saved.get("harnesses") or [])
+                 if isinstance(h, dict)]
+    models = [_strip_keys(m) for m in (saved.get("models") or [])
+              if isinstance(m, dict)]
     blocks = [b for b in (saved.get("blocks") or []) if isinstance(b, dict)]
 
     common = {k: v for k, v in saved.items()
-              if k not in ("arms", "sim_arms", "blocks")}
+              if k not in ("arms", "sim_arms", "blocks", "harnesses", "models")}
     if isinstance(common.get("agents"), list):
         common["agents"] = [dict(a) if isinstance(a, dict) else a
                             for a in common["agents"]]
@@ -1032,6 +1092,8 @@ async def copy_experiment(batch_id: str, user: dict = Depends(require_operator))
         name=f"{row['name']}（副本）",
         description=row.get("description") or "",
         registration_id=row.get("registration_id"),
+        harnesses=harnesses,
+        models=models,
         blocks=blocks,
         arms=arms,
         sim_arms=[],

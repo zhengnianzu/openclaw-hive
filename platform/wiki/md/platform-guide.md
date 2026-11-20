@@ -31,6 +31,7 @@ updated_at: '2026-11-16T20:11:26'
 └── environments/                     ← input_dir.user_dir.path 引用
     └── task-00000/
         ├── user_profile.json         ← 用户画像
+        ├── simple_eval_rubrics.json  ← rubric文件（见章节#7）
         ├── MAP_Linux.json            ← map_file（把 demo.md 映射进 agent workspace）
         └── task-00000/
             └── demo.md               ← 任务源文档
@@ -42,6 +43,11 @@ updated_at: '2026-11-16T20:11:26'
 
 ```jsonc
 {
+  "system": {
+    "platform": ["linux"],
+    "python": "3.12",
+    "tools": []
+  },
   "harness_type": "openclaw",
   "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
   "gateway_timeout": 7200,
@@ -63,7 +69,7 @@ updated_at: '2026-11-16T20:11:26'
       ]
     }
   ],
-  "queries": [                              // query 列表，支持多 query
+  "queries": [                              // query 列表，支持多 query 串行执行
     {
       "agent_name": "main",
       "session_name": "task-00000",
@@ -86,7 +92,8 @@ updated_at: '2026-11-16T20:11:26'
 ```
 
 ### 1.3 模型Key准备
-（如需）去 AI数据技术创新平台 - 外部API管理 - 数据生产申请里面申请
+（如需）去 AI数据技术创新平台 - 外部API管理 - 数据生产申请里面申请。
+如果自备模型url和key，请先转发到蓝区网络，本平台生产环境为蓝区。
 
 ## 2. 开始批跑
 
@@ -122,7 +129,7 @@ updated_at: '2026-11-16T20:11:26'
 
 #### 2.2.3 输出页
 
-指导文档：<http://115.120.48.151:8087/#/wiki/outputview-usage>
+> 完整说明：<http://115.120.48.151:8087/#/wiki/outputview-usage>
 
 ![alt text](/api/wiki/assets/e82e5f9ec73e46cbaacb7cfd56518c0e.webp)
 
@@ -152,6 +159,10 @@ updated_at: '2026-11-16T20:11:26'
 
 ![alt text](/api/wiki/assets/c930f0a5c5584f16a02b220a02f65843.webp)
 
+
+#### 2.2.5 任务导出
+![alt text](/api/wiki/assets/3c223c3dd47d4eca97da27cb25cc29db.webp)
+
 ## 3. Harness 配置管理
 
 ### 3.1 三层关系
@@ -174,7 +185,7 @@ Harness 类型
 
 - `AGENTS.md`
 - `SOUL.md`
-- `IDENTITY.md`
+- `Claude.md`
 - 其他该类型模板提供的 Markdown 文件
 
 不需要的文件可以保持“未初始化”状态。
@@ -194,12 +205,70 @@ Harness 类型
 ```
 
 ### 3.3 现有配置说明
+配置的三个文件：
+1. config.yaml，任务实例的配置文件
+```yaml
+# ==================== 全局配置固定模板 ====================
+略
+# ==================== 沙箱环境配置 ====================
+# 定义不同架构/加速器类型的沙箱配置，每种配置对应一种运行环境:x86 CPU\ARM CPU\NPU\windows
+sandbox:
+  # ---------- x86 CPU 沙箱 ----------
+  x86_cpu:
+    sandbox:
+      image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:26.8.3  # 镜像选择
+      # 【重要关注】环境变量配置，根据需求修改
+      env:
+        - name: PIP_INDEX_URL
+          value: "https://mirrors.huaweicloud.com/repository/pypi/simple"
+        - name: PIP_TRUSTED_HOST
+          value: "mirrors.huaweicloud.com"
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: "0"
+        # 1. serper 默认搜索工具配置，（请使用自己团队的key）
+        - name: SERPER_API_URL
+          value: https://yibuapi.com/serper/
+        - name: SERPER_API_KEY
+          value: sk-key
+
+        # 2. image-reading工具配置（请使用自己团队的key）
+        - name: IMAGE_READING   # 是否启用image-reading工具，默认off
+          value: 'off'
+        - name: IMAGE_READING_PATH   # image-reading工具位置，linux沙箱专用
+          value: /home/ma-user/claude_code_image_reading_tool/mcp-image-reading/server.js
+        - name: VL_API_URL      
+          value: http://115.33.106.57:8082/v1
+        - name: VL_API_KEY
+          value: sk-vl-key
+        - name: VL_MODEL_ID
+          value: gemini-3.7-flash
+
+        # 3. harness 专用
+        - name: MCP_PLAYWRIGHT  # 是否启用PLAYWRIGHT工具。默认off
+          value: 'off'
+        - name: OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS
+          value: "off"
+        
+      # 资源请求与限制
+      resources:
+        cpu_request: "1"          # CPU 请求：500m（代表0.5核）
+        cpu_limit: "2"            # CPU 上限
+        memory_request: "4Gi"     # 内存请求量
+        memory_limit: "6Gi"       # 内存上限
 
 
+sandbox_namespace: omni-env-default-worker
+
+
+s3:
+  s3_uploader_script: /home/ma-user/obsutil/obsutil
+  s3_download_script: /home/ma-user/obsutil/obsutil
+  bucket_name: obs://s3-asset-b-hd-cce-aifm-nlp-exp
+```
 
 ## 4. 队列管理
 
-> 指导文档：<http://115.120.48.151:8087/#/wiki/queue-usage>
+> 完整说明：<http://115.120.48.151:8087/#/wiki/queue-usage>
 
 ### 4.1 新建队列
 在高级配置中，可以选择 **任务队列**，用来让多个任务按顺序串行执行：一个跑完，下一个自动开始，不用自己盯着。
@@ -249,6 +318,16 @@ Harness 类型
 
 
 ## 7. Evaluator配置
+### 7.1 理解三个角色
+
+| 角色 | 做什么 | 是否决定任务结束 |
+|---|---|---|
+| 执行 Agent | 真正执行 Query、调用工具、生成文件或回答问题 | 否 |
+| User Simulator | 模拟用户追问，并输出 `【Task_Done】` 或 `【Task_Failed】` | 是 |
+| Evaluator | 读取原始任务、最近几轮回复、工具调用和磁盘文件，根据 Rubric 逐项检查，再把建议选择性反馈给 User Simulator | 否，只是顾问 |
+
+
+### 7.2 启用Evaluator
 在task-00000.json中添加如下内容：
 ```json
 {
@@ -260,7 +339,7 @@ Harness 类型
       "system_prompt": "You are a helpful AI assistant. Answer questions clearly and concisely in Chinese."
     },
     {
-      "name": "evaluator",   // 新增 evaluator agent配置，可自定义所需skill和md文件
+      "name": "evaluator",   // 顶层 agents 声明独立的 evaluator Agent
       "config": [],
       "skills": [],
       "system_prompt": null
@@ -270,21 +349,116 @@ Harness 类型
     {
       "agent_name": "main",
       "text": "请解释什么是快速排序算法，给出时间复杂度分析，并用Python写一个实现。",
-      "session_name": "eval_test",
+      "session_name": "main",
       "timeout": 3600,
       "use_simulator": true,        // 是否开启多轮对话
-      "evaluate": {                 // 新增 evaluate 字典 ----> 启用 evaluator 配置
-        "agent_name": "evaluator",  // 必须预先定义在agent列表中
-        "eval_step": 1,             // 评估步长，多少轮评估一次
-        "to_simulator": true,       // 是否利用evaluator的结果
+      "evaluate": {                 // 包含 evaluate 块，并引用该 evaluator Agent；
+        "agent_name": "evaluator",  
+        "session_name": "eval",
+        "eval_step": 1,             // 每 N 轮评估一次，同时只投喂最近 N 轮窗口
+        "to_simulator": true,       // use_simulator是否利用evaluator的结果
         "rubrics_ref": "simple_eval_rubrics.json#/rubrics", // rubrics门禁引用
-        "scoring_ref": "simple_eval_rubrics.json#/scoring"  // 权重分数引用
+        "scoring_ref": "simple_eval_rubrics.json#/scoring",  // 权重分数引用
+        "oracle_ref": null          // Ground Truth JSON 文件路径
       }
     }
   ]
 }
 
 ``` 
+### 7.3 定义Rubric
+#### 简单任务：内联 `rubrics`
+
+直接写字符串列表即可。系统会自动生成 R1、R2 等 ID，所有项按普通最终评分项等权处理。
+
+```json
+"rubrics": [
+  "回答包含明确结论",
+  "关键数字有来源或计算过程",
+  "最终文件已经真实写入工作区"
+]
+```
+
+#### 正式评测：`simple_eval_rubrics.json`
+
+```json
+{
+  "rubrics": [
+    {
+      "id": "G1",
+      "when": "gate",
+      "evaluator": "llm_judge",
+      "text": "回答中包含快速排序的核心思想（分治、选取pivot、分区）"
+    },
+    {
+      "id": "G2",
+      "when": "gate",
+      "evaluator": "llm_judge",
+      "text": "没有将快速排序与其他排序算法混淆（如归并排序、堆排序）"
+    },
+    {
+      "id": "C1",
+      "when": "final",
+      "evaluator": "llm_judge",
+      "text": "正确给出平均时间复杂度 O(n log n) 和最坏时间复杂度 O(n²)"
+    },
+    {
+      "id": "C2",
+      "when": "final",
+      "evaluator": "llm_judge",
+      "text": "给出了可运行的 Python 代码实现"
+    },
+    {
+      "id": "C3",
+      "when": "final",
+      "evaluator": "llm_judge",
+      "text": "代码逻辑正确（包含 partition 步骤和递归调用）"
+    },
+    {
+      "id": "PT1",
+      "when": "per_turn",
+      "evaluator": "llm_judge",
+      "text": "回答使用中文，表述清晰易懂"
+    }
+  ],
+  "scoring": {
+    "gate_zero": true,
+    "weights": {
+      "correctness": 0.6,
+      "presentation": 0.2,
+      "process": 0.2
+    },
+    "bucket_map": {
+      "correctness": [
+        "C1",
+        "C2",
+        "C3"
+      ],
+      "presentation": [
+        "PT1"
+      ],
+      "process": []
+    }
+  }
+}
+```
+#### 7.4 评估结果
+![alt text](/api/wiki/assets/6717c5af184e48f6b00669eee5fce0b8.webp)
+
+
+## 8. 资源看板
+> 完整说明：<http://115.120.48.151:8087/#/wiki/dashboard-usage>
+
+平台有两个查看资源的入口，二者统计口径一致：
+
+| 入口 | 适合什么时候看 | 能看到什么 |
+|---|---|---|
+| 首页顶部「当前资源使用情况」 | 创建、启动任务前快速确认 | 当前 CPU、内存、沙箱并发和任务状态 |
+| 侧栏「资源看板」 | 任务运行中排查资源占用 | 资源池、用户排行、实例分布、规格和历史趋势 |
+
+### 8.1 指标说明
+判断资源是否紧张时：（资源查看）CPU、内存或沙箱容量中的任意一项接近上限，都可能导致新实例长时间准备或排队。
+![alt text](/api/wiki/assets/e59c8210d6314b1ab0f862e97ec1e050.webp)
 
 
 ## 参考资料

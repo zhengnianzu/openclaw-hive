@@ -33,6 +33,7 @@ class MaskedParamsTest(unittest.TestCase):
         return {
             "model_api_key": MODEL_KEY,
             "agents": [{"name": "user_simulator", "api_key": AGENT_KEY}],
+            "models": [{"model_id": "glm-5.3", "model_api_key": MODEL_KEY}],
             "arms": [{"harness_type": "openclaw", "model_api_key": MODEL_KEY}],
             "blocks": [{
                 "harness_type": "openclaw",
@@ -41,10 +42,12 @@ class MaskedParamsTest(unittest.TestCase):
             "sim_arms": [{"agents": [{"name": "evaluator", "api_key": AGENT_KEY}]}],
         }
 
-    def test_all_five_key_slots_are_masked(self):
+    def test_all_key_slots_are_masked(self):
         masked = be._masked_params(self._params())
         self.assertNotEqual(masked["model_api_key"], MODEL_KEY)
         self.assertNotEqual(masked["agents"][0]["api_key"], AGENT_KEY)
+        # 模型轴：与 Harness 解耦后单独的列表，漏脱敏同样是明文落库
+        self.assertNotEqual(masked["models"][0]["model_api_key"], MODEL_KEY)
         self.assertNotEqual(masked["arms"][0]["model_api_key"], MODEL_KEY)
         # 这条是本 bug 的回归点：blocks 曾经漏脱敏，明文直接入库
         self.assertNotEqual(masked["blocks"][0]["models"][0]["model_api_key"], MODEL_KEY)
@@ -54,6 +57,7 @@ class MaskedParamsTest(unittest.TestCase):
         src = self._params()
         be._masked_params(src)
         self.assertEqual(src["model_api_key"], MODEL_KEY)
+        self.assertEqual(src["models"][0]["model_api_key"], MODEL_KEY)
         self.assertEqual(src["blocks"][0]["models"][0]["model_api_key"], MODEL_KEY)
         self.assertEqual(src["agents"][0]["api_key"], AGENT_KEY)
 
@@ -105,6 +109,11 @@ class RestoreParamsTest(unittest.TestCase):
             "model_api_key": be._mask_secret(MODEL_KEY),
             "model_id": "glm-5.3",
             "agents": [{"name": "user_simulator", "api_key": be._mask_secret(AGENT_KEY)}],
+            "models": [{
+                "model_id": "glm-5.3",
+                "model_base_url": "http://10.0.0.1:8082/v1",
+                "model_api_key": be._mask_secret(MODEL_KEY),
+            }],
             "arms": [{
                 "harness_type": "openclaw", "harness_config_id": 1,
                 "harness_config_version_id": 150, "model_id": "glm-5.3",
@@ -139,6 +148,16 @@ class RestoreParamsTest(unittest.TestCase):
         self.assertEqual(out["arms"][0]["model_api_key"], MODEL_KEY)
         self.assertEqual(out["model_api_key"], MODEL_KEY)
         self.assertEqual(out["agents"][0]["api_key"], AGENT_KEY)
+
+    def test_restores_model_axis_across_harnesses(self):
+        """模型轴与 Harness 解耦：key 从任意一个子任务取回即可。
+
+        这里源实例的 harness 是 openclaw，而 models 轴没有任何 harness 信息 ——
+        查找必须按 (model_id, base_url) 做，不能依赖 harness 三件套。
+        """
+        self._insert(self._instance_params())
+        out = be._restore_params_secrets(self.BATCH, self._masked_input())
+        self.assertEqual(out["models"][0]["model_api_key"], MODEL_KEY)
 
     def test_does_not_mutate_input(self):
         self._insert(self._instance_params())

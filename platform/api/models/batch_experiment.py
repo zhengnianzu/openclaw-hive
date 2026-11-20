@@ -48,20 +48,37 @@ class BatchArm(BaseModel):
 
 
 class BatchModelParams(BaseModel):
-    """Harness 块内的一个模型 —— 矩阵的第二维（同一 Harness 下可配多个模型）。"""
+    """矩阵的一条模型轴 —— 与 Harness 完全解耦，对所有 Harness 生效。
+
+    一个模型 × 一个 Harness = 一个子任务配置（纯正交笛卡尔积）。
+    model_base_url 原样传递，不做 /v1 规整：各 harness 在 create_instance 里
+    自己补或剥（claude-code 剥、openclaw 补），带不带 /v1 都能被正确解析。
+    """
     model_id: str = ""
     model_base_url: str = ""
     model_api_key: str = ""
     model_api_type: str = ""
 
 
-class BatchBlock(BaseModel):
-    """一个 Harness 配置块 = 一个 Harness（类型/方案/版本/镜像/沙箱）+ 若干模型。
+class BatchHarness(BaseModel):
+    """矩阵的 Harness 轴 —— 只描述「跑哪个 Harness」，不带模型。
 
-    这是矩阵的**原始二维结构**：Harness 是一维，块内 models 是另一维。
-    真正的展开（Harness × 模型 → 一个子任务配置）发生在 create_experiment
-    建子任务时，而不是在前端提交前就压平 —— 否则 params_json 里只剩笛卡尔积，
-    详情页无法还原出「两个 Harness、两个模型」这样的原始配置。
+    模型在 BatchExperimentCreate.models 这个独立轴上，两者正交组合。
+    旧客户端把模型塞在块内的形状仍由 BatchBlock 兼容。
+    """
+    harness_type: str
+    harness_config_id: Optional[int] = None
+    harness_config_version_id: Optional[int] = None
+    label: str = ""
+    image_name: Optional[str] = None
+    sandbox_config_id: Optional[int] = None
+
+
+class BatchBlock(BaseModel):
+    """【旧形状】一个 Harness 配置块 = 一个 Harness + 块内若干模型。
+
+    模型现在独立成轴（BatchHarness + BatchModelParams），这里只为历史实验与
+    旧客户端保留：块内 models 非空时按「Harness × 块内模型」展开，与改造前一致。
     """
     harness_type: str
     harness_config_id: Optional[int] = None
@@ -142,10 +159,15 @@ class BatchExperimentCreate(BaseModel):
     name: str
     description: str = ""
     registration_id: int                      # 测试集
-    # 矩阵原始二维结构：Harness 块 × 块内模型。优先于 arms 使用，
-    # 由后端展开成 arms（一个模型一个臂）再建子任务。
+    # 矩阵的两条正交轴：Harness 列表 × 模型列表。同时给齐时按纯笛卡尔积展开
+    # （每个模型在每个 Harness 上各跑一个子任务）。models 为空会拒绝创建：
+    # 一个「不知道测哪个模型」的实验没有意义。
+    harnesses: List[BatchHarness] = []
+    models: List[BatchModelParams] = []
+    # 【旧形状】Harness 块 × 块内模型。harnesses/models 为空时才启用，
+    # 保证历史实验的复制/重跑路径不受影响。
     blocks: List[BatchBlock] = []
-    # 摊平后的臂。为兼容旧客户端保留：blocks 为空时才直接使用它。
+    # 摊平后的臂。旧客户端兜底：harnesses/models/blocks 都为空时直接使用它。
     arms: List[BatchArm] = []
     # 第二矩阵轴。空列表 = 该轴退化，子任务吃 harness 模板默认的
     # user_proxy_model.json（旧客户端行为）。

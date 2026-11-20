@@ -502,13 +502,15 @@ const simSummary = computed(() => {
   return '模板默认'
 })
 
-// 参数分组与创建页的五个 Tab 一一对应：Harness 类型 / Harness 配置 /
+// 参数分组与创建页的五个 Tab 一一对应：Harness 类型 / 模型配置 /
 // 用户模拟配置 / 批量任务配置 / 高级配置。
-// 数据源是 params_json.blocks —— 矩阵的原始二维结构（Harness 块 × 块内模型），
+// 数据源优先 params_json.harnesses + params_json.models —— 矩阵的两条正交轴，
 // 不是摊平后的 arms。展开成子任务配置是后端在建任务时才做的，
 // 这里必须还原原始配置，否则「2 个 Harness × 2 个模型」会显示成 4 个重复项。
 const paramGroups = computed(() => {
   const p = parsedParams.value
+  const harnessList = Array.isArray(p.harnesses) ? p.harnesses : []
+  const modelList = Array.isArray(p.models) ? p.models : []
   const blocks = Array.isArray(p.blocks) ? p.blocks : []
 
   // 老实验没有 blocks（只存了摊平后的 arms），按 harness 三件套归组还原成块。
@@ -558,7 +560,10 @@ const paramGroups = computed(() => {
     return s ? (s.name || s.pool_name || `#${id}`) : (id != null ? `#${id}` : null)
   }
 
-  const harnessRows = blockList.map(b => ({
+  // Harness 轴的行来源：新形状直接用 harnesses；老形状用上面还原的块
+  const harnessSource = harnessList.length ? harnessList : blockList
+
+  const harnessRows = harnessSource.map(b => ({
     harness_type: harnessStore.label(b.harness_type),
     config_name: cfgName(b.harness_config_id),
     version_name: verName(b.harness_config_version_id),
@@ -566,31 +571,31 @@ const paramGroups = computed(() => {
     sandbox_name: sandboxName(b.sandbox_config_id ?? p.sandbox_config_id),
   }))
 
-  // ---- Harness 配置：一行一个模型，带所属 Harness 以区分归属 ----
+  // ---- 模型配置：一行一个模型（模型轴对新形状是独立的，对所有 Harness 生效） ----
   const modelCols = [
     { prop: 'model_id', label: '模型 ID', minWidth: 180 },
     { prop: 'model_api_type', label: 'API 类型', minWidth: 130 },
     { prop: 'model_base_url', label: 'Base URL', minWidth: 240 },
     { prop: 'model_api_key', label: 'API Key', minWidth: 150 },
   ]
-  // 按 model_id 去重：同一模型配在多个 Harness 下只列一次，
+  // 新形状直接用 params.models；老形状从块内模型里按 model_id 去重凑出来。
   // 这张表回答的是「这次实验用了哪几个模型」。
   const modelSeen = new Map()
-  for (const b of blockList) {
-    const models = (b.models || []).length
-      ? b.models
-      : [{ model_id: p.model_id || '模板默认', model_api_type: p.model_api_type,
-           model_base_url: p.model_base_url, model_api_key: p.model_api_key }]
-    for (const m of models) {
-      const mid = (m.model_id || '').trim()
-      if (mid && !modelSeen.has(mid)) {
-        modelSeen.set(mid, {
-          model_id: mid,
-          model_api_type: m.model_api_type,
-          model_base_url: m.model_base_url,
-          model_api_key: m.model_api_key,
-        })
-      }
+  const rawModels = modelList.length
+    ? modelList
+    : blockList.flatMap(b => ((b.models || []).length
+        ? b.models
+        : [{ model_id: p.model_id || '模板默认', model_api_type: p.model_api_type,
+             model_base_url: p.model_base_url, model_api_key: p.model_api_key }]))
+  for (const m of rawModels) {
+    const mid = (m.model_id || '').trim()
+    if (mid && !modelSeen.has(mid)) {
+      modelSeen.set(mid, {
+        model_id: mid,
+        model_api_type: m.model_api_type,
+        model_base_url: m.model_base_url,
+        model_api_key: m.model_api_key,
+      })
     }
   }
   const modelRows = [...modelSeen.values()]
@@ -637,7 +642,7 @@ const paramGroups = computed(() => {
       })),
     },
     {
-      key: 'hconfig', title: 'Harness 配置',
+      key: 'hconfig', title: '模型配置',
       icon: Cpu,
       columns: modelCols,
       rows: modelRows,

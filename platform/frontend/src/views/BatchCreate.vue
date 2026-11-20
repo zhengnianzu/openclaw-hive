@@ -54,7 +54,8 @@
               @click="tab = t.key">
               <el-icon :size="16"><component :is="t.icon" /></el-icon>
               <span>{{ t.label }}</span>
-              <el-badge v-if="t.key === 'harness' && form.arms.length" :value="form.arms.length" class="tab-badge" />
+              <el-badge v-if="t.key === 'harness' && form.harnesses.length" :value="form.harnesses.length" class="tab-badge" />
+              <el-badge v-else-if="t.key === 'hconfig' && form.models.length" :value="form.models.length" class="tab-badge" />
               <el-badge v-else-if="t.key === 'sim' && form.agents.length" :value="form.agents.length" class="tab-badge" />
             </button>
           </div>
@@ -64,22 +65,22 @@
             <!-- 左：Harness 列表 -->
             <aside class="list-col">
               <div class="list-head">
-                <span>Harness 列表（{{ form.arms.length }}）</span>
+                <span>Harness 列表（{{ form.harnesses.length }}）</span>
               </div>
               <el-button class="add-btn" @click="addArm">
                 <el-icon><Plus /></el-icon> 添加 Harness
               </el-button>
 
-              <div v-if="!form.arms.length" class="list-empty">
+              <div v-if="!form.harnesses.length" class="list-empty">
                 还没有添加 Harness。<br />每个 Harness 是矩阵的一列。
               </div>
 
-              <div v-for="(a, i) in form.arms" :key="a._uid" class="list-item"
+              <div v-for="(a, i) in form.harnesses" :key="a._uid" class="list-item"
                 :class="{ active: selectedArm === i }" @click="selectedArm = i">
                 <span class="li-tag">H{{ i + 1 }}</span>
                 <div class="li-main">
                   <div class="li-name">{{ a.label || configName(a.harness_config_id) || '未命名' }}</div>
-                  <div class="li-sub">{{ versionName(a) || '未选版本' }} · {{ modelCountOf(a) }} 个模型</div>
+                  <div class="li-sub">{{ versionName(a) || '未选版本' }}</div>
                 </div>
                 <el-dropdown trigger="click" @command="cmd => onArmCommand(cmd, i)">
                   <el-button text class="li-more" @click.stop>
@@ -182,30 +183,29 @@
             </section>
           </div>
 
-          <!-- ---------- Tab: Harness 配置（主 Agent 的模型配置 = 矩阵第二维） ---------- -->
+          <!-- ---------- Tab: 模型配置（矩阵的另一条轴，独立于 Harness） ---------- -->
           <div v-else-if="tab === 'hconfig'" class="split">
-            <!-- 左：模型列表。一个模型 = 矩阵的一列，这才是真正的第二个变量维度 -->
+            <!-- 左：模型列表。一条扁平的轴 —— 每个模型都在所有 Harness 上各跑一遍 -->
             <aside class="list-col">
               <div class="list-head">
                 <span>模型列表（{{ totalModels }}）</span>
               </div>
-              <el-button class="add-btn" :disabled="!curArm" @click="addModel">
+              <el-button class="add-btn" @click="addModel">
                 <el-icon><Plus /></el-icon> 添加模型
               </el-button>
 
               <div v-if="!totalModels" class="list-empty">
-                还没有配置模型。<br />添加后每个模型独立生成一列矩阵。
+                还没有配置模型。<br />模型与 Harness 正交，列表里的每个模型都会在每个 Harness 上各跑一遍。
               </div>
 
-              <div v-for="m in allModels" :key="m._uid" class="list-item"
-                :class="{ active: m._armIdx === selectedArm && m._mi === selectedModel }"
-                @click="selectedArm = m._armIdx; selectedModel = m._mi">
-                <span class="li-tag model">M{{ m._globalIdx + 1 }}</span>
+              <div v-for="(m, mi) in form.models" :key="m._uid" class="list-item"
+                :class="{ active: selectedModel === mi }" @click="selectedModel = mi">
+                <span class="li-tag model">M{{ mi + 1 }}</span>
                 <div class="li-main">
                   <div class="li-name">{{ m.model_id || '未填模型 ID' }}</div>
-                  <div class="li-sub">{{ m._armLabel }}</div>
+                  <div class="li-sub">对所有 Harness 生效</div>
                 </div>
-                <el-button text class="li-more" @click.stop="removeModelAt(m._armIdx, m._mi)">
+                <el-button text class="li-more" @click.stop="removeModelAt(mi)">
                   <el-icon><Delete /></el-icon>
                 </el-button>
               </div>
@@ -213,23 +213,15 @@
 
             <!-- 右：选中模型的参数（字段顺序照搬单任务「Harness配置」tab） -->
             <section class="detail-col">
-              <div v-if="!curArm" class="detail-empty">
-                <el-empty :image-size="80" description="请先在「Harness 类型」里添加 Harness" />
-              </div>
-              <div v-else-if="!curModel" class="detail-empty">
-                <el-empty :image-size="80"
-                  :description="curArm.models.length
-                    ? '请从左侧选择一个模型'
-                    : '该 Harness 还没有模型 —— 点左侧「添加模型」，或使用高级配置里的兜底模型'" />
+              <div v-if="!curModel" class="detail-empty">
+                <el-empty :image-size="80" description="点左侧「添加模型」配置矩阵的另一条轴" />
               </div>
               <template v-else>
                 <div class="detail-head">
                   <div class="dh-left">
-                    <span class="dh-tag">H{{ selectedArm + 1 }}</span>
+                    <span class="dh-tag">M{{ selectedModel + 1 }}</span>
                     <span class="dh-title">{{ curModel.model_id || '未填模型 ID' }}</span>
-                    <el-tag :style="harnessStore.tagStyle(curArm.harness_type)" size="small">
-                      {{ harnessStore.label(curArm.harness_type) }}
-                    </el-tag>
+                    <el-tag size="small">所有 Harness</el-tag>
                   </div>
                   <div class="dh-right">
                     <el-button type="danger" plain @click="removeModelAt(selectedArm, selectedModel)">
@@ -582,8 +574,8 @@
               <table class="matrix">
                 <thead>
                   <tr>
-                    <th class="corner">Harness 配置（模型）\ Harness 类型</th>
-                    <th v-for="(a, i) in form.arms" :key="a._uid" class="mh">
+                    <th class="corner">模型 \ Harness 类型</th>
+                    <th v-for="(a, i) in form.harnesses" :key="a._uid" class="mh">
                       <div class="mh-name">
                         <el-tag :style="harnessStore.tagStyle(a.harness_type)" size="small"
                           style="margin-right:5px">{{ harnessStore.label(a.harness_type) }}</el-tag>
@@ -647,7 +639,7 @@
               <el-descriptions-item label="测试集">
                 {{ selectedReg?.task_name }}（{{ sampleTotal }} 条）
               </el-descriptions-item>
-              <el-descriptions-item label="Harness 数">{{ form.arms.length }}</el-descriptions-item>
+              <el-descriptions-item label="Harness 数">{{ form.harnesses.length }}</el-descriptions-item>
               <el-descriptions-item label="模型配置数">{{ modelCount }}</el-descriptions-item>
               <el-descriptions-item label="用户模拟 Agent">{{ form.agents.length || '模板默认' }}</el-descriptions-item>
               <el-descriptions-item label="重复次数">{{ form.repeat_times }}</el-descriptions-item>
@@ -720,7 +712,7 @@
               <div class="stat-ic"><el-icon><Files /></el-icon></div>
               <div>
                 <div class="stat-k">Harness 数</div>
-                <div class="stat-v">{{ form.arms.length }}</div>
+                <div class="stat-v">{{ form.harnesses.length }}</div>
               </div>
             </div>
             <div class="stat">
@@ -755,7 +747,7 @@
           </div>
           <div v-else class="ok-box small">
             <el-icon><CircleCheckFilled /></el-icon>
-            当前共 {{ form.arms.length }} 个 Harness（{{ modelCount }} 个模型配置），
+            当前共 {{ form.harnesses.length }} 个 Harness（{{ modelCount }} 个模型配置），
             用户模拟为通用配置，将生成 {{ totalTasks }} 个执行任务。
           </div>
         </div>
@@ -817,7 +809,7 @@ const STEPS = ['配置实验', '矩阵预览', '确认创建']
 // 而 main.js 只全局注册了部分图标，Collection / MagicStick 不在其中。
 const TABS = [
   { key: 'harness', label: 'Harness 类型', icon: Collection },
-  { key: 'hconfig', label: 'Harness 配置', icon: Setting },
+  { key: 'hconfig', label: '模型配置', icon: Setting },
   { key: 'sim', label: '用户模拟配置', icon: User },
   { key: 'batch', label: '批量任务配置', icon: Tickets },
   { key: 'adv', label: '高级配置', icon: MagicStick },
@@ -845,7 +837,9 @@ const form = ref({
   name: '',
   description: '',
   registration_id: null,
-  arms: [],
+  // 矩阵的两条正交轴：Harness 列表 × 模型列表，每个模型在每个 Harness 上都跑。
+  harnesses: [],
+  models: [],
   // 用户模拟 = 通用配置，写进每个子任务的 user_proxy_model.json。
   // 默认给一行 user_simulator（与单任务表单一致），清空则用模板默认值。
   agents: [emptyAgent()],
@@ -880,13 +874,12 @@ const form = ref({
 function emptyModel() {
   return { _uid: uid(), model_id: '', model_base_url: '', model_api_key: '', model_api_type: '' }
 }
-function emptyArm() {
+function emptyHarness() {
   return {
     _uid: uid(), harness_type: '', harness_config_id: null,
     harness_config_version_id: null, label: '', description: '',
     run_mode: 'standard', sys_file_version: '', skill_set: '',
     image_name: '', sandbox_config_id: null,
-    models: [],
   }
 }
 function emptyAgent() {
@@ -894,27 +887,15 @@ function emptyAgent() {
 }
 
 const curArm = computed(() =>
-  selectedArm.value >= 0 ? form.value.arms[selectedArm.value] || null : null)
+  selectedArm.value >= 0 ? form.value.harnesses[selectedArm.value] || null : null)
 
-// 「Harness 配置」tab：把所有 Harness 的模型摊平成一份列表（一个模型 = 矩阵一列）
-const allModels = computed(() => {
-  const out = []
-  let g = 0
-  form.value.arms.forEach((a, ai) => {
-    const armLabel = a.label || configName(a.harness_config_id) || `H${ai + 1}`
-    ;(a.models || []).forEach((m, mi) => {
-      out.push({ ...m, _armIdx: ai, _mi: mi, _globalIdx: g++, _armLabel: armLabel })
-    })
-  })
-  return out
-})
-const totalModels = computed(() => allModels.value.length)
+// 「模型配置」tab：一条扁平的模型轴，不属于任何 Harness —— 每个模型都在所有
+// Harness 上各跑一遍（与 Harness 正交）。原名 allModels 保留，模板里直接用。
+const allModels = computed(() => form.value.models)
+const totalModels = computed(() => form.value.models.length)
 
-const curModel = computed(() => {
-  const a = curArm.value
-  if (!a) return null
-  return (a.models || [])[selectedModel.value] || null
-})
+const curModel = computed(() =>
+  form.value.models[selectedModel.value] || null)
 // 用户模拟配置是通用配置：一份 agents，作用于全部子任务
 const sharedAgents = computed(() => form.value.agents)
 
@@ -922,15 +903,10 @@ const selectedReg = computed(() =>
   regList.value.find(r => r.id === form.value.registration_id) || null)
 const sampleTotal = computed(() => selectedReg.value?.data_total || 0)
 
-// 每个 Harness 至少贡献 1 列（没配模型时用兜底模型）
-function modelCountOf(a) {
-  return Math.max((a.models || []).length, 1)
-}
-const modelCount = computed(() =>
-  form.value.arms.reduce((n, a) => n + modelCountOf(a), 0))
-// 矩阵维度只有「Harness 类型 × 模型配置」；用户模拟与高级配置都是通用配置，不进乘法
+const modelCount = computed(() => form.value.models.length)
+// 矩阵两条轴：Harness 数 × 模型数；用户模拟与高级配置是通用配置，不进乘法
 const subtaskCount = computed(() =>
-  modelCount.value * form.value.repeat_times)
+  form.value.harnesses.length * modelCount.value * form.value.repeat_times)
 const totalTasks = computed(() => subtaskCount.value * sampleTotal.value)
 
 function agentsLabel() {
@@ -940,65 +916,28 @@ function agentsLabel() {
 
 // ---------- 右侧迷你矩阵 ----------
 const sideCols = computed(() => {
-  if (!form.value.arms.length) return [{ short: '—', sub: '未配置' }]
-  return form.value.arms.map(a => ({
+  if (!form.value.harnesses.length) return [{ short: '—', sub: '未配置' }]
+  return form.value.harnesses.map((a, i) => ({
     _uid: a._uid,
-    short: a.label || configName(a.harness_config_id) || 'Harness',
-    sub: `（${modelCountOf(a)} 个模型）`,
+    short: a.label || configName(a.harness_config_id) || `H${i + 1}`,
+    sub: versionName(a) ? `（${versionName(a)}）` : '',
   }))
 })
-// 矩阵两轴：列 = Harness（类型/方案/版本），行 = Harness 配置（模型）。
-// 模型挂在某个 Harness 下，所以单元格只在「该模型属于该 Harness」时打勾，
-// 其余留空 —— 直接画满会让 2 个 Harness 各 1 个模型时错显示成 2×2=4 个组合。
-function armDisplayName(ai) {
-  const a = form.value.arms[ai]
-  if (!a) return ''
-  return a.label || configName(a.harness_config_id) || `H${ai + 1}`
-}
 
-// 矩阵两轴：列 = Harness（类型/方案/版本），行 = 模型（跨 Harness 去重）。
-//
-// 行必须按 model_id 合并，不能按「模型属于哪个臂」各占一行 —— 后者会让同一个
-// GLM 配在两个 Harness 上时出现两行、每行只有一个勾（看起来像两条独立配置，
-// 实际是两个 Harness 各跑一遍 GLM）。去重后同一行在两列都打勾，才是真笛卡尔积。
+// 矩阵两轴：列 = Harness（类型/方案/版本），行 = 模型。
+// 两条轴正交，所以每个格子都打勾（Harness 数 × 模型数 = 子任务配置数）。
+// 模型列表为空时没有可跑的配置，画一行「未配置模型」提示，而不是假装有兜底。
 const matrixAxisRows = computed(() => {
-  const order = []
-  const byKey = new Map()
-
-  form.value.arms.forEach((a, ai) => {
-    ;(a.models || []).forEach((m) => {
-      const mid = (m.model_id || '').trim()
-      // 没填 model_id 的不能按空串合并（多个空模型会糊成一行），各占一行
-      const key = mid || `__anon__${m._uid}`
-      if (!byKey.has(key)) {
-        byKey.set(key, { name: mid || '未填模型 ID', arms: new Set() })
-        order.push(key)
-      }
-      byKey.get(key).arms.add(ai)
-    })
-  })
-
-  const rows = order.map(k => {
-    const r = byKey.get(k)
-    return {
-      key: k,
-      name: r.name,
-      sub: [...r.arms].map(armDisplayName).join('、'),
-      cells: form.value.arms.map((_, ci) => r.arms.has(ci)),
-    }
-  })
-
-  // 没配模型的 Harness 会用模板默认模型，单独占一行 ——
-  // 否则那一列全是空格，看不出它会跑什么。
-  const noModel = form.value.arms
-    .map((a, ai) => ({ a, ai }))
-    .filter(({ a }) => !(a.models || []).length)
-  if (noModel.length) {
+  const rows = form.value.models.map((m, mi) => ({
+    key: m._uid,
+    name: m.model_id || `模型 ${mi + 1}`,
+    cells: form.value.harnesses.map(() => true),
+  }))
+  if (!rows.length) {
     rows.push({
-      key: '__fallback__',
-      name: '模板默认模型',
-      sub: noModel.map(({ ai }) => armDisplayName(ai)).join('、'),
-      cells: form.value.arms.map((a) => !(a.models || []).length),
+      key: '__empty__',
+      name: '未配置模型',
+      cells: form.value.harnesses.map(() => false),
     })
   }
   return rows
@@ -1011,7 +950,7 @@ const sideRows = computed(() => matrixAxisRows.value.map(r => ({
 
 const matrixRows = computed(() => matrixAxisRows.value.map(r => ({
   label: r.name,
-  sub: r.armLabel,
+  sub: '',
   cells: r.cells,
 })))
 
@@ -1037,44 +976,46 @@ const taskPreview = computed(() => {
   return out
 })
 
-// 提交时把「Harness 块 × 块内模型」摊平成后端认识的 arms
-// 矩阵的原始二维结构：Harness 块 × 块内模型。
-// 提交时连同 blocks 一起发，后端在 params_json 里原样保存，
-// 详情页才还原得出「两个 Harness、两个模型」；展开成子任务由后端做。
-function buildBlocks() {
-  return form.value.arms.map(a => ({
+// 提交时把两条正交轴原样发给后端：harnesses（Harness 轴）+ models（模型轴）。
+// 后端按笛卡尔积展开成子任务，params_json 里也原样保存这两条轴 ——
+// 详情页/复制页因此还原得出「哪几个 Harness、哪几个模型」，而不是从摊平结果反推。
+function buildHarnesses() {
+  return form.value.harnesses.map(a => ({
     harness_type: a.harness_type,
     harness_config_id: a.harness_config_id,
     harness_config_version_id: a.harness_config_version_id,
     label: a.label || configName(a.harness_config_id) || a.harness_type,
     image_name: a.image_name || null,
     sandbox_config_id: a.sandbox_config_id ?? null,
-    models: (a.models || []).map(m => ({
-      model_id: (m.model_id || '').trim(),
-      model_base_url: (m.model_base_url || '').trim(),
-      model_api_key: m.model_api_key || '',
-      model_api_type: m.model_api_type || '',
-    })),
   }))
 }
 
+function buildModels() {
+  return form.value.models.map(m => ({
+    model_id: (m.model_id || '').trim(),
+    // base_url 原样传，不做 /v1 规整：各 harness 在 create_instance 里自己补或剥。
+    model_base_url: (m.model_base_url || '').trim(),
+    model_api_key: m.model_api_key || '',
+    model_api_type: m.model_api_type || '',
+  }))
+}
+
+// 摊平后的臂：显式给后端一份「Harness × 模型」，同时用作前端预览。
+// label 带上 Harness 名，保证对比页每一列唯一可辨。
 function flattenArms() {
   const out = []
-  for (const a of form.value.arms) {
+  for (const a of form.value.harnesses) {
     const base = a.label || configName(a.harness_config_id) || a.harness_type
-    const models = a.models.length ? a.models : [null]
-    for (const m of models) {
+    for (const m of form.value.models) {
       out.push({
         harness_type: a.harness_type,
         harness_config_id: a.harness_config_id,
         harness_config_version_id: a.harness_config_version_id,
-        // 列轴已经是「Harness 类型」，这里只标模型就够了 —— 拼成
-        // 「Claude Code · GLM」会在矩阵里跟列头重复一遍 Harness 名。
-        label: m ? (m.model_id || '未填模型') : base,
-        model_base_url: (m?.model_base_url || '').trim(),
-        model_api_key: m?.model_api_key || '',
-        model_id: (m?.model_id || '').trim(),
-        model_api_type: m?.model_api_type || '',
+        label: m.model_id ? `${base} · ${m.model_id}` : base,
+        model_base_url: (m.model_base_url || '').trim(),
+        model_api_key: m.model_api_key || '',
+        model_id: (m.model_id || '').trim(),
+        model_api_type: m.model_api_type || '',
       })
     }
   }
@@ -1087,16 +1028,19 @@ const blockingIssues = computed(() => {
   if (!form.value.name.trim()) issues.push('实验名称为空')
   if (!form.value.registration_id) issues.push('未选择测试集')
   else if (!selectedReg.value?.task_path_obs) issues.push('该数据集未填写任务路径（task_path_obs）')
-  if (!form.value.arms.length) issues.push('至少需要添加一个 Harness')
+  if (!form.value.harnesses.length) issues.push('至少需要添加一个 Harness')
+  // 模型轴独立于 Harness，空列表没有业务含义 —— 老版本正是靠「块内 0 模型 +
+  // 兜底模型」静默退化成模板占位模型（token 字面量 keys），跑出来的数据不可用。
+  if (!form.value.models.length) issues.push('至少需要添加一个模型')
 
-  form.value.arms.forEach((a, i) => {
+  form.value.harnesses.forEach((a, i) => {
     const no = `H${i + 1}`
     if (!a.harness_type) issues.push(`${no} 未选择 Harness 类型`)
     if (a.harness_config_id == null) issues.push(`${no} 未选择执行方案`)
     if (a.harness_config_version_id == null) issues.push(`${no} 未选择配置版本`)
-    for (const [mi, m] of (a.models || []).entries()) {
-      if (!m.model_id.trim()) issues.push(`${no} 的第 ${mi + 1} 个模型未填模型 ID`)
-    }
+  })
+  form.value.models.forEach((m, mi) => {
+    if (!(m.model_id || '').trim()) issues.push(`第 ${mi + 1} 个模型未填模型 ID`)
   })
   form.value.agents.forEach((ag, ai) => {
     if (!(ag.name || '').trim()) issues.push(`第 ${ai + 1} 个模拟 Agent 未填名称`)
@@ -1110,8 +1054,8 @@ const blockingIssues = computed(() => {
 const canNext = computed(() => {
   if (step.value === 0) {
     return !!form.value.name.trim() && !!form.value.registration_id &&
-      !!selectedReg.value?.task_path_obs && form.value.arms.length > 0 &&
-      form.value.arms.every(a => a.harness_config_version_id != null) &&
+      !!selectedReg.value?.task_path_obs && form.value.harnesses.length > 0 &&
+      form.value.harnesses.every(a => a.harness_config_version_id != null) &&
       true
   }
   if (step.value === 1) return blockingIssues.value.length === 0
@@ -1206,11 +1150,7 @@ let keyTarget = { type: 'model', slot: '' }
 function findKeyTarget() {
   const { type, slot } = keyTarget
   if (type === 'model') {
-    for (const a of form.value.arms) {
-      const m = a.models.find(x => x._uid === slot)
-      if (m) return m
-    }
-    return null
+    return form.value.models.find(x => x._uid === slot) || null
   }
   const m = /^a(\d+)$/.exec(slot)
   if (!m) return null
@@ -1269,21 +1209,19 @@ function commitDraftKey(slot, target) {
 
 // ---------- Harness 增删改 ----------
 function addArm() {
-  form.value.arms.push(emptyArm())
-  selectedArm.value = form.value.arms.length - 1
+  form.value.harnesses.push(emptyHarness())
+  selectedArm.value = form.value.harnesses.length - 1
   tab.value = 'harness'
 }
 
 function selectArm(i) {
   selectedArm.value = i
-  selectedModel.value = 0
 }
 
 function onArmTypeChange() {
   const a = curArm.value
   a.harness_config_id = null
   a.harness_config_version_id = null
-  a.models = []
   const cs = configsOf(a.harness_type)
   if (cs.length === 1) {
     a.harness_config_id = cs[0].config_id
@@ -1300,26 +1238,22 @@ function onArmSchemeChange() {
 }
 
 function copyArm(i) {
-  const src = form.value.arms[i]
-  const clone = {
-    ...src,
-    _uid: uid(),
-    models: src.models.map(m => ({ ...m, _uid: uid() })),
-  }
-  form.value.arms.splice(i + 1, 0, clone)
+  const src = form.value.harnesses[i]
+  const clone = { ...src, _uid: uid() }
+  form.value.harnesses.splice(i + 1, 0, clone)
   selectedArm.value = i + 1
   ElMessage.success('已复制')
 }
 
 async function removeArm(i) {
-  if (form.value.arms.length <= 1) {
+  if (form.value.harnesses.length <= 1) {
     try {
       await ElMessageBox.confirm('删除最后一个 Harness 后将无法创建，确定？', '提示', { type: 'warning' })
     } catch { return }
   }
-  form.value.arms.splice(i, 1)
-  if (selectedArm.value >= form.value.arms.length) {
-    selectedArm.value = form.value.arms.length - 1
+  form.value.harnesses.splice(i, 1)
+  if (selectedArm.value >= form.value.harnesses.length) {
+    selectedArm.value = form.value.harnesses.length - 1
   }
 }
 
@@ -1339,18 +1273,22 @@ async function renameArm() {
   } catch { /* cancelled */ }
 }
 
-// ---------- 块内模型 ----------
+// ---------- 模型轴（独立于 Harness，对所有 Harness 生效） ----------
 function addModel() {
-  if (!curArm.value) return
-  curArm.value.models.push(emptyModel())
-  selectedModel.value = curArm.value.models.length - 1
+  form.value.models.push(emptyModel())
+  selectedModel.value = form.value.models.length - 1
 }
-function removeModelAt(ai, mi) {
-  const arm = form.value.arms[ai]
-  if (!arm) return
-  arm.models.splice(mi, 1)
-  if (selectedArm.value === ai && selectedModel.value >= arm.models.length) {
-    selectedModel.value = Math.max(arm.models.length - 1, 0)
+function copyModel(i) {
+  const src = form.value.models[i]
+  if (!src) return
+  form.value.models.splice(i + 1, 0, { ...src, _uid: uid() })
+  selectedModel.value = i + 1
+  ElMessage.success('已复制')
+}
+function removeModelAt(mi) {
+  form.value.models.splice(mi, 1)
+  if (selectedModel.value >= form.value.models.length) {
+    selectedModel.value = Math.max(form.value.models.length - 1, 0)
   }
 }
 
@@ -1496,9 +1434,7 @@ async function submit() {
     return
   }
   // 失焦没触发就点了提交 —— 把缓冲里的 key 补回来，别丢用户输入
-  if (curArm.value) {
-    for (const m of curArm.value.models) commitDraftKey(m._uid, m)
-  }
+  for (const m of form.value.models) commitDraftKey(m._uid, m)
   form.value.agents.forEach((ag, ai) => commitDraftKey(agentSlot(ai), ag))
 
   creating.value = true
@@ -1507,9 +1443,11 @@ async function submit() {
       name: form.value.name.trim(),
       description: form.value.description,
       registration_id: form.value.registration_id,
-      // 原始二维结构（Harness 块 × 模型）—— 后端据此存 params_json 并展开
-      blocks: buildBlocks(),
-      // 兼容字段：后端优先用 blocks，为空时才用 arms
+      // 两条正交轴：Harness 列表 × 模型列表 —— 后端据此存 params_json 并按
+      // 笛卡尔积展开成子任务（一个模型在一个 Harness 上 = 一个子任务）
+      harnesses: buildHarnesses(),
+      models: buildModels(),
+      // 兼容字段：摊平后的臂，后端在 harnesses/models 缺省时才用
       arms: flattenArms(),
       // 用户模拟是通用配置：进 common，由后端写进每个子任务的 user_proxy_model.json
       sim_arms: [],
@@ -1549,19 +1487,19 @@ async function prefillFromCopy(batchId) {
     form.value.queue.tail_skip_enabled = !!src.tail_skip_enabled
     form.value.queue.tail_skip_percent = src.tail_skip_percent || 10
 
-    // 还原 Harness 块：优先用 params_json.blocks（原始二维结构，块 × 模型），
-    // 老实验没有 blocks 时才退回摊平的 arms 并按 harness 三件套归组。
+    // 还原两条正交轴：优先 params.harnesses + params.models（新形状）。
+    // 老实验只有 blocks（块内嵌模型）或摊平的 arms —— 把其中的模型去重后
+    // 摊成模型轴，保证「2 个 Harness 各配 1 个模型」不会退化成两个独立块。
     let saved = (full && full.params) || {}
     if (typeof saved !== 'object') saved = {}
 
-    const newBlock = (b = {}) => ({
+    const newHarness = (b = {}) => ({
       _uid: uid(), harness_type: b.harness_type || '',
       harness_config_id: b.harness_config_id ?? null,
       harness_config_version_id: b.harness_config_version_id ?? null,
-      label: '', description: '', run_mode: 'standard',
+      label: b.label || '', description: '', run_mode: 'standard',
       sys_file_version: '', skill_set: '',
       image_name: b.image_name || '', sandbox_config_id: b.sandbox_config_id ?? null,
-      models: [],
     })
     const newModel = (m = {}) => ({
       _uid: uid(), model_id: m.model_id || '',
@@ -1571,24 +1509,49 @@ async function prefillFromCopy(batchId) {
       model_api_type: m.model_api_type || '',
     })
 
+    const harnessList = Array.isArray(saved.harnesses) ? saved.harnesses : []
+    const modelList = Array.isArray(saved.models) ? saved.models : []
     const blocks = Array.isArray(saved.blocks) ? saved.blocks : []
-    if (blocks.length) {
-      form.value.arms = blocks.map(b => {
-        const blk = newBlock(b)
-        blk.models = (b.models || []).map(newModel)
-        return blk
-      })
+    const arms = Array.isArray(saved.arms) ? saved.arms : []
+
+    if (harnessList.length) {
+      form.value.harnesses = harnessList.map(newHarness)
+      form.value.models = modelList.map(newModel)
+    } else if (blocks.length) {
+      // 老形状：块 = Harness + 块内模型。模型去重（同 model_id + base_url 只留一套）
+      form.value.harnesses = blocks.map(newHarness)
+      const seen = new Set()
+      const models = []
+      for (const b of blocks) {
+        for (const m of (b.models || [])) {
+          const key = `${m.model_id || ''}|${m.model_base_url || ''}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          models.push(newModel(m))
+        }
+      }
+      form.value.models = models
     } else {
-      const arms = Array.isArray(saved.arms) ? saved.arms : []
-      const grouped = new Map()
+      // 更老的形状：只有摊平的 arms，按 harness 三件套归组成 Harness 轴
+      const byHarness = new Map()
+      const seen = new Set()
+      const models = []
       for (const a of arms) {
         const key = `${a.harness_type}|${a.harness_config_id}|${a.harness_config_version_id}`
-        if (!grouped.has(key)) grouped.set(key, newBlock(a))
-        if (a.model_id || a.model_base_url) grouped.get(key).models.push(newModel(a))
+        if (!byHarness.has(key)) byHarness.set(key, newHarness(a))
+        if (a.model_id || a.model_base_url) {
+          const mk = `${a.model_id || ''}|${a.model_base_url || ''}`
+          if (!seen.has(mk)) {
+            seen.add(mk)
+            models.push(newModel(a))
+          }
+        }
       }
-      form.value.arms = [...grouped.values()]
+      form.value.harnesses = [...byHarness.values()]
+      form.value.models = models
     }
-    selectedArm.value = form.value.arms.length ? 0 : -1
+    selectedArm.value = form.value.harnesses.length ? 0 : -1
+    selectedModel.value = 0
 
     // 通用参数
     const common = saved
