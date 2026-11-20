@@ -358,39 +358,7 @@
             <el-icon><Setting /></el-icon><h4>公共任务参数</h4>
             <span class="muted">任务级公共配置，包含 Harness、模型、沙箱等参数</span>
           </div>
-          <div class="param-wrap">
-            <div class="param-nav">
-              <div v-for="g in paramGroups" :key="g.key" class="pnav-item"
-                :class="{ active: activeGroup === g.key }" @click="activeGroup = g.key">
-                <div class="pnav-icon"><el-icon><component :is="g.icon" /></el-icon></div>
-                <div class="pnav-body">
-                  <div class="pnav-t">{{ g.title }}</div>
-                  <div class="pnav-s">{{ g.desc }}</div>
-                </div>
-                <el-icon class="pnav-arrow"><ArrowRight /></el-icon>
-              </div>
-            </div>
-            <div class="param-body">
-              <div class="param-body-head">
-                <span class="code-mark">{{ activeGroupMeta.title }}</span>
-                <el-button size="small" @click="copyParams">
-                  <el-icon style="margin-right:4px"><CopyDocument /></el-icon>复制
-                </el-button>
-              </div>
-              <el-table :data="activeGroupMeta.rows" size="small" border class="param-table"
-                :empty-text="'暂无数据'">
-                <el-table-column v-for="c in activeGroupMeta.columns" :key="c.prop"
-                  :prop="c.prop" :label="c.label" :width="c.width"
-                  :min-width="c.minWidth || 120" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span :class="{ 'cell-empty': isEmpty(row[c.prop]) }">
-                      {{ formatParam(row[c.prop]) }}
-                    </span>
-                  </template>
-                </el-table-column>
-              </el-table>
-            </div>
-          </div>
+          <ParamGroups :groups="paramGroups" default-active="harness" copyable />
         </section>
       </el-tab-pane>
     </el-tabs>
@@ -403,13 +371,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Back, VideoPlay, VideoPause, CircleClose, CircleCheck, QuestionFilled, ArrowDown,
-  RefreshRight, Files, Timer, Document, Box, Cpu, User, Setting, ArrowRight,
-  CopyDocument, ArrowUp, Tickets, MagicStick,
+  RefreshRight, Files, Timer, Document, Box, Cpu, User, Setting,
+  ArrowUp, Tickets, MagicStick,
 } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 import EChart from '../components/EChart.vue'
+import ParamGroups from '../components/ParamGroups.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -439,13 +408,7 @@ const parsedParams = computed(() => {
   try { return JSON.parse(exp.value.params_json || '{}') } catch { return {} }
 })
 
-const prettyParams = computed(() => {
-  try { return JSON.stringify(JSON.parse(exp.value.params_json || '{}'), null, 2) }
-  catch { return exp.value.params_json || '{}' }
-})
-
 // ---- 详情 tab：配置摘要 + 参数分组 ----
-const activeGroup = ref('harness')
 
 // harness_config_id / version_id → 可读名称。
 // params_json 里存的是 ID，直接展示用户看不懂，所以进页面时拉一次映射表。
@@ -710,31 +673,6 @@ const paramGroups = computed(() => {
     },
   ]
 })
-
-const activeGroupMeta = computed(
-  () => paramGroups.value.find(g => g.key === activeGroup.value) || paramGroups.value[0],
-)
-
-const activeJson = computed(() => {
-  const g = activeGroupMeta.value
-  if (!g) return prettyParams.value
-  try { return JSON.stringify(g.data, null, 2) } catch { return '{}' }
-})
-
-const isEmpty = v => v === null || v === undefined || v === ''
-
-function formatParam(v) {
-  if (v === null || v === undefined || v === '') return '—'
-  if (typeof v === 'boolean') return v ? '开启' : '关闭'
-  return v
-}
-
-async function copyParams() {
-  try {
-    await navigator.clipboard.writeText(activeJson.value)
-    ElMessage.success('已复制到剪贴板')
-  } catch { ElMessage.warning('复制失败，请手动选择文本') }
-}
 
 const STATUS_LABEL = {
   created: '待开始', running: '运行中', paused: '已暂停',
@@ -1066,44 +1004,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
   border-radius: 10px; padding: 1px 9px;
 }
 
-.param-wrap { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
-.param-nav { display: flex; flex-direction: column; gap: 8px; }
-.pnav-item {
-  display: flex; align-items: center; gap: 10px; cursor: pointer;
-  padding: 11px 12px; border-radius: 8px;
-  border: 1px solid var(--border-color);
-  background: var(--bg-primary);
-  transition: border-color .15s, background .15s;
-}
-.pnav-item:hover { border-color: #8b5cf6; }
-.pnav-item.active {
-  border-color: #8b5cf6;
-  background: rgba(139, 92, 246, .08);
-}
-.pnav-icon {
-  width: 32px; height: 32px; border-radius: 8px; flex: 0 0 auto;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(139, 92, 246, .12); color: #8b5cf6;
-}
-.pnav-body { min-width: 0; flex: 1; }
-.pnav-t { font-size: 13px; font-weight: 600; }
-.pnav-s {
-  font-size: 11px; color: var(--text-muted); margin-top: 1px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.pnav-arrow { color: var(--text-muted); font-size: 12px; flex: 0 0 auto; }
-
-.param-body { min-width: 0; }
-.param-body-head {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 8px;
-}
-.code-mark { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
-.param-table { margin-top: 2px; }
-.cell-empty { color: var(--text-muted); }
-
 @media (max-width: 900px) {
   .detail-stats { grid-template-columns: repeat(2, 1fr); }
-  .param-wrap { grid-template-columns: 1fr; }
 }
 </style>

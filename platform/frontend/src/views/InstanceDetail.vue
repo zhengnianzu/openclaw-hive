@@ -69,8 +69,8 @@
           </div>
         </div>
 
-        <el-row :gutter="20">
-          <el-col :span="12">
+        <el-row :gutter="20" class="cfg-row">
+          <el-col :span="8">
             <el-card class="sec-card">
               <template #header>
                 <span class="sec-head"><el-icon class="sec-head-icon"><Postcard /></el-icon>实例信息</span>
@@ -104,7 +104,7 @@
               </el-descriptions>
             </el-card>
           </el-col>
-          <el-col :span="12">
+          <el-col :span="8">
             <el-card class="sec-card">
               <template #header>
                 <span class="sec-head"><el-icon class="sec-head-icon"><TrendCharts /></el-icon>任务执行情况</span>
@@ -165,29 +165,54 @@
                 </div>
                 <!-- 粒度被接口降级时说明一下，否则用户选了 1m 却看到 27m 的点会以为是 bug -->
                 <div v-if="metricNote" class="trend-note">{{ metricNote }}</div>
-
-                <!-- 异常明细：一级分类默认折叠，展开看具体错误码 -->
-                <el-collapse v-if="overview.error_tree && overview.error_tree.length"
-                  v-model="expandedErrorGroups" class="error-tree">
-                  <el-collapse-item v-for="grp in overview.error_tree" :key="grp.prefix" :name="grp.prefix">
-                    <template #title>
-                      <span class="err-grp-title">
-                        <el-tag size="small" type="warning" effect="plain">{{ grp.prefix }}</el-tag>
-                        <span class="err-grp-name">{{ grp.label }}</span>
-                        <span class="err-grp-count">{{ grp.count }}</span>
-                      </span>
-                    </template>
-                    <div v-for="c in grp.codes" :key="c.code" class="breakdown-row breakdown-sub">
-                      <span>
-                        <code class="err-code">{{ c.code }}</code>
-                        <span class="err-desc" v-if="c.desc">{{ c.desc }}</span>
-                      </span>
-                      <el-tag type="info" size="small">{{ c.count }}</el-tag>
-                    </div>
-                  </el-collapse-item>
-                </el-collapse>
               </div>
               <el-empty v-else description="暂无数据" :image-size="60" />
+            </el-card>
+          </el-col>
+          <!-- 错误类型（服务端）：合计 / 错误率 / 类型数 + 明细表 + 错误趋势。
+               错误明细原先折叠在「任务执行情况」底部，三栏排布后独立成卡，
+               两栏各自有固定宽度，表格不会再被成功率趋势挤窄。 -->
+          <el-col :span="8">
+            <el-card class="sec-card">
+              <template #header>
+                <div class="err-head">
+                  <span class="sec-head"><el-icon class="sec-head-icon"><Warning /></el-icon>错误类型（服务端）</span>
+                  <span v-if="errorSummary.total" class="err-head-total">共 {{ errorSummary.total }} 条</span>
+                </div>
+              </template>
+              <template v-if="errorRows.length">
+                <div class="err-stats">
+                  <div class="err-stat">
+                    <span class="err-stat-num err-num-danger">{{ errorSummary.total }}</span>
+                    <span class="err-stat-label">总错误数</span>
+                  </div>
+                  <div class="err-stat">
+                    <span class="err-stat-num err-num-danger">{{ errorSummary.rate }}%</span>
+                    <span class="err-stat-label">错误率</span>
+                  </div>
+                  <div class="err-stat">
+                    <span class="err-stat-num err-num-primary">{{ errorSummary.types }}</span>
+                    <span class="err-stat-label">错误类型数</span>
+                  </div>
+                </div>
+                <el-table :data="errorRows" size="small" class="err-table">
+                  <el-table-column label="错误类型" min-width="170">
+                    <template #default="{ row }">
+                      <el-tag size="small" type="warning" effect="plain">{{ row.code }}</el-tag>
+                      <span class="err-desc">{{ row.desc || row.label }}</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="count" label="数量" width="60" align="right" />
+                  <el-table-column label="占比" width="60" align="right">
+                    <template #default="{ row }">{{ row.pct }}%</template>
+                  </el-table-column>
+                </el-table>
+                <div class="err-trend-title">错误趋势</div>
+                <EChart v-if="errorTrendPoints.length >= 2 && errorTrendTotal > 0"
+                  :option="errorTrendOption" height="150px" />
+                <div v-else class="trend-empty">暂无错误趋势数据</div>
+              </template>
+              <el-empty v-else description="暂无失败任务" :image-size="40" />
             </el-card>
           </el-col>
         </el-row>
@@ -195,165 +220,18 @@
           <template #header>
             <span class="sec-head"><el-icon class="sec-head-icon"><Setting /></el-icon>创建参数</span>
           </template>
-          <el-collapse v-model="expandedPanels" class="param-collapse">
-            <el-collapse-item name="basic">
-              <template #title>
-                <span class="param-title">
-                  <el-icon class="param-icon"><Setting /></el-icon>
-                  <span class="param-name">基本配置</span>
-                  <span class="param-peek">{{ peek.basic }}</span>
-                </span>
-              </template>
-              <el-descriptions :column="2" border size="small">
-                <el-descriptions-item label="任务标识">{{ createParams.task_name || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="Harness类型">
-                  <el-tag size="small" :style="harnessTagStyle(createParams.harness_type)">
-                    {{ harnessLabel(createParams.harness_type) }}
-                  </el-tag>
-                </el-descriptions-item>
-                <el-descriptions-item label="Invite Code">{{ createParams.invite_code || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="Harness 配置">
-                  <template v-if="createParams.harness_config_name">
-                    {{ createParams.harness_config_name }}
-                    <span v-if="createParams.harness_config_version" class="muted">
-                      / v{{ createParams.harness_config_version }}
-                    </span>
-                  </template>
-                  <template v-else-if="createParams.harness_config_label">
-                    {{ createParams.harness_config_label }}
-                  </template>
-                  <span v-else>{{ createParams.harness_config_id || '-' }}</span>
-                </el-descriptions-item>
-              </el-descriptions>
-            </el-collapse-item>
-
-            <el-collapse-item name="obs">
-              <template #title>
-                <span class="param-title">
-                  <el-icon class="param-icon"><FolderOpened /></el-icon>
-                  <span class="param-name">OBS配置</span>
-                  <span class="param-peek">{{ peek.obs }}</span>
-                </span>
-              </template>
-              <el-descriptions :column="1" border size="small">
-                <el-descriptions-item label="技能目录">{{ obsPath(createParams.skill_dir) }}</el-descriptions-item>
-                <el-descriptions-item label="默认技能">{{ createParams.default_skills || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="Agent目录">{{ obsPath(createParams.agent_dir) }}</el-descriptions-item>
-                <el-descriptions-item label="用户Config目录">{{ obsPath(createParams.user_config_dir) }}</el-descriptions-item>
-                <el-descriptions-item label="用户Profile目录">{{ obsPath(createParams.user_profile_dir) }}</el-descriptions-item>
-                <el-descriptions-item label="轨迹保存路径">{{ trajSaveFullPath || obsPath(createParams.traj_save_path) }}</el-descriptions-item>
-              </el-descriptions>
-            </el-collapse-item>
-
-            <el-collapse-item name="model">
-              <template #title>
-                <span class="param-title">
-                  <el-icon class="param-icon"><Cpu /></el-icon>
-                  <span class="param-name">模型配置</span>
-                  <span class="param-peek">{{ peek.model }}</span>
-                </span>
-              </template>
-              <el-descriptions :column="2" border size="small">
-                <el-descriptions-item label="Base URL">{{ createParams.model_base_url || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="API Key">{{ maskKey(createParams.model_api_key) }}</el-descriptions-item>
-                <el-descriptions-item label="API类型">{{ createParams.model_api_type || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="模型ID">{{ createParams.model_id || '-' }}</el-descriptions-item>
-              </el-descriptions>
-            </el-collapse-item>
-
-            <el-collapse-item name="agents">
-              <template #title>
-                <span class="param-title">
-                  <el-icon class="param-icon"><User /></el-icon>
-                  <span class="param-name">用户模拟配置</span>
-                  <span class="param-peek">{{ peek.agents }}</span>
-                </span>
-              </template>
-              <template v-if="createParams.agents && createParams.agents.length">
-                <div v-for="(ag, idx) in createParams.agents" :key="idx" :style="idx > 0 ? 'margin-top:12px' : ''">
-                  <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Agent {{ idx + 1 }}: {{ ag.name || '-' }}</div>
-                  <el-descriptions :column="2" border size="small">
-                    <el-descriptions-item label="Provider">{{ ag.provider || '-' }}</el-descriptions-item>
-                    <el-descriptions-item label="Base URL">{{ ag.base_url || '-' }}</el-descriptions-item>
-                    <el-descriptions-item label="API Key">{{ maskKey(ag.api_key) }}</el-descriptions-item>
-                    <el-descriptions-item label="API类型">{{ ag.api || '-' }}</el-descriptions-item>
-                    <el-descriptions-item label="模型ID">{{ ag.model || '-' }}</el-descriptions-item>
-                  </el-descriptions>
-                </div>
-              </template>
-              <template v-else-if="createParams.user_proxy_model_name || createParams.user_proxy_base_url">
-                <el-descriptions :column="2" border size="small">
-                  <el-descriptions-item label="模型名称">{{ createParams.user_proxy_model_name || '-' }}</el-descriptions-item>
-                  <el-descriptions-item label="Base URL">{{ createParams.user_proxy_base_url || '-' }}</el-descriptions-item>
-                  <el-descriptions-item label="API Key">{{ maskKey(createParams.user_proxy_api_key) }}</el-descriptions-item>
-                </el-descriptions>
-              </template>
-              <el-empty v-else description="未配置" :image-size="40" />
-            </el-collapse-item>
-
-            <el-collapse-item name="advanced">
-              <template #title>
-                <span class="param-title">
-                  <el-icon class="param-icon"><Box /></el-icon>
-                  <span class="param-name">高级配置</span>
-                  <span class="param-peek">{{ peek.advanced }}</span>
-                </span>
-              </template>
-              <el-descriptions :column="2" border size="small">
-                <el-descriptions-item label="起始索引">{{ createParams.start_index ?? 0 }}</el-descriptions-item>
-                <el-descriptions-item label="任务总数">{{ createParams.total_num ? createParams.total_num : '不限' }}</el-descriptions-item>
-                <el-descriptions-item label="沙箱存活时间">
-                  <span v-if="createParams.max_ttl_second">
-                    {{ createParams.max_ttl_second }} 秒（{{ formatDuration(createParams.max_ttl_second) }}）
-                  </span>
-                  <span v-else>-</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="沙箱配置">
-                  <template v-if="createParams.sandbox_config_name">
-                    {{ createParams.sandbox_config_name }}
-                    <el-tag size="small" type="info" style="margin-left:6px">{{ createParams.sandbox_type === 'windows' ? 'Windows' : 'Linux' }}</el-tag>
-                  </template>
-                  <span v-else-if="createParams.sandbox_config_id">已删除（id={{ createParams.sandbox_config_id }}）</span>
-                  <span v-else>未选择（用模板默认）</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="沙箱标识">
-                  <span v-if="createParams.task_name">{{ createParams.task_name }}</span>
-                  <span v-else>-</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="沙箱块">
-                  <span v-if="createParams.sandbox_active_key">
-                    <code>{{ createParams.sandbox_active_key }}</code>
-                  </span>
-                  <span v-else>-</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="沙箱文件">{{ createParams.sandbox_file || '-' }}</el-descriptions-item>
-                <el-descriptions-item label="Key 沙箱后缀">
-                  <el-tag size="small" :type="createParams.suffix_api_keys ? 'success' : 'info'">
-                    {{ createParams.suffix_api_keys ? '已开启' : '未开启' }}
-                  </el-tag>
-                </el-descriptions-item>
-                <el-descriptions-item label="启动本地代理">
-                  <el-tag size="small" :type="createParams.proxy_enable ? 'success' : 'info'">
-                    {{ createParams.proxy_enable ? '已开启' : '未开启' }}
-                  </el-tag>
-                </el-descriptions-item>
-                <el-descriptions-item label="资源池">
-                  <span v-if="inst.sandbox_namespace"><code>{{ inst.sandbox_namespace }}</code></span>
-                  <span v-else>-</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="单沙箱资源">
-                  <span v-if="inst.cpu_request">
-                    {{ inst.cpu_request }}/{{ inst.cpu_limit }} 核 · {{ inst.memory_request }}/{{ inst.memory_limit }} GiB
-                  </span>
-                  <span v-else>-</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="镜像名称" :span="2">
-                  <span style="word-break:break-all">{{ createParams.sandbox_image || createParams.image_name || '-' }}</span>
-                </el-descriptions-item>
-                <el-descriptions-item label="代码仓ID">{{ createParams.code_repo_id || '-' }}</el-descriptions-item>
-              </el-descriptions>
-            </el-collapse-item>
-          </el-collapse>
+          <ParamGroups :groups="paramGroups" default-active="basic" copyable>
+            <!-- 值列：Harness 类型和几个开关保留彩色标签，其余按纯文本展示 -->
+            <template #cell-v="{ row, value }">
+              <el-tag v-if="row.tag === 'harness'" size="small" :style="harnessTagStyle(createParams.harness_type)">
+                {{ value || '-' }}
+              </el-tag>
+              <el-tag v-else-if="row.tag" size="small" :type="row.tag">{{ value }}</el-tag>
+              <span v-else :class="{ 'param-empty': value == null || value === '' }">
+                {{ value == null || value === '' ? '—' : value }}
+              </span>
+            </template>
+          </ParamGroups>
         </el-card>
 
         <!-- 配置文件：卡片上只放摘要（文件数 / 最后更新 / 文件名快捷入口），
@@ -1293,12 +1171,13 @@ import {
   ArrowDown, ArrowRight, ArrowUp, Box, CircleCheckFilled, CircleCloseFilled, Clock,
   CopyDocument, Cpu, DataLine, Document, Download, Files, FolderOpened, FullScreen,
   Loading, Postcard, QuestionFilled, RefreshLeft, Search, Setting, Timer, TrendCharts,
-  User, VideoPause, VideoPlay, View,
+  User, VideoPause, VideoPlay, View, Warning,
 } from '@element-plus/icons-vue'
 import api from '../api'
 import ArtifactWorkspace from '../components/ArtifactWorkspace.vue'
 import TrajBlocks from '../components/TrajBlocks.vue'
 import EChart from '../components/EChart.vue'
+import ParamGroups from '../components/ParamGroups.vue'
 import { useAuthStore } from '../stores/auth'
 import { useHarnessStore } from '../stores/harness'
 
@@ -1352,8 +1231,6 @@ function ensureTabLoaded(tab) {
 const overview = ref({ total: 0, completed: 0, failed: 0, running: 0, pending: 0, success_rate: 0, error_breakdown: {}, error_tree: [] })
 const prepareInfo = ref({ downloaded_configs: 0 })
 const createParams = ref({})
-const expandedPanels = ref([])
-const expandedErrorGroups = ref([])
 let timer = null
 let metricsTimer = null
 
@@ -1429,6 +1306,77 @@ const outcomeOption = computed(() => {
   }
 })
 
+// 错误明细：把 error_tree（[{prefix,label,count,codes:[{code,desc,count}]}]）
+// 摊平成表格行。占比按「各错误码数量之和」算，和卡片右上角的合计同一口径。
+const errorRows = computed(() => {
+  const tree = overview.value.error_tree || []
+  const total = tree.reduce((s, g) => s + (g.count || 0), 0)
+  return tree.flatMap(g => (g.codes || []).map(c => ({
+    code: c.code,
+    desc: c.desc,
+    label: g.label,
+    count: c.count || 0,
+    pct: total ? Math.round((c.count || 0) / total * 1000) / 10 : 0,
+  })))
+})
+
+const errorSummary = computed(() => {
+  const rows = errorRows.value
+  const total = rows.reduce((s, r) => s + r.count, 0)
+  return {
+    total,
+    types: rows.length,
+    // 分母用任务总数：回答「这批任务里有多大比例撞上了服务端错误」
+    rate: overview.value.total ? (total / overview.value.total * 100).toFixed(1) : '0.0',
+  }
+})
+
+// 错误趋势：metrics 的 failed 是累计失败数，相邻点相减就是该统计粒度内新增的失败。
+// 不额外请求接口 —— 成功率和错误数本来就出自同一批 task_records。
+const errorTrendPoints = computed(() => {
+  const pts = metricPoints.value
+  const out = []
+  for (let i = 1; i < pts.length; i++) {
+    out.push({
+      ts: pts[i].ts,
+      label: pts[i].ts.slice(11, 16),
+      count: Math.max(0, (pts[i].failed || 0) - (pts[i - 1].failed || 0)),
+    })
+  }
+  return out
+})
+
+const errorTrendTotal = computed(
+  () => errorTrendPoints.value.reduce((s, p) => s + p.count, 0),
+)
+
+const errorTrendOption = computed(() => ({
+  tooltip: {
+    trigger: 'axis',
+    formatter: (ps) => {
+      const p = errorTrendPoints.value[ps[0]?.dataIndex ?? 0]
+      return p ? `${p.ts.replace('T', ' ')}<br/>失败任务：<b>${p.count}</b>` : ''
+    },
+  },
+  grid: { left: 32, right: 8, top: 8, bottom: 24 },
+  xAxis: {
+    type: 'category', data: errorTrendPoints.value.map(p => p.label),
+    axisLabel: { fontSize: 10, color: '#94a3b8' },
+    axisLine: { lineStyle: { color: '#e5e7eb' } },
+  },
+  yAxis: {
+    type: 'value', minInterval: 1,
+    axisLabel: { fontSize: 10, color: '#94a3b8' },
+    splitLine: { lineStyle: { color: '#f0f0f0' } },
+  },
+  series: [{
+    type: 'bar',
+    data: errorTrendPoints.value.map(p => p.count),
+    barMaxWidth: 14,
+    itemStyle: { color: 'rgba(139,92,246,.75)', borderRadius: [3, 3, 0, 0] },
+  }],
+}))
+
 function statusColor(s) { return { running: 'success', preparing: 'warning', queued: 'warning', completed: 'info', finished: 'warning', stopped: 'danger', failed: 'danger', created: '' }[s] || '' }
 function statusText(s) { return { running: '运行中', preparing: '准备中', queued: '排队中', completed: '已完成', finished: '已结束', stopped: '已停止', failed: '失败', created: '待启动' }[s] || s }
 
@@ -1482,8 +1430,13 @@ const trendOption = computed(() => {
           + `成功 ${p.completed} · 失败 ${p.failed}`
       },
     },
-    legend: { data: ['窗口成功率', '累计成功率'], bottom: 0, itemHeight: 8, textStyle: { fontSize: 11 } },
-    grid: { left: 38, right: 12, top: 12, bottom: 32 },
+    // legend 放在 x 轴刻度下方时要留出足够空隙：三栏后图表变窄，
+    // 时间刻度（11:35…）比之前更长，和「累计成功率」紧贴着会像压在一起。
+    legend: {
+      data: ['窗口成功率', '累计成功率'], bottom: 0, itemHeight: 8, itemGap: 18,
+      textStyle: { fontSize: 11 },
+    },
+    grid: { left: 38, right: 12, top: 12, bottom: 52 },
     xAxis: {
       type: 'category', data: labels, boundaryGap: false,
       axisLabel: { fontSize: 10, color: '#94a3b8' },
@@ -1675,6 +1628,114 @@ const peek = computed(() => {
       cp.max_ttl_second && `存活: ${formatDuration(cp.max_ttl_second)}`,
     ),
   }
+})
+
+// 创建参数分组：与批量详情的「公共任务参数」共用 ParamGroups 组件（左导航 + 右表格）。
+// 参数大多是 k/v，统一走「参数 / 值」两列；用户模拟配置是列表数据，单独给多列表格。
+// 分组标题与创建页的配置步骤一致，方便「创建 → 查看」一一对应。
+const paramGroups = computed(() => {
+  const cp = createParams.value
+  const kvColumns = () => [
+    { prop: 'k', label: '参数', minWidth: 180 },
+    { prop: 'v', label: '值', minWidth: 280 },
+  ]
+  const row = (k, v, tag) => ({ k, v, tag })
+
+  const harnessConfig = cp.harness_config_name
+    ? `${cp.harness_config_name}${cp.harness_config_version ? ` / v${cp.harness_config_version}` : ''}`
+    : (cp.harness_config_label || cp.harness_config_id || null)
+
+  // agents 优先；老数据只有单个 user_proxy_* 字段时折成一行，接口没给就空表
+  const agents = Array.isArray(cp.agents) ? cp.agents : []
+  const agentRows = agents.length
+    ? agents.map((ag, i) => ({
+        name: ag.name || `agent${i + 1}`,
+        provider: ag.provider,
+        model: ag.model,
+        api: ag.api,
+        base_url: ag.base_url,
+        api_key: maskKey(ag.api_key),
+      }))
+    : (cp.user_proxy_model_name || cp.user_proxy_base_url)
+      ? [{
+          name: cp.user_proxy_model_name || '默认模型',
+          model: cp.user_proxy_model_name,
+          base_url: cp.user_proxy_base_url,
+          api_key: maskKey(cp.user_proxy_api_key),
+        }]
+      : []
+
+  return [
+    {
+      key: 'basic', title: '基本配置', icon: Setting, desc: peek.value.basic,
+      columns: kvColumns(),
+      rows: [
+        row('任务标识', cp.task_name),
+        row('Harness 类型', harnessLabel(cp.harness_type), 'harness'),
+        row('Invite Code', cp.invite_code),
+        row('Harness 配置', harnessConfig),
+      ],
+    },
+    {
+      key: 'obs', title: 'OBS配置', icon: FolderOpened, desc: peek.value.obs,
+      columns: kvColumns(),
+      rows: [
+        row('技能目录', obsPath(cp.skill_dir)),
+        row('默认技能', cp.default_skills),
+        row('Agent目录', obsPath(cp.agent_dir)),
+        row('用户Config目录', obsPath(cp.user_config_dir)),
+        row('用户Profile目录', obsPath(cp.user_profile_dir)),
+        row('轨迹保存路径', trajSaveFullPath.value || obsPath(cp.traj_save_path)),
+      ],
+    },
+    {
+      key: 'model', title: '模型配置', icon: Cpu, desc: peek.value.model,
+      columns: kvColumns(),
+      rows: [
+        row('Base URL', cp.model_base_url),
+        row('API Key', maskKey(cp.model_api_key)),
+        row('API类型', cp.model_api_type),
+        row('模型ID', cp.model_id),
+      ],
+    },
+    {
+      key: 'agents', title: '用户模拟配置', icon: User, desc: peek.value.agents,
+      columns: [
+        { prop: 'name', label: 'Agent 名称', minWidth: 130 },
+        { prop: 'provider', label: 'Provider', minWidth: 110 },
+        { prop: 'model', label: '模型 ID', minWidth: 160 },
+        { prop: 'api', label: 'API 类型', minWidth: 120 },
+        { prop: 'base_url', label: 'Base URL', minWidth: 220 },
+        { prop: 'api_key', label: 'API Key', minWidth: 130 },
+      ],
+      rows: agentRows,
+    },
+    {
+      key: 'advanced', title: '高级配置', icon: Box, desc: peek.value.advanced,
+      columns: kvColumns(),
+      rows: [
+        row('起始索引', cp.start_index ?? 0),
+        row('任务总数', cp.total_num || '不限'),
+        row('沙箱存活时间', cp.max_ttl_second
+          ? `${cp.max_ttl_second} 秒（${formatDuration(cp.max_ttl_second)}）`
+          : null),
+        row('沙箱配置', cp.sandbox_config_name
+          ? `${cp.sandbox_config_name}（${cp.sandbox_type === 'windows' ? 'Windows' : 'Linux'}）`
+          : cp.sandbox_config_id ? `已删除（id=${cp.sandbox_config_id}）` : '未选择（用模板默认）'),
+        row('沙箱标识', cp.task_name),
+        row('沙箱块', cp.sandbox_active_key),
+        row('沙箱文件', cp.sandbox_file),
+        row('Key 沙箱后缀', cp.suffix_api_keys ? '已开启' : '未开启', cp.suffix_api_keys ? 'success' : 'info'),
+        row('启动本地代理', cp.proxy_enable ? '已开启' : '未开启', cp.proxy_enable ? 'success' : 'info'),
+        row('资源池', inst.value.sandbox_namespace),
+        row('单沙箱资源', inst.value.cpu_request
+          ? `${inst.value.cpu_request}/${inst.value.cpu_limit} 核 · ${inst.value.memory_request}/${inst.value.memory_limit} GiB`
+          : null),
+        row('镜像名称', cp.sandbox_image || cp.image_name),
+        row('代码仓ID', cp.code_repo_id),
+      ],
+    },
+  ]
 })
 
 async function copyTrajPath() {
@@ -3089,15 +3150,8 @@ onUnmounted(() => {
 .sec-head { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--text-primary); }
 .sec-head-icon { color: var(--accent-purple); font-size: 17px; }
 
-/* 创建参数折叠面板：收起时在标题右侧给一行灰色摘要 */
-.param-collapse :deep(.el-collapse-item__header) { height: 46px; line-height: 46px; }
-.param-title { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding-right: 8px; }
-.param-icon { color: var(--accent-purple); font-size: 16px; flex: 0 0 auto; }
-.param-name { font-weight: 600; color: var(--text-primary); flex: 0 0 auto; }
-.param-peek {
-  flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--text-muted);
-  font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
+/* 创建参数表格：空值用灰色占位，和表格默认的「—」一致 */
+.param-empty { color: var(--text-muted); }
 
 /* 配置文件摘要卡 */
 .cfg-summary { display: flex; gap: 12px; align-items: flex-start; }
@@ -3181,13 +3235,22 @@ onUnmounted(() => {
   padding: 24px 12px; text-align: center;
   font-size: 12px; color: var(--text-muted); line-height: 1.6;
 }
-/* 异常明细折叠树 */
-.error-tree { margin-top: 6px; border-top: 1px solid var(--border-color); }
-.error-tree :deep(.el-collapse-item__header) { height: 40px; line-height: 40px; font-size: 14px; }
-.error-tree :deep(.el-collapse-item__content) { padding-bottom: 6px; }
-.err-grp-title { display: flex; align-items: center; gap: 8px; width: 100%; }
-.err-grp-name { flex: 1; color: var(--text-secondary); }
-.err-grp-count { color: var(--text-muted); font-size: 13px; margin-right: 8px; }
+/* 配置信息三栏：三张卡等高，避免内容长短不同导致底部参差 */
+.cfg-row { align-items: stretch; }
+.cfg-row > .el-col > .el-card { height: 100%; }
+
+/* 错误类型（服务端） */
+.err-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.err-head-total { font-size: 12px; color: var(--text-muted); flex: 0 0 auto; }
+.err-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+.err-stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.err-stat-num { font-size: 20px; font-weight: 700; line-height: 1.2; }
+.err-num-danger { color: #ef4444; }
+.err-num-primary { color: #6366f1; }
+.err-stat-label { font-size: 12px; color: var(--text-muted); }
+.err-table :deep(.el-table__cell) { padding: 4px 0; }
+.err-table :deep(.el-tag) { margin-right: 6px; }
+.err-trend-title { margin-top: 12px; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
 .err-code {
   font-family: 'Cascadia Code', 'Fira Code', monospace;
   background: var(--fill-color, #f4f4f5); padding: 1px 6px; border-radius: 3px;
