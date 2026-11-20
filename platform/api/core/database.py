@@ -715,7 +715,10 @@ def ensure_traj_extra_columns() -> None:
     """
     for table, columns in (("task_traj_records", TRAJ_EXTRA_COLUMNS),
                            ("task_instances", INSTANCE_EXTRA_COLUMNS),
-                           ("task_records", TASK_EXTRA_COLUMNS)):
+                           ("task_records", TASK_EXTRA_COLUMNS),
+                           # 镜像/代码仓的启用开关: 存量行默认 1(全部可见, 行为不变)
+                           ("images", ("enabled INTEGER NOT NULL DEFAULT 1",)),
+                           ("code_repos", ("enabled INTEGER NOT NULL DEFAULT 1",))):
         try:
             with get_connection() as conn:
                 if not _table_exists(conn, table):
@@ -970,6 +973,8 @@ def init_db_unlocked():
                 -- 该镜像相对上一版的改进点。名称/地址里只有版本号，看不出改了什么，
                 -- 所以单独留一列让运维写明，选镜像时能看到。
                 remark TEXT NOT NULL DEFAULT '',
+                -- 创建页可见性开关: 0=停用(高级配置下拉不再列出, 存量实例引用不受影响)
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );
@@ -985,6 +990,8 @@ def init_db_unlocked():
                 -- openclaw-task，分支信息此前只能靠 version 前缀猜，这里显式存一列。
                 -- 取值来自 code_repo_tags 字典表，空串表示未归类。
                 tag TEXT NOT NULL DEFAULT '',
+                -- 创建页可见性开关: 0=停用(高级配置下拉不再列出, 存量实例引用不受影响)
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );

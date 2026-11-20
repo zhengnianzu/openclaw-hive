@@ -10,6 +10,12 @@
       </div>
     </div>
 
+    <el-alert type="info" :closable="false" style="margin-bottom:12px">
+      <template #title>版本命名规范（新版本请以 <code>v + 完整日期</code> 命名）</template>
+      推荐规则：符合上述命名格式（兼容旧格式）的启用版本中取日期最新的一条；其他分支 / 自定义版本仍在下拉可选，但不参与推荐。<br>
+      <b>停用</b>只影响创建页下拉可见性，存量实例不受影响。
+    </el-alert>
+
     <div class="filter-bar">
       <el-input v-model="versionQuery" placeholder="搜索版本" clearable size="default" style="width:220px"
         @keyup.enter="applyFilters" @clear="applyFilters">
@@ -38,6 +44,11 @@
           <template #default="{row}">
             <span v-if="row.description">{{ row.description }}</span>
             <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="启用" width="90" align="center" resizable>
+          <template #default="{row}">
+            <el-switch :model-value="row.enabled !== false" @change="v => toggleEnabled(row, v)" />
           </template>
         </el-table-column>
         <el-table-column prop="created_by" label="创建者" width="100" resizable />
@@ -273,6 +284,17 @@ watch(() => repos.value.length, (n) => {
   const maxPage = Math.max(1, Math.ceil(n / pageSize.value))
   if (currentPage.value > maxPage) currentPage.value = maxPage
 })
+
+// 启用开关: 只影响创建页下拉可见性; 存量实例引用的是版本快照, 不受影响
+async function toggleEnabled(row, v) {
+  try {
+    await api.patch(`/code-repos/${row.id}`, { enabled: v })
+    row.enabled = v
+    ElMessage.success(v ? '已启用' : '已停用（创建页不再列出）')
+  } catch (e) {
+    ElMessage.error('切换失败')
+  }
+}
 
 async function loadRepos() {
   loading.value = true

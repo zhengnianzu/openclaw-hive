@@ -152,6 +152,9 @@ def update_code_repo(repo_id: int, req: CodeRepoUpdate, user: dict = Depends(req
         if req.tag is not None:
             sets.append("tag = ?")
             params.append(_check_tag(conn, req.tag))
+        if req.enabled is not None:
+            sets.append("enabled = ?")
+            params.append(1 if req.enabled else 0)
         if sets:
             conn.execute(
                 f"UPDATE code_repos SET {', '.join(sets)} WHERE id = ?",

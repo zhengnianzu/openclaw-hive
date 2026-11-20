@@ -18,6 +18,8 @@ class CodeRepoUpdate(BaseModel):
     description: Optional[str] = None
     main_python_file: Optional[str] = None
     tag: Optional[str] = None
+    # 创建页可见性开关: 停用后高级配置下拉不再列出(存量实例引用不受影响)
+    enabled: Optional[bool] = None
 
 
 class CodeRepoInfo(BaseModel):
@@ -28,6 +30,7 @@ class CodeRepoInfo(BaseModel):
     description: str = ""
     main_python_file: str = "harness_automation.py"
     tag: str = ""
+    enabled: bool = True
     created_at: str
     created_by: str = ""
 

@@ -16,6 +16,8 @@ class ImageUpdate(BaseModel):
     name: Optional[str] = None
     os: Optional[str] = None
     remark: Optional[str] = None
+    # 创建页可见性开关: 停用后高级配置下拉不再列出(存量实例引用不受影响)
+    enabled: Optional[bool] = None
 
 
 class ImageInfo(BaseModel):
@@ -25,5 +27,6 @@ class ImageInfo(BaseModel):
     harness_type: str
     os: str = "linux"
     remark: str = ""
+    enabled: bool = True
     created_at: str
     created_by: str = ""

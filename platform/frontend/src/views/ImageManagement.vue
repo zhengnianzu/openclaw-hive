@@ -7,6 +7,14 @@
       </el-button>
     </div>
 
+    <el-alert type="info" :closable="false" style="margin-bottom:12px">
+      <template #title>镜像命名规范（名称中请携带日期）</template>
+      支持三种写法：<code>26.11.4</code>（年.月.日）、<code>20261102</code>（年月日连写）、
+      <code>jiuwenswarm:dev-stable-2026.10.23v1</code>（任意位置含日期即可）。<br>
+      推荐规则：当前 Harness 有专属镜像时优先推荐专属里日期最新的，否则推荐通用（如 multiharness 主镜像）里日期最新的；
+      名称中无日期的镜像不参与日期排序，按注册时间兜底。<b>停用</b>只影响创建页下拉可见性，存量实例不受影响。
+    </el-alert>
+
     <div class="filter-bar">
       <el-select v-model="typeFilter" placeholder="Harness 类型" clearable size="default" style="width:160px">
         <el-option label="通用" value="common" />
@@ -38,6 +46,11 @@
           <template #default="{ row }">
             <span v-if="row.remark">{{ row.remark }}</span>
             <span v-else class="remark-empty">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="启用" width="90" align="center">
+          <template #default="{ row }">
+            <el-switch :model-value="row.enabled !== false" @change="v => toggleEnabled(row, v)" />
           </template>
         </el-table-column>
         <el-table-column prop="created_by" label="注册人" width="120" />
@@ -193,6 +206,17 @@ watch(() => filteredImages.value.length, (n) => {
   const maxPage = Math.max(1, Math.ceil(n / pageSize.value))
   if (currentPage.value > maxPage) currentPage.value = maxPage
 })
+
+// 启用开关: 只影响创建页下拉可见性; 存量实例引用的是地址快照, 不受影响
+async function toggleEnabled(row, v) {
+  try {
+    await api.patch(`/images/${row.id}`, { enabled: v })
+    row.enabled = v
+    ElMessage.success(v ? '已启用' : '已停用（创建页不再列出）')
+  } catch (e) {
+    ElMessage.error('切换失败')
+  }
+}
 
 async function loadImages() {
   loading.value = true

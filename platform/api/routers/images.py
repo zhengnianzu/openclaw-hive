@@ -74,6 +74,9 @@ def update_image(image_id: int, req: ImageUpdate, user: dict = Depends(require_o
     if req.remark is not None:
         sets.append("remark = ?")
         params.append(req.remark.strip())
+    if req.enabled is not None:
+        sets.append("enabled = ?")
+        params.append(1 if req.enabled else 0)
 
     with get_connection() as conn:
         if not conn.execute("SELECT 1 FROM images WHERE id = ?", (image_id,)).fetchone():

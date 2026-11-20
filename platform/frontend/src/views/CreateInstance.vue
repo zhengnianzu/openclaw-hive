@@ -248,20 +248,6 @@
             </div>
           </el-form-item>
 
-          <el-form-item label="镜像名称">
-            <el-select v-model="form.image_name" filterable allow-create default-first-option
-              placeholder="选择或输入镜像地址" style="width:100%" clearable>
-              <el-option v-for="img in imageList" :key="img.id" :label="img.name" :value="img.address"
-                :style="img.remark ? 'height:auto;line-height:1.5;padding-top:6px;padding-bottom:6px' : ''">
-                <div>
-                  <span>{{ img.name }}</span>
-                  <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
-                </div>
-                <div v-if="img.remark" style="color:#999;font-size:12px;line-height:1.3;white-space:normal">{{ img.remark }}</div>
-              </el-option>
-            </el-select>
-          </el-form-item>
-
           <el-form-item label="沙箱配置">
             <el-select v-model="form.sandbox_config_id" placeholder="选择沙箱运行环境" style="width:100%">
               <el-option label="默认（不替换，用模板原样）" :value="0" />
@@ -277,6 +263,20 @@
             <div style="font-size:12px;color:#999;margin-top:4px">
               决定沙箱的资源规格、超时、环境变量与镜像；选「默认」则不替换，用 harness 模板原样
             </div>
+          </el-form-item>
+          <el-form-item label="镜像名称">
+            <el-select v-model="form.image_name" filterable allow-create default-first-option
+              placeholder="选择或输入镜像地址" style="width:100%" clearable>
+              <el-option v-for="img in imageOptions" :key="img.id" :label="img.name" :value="img.address"
+                :style="img.remark ? 'height:auto;line-height:1.5;padding-top:6px;padding-bottom:6px' : ''">
+                <div>
+                  <el-tag v-if="img.address === recommendedImageAddress" size="small" type="success" effect="light" style="margin-right:6px">推荐</el-tag>
+                  <span>{{ img.name }}</span>
+                  <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
+                </div>
+                <div v-if="img.remark" style="color:#999;font-size:12px;line-height:1.3;white-space:normal">{{ img.remark }}</div>
+              </el-option>
+            </el-select>
           </el-form-item>
 
           <el-form-item label="Key 追加沙箱后缀">
@@ -295,8 +295,10 @@
 
           <el-form-item label="代码仓">
             <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
-              <el-option v-for="repo in codeRepoList" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
-                <span>{{ repo.name }} / {{ repo.version }}</span>
+              <el-option v-for="repo in codeRepoOptions" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
+                <span>
+                  <el-tag v-if="repo.id === recommendedRepoId" size="small" type="success" effect="light" style="margin-right:6px">推荐</el-tag>{{ repo.name }} / {{ repo.version }}
+                </span>
                 <span style="float:right;color:#999;font-size:12px">{{ repo.obs_path.length > 40 ? '...' + repo.obs_path.slice(-40) : repo.obs_path }}</span>
               </el-option>
             </el-select>
@@ -538,6 +540,79 @@ function removeAgentTab(tabName) {
 }
 
 const imageList = ref([])
+
+// ============ 启用过滤 + 最新日期推荐 ============
+// 从版本/镜像名里抽日期, 三种形态: 20261102 / 26.11.4 / v1117(月日)。
+// 抽不出返回 null, 排序兜底用 created_at(注册时间)。
+function extractDate(token) {
+  const s = String(token || '')
+  let m = /(20\d{2})(\d{2})(\d{2})/.exec(s)
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]).getTime()
+  m = /(\d{2})\.(\d{1,2})\.(\d{1,2})/.exec(s)
+  if (m) return new Date(2000 + +m[1], +m[2] - 1, +m[3]).getTime()
+  m = /v?(\d{2})(\d{2})\b/.exec(s)
+  if (m) {
+    const now = new Date()
+    return new Date(now.getFullYear(), +m[1] - 1, +m[2]).getTime()
+  }
+  return null
+}
+function _dateKey(token, createdAt) {
+  const d = extractDate(token)
+  if (d != null) return d
+  return new Date(createdAt || 0).getTime() || 0
+}
+
+// 镜像下拉: 只列启用的, 按所选沙箱配置的 os 过滤(未选沙箱配置/过滤后为空则不过滤)。
+// 推荐规则: 该 harness 有专属镜像 -> 专属里日期最新; 否则 common(主镜像)里日期最新。
+// 只打标不自动选中 —— 留空仍走 harness 模板默认镜像。
+const imageOptions = computed(() => {
+  let list = (imageList.value || []).filter(i => i.enabled !== false)
+  const sb = (sandboxList.value || []).find(s => s.id === form.value.sandbox_config_id)
+  if (sb) {
+    const filtered = list.filter(i => i.os === sb.sandbox_type)
+    if (filtered.length) list = filtered
+  }
+  if (!list.length) return list
+  const recommended = recommendedImageAddress.value
+  if (!recommended) return list
+  return [...list.filter(i => i.address === recommended), ...list.filter(i => i.address !== recommended)]
+})
+
+const recommendedImageAddress = computed(() => {
+  const list = (imageList.value || []).filter(i => i.enabled !== false)
+  if (!list.length) return ''
+  const dedicated = list.filter(i => i.harness_type === form.value.harness_type)
+  const pool = dedicated.length ? dedicated : list.filter(i => i.harness_type === 'common')
+  if (!pool.length) return ''
+  // os 偏好: 选了沙箱配置按其系统; 未选默认 linux 优先(linux > windows)。
+  // 偏好系内无镜像时回退另一系, 避免推荐指向不在下拉里的地址。
+  const sb = (sandboxList.value || []).find(s => s.id === form.value.sandbox_config_id)
+  const preferOs = sb ? sb.sandbox_type : 'linux'
+  const osPool = pool.filter(i => (i.os || 'linux') === preferOs)
+  const finalPool = osPool.length ? osPool : pool
+  return finalPool.reduce((a, b) => (_dateKey(b.name, b.created_at) > _dateKey(a.name, a.created_at) ? b : a)).address
+})
+
+// 代码仓下拉: 只列启用的; 推荐只认「v+完整日期」命名的最新一条(默认推荐),
+// 其他分支/自定义版本仍在可选列表(兼容自定义分支开发)但不参与推荐。只打标不自动选中。
+const codeRepoOptions = computed(() => {
+  const list = (codeRepoList.value || []).filter(r => r.enabled !== false)
+  const rec = recommendedRepoId.value
+  if (!rec) return list
+  return [...list.filter(r => r.id === rec), ...list.filter(r => r.id !== rec)]
+})
+
+const recommendedRepoId = computed(() => {
+  // 参与推荐的版本格式: 新命名 v+完整日期(v20261117), 兼容旧格式 v+月日(v1117,
+  // 年份取当前年)。其余分支/自定义版本(xiaoyiclaw_v42、test-* 等)不参与推荐,
+  // 但仍在下拉可选。新旧格式按解析出的日期统一比较, 取最新。
+  const pool = (codeRepoList.value || []).filter(
+    r => r.enabled !== false && /^(v20\d{6}|v\d{4})$/.test(String(r.version || '').trim())
+  )
+  if (!pool.length) return null
+  return pool.reduce((a, b) => (extractDate(b.version) > extractDate(a.version) ? b : a)).id
+})
 const baseUrlOptions = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
