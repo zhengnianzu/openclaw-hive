@@ -9,6 +9,8 @@ class CodeRepoCreate(BaseModel):
     description: str = ""
     main_python_file: str = "harness_automation.py"
     tag: str = ""
+    # 全局默认代码仓(唯一): 高级配置选完 harness 后自动填入
+    is_default: bool = False
 
 
 class CodeRepoUpdate(BaseModel):
@@ -18,6 +20,9 @@ class CodeRepoUpdate(BaseModel):
     description: Optional[str] = None
     main_python_file: Optional[str] = None
     tag: Optional[str] = None
+    is_default: Optional[bool] = None
+    # 创建页可见性开关: 停用后高级配置下拉不再列出(存量实例引用不受影响)
+    enabled: Optional[bool] = None
 
 
 class CodeRepoInfo(BaseModel):
@@ -28,6 +33,8 @@ class CodeRepoInfo(BaseModel):
     description: str = ""
     main_python_file: str = "harness_automation.py"
     tag: str = ""
+    is_default: bool = False
+    enabled: bool = True
     created_at: str
     created_by: str = ""
 

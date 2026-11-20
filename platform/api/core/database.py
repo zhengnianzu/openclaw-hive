@@ -561,6 +561,29 @@ def init_db():
     os.makedirs(os.path.dirname(get_db_path()), exist_ok=True)
     with init_db_lock():
         init_db_unlocked()
+        _migrate_image_harness_map()
+
+
+def _migrate_image_harness_map() -> None:
+    """把 images.harness_type(单值, 已废弃)展开进 image_harness_map 多对多表。
+
+    幂等: 映射表已有数据的镜像跳过; 展开只做 INSERT OR IGNORE, 重复启动无副作用。
+    现存的 is_default 全部为 0 —— 默认镜像由管理员在新页面显式设置。
+    """
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT id, harness_type FROM images WHERE harness_type != ''"
+            ).fetchall()
+            for r in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO image_harness_map (image_id, harness_type, is_default) "
+                    "VALUES (?, ?, 0)",
+                    (r["id"], r["harness_type"]),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
 
 
 # task_traj_records 的「新增可选列」。建表语句、重建表语句、ADD COLUMN 迁移三处
@@ -723,7 +746,10 @@ def ensure_traj_extra_columns() -> None:
     """
     for table, columns in (("task_traj_records", TRAJ_EXTRA_COLUMNS),
                            ("task_instances", INSTANCE_EXTRA_COLUMNS),
-                           ("task_records", TASK_EXTRA_COLUMNS)):
+                           ("task_records", TASK_EXTRA_COLUMNS),
+                           ("images", ("enabled INTEGER NOT NULL DEFAULT 1",)),
+                           ("code_repos", ("is_default INTEGER NOT NULL DEFAULT 0",
+                                           "enabled INTEGER NOT NULL DEFAULT 1"))):
         try:
             with get_connection() as conn:
                 if not _table_exists(conn, table):
@@ -1070,6 +1096,8 @@ def init_db_unlocked():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 address TEXT NOT NULL,
+                -- 已废弃: 多 harness 映射迁到 image_harness_map 表, 此列仅作
+                -- 存量数据展开的迁移源, 新代码不读写。
                 harness_type TEXT NOT NULL DEFAULT 'openclaw',
                 -- 运行该镜像的操作系统：linux | windows。绝大多数镜像是 linux，
                 -- 所以默认 linux，Windows 镜像在注册时显式选择。
@@ -1077,8 +1105,19 @@ def init_db_unlocked():
                 -- 该镜像相对上一版的改进点。名称/地址里只有版本号，看不出改了什么，
                 -- 所以单独留一列让运维写明，选镜像时能看到。
                 remark TEXT NOT NULL DEFAULT '',
+                -- 创建页可见性开关: 0=停用(高级配置下拉不再列出, 存量实例不受影响)
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
+            );
+
+            -- 镜像 <-> harness 多对多映射, is_default 为该 harness 的默认镜像
+            -- (同一 harness 至多一条 is_default=1, 由应用层在设置时清除旧默认)。
+            CREATE TABLE IF NOT EXISTS image_harness_map (
+                image_id INTEGER NOT NULL,
+                harness_type TEXT NOT NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (image_id, harness_type)
             );
 
             CREATE TABLE IF NOT EXISTS code_repos (
@@ -1092,6 +1131,10 @@ def init_db_unlocked():
                 -- openclaw-task，分支信息此前只能靠 version 前缀猜，这里显式存一列。
                 -- 取值来自 code_repo_tags 字典表，空串表示未归类。
                 tag TEXT NOT NULL DEFAULT '',
+                -- 全局默认代码仓(至多一条=1): 高级配置选完 harness 后自动填入
+                is_default INTEGER NOT NULL DEFAULT 0,
+                -- 创建页可见性开关: 0=停用(高级配置下拉不再列出, 存量实例不受影响)
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );

@@ -23,7 +23,7 @@ from pathlib import Path, PureWindowsPath
 from prepare_config import HiveError, _log_sandbox_detail, _classify_task_stdout, ERROR_CATALOG
 
 from execution_client.core.error_code import ErrorCode
-from execution_client.core.utils import generate_random_port
+
 from execution_client.models.request import ExtendExecCommand
 
 from utils.llm_proxy import PROXY_CONFIG_NAME, PROXY_DIR_NAME
@@ -389,81 +389,120 @@ async def _gen_proxy_summary_windows(self, project_dir: str) -> None:
 async def _start_openclaw_gateway_windows(self, config_file: str) -> None:
     """在 Windows 沙箱里启动 OpenClaw gateway (PowerShell -EncodedCommand 版)。
 
-    端口模型与 Linux 分支一致: 本地把随机端口写进 openclaw.json (gateway.port)
-    和 data config (gateway_ws_url) 再上传, 不远程 sed。启动方式参照 win_demo.py
-    第 200 行: Start-Process 后台起 `openclaw gateway`, 再 Test-NetConnection
-    轮询随机端口就绪 (openclaw gateway 读配置里的 gateway.port, 不带 --port)。
+    与 Linux 分支同一思路(2026-11-20 对齐): 固定端口 openclaw_gateway_port
+    (沙箱网络命名空间隔离, 不跨沙箱冲突, 不撞临时端口段), 配置只写一次。
+    openclaw gateway 读 openclaw.json 里的 gateway.port(不带 --port), 所以
+    端口仍需写进配置再上传 —— 固定后重试不必重传。固定端口的代价是上一轮
+    残留进程会占住端口: 残留清理单独立一次 exec(尽力而为, 失败仅告警),
+    启动脚本自身不含任何 kill 片段 —— 与 hive.py 对 _start_openclaw_gateway
+    的拆分修复同构。就绪靠 PS 内 TcpClient 轮询(70 轮 x 2s); 
     """
     start_time = asyncio.get_running_loop().time()
     max_wait = self.config.openclaw_gateway_timeout
     sandbox_cfg = self.config.sandbox_config
+    port = str(sandbox_cfg.openclaw_gateway_port)
 
     # 前向斜杠路径 (win_demo / xiaoying.sh 的写法); openclaw.json 上传到了 ~/.openclaw
     config_dir = str(PureWindowsPath(sandbox_cfg.harness_sandbox_config_file).parent).replace("\\", "/")
     workdir = sandbox_cfg.result_workdir.replace("\\", "/")
     gateway_log = f"{workdir}/{sandbox_cfg.gateway_log}"
 
-    while True:
-        elapsed = asyncio.get_running_loop().time() - start_time
-        if elapsed > max_wait:
-            self.logger.error(f"[S002] gateway startup timeout ({max_wait}s)")
-            raise HiveError("S002", detail=f"{max_wait}s / config={os.path.basename(config_file)}")
+    # 固定端口: 配置只写一次(openclaw gateway 读配置里的 gateway.port)
+    await self._copy_agent_config(config_file, port=port)
+    await self._upload_data_config(config_file, port=port)
 
-        port = str(generate_random_port())
-
-        # 每次重试重新写端口再上传 (与 Linux 分支一致)
-        await self._copy_agent_config(config_file, port=port)
-        await self._upload_data_config(config_file, port=port)
-
-        # Start-Process 后台起 openclaw gateway + Test-NetConnection 轮询就绪
-        # 就绪后把 gateway.log 以 base64 读回 (见 ps_read_file_b64 的说明),
-        # 由 Python 端解码后落进 task-<idx>.log —— 与 Linux 分支的 cat 对齐。
-        # 注意顺序: base64 必须在 throw 之前输出, 否则启动失败时反而拿不到日志。
-        launch_script = (
-            _windows_env_assign(self) + " "
-            f"New-Item -ItemType Directory -Force '{workdir}' | Out-Null; "
-            f"$p=Start-Process cmd.exe -ArgumentList '/d /s /c {sandbox_cfg.openclaw_bash} gateway 1> {gateway_log} 2>&1' "
-            f"-PassThru -WindowStyle Hidden; "
-            f"$p.Id | Set-Content '{workdir}/gateway.pid'; "
-            f"$ready=$false; "
-            f"for($i=0;$i -lt 90;$i++) {{ "
-            f"if (Test-NetConnection 127.0.0.1 -Port {port} -InformationLevel Quiet -WarningAction SilentlyContinue) "
-            f"{{$ready=$true;break}}; Start-Sleep 2 }}; "
-            f"if($ready) {{Write-Output 'gateway-ready'}}; "
-            + ps_read_file_b64(gateway_log) + "; "
-            f"if(!$ready) {{throw 'gateway not ready'}}"
+    # ---- 残留清理: 单独立一次 exec (对齐 Linux 分支 _cleanup_cmd/_launch_cmd 的拆分) ----
+    # 清理与启动耦合在同一段脚本时, 清理段的任何意外都会连带启动一起死:
+    #   1) ps_command 前缀设了 $ErrorActionPreference='Stop', 而 PS 5.1 下外部
+    #      命令(taskkill)的 stderr 一旦被 2>&1 重定向进管道, 会被包装成
+    #      ErrorRecord 并按 Stop 偏好直接终止脚本 —— 杀一个不存在的残留 PID
+    #      (常态)就可能让后面的 Start-Process 永远执行不到。这是 Linux 版
+    #      「pkill 匹配到自己的命令行」的 Windows 同构问题。
+    #   2) 原特征匹配 'openclaw' AND 'gateway' 两词分开出现, 会误杀命令行恰好
+    #      同时含两个词的无辜进程 (如带 --gateway-url 参数的 automation 脚本);
+    #      收紧为相邻字样 'openclaw gateway', 与 Linux 的 pkill 模式同语义。
+    cleanup_script = (
+        # 清理必须尽力而为: 覆盖前缀的 Stop 偏好, 任何 kill 失败都不中断
+        "$ErrorActionPreference='Continue'; "
+        f"$pidPath='{workdir}/gateway.pid'; "
+        "if(Test-Path $pidPath) { $oldpid=(Get-Content $pidPath -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1); if($oldpid) { taskkill /PID $oldpid /T /F 2>&1 | Out-Null } }; "
+        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { "
+        "$_.CommandLine -match 'openclaw gateway' } | "
+        "ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>&1 | Out-Null }; "
+        "Start-Sleep 1; "
+        "Write-Output 'CLEANED'"
+    )
+    cleanup_result = await self._exec_sandbox(
+        ps_command(cleanup_script, config_dir), self.config.simple_bash_timeout
+    )
+    cleanup_data = cleanup_result.data or {}
+    if cleanup_result.code != ErrorCode.SUCCESS[0] or cleanup_data.get("exit_code") != 0:
+        self.logger.warning(
+            f"[S001] gateway 残留清理异常(忽略, 继续启动): "
+            f"code={cleanup_result.code} exit={cleanup_data.get('exit_code')}"
         )
-        exec_request = ExtendExecCommand(
-            command=ps_command(launch_script, config_dir),
-            timeout=self.config.sandbox_config.openclaw_start_timeout,
-        )
-        result = await self.execution_client.extend(args=exec_request.to_dict())
 
-        gateway_content = decode_remote_b64(
-            (result.data or {}).get("stdout", "") or ""
-        ) if result.data else ""
+    # ---- 启动 + 轮询: 不含任何 kill 片段, 同一 exec 内无自杀/误杀风险 ----
+    # 就绪后把 gateway.log 以 base64 读回 (见 ps_read_file_b64 的说明),
+    # 由 Python 端解码后落进 task-<idx>.log —— 与 Linux 分支的 cat 对齐。
+    # 注意顺序: base64 必须在 throw 之前输出, 否则启动失败时反而拿不到日志。
+    launch_script = (
+        _windows_env_assign(self) + " "
+        f"New-Item -ItemType Directory -Force '{workdir}' | Out-Null; "
+        f"$p=Start-Process cmd.exe -ArgumentList '/d /s /c {sandbox_cfg.openclaw_bash} gateway 1> {gateway_log} 2>&1' "
+        f"-PassThru -WindowStyle Hidden; "
+        f"$p.Id | Set-Content '{workdir}/gateway.pid'; "
+        f"$ready=$false; "
+        # 用 TcpClient 而非 Test-NetConnection: 后者单次约 1-2s, 轮询最坏情况
+        # 会撞穿 exec 超时, 失败路径拿不到日志尾; TcpClient 单次 1s 封顶。
+        # 时间预算: 70 轮 x (2s sleep + 1s 探测上限) = 最坏 210s, + PS 启动/
+        # 读日志开销 ~20s, 总 ~230s < exec 超时 240s, 失败必能带出日志。
+        f"for($i=0;$i -lt 70;$i++) {{ "
+        f"$open=$false; $tcp=New-Object Net.Sockets.TcpClient; "
+        "try { $iar=$tcp.BeginConnect('127.0.0.1',"
+        f"{port}"
+        ",$null,$null); "
+        "if ($iar.AsyncWaitHandle.WaitOne(1000) -and $tcp.Connected) { $open=$true } "
+        "} catch { $open=$false } finally { $tcp.Close() }; "
+        f"if($open) {{$ready=$true;break}}; Start-Sleep 2 }}; "
+        f"if($ready) {{Write-Output 'gateway-ready'}}; "
+        + ps_read_file_b64(gateway_log) + "; "
+        f"if(!$ready) {{throw 'gateway not ready on port {port}'}}"
+    )
+    exec_request = ExtendExecCommand(
+        command=ps_command(launch_script, config_dir),
+        # 轮询窗口 70x(2+1)s=210s, exec 超时必须盖住它再留余量
+        timeout=max(self.config.sandbox_config.openclaw_start_timeout, 240),
+    )
+    result = await self.execution_client.extend(args=exec_request.to_dict())
 
-        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-            self.logger.error(f"[S001] gateway start failed on port {port}")
-            _log_sandbox_detail(self.logger, f"gateway start failed — port {port}",
-                                     result, level=logging.ERROR,
-                                     extra_stdout=gateway_content,
-                                     extra_label=f"{sandbox_cfg.gateway_log} (tail)")
-            raise HiveError("S001", detail=f"port={port}", sandbox_result=result)
+    gateway_content = decode_remote_b64(
+        (result.data or {}).get("stdout", "") or ""
+    ) if result.data else ""
 
-        stdout = result.data.get("stdout", "")
-        if "gateway-ready" in stdout:
-            _log_sandbox_detail(self.logger, f"gateway startup OK — port {port}", result,
-                                     extra_stdout=gateway_content,
-                                     extra_label=f"{sandbox_cfg.gateway_log} (tail)")
-            break
-        else:
-            self.logger.error(f"[S003] gateway unexpected output on port {port}")
-            _log_sandbox_detail(self.logger, f"gateway unexpected output — port {port}",
-                                     result, level=logging.ERROR,
-                                     extra_stdout=gateway_content,
-                                     extra_label=f"{sandbox_cfg.gateway_log} (tail)")
-            raise HiveError("S003", detail=f"port={port}", sandbox_result=result)
+    if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+        elapsed = int(asyncio.get_running_loop().time() - start_time)
+        self.logger.error(f"[S002] gateway startup failed/timeout on port {port} ({elapsed}s)")
+        _log_sandbox_detail(self.logger, f"gateway startup failed — port {port}",
+                                 result, level=logging.ERROR,
+                                 extra_stdout=gateway_content,
+                                 extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+        raise HiveError("S002", detail=f"port={port} elapsed={elapsed}s", sandbox_result=result)
+
+    stdout = result.data.get("stdout", "")
+    if "gateway-ready" in stdout:
+        _log_sandbox_detail(self.logger, f"gateway startup OK — port {port}", result,
+                                 extra_stdout=gateway_content,
+                                 extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+    else:
+        # 脚本 throw 时 exit_code 必非 0, 走不到这; 留作意外输出兜底
+        self.logger.error(f"[S003] gateway unexpected output on port {port}")
+        _log_sandbox_detail(self.logger, f"gateway unexpected output — port {port}",
+                                 result, level=logging.ERROR,
+                                 extra_stdout=gateway_content,
+                                 extra_label=f"{sandbox_cfg.gateway_log} (tail)")
+        raise HiveError("S003", detail=f"port={port}", sandbox_result=result)
 
     self.logger.info(f"Gateway started on port {port}")
 
@@ -541,14 +580,30 @@ async def _start_jiuwenswarm_gateway_windows(self, config_file: str) -> None:
         # 上传 jw_config.yaml → <home>\.jiuwenswarm\config\config.yaml (含注入的模型)
         await self._copy_agent_config(config_file)
 
+        # 残留清理单独立一次 exec (对齐 _start_openclaw_gateway_windows 的拆分):
+        # 启动脚本自设 $ErrorActionPreference='Stop', taskkill 的 stderr 一旦被
+        # 2>&1 重定向进管道就可能按 Stop 终止脚本, 让 Start-Process 执行不到。
+        # 清理尽力而为: 覆盖前缀的 Stop 偏好, 失败仅告警, 不中断启动。
+        cleanup_script = "$ErrorActionPreference='Continue'; " + _jiuwenswarm_kill_script() + \
+            "Start-Sleep 1; Write-Output 'CLEANED'"
+        cleanup_result = await self._exec_sandbox(
+            ps_command(cleanup_script, paths["config_dir"]),
+            self.config.simple_bash_timeout,
+        )
+        cleanup_data = cleanup_result.data or {}
+        if cleanup_result.code != ErrorCode.SUCCESS[0] or cleanup_data.get("exit_code") != 0:
+            self.logger.warning(
+                f"[S001] jiuwenswarm 残留清理异常(忽略, 继续启动): "
+                f"code={cleanup_result.code} exit={cleanup_data.get('exit_code')}"
+            )
+
         # 脚本内容走 .ps1 文件 + -File 调用: -EncodedCommand 会把脚本放大 ~2.67 倍
         # 塞进 cmd.exe 命令行, 超过 8191 字符就直接「命令行太长。」(实测 exit_code=1)。
+        # 启动脚本不含任何 kill 片段, 同一 exec 内无自杀/误杀风险。
         launch_script = (
             "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
             + _windows_env_assign(self) + " "
             f"New-Item -ItemType Directory -Force '{paths['workdir']}' | Out-Null; "
-            # 固定端口: 先清掉上一轮残留, 否则重试永远撞在同一个端口上。
-            + _jiuwenswarm_kill_script()
             # 运行入口: venv python 优先, 缺失时回落到 PATH 上的 python.exe
             + f"$py='{paths['runtime_py']}'; "
             "if(!(Test-Path $py)) { "

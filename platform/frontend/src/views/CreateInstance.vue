@@ -255,20 +255,6 @@
             </div>
           </el-form-item>
 
-          <el-form-item label="镜像名称">
-            <el-select v-model="form.image_name" filterable allow-create default-first-option
-              placeholder="选择或输入镜像地址" style="width:100%" clearable>
-              <el-option v-for="img in imageList" :key="img.id" :label="img.name" :value="img.address"
-                :style="img.remark ? 'height:auto;line-height:1.5;padding-top:6px;padding-bottom:6px' : ''">
-                <div>
-                  <span>{{ img.name }}</span>
-                  <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
-                </div>
-                <div v-if="img.remark" style="color:#999;font-size:12px;line-height:1.3;white-space:normal">{{ img.remark }}</div>
-              </el-option>
-            </el-select>
-          </el-form-item>
-
           <el-form-item label="沙箱配置">
             <el-select v-model="form.sandbox_config_id" placeholder="选择沙箱运行环境" style="width:100%">
               <el-option label="默认（不替换，用模板原样）" :value="0" />
@@ -284,6 +270,20 @@
             <div style="font-size:12px;color:#999;margin-top:4px">
               决定沙箱的资源规格、超时、环境变量与镜像；选「默认」则不替换，用 harness 模板原样
             </div>
+          </el-form-item>
+          <el-form-item label="镜像名称">
+            <el-select v-model="form.image_name" filterable allow-create default-first-option
+              placeholder="选择或输入镜像地址" style="width:100%" clearable>
+              <el-option v-for="img in imageOptions" :key="img.id" :label="img.name" :value="img.address"
+                :style="img.remark ? 'height:auto;line-height:1.5;padding-top:6px;padding-bottom:6px' : ''">
+                <div>
+                  <el-tag v-if="img.address === defaultImageAddress" size="small" type="success" effect="light" style="margin-right:6px">推荐</el-tag>
+                  <span>{{ img.name }}</span>
+                  <span style="float:right;color:#999;font-size:12px">{{ img.address.length > 40 ? '...' + img.address.slice(-40) : img.address }}</span>
+                </div>
+                <div v-if="img.remark" style="color:#999;font-size:12px;line-height:1.3;white-space:normal">{{ img.remark }}</div>
+              </el-option>
+            </el-select>
           </el-form-item>
 
           <el-form-item label="Key 追加沙箱后缀">
@@ -302,8 +302,10 @@
 
           <el-form-item label="代码仓">
             <el-select v-model="form.code_repo_id" placeholder="选择代码仓（可选）" style="width:100%" clearable>
-              <el-option v-for="repo in codeRepoList" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
-                <span>{{ repo.name }} / {{ repo.version }}</span>
+              <el-option v-for="repo in codeRepoOptions" :key="repo.id" :label="`${repo.name} / ${repo.version}`" :value="repo.id">
+                <span>
+                  <el-tag v-if="repo.id === defaultRepoId" size="small" type="success" effect="light" style="margin-right:6px">默认</el-tag>{{ repo.name }} / {{ repo.version }}
+                </span>
                 <span style="float:right;color:#999;font-size:12px">{{ repo.obs_path.length > 40 ? '...' + repo.obs_path.slice(-40) : repo.obs_path }}</span>
               </el-option>
             </el-select>
@@ -562,6 +564,54 @@ function removeAgentTab(tabName) {
 }
 
 const imageList = ref([])
+
+// ============ 启用过滤 + os 过滤 + 默认(推荐) ============
+// 镜像下拉: 只列启用的, 按所选沙箱配置的 os 过滤(未选/过滤后为空则不过滤)。
+// 默认镜像 = 该 harness 映射里 is_default 的; 无则 common 默认; 都无则不标。
+const imageOptions = computed(() => {
+  let list = (imageList.value || []).filter(i => i.enabled !== false)
+  const sb = (sandboxList.value || []).find(s => s.id === form.value.sandbox_config_id)
+  if (sb) {
+    const filtered = list.filter(i => i.os === sb.sandbox_type)
+    if (filtered.length) list = filtered
+  }
+  const def = defaultImageAddress.value
+  if (!def) return list
+  return [...list.filter(i => i.address === def), ...list.filter(i => i.address !== def)]
+})
+
+const defaultImageAddress = computed(() => {
+  const list = (imageList.value || []).filter(i => i.enabled !== false)
+  const ht = form.value.harness_type
+  const hit = list.find(i => (i.defaults || []).includes(ht))
+  if (hit) return hit.address
+  const common = list.find(i => (i.defaults || []).includes('common'))
+  return common ? common.address : ''
+})
+
+// 代码仓下拉: 只列启用的; 默认代码仓置顶打标。
+const codeRepoOptions = computed(() => {
+  const list = (codeRepoList.value || []).filter(r => r.enabled !== false)
+  const d = defaultRepoId.value
+  if (!d) return list
+  return [...list.filter(r => r.id === d), ...list.filter(r => r.id !== d)]
+})
+
+const defaultRepoId = computed(() => {
+  const d = (codeRepoList.value || []).find(r => r.enabled !== false && r.is_default)
+  return d ? d.id : null
+})
+
+// harness 切换后自动填默认镜像/代码仓(可手动改选其他); suppressDefaultFill
+// 用于复制实例场景 —— 保留源实例的选择不被覆盖。
+let suppressDefaultFill = false
+function applyDefaults() {
+  if (suppressDefaultFill) { suppressDefaultFill = false; return }
+  const addr = defaultImageAddress.value
+  if (addr) form.value.image_name = addr
+  const rid = defaultRepoId.value
+  if (rid) form.value.code_repo_id = rid
+}
 const baseUrlOptions = ref([])
 const codeRepoList = ref([])
 const harnessConfigList = ref([])
@@ -709,8 +759,9 @@ function applyTemplate(tpl) {
   form.value.invite_code = tpl.invite_code || ''
   form.value.model_api_type = tpl.model_api_type || ''
   if (tpl.model_id) form.value.model_id = tpl.model_id
-  form.value.image_name = tpl.image_name || ''
-  form.value.code_repo_id = tpl.code_repo_id || null
+  // 模板配置优先; 未配置时回落 harness 默认镜像/默认代码仓(而非清空)
+  form.value.image_name = tpl.image_name || defaultImageAddress.value || ''
+  form.value.code_repo_id = tpl.code_repo_id || defaultRepoId.value || null
   form.value.model_api_key = ''
   validateResults.value = {}
   try {
@@ -734,6 +785,7 @@ async function loadImages() {
   try {
     imageList.value = await api.get('/images', { params: { harness_type: form.value.harness_type } })
   } catch { imageList.value = [] }
+  applyDefaults()
 }
 
 async function loadCodeRepos() {
@@ -808,7 +860,9 @@ function queryAgentBaseUrls(queryString, cb) {
 }
 
 function onHarnessChange() {
+  suppressDefaultFill = false  // 用户显式切换 harness, 恢复默认自动填
   form.value.image_name = ''
+  form.value.code_repo_id = null
   form.value.harness_config_id = null
   form.value.harness_config_version_id = null
   versionList.value = []
@@ -908,6 +962,8 @@ onMounted(async () => {
       // 直接回填会让复制出的任务带着掩码当 key 去跑。
       const params = await api.get(`/instances/${copyFrom}/create-params/full`)
       Object.assign(form.value, params)
+      // 复制保留源实例的镜像/代码仓选择: 压制下一次默认自动填
+      suppressDefaultFill = true
       // 历史实例的 suffix_api_keys 统一是 false（迁移默认值），直接继承会让
       // 「复制」出来的新任务默认关闭后缀。复制时回到当前默认值，用户仍可手动改。
       form.value.suffix_api_keys = true

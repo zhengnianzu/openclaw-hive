@@ -261,6 +261,7 @@ class SandboxConfig:
     openclaw_bash: str = "/usr/local/node24/bin/openclaw"
     gateway_log: str = "gateway.log"
     proxy_log: str = "proxy.log"
+    openclaw_gateway_port: int = 18789  # 固定端口(task config 模板 gateway_ws_url 的默认值)
     openclaw_start_timeout: int = 10
     user_proxy_model_local_file: str = "uploads/user_proxy_model.json"
     user_proxy_model_remote_file: str = "configs/user_proxy_model.json"
@@ -738,7 +739,10 @@ class OpenClawDistillationTask:
             )
 
         data = json.loads(Path(config_file).read_text(encoding="utf-8"))
-        data["platform"] = "windows" if sandbox_type == "windows" else "linux"
+        # platform 写在 system.platform(列表)
+        data.setdefault("system", {})["platform"] = [
+            "windows" if sandbox_type == "windows" else "linux"
+        ]
         data["harness_type"] = self.config.sandbox_config.harness_type
 
         harness_configs = [
@@ -800,7 +804,7 @@ class OpenClawDistillationTask:
         )
 
         self.logger.info(
-            f"Patched data config: platform={data['platform']}, "
+            f"Patched data config: platform={data['system']['platform']}, "
             f"harness_type={data['harness_type']}, "
             f"harness_md={len(harness_configs)}, "
             f"query_agents={query_agent_names}, port={port or '-'}"
@@ -835,62 +839,93 @@ class OpenClawDistillationTask:
 
 
     async def _start_openclaw_gateway(self, config_file: str) -> None:
-        """Start the OpenClaw gateway in the sandbox."""
+        """Start the OpenClaw gateway in the sandbox.
+
+        固定端口 + 就绪轮询(与 jiuwenswarm 同一思路): 沙箱网络命名空间隔离,
+        固定端口不会跨沙箱冲突, 也不再撞内核临时端口段。改为启动后台进程后循环
+        读日志, 直到 listening 标记或 S002 超时, 慢启动只是多等几轮。
+        端口占用(残留进程)→ kill 后重启, 受 max_wait 约束。
+        """
+        port = str(self.config.sandbox_config.openclaw_gateway_port)
         start_time = asyncio.get_running_loop().time()
         max_wait = self.config.openclaw_gateway_timeout
+        gateway_log_path = os.path.join(
+            self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
+        )
 
+        # 固定端口: 配置只写一次, 重试不必重传
+        await self._copy_agent_config(config_file, port=port)
+        await self._upload_data_config(config_file, port=port)
+
+        def _cleanup_cmd() -> list:
+            # 残留清理必须单独立一次 exec
+            return [
+                "/bin/bash", "-c",
+                "pkill -f '[o]penclaw gateway' 2>/dev/null; sleep 1; echo CLEANED"
+            ]
+
+        def _launch_cmd() -> list:
+            # 启动命令本身不含 pkill, 无自杀风险
+            return [
+                "/bin/bash", "-c",
+                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
+                f"nohup {self.config.sandbox_config.openclaw_bash} gateway --port {port} "
+                f"> {gateway_log_path} 2>&1 & echo LAUNCHED"
+            ]
+
+        def _check_cmd() -> list:
+            return [
+                "/bin/bash", "-c",
+                f"cat {gateway_log_path} 2>/dev/null | tail -n 50"
+            ]
+
+        launched = False
         while True:
             elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > max_wait:
                 self.logger.error(f"[S002] gateway startup timeout ({max_wait}s)")
-                raise HiveError("S002", detail=f"{max_wait}s / config={os.path.basename(config_file)}")
+                tail_result = await self._exec_sandbox(_check_cmd(), 30)
+                _log_sandbox_detail(
+                    self.logger, f"gateway startup timeout — port {port}",
+                    tail_result, level=logging.ERROR,
+                )
+                raise HiveError("S002", detail=f"{max_wait}s port={port}")
 
-            port = str(generate_random_port())
-            remote_config_path = os.path.join(
-                self.config.sandbox_config.data_config_path, os.path.basename(config_file)
-            )
+            if not launched:
+                # 先清残留(独立 exec, 防自杀), 再启动
+                cleanup_result = await self._exec_sandbox(
+                    _cleanup_cmd(), self.config.simple_bash_timeout
+                )
+                cleanup_data = cleanup_result.data or {}
+                if cleanup_result.code != ErrorCode.SUCCESS[0] or cleanup_data.get("exit_code") != 0:
+                    self.logger.warning(
+                        f"[S001] gateway 残留清理异常(忽略, 继续启动): "
+                        f"code={cleanup_result.code} exit={cleanup_data.get('exit_code')}"
+                    )
+                result = await self._exec_sandbox(
+                    _launch_cmd(), self.config.simple_bash_timeout
+                )
+                launch_data = result.data or {}
+                if result.code != ErrorCode.SUCCESS[0] or launch_data.get("exit_code") != 0:
+                    self.logger.error(f"[S001] gateway start failed on port {port}")
+                    _log_sandbox_detail(self.logger, f"gateway start failed — port {port}",
+                                        result, level=logging.ERROR)
+                    raise HiveError("S001", detail=f"port={port}", sandbox_result=result)
+                launched = True
+                await asyncio.sleep(self.config.sandbox_config.openclaw_start_timeout)
+                continue
 
-            # 每次尝试重新复制副本, 并把 gateway.port 本地写进 openclaw.json 副本再上传 
-            await self._copy_agent_config(config_file, port=port)
-
-            # data config 的 gateway_ws_url 写入正确端口再上传
-            await self._upload_data_config(config_file, port=port)
-
-            # Start gateway
-            gateway_log_path = os.path.join(
-                self.config.sandbox_config.result_workdir, self.config.sandbox_config.gateway_log
-            )
-            gateway_cmd = [
-                "/bin/bash", "-c",
-                f"mkdir -p {self.config.sandbox_config.result_workdir} && "
-                f"nohup {self.config.sandbox_config.openclaw_bash} gateway --port {port} "
-                f"> {gateway_log_path} 2>&1 & sleep {self.config.sandbox_config.openclaw_start_timeout} && cat {gateway_log_path}"
-            ]
-            exec_request = ExtendExecCommand(
-                command=gateway_cmd,
-                timeout=self.config.sandbox_config.openclaw_start_timeout + 5
-            )
-            result = await self.execution_client.extend(args=exec_request.to_dict())
-
-            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
-                self.logger.error(f"[S001] gateway start failed on port {port}")
-                _log_sandbox_detail(self.logger, f"gateway start failed — port {port}",
-                                    result, level=logging.ERROR)
-                raise HiveError("S001", detail=f"port={port}", sandbox_result=result)
-
-            stdout = result.data.get("stdout", "")
-            if f"Port {port} is already in use" in stdout:
-                self.logger.warning(f"Port {port} in use, retrying...")
-                await asyncio.sleep(2)
-            elif "http server listening" in stdout:
-                # 成功时也把 gateway 启动详情打进 task-<idx>.log (main.log 里过滤掉)
+            result = await self._exec_sandbox(_check_cmd(), 30)
+            stdout = (result.data or {}).get("stdout", "") or ""
+            if "http server listening" in stdout:
                 _log_sandbox_detail(self.logger, f"gateway startup OK — port {port}", result)
                 break
-            else:
-                self.logger.error(f"[S003] gateway unexpected output on port {port}")
-                _log_sandbox_detail(self.logger, f"gateway unexpected output — port {port}",
-                                    result, level=logging.ERROR)
-                raise HiveError("S003", detail=f"port={port}", sandbox_result=result)
+            if f"Port {port} is already in use" in stdout:
+                self.logger.warning(f"[S003] port {port} occupied (stale gateway?), kill & relaunch")
+                launched = False  # 下一轮走 _launch_cmd 的 pkill 分支
+                await asyncio.sleep(2)
+                continue
+            await asyncio.sleep(5)
 
         self.logger.info(f"Gateway started on port {port}")
 

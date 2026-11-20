@@ -538,6 +538,17 @@ def prepare_local_agent_config(
         # llm-pi-ai.providers 追加 provider 到 settings.yaml, 已存在则跳过
         data = load_yaml_config(local_path)
 
+        # 注入 agent(evaluator 等)的 contextWindow/maxTokens 与主 agent(模板里
+        # 已有的 provider 模型条目)保持一致, 模板改参后这里自动跟随;
+        _template_providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
+        main_model = next(
+            (m for p in _template_providers.values() if hasattr(p, "get")
+             for m in p.get("models", []) if hasattr(m, "get") and "contextWindow" in m),
+            {},
+        )
+        dsh_context_window = main_model.get("contextWindow", 200000)
+        dsh_max_tokens = main_model.get("maxTokens", 326800)
+
         for agent_name, cfg in model_cfg.items():
             if agent_name == "user_simulator":
                 continue
@@ -574,6 +585,8 @@ def prepare_local_agent_config(
                     "models": [
                         {
                             "id": model_name,
+                            "contextWindow": dsh_context_window,
+                            "maxTokens": dsh_max_tokens
                         }
                     ],
                 }
