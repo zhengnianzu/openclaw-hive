@@ -147,7 +147,7 @@
                     <el-select v-model="curArm.harness_config_version_id" style="width:100%"
                       :placeholder="versionsOf(curArm).length ? '选择已发布版本' : '该方案暂无已发布版本'">
                       <el-option v-for="v in versionsOf(curArm)" :key="v.id"
-                        :label="`${v.version}${v.description ? ' · ' + v.description : ''}`" :value="v.id" />
+                        :label="`${v.version}${v.published_at ? ' · ' + formatShortTime(v.published_at) + ' 发布' : (v.description ? ' · ' + v.description : '')}`" :value="v.id" />
                     </el-select>
                     <div v-if="curArm.harness_config_id && !versionsOf(curArm).length" class="hint danger">
                       该方案没有已发布版本，无法用于实验。请到「配置工作台」创建并发布。
@@ -1108,6 +1108,12 @@ function versionName(a) {
   const v = o.versions.find(x => x.id === a.harness_config_version_id)
   return v ? v.version : ''
 }
+// 版本下拉的发布时间格式，与 CreateInstance 的同名函数保持完全一致 —
+// 两页展示同一批版本，文案不一致会让人以为版本不同（如「v1.0 · 11-18 发布」
+// vs「1.0 · 从旧配置迁移」）。
+function formatShortTime(t) {
+  return String(t || '').replace('T', ' ').slice(5, 16)
+}
 function configsOf(t) {
   return armOptions.value.filter(o => o.harness_type === t)
 }
@@ -1287,6 +1293,8 @@ function onArmTypeChange() {
   if (cs.length === 1) {
     a.harness_config_id = cs[0].config_id
     onArmSchemeChange()
+  } else {
+    applyArmDefaults(a)
   }
 }
 
@@ -1296,6 +1304,45 @@ function onArmSchemeChange() {
   const vs = versionsOf(a)
   // 接口按 created_at DESC 返回，[0] 是最新已发布版本
   if (vs.length) a.harness_config_version_id = vs[0].id
+  applyArmDefaults(a)
+}
+
+// ---------- 镜像 / 代码仓默认带出 ----------
+// 与 CreateInstance 的 defaultImageAddress / defaultRepoId / applyDefaults 同口径：
+// 选了 harness 就自动带出该 harness 映射的默认镜像与默认代码仓，用户可再改。
+//
+// 为什么批量页也要：单实例页一直有这个行为，两边不一致会让用户以为批量页"漏配了"。
+// 镜像按 arm 各自生效（不同 harness 的默认镜像不同）；代码仓是批次级 common 字段，
+// 只在为空时带出，不覆盖用户已选的值。
+const defaultRepoId = computed(() => {
+  const d = (codeRepoList.value || []).find(r => r.enabled !== false && r.is_default)
+  return d ? d.id : null
+})
+
+function defaultImageAddressFor(harnessType) {
+  const list = (imageList.value || []).filter(i => i.enabled !== false)
+  if (!harnessType) {
+    const common = list.find(i => (i.defaults || []).includes('common'))
+    return common ? common.address : ''
+  }
+  const hit = list.find(i => (i.defaults || []).includes(harnessType))
+  if (hit) return hit.address
+  const common = list.find(i => (i.defaults || []).includes('common'))
+  return common ? common.address : ''
+}
+
+function applyArmDefaults(a) {
+  if (!a) return
+  // 镜像：只在 arm 还没选过时带出，避免把用户手选的值冲掉
+  if (!a.image_name) {
+    const addr = defaultImageAddressFor(a.harness_type)
+    if (addr) a.image_name = addr
+  }
+  // 代码仓是批次级字段，同样只在空时带出
+  if (form.value.common.code_repo_id == null) {
+    const rid = defaultRepoId.value
+    if (rid) form.value.common.code_repo_id = rid
+  }
 }
 
 function copyArm(i) {
