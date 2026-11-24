@@ -950,6 +950,47 @@ def init_db_unlocked():
                 linked_instance_id TEXT,
                 traj_path TEXT DEFAULT ''
             );
+
+            -- 数据集（任务登记）的变更历史。与 harness_config_versions 不同，
+            -- 这里没有磁盘快照也没有发布状态：数据集本体就是一行 OBS 路径字段，
+            -- 所以一条版本 = 一份「编辑字段」的 JSON 快照。只追加，不修改、不删除；
+            -- 「恢复」也是追加一个新版本，历史永远可回溯。
+            CREATE TABLE IF NOT EXISTS task_registration_versions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                registration_id INTEGER NOT NULL,
+                version         INTEGER NOT NULL,          -- 每个数据集内从 1 递增
+                snapshot_json   TEXT NOT NULL DEFAULT '{}',-- 编辑字段的完整快照
+                change_json     TEXT NOT NULL DEFAULT '[]',-- [{field, old, new}]，v1 为空
+                summary         TEXT DEFAULT '',           -- 变更说明（用户填或自动生成）
+                created_by      TEXT DEFAULT '',
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(registration_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trv_reg
+                ON task_registration_versions(registration_id, version DESC);
+
+            -- 数据集文件清单 + 哈希基线。注册后整份数据集会下载到本地
+            -- (OUTPUT_CACHE/dataset/<path>)，首次下载时对每个文件算 sha256 存这里，
+            -- 作为「云端那一版」的指纹。
+            --   本地编辑 → sha256 变、synced_sha256 不变 → status='modified'
+            --   sync_worker 上传成功 → synced_sha256 跟上 → status='clean'
+            -- rel_path 是**相对数据集根目录**的路径，同时也是相对 OBS 前缀的路径。
+            CREATE TABLE IF NOT EXISTS task_registration_files (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                registration_id INTEGER NOT NULL,
+                rel_path        TEXT NOT NULL,
+                sha256          TEXT NOT NULL DEFAULT '',   -- 本地当前内容的指纹
+                synced_sha256   TEXT NOT NULL DEFAULT '',   -- 上次同步到云端时的指纹
+                size            INTEGER NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL DEFAULT 'clean',  -- clean | modified
+                modified_at     TIMESTAMP,
+                synced_at       TIMESTAMP,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(registration_id, rel_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trf_reg ON task_registration_files(registration_id);
+            CREATE INDEX IF NOT EXISTS idx_trf_status ON task_registration_files(status);
         """)
         # migrate: add create_params for existing databases
         try:
@@ -1216,6 +1257,17 @@ def init_db_unlocked():
             "count_status TEXT NOT NULL DEFAULT ''",
             "count_error TEXT NOT NULL DEFAULT ''",
             "counted_at TIMESTAMP",
+            # 版本功能：updated_at 供列表页「更新时间」列；current_version 是
+            # 「最后一次编辑后的版本号」的冗余列，避免列表页为每条数据集查一次版本表。
+            "updated_at TIMESTAMP",
+            "current_version INTEGER NOT NULL DEFAULT 0",
+            # 本地副本状态：注册后整份数据集自动下载到本地，这里记录下载进度；
+            # modified_count 是「本地改过、还没同步到云端」的文件数，列表页直接读。
+            "download_status TEXT NOT NULL DEFAULT ''",   # '' | downloading | done | error
+            "download_error TEXT NOT NULL DEFAULT ''",
+            "downloaded_at TIMESTAMP",
+            "modified_count INTEGER NOT NULL DEFAULT 0",
+            "last_synced_at TIMESTAMP",
         ]:
             try:
                 conn.execute(f"ALTER TABLE task_registrations ADD COLUMN {_col}")

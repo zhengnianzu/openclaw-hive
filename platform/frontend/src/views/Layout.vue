@@ -124,6 +124,7 @@ const activeMenu = computed(() => {
   if (p.startsWith('/wiki')) return '/wiki'
   if (p.startsWith('/instance') || p.startsWith('/logs') || p.startsWith('/outputs')) return '/dashboard'
   if (p.startsWith('/task-register')) return '/registrations'
+  if (p.startsWith('/datasets')) return '/registrations'
   return p
 })
 

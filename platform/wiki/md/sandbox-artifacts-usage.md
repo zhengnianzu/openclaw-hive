@@ -8,7 +8,7 @@ tags:
 - 工作区
 summary: 在哪看沙箱跑出来的文件、怎么点开预览、各种状态是什么意思，以及「已下载 / 已完成 / 共」三个数字怎么看。
 is_pinned: false
-sort_order: 80
+sort_order: 120
 author: admin
 created_at: '2026-10-26T20:00:00'
 updated_at: '2026-10-26T20:00:00'

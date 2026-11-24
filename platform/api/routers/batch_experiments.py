@@ -26,6 +26,7 @@ from ..models.batch_experiment import (
     BatchCompareRow, BatchMatrixResponse, BatchMatrixRow, BatchArm,
 )
 from ..models.instance import InstanceCreate
+from ..services import token_stats
 
 logger = logging.getLogger(__name__)
 
@@ -503,10 +504,16 @@ def _build_info(row: dict, agg: dict) -> BatchExperimentInfo:
     # 状态由子任务推导：库里那列只在 pause/resume/cancel 时写，普通跑完没人更新。
     # 不推导的话，4 个子任务全 failed 了实验还显示「待开始」。
     info.status = _derive_status(info.status, info)
-    # 成功率用 DONE 口径（agent 自己打的【Task_Done】标记），分母是「已跑完的」
-    # 而不是 total_tasks —— 否则实验刚开始时成功率会从 0 慢慢爬，看起来像全挂了。
+    # 成功率用 **completed 口径**（流水线正常跑完），分母是「已跑完的」而不是
+    # total_tasks —— 否则实验刚开始时成功率会从 0 慢慢爬，看起来像全挂了。
+    #
+    # 不用 DONE 口径：DONE 是 agent 自己打的【Task_Done】标记，很多任务类型根本
+    # 不会打（实测 batch 24 某臂 6 条跑完只有 2 条 DONE），拿它当「成功率」会
+    # 系统性低估。DONE 仍作为副指标返回（info.done），对比页可单独切换。
     settled = completed + failed
-    info.success_rate = round(done / settled * 100, 1) if settled else 0.0
+    info.success_rate = round(completed / settled * 100, 1) if settled else 0.0
+    # 副指标：DONE 率，同一分母，供页面并排展示
+    info.done_rate = round(done / settled * 100, 1) if settled else 0.0
     info.progress_percent = round(settled / task_total * 100, 1) if task_total else 0.0
     return info
 
@@ -975,17 +982,28 @@ async def cancel_experiment(batch_id: str, user: dict = Depends(require_operator
 
 @router.post("/{batch_id}/rerun-failed")
 async def rerun_failed(batch_id: str, user: dict = Depends(require_operator)):
-    """重跑失败：只把 status='failed' 的子任务重新拉起来，成功的和平跑的都不动。
+    """重跑失败的样本：按臂把「还有失败样本」的子任务重新拉起来。
 
-    与「启动队列」的区别：后者会把 created/stopped 的一起入队，这里**只挑 failed**，
-    避免已经跑出结果的任务被重跑一遍浪费资源。
+    原先只挑 `status='failed'` 的子任务，那只覆盖「准备/启动失败」；跑完了但
+    部分样本失败的子任务状态是 finished/completed，永远选不中（实测 batch 24
+    三个臂全 finished，失败样本 2/6/8 条，点「重跑失败」什么都不做）。
+
+    现在按 `failed_tasks > 0` 选：已经跑过的成功样本不需要重跑 —— 重启子任务
+    是**增量**的（hive 读 complete.jsonl 跳过成功项，只跑剩下的，见
+    instances._clear_failed_task_logs 与 hive 的 skip 逻辑），所以不会因为
+    几条失败把整份测试集重跑一遍。
+
+    运行中的不碰（重跑会打架），排队中的也不碰（它还没跑）。
     """
     _get_batch(batch_id)
     with get_connection() as conn:
         rows = conn.execute(
-            """SELECT t.id FROM batch_experiment_items i
+            """SELECT t.id, t.name, t.status, COALESCE(t.failed_tasks, 0) AS failed_tasks
+                 FROM batch_experiment_items i
                  JOIN task_instances t ON t.id = i.instance_id
-                WHERE i.batch_id = ? AND t.status = 'failed'
+                WHERE i.batch_id = ?
+                  AND (t.status = 'failed' OR COALESCE(t.failed_tasks, 0) > 0)
+                  AND t.status NOT IN ('running', 'preparing', 'queued')
                 ORDER BY i.id""",
             (batch_id,),
         ).fetchall()
@@ -1138,7 +1156,7 @@ def _compare_rows(batch_id: str) -> list[BatchCompareRow]:
             """SELECT i.id AS item_id, i.instance_id, i.arm_label, i.harness_type,
                       i.sim_label, i.sim_idx,
                       t.total_tasks, t.completed_tasks, t.failed_tasks,
-                      t.started_at, t.stopped_at,
+                      t.started_at, t.stopped_at, t.create_params,
                       (SELECT AVG(eval_score) FROM task_records
                         WHERE instance_id = t.id AND eval_score IS NOT NULL) AS avg_score,
                       (SELECT COUNT(*) FROM task_records
@@ -1168,6 +1186,9 @@ def _compare_rows(batch_id: str) -> list[BatchCompareRow]:
         avg = (elapsed / settled) if (elapsed and settled) else None
 
         avg_score = d.get("avg_score")
+        # Token 用量：读本地轨迹缓存里的 logs_proxy/proxy_summary.txt（需开网关）。
+        # 没有数据返回 None，前端渲染 '—'；不能填 0，否则和「真的没消耗」混淆。
+        tok = token_stats.collect_instance_tokens(d.get("create_params"))
         out.append(BatchCompareRow(
             item_id=d["item_id"],
             instance_id=d.get("instance_id"),
@@ -1186,9 +1207,12 @@ def _compare_rows(batch_id: str) -> list[BatchCompareRow]:
             avg_score=round(avg_score, 2) if avg_score is not None else None,
             scored_count=d.get("scored_count") or 0,
             unscored_count=d.get("unscored_count") or 0,
-            # Token：本期不计算，前端渲染为 '—'。
-            # 数据源 task_traj_records.total_tokens 已就绪，补的时候加个子查询即可。
-            total_tokens=None,
+            request_count=tok["ok_calls"] if tok else None,
+            failed_calls=tok["fail_calls"] if tok else None,
+            input_tokens=tok["input_tokens"] if tok else None,
+            output_tokens=tok["output_tokens"] if tok else None,
+            total_tokens=tok["total_tokens"] if tok else None,
+            tokens_by_model=tok["models"] if tok else [],
         ))
     return out
 

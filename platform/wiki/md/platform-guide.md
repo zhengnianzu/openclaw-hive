@@ -7,7 +7,7 @@ tags:
 - 入门
 summary: 从准备 OBS 材料、任务配置格式，到新建实例批跑、查看输出与 Harness 配置的完整上手流程。
 is_pinned: true
-sort_order: 15
+sort_order: 10
 author: admin
 created_at: '2026-11-16T20:11:26'
 updated_at: '2026-11-16T20:11:26'
@@ -69,7 +69,7 @@ updated_at: '2026-11-16T20:11:26'
       ]
     }
   ],
-  "queries": [                              // query 列表，支持多 query 串行执行
+  "queries": [                              // 【核心】query 列表，支持多 query 串行执行
     {
       "agent_name": "main",
       "session_name": "task-00000",
@@ -91,9 +91,11 @@ updated_at: '2026-11-16T20:11:26'
 }
 ```
 
-### 1.3 模型Key准备
-（如需）去 AI数据技术创新平台 - 外部API管理 - 数据生产申请里面申请。
-如果自备模型url和key，请先转发到蓝区网络，本平台生产环境为蓝区。
+### 1.3 生产Key平台申请
+> 完整说明：<http://115.120.48.151:8087/#/wiki/Application_Process_for_the_Production_Key_Platform.md>
+
+1. AI数据技术创新平台 - 外部API管理 - 数据生产申请里面申请。
+2. 如果自备模型url和key，请先转发到蓝区网络，本平台生产环境为蓝区。
 
 ## 2. 开始批跑
 
@@ -105,7 +107,7 @@ updated_at: '2026-11-16T20:11:26'
 
 - 步骤 2：Harness 配置
 
-![alt text](/api/wiki/assets/91d32be8da5045fcb5bfb054f3b39f2b.webp)
+![alt text](/api/wiki/assets/3711345fff3b485a945ac88d7c147a1d.webp)
 
 - 步骤 3：用户模拟配置
 
@@ -113,9 +115,10 @@ updated_at: '2026-11-16T20:11:26'
 
 - 步骤 4：高级配置
 
-![alt text](/api/wiki/assets/36440718d5094bf7887a6872e892dc94.webp)
-
-最后点击 **创建实例**，跳转到主界面，再点击该实例的【更多】→【启动】。
+![alt text](/api/wiki/assets/8170177a288d42748ecae27ca9b28233.webp)
+1. 使用自部署模型时，必须强制开启【Key追加沙箱后缀】，使用第三方模型则请关闭；
+2. 任务生成后，请检查任务名称是否带【红色*】号，带上则表示user_id配置成功
+3. 最后点击 **创建实例**，跳转到主界面，再点击该实例的【更多】→【启动】
 
 ### 2.2 查看任务
 
@@ -213,7 +216,6 @@ Harness 类型
 # ==================== 沙箱环境配置 ====================
 # 定义不同架构/加速器类型的沙箱配置，每种配置对应一种运行环境:x86 CPU\ARM CPU\NPU\windows
 sandbox:
-  # ---------- x86 CPU 沙箱 ----------
   x86_cpu:
     sandbox:
       image: swr.cn-east-4.myhuaweicloud.com/rl_team/multiharness:26.8.3  # 镜像选择
@@ -246,8 +248,6 @@ sandbox:
         # 3. harness 专用
         - name: MCP_PLAYWRIGHT  # 是否启用PLAYWRIGHT工具。默认off
           value: 'off'
-        - name: OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS
-          value: "off"
         
       # 资源请求与限制
       resources:
@@ -255,11 +255,7 @@ sandbox:
         cpu_limit: "2"            # CPU 上限
         memory_request: "4Gi"     # 内存请求量
         memory_limit: "6Gi"       # 内存上限
-
-
 sandbox_namespace: omni-env-default-worker
-
-
 s3:
   s3_uploader_script: /home/ma-user/obsutil/obsutil
   s3_download_script: /home/ma-user/obsutil/obsutil
@@ -289,36 +285,43 @@ s3:
 
 
 ## 5. 镜像管理
-![alt text](/api/wiki/assets/a5e309761f224a7aa80281cf358cc0c1.webp)
-
-| harness类型 | 镜像 | 描述 | 
-|---|---|---|
-| openclaw2026.6.6、hermes0.18.2、claude-code2.1.22、opencode1.18.18、codex0.147.0、pi0.84.3、grok1.0.5、dsh0.1.1-rc.2 | multiharness:26.11.4 （**主镜像**）| 默认包含serper技能，日期更新版本 |
-| 多harness（同上） | multiharness-no-serper:26.11.12 | 移除所有harness的默认serper技能，skill泛化专用 | 
-| 多harness（同上） | windows:default-20261010 | 通用windows镜像|
-| openclaw26.10.6（专用） | openclaw:26.10.6-20261102 | openclaw-tui的linux镜像 | 
-| jiuwenswarm-dev 10.23版本 | jiuwenswarm:dev-stable-2026.10.23v1 | jiuwenswarm-dev专属镜像，默认带serper | 
-| jiuwenswarm-dev 10.23版本 | windows-jiuwenswarm-dev-stable-0.2.3-20261102 | windwos镜像 | 
-| jiuwenswarm-xiaoyi 11.2版本 | jiuwenswarm:xiaoyi-2026.11.2 | jiuwenswarm-xiaoyi专属镜像，默认带serper | 
-| jiuwenswarm-xiaoyi 11.2版本 | windows-jiuwenswarm-xiaoyi-toc-stable-20261103-fix1 | windows镜像 | 
-| lego-preset-v2 | lego专属镜像 | 万轶维护linux |
-| xiaoyiclaw:0.0.x | xiaoyiclaw 专属镜像  | 曹子轩维护linux | 
-| xiaoyiwork（基于jiuwenswarm-xiaoyi） | xiaoyiwork:windows-jiuwenswarm-toc-stable-20261110 | windows镜像 | 
-
+![alt text](/api/wiki/assets/7e8841936bf7459dab13b60ce3a9b00a.webp)
+- **一个镜像可以映射多个 Harness**：注册/编辑镜像时可多选 Harness 类型
+- **默认镜像（每个 Harness 唯一）**：注册或编辑时打开「设为默认镜像」开关，它就成为其映射的每个 Harness 的默认镜像；镜像列表的 Harness 映射列中，默认项以 + ★ 标识。
+- **启用开关**：停用的镜像不再出现在创建页下拉，不影响已运行实例。
+- **与创建页联动**：高级配置中选好 Harness 类型后，「镜像名称」会自动填入该 Harness 的默认镜像，并带【推荐】标记；仍可手动改选其他。镜像下拉还会按所选沙箱配置的操作系统（Linux/Windows）过滤。
 
 
 ## 6. 代码管理
-![alt text](/api/wiki/assets/5842ae4be0da4df5b94236ac4a76db43.webp)
+![alt text](/api/wiki/assets/b8905809b62f48e0bb7ce3a9ac35ab1c.webp)
+
+### 6.1 当前常用代码仓
+
 | 代码仓 | 描述 |
 |---|---|
-| openclaw-task/v1117 | **主代码仓版本**：选择最新日期的 | 
-| openclaw-task/test-jiuwenswarm-serper | test代码仓，测试用 | 
-| openclaw-task/xiaoyiclaw-pangu-v4 | xiaoyiclaw专属代码仓，曹子轩维护 | 
-| openclaw-task/trg0249_261112_fix2 | trg专属代码仓，万轶维护 | k\
+| openclaw-task/v1117 | **主代码仓版本**（建议设为默认） |
+| openclaw-task/test-jiuwenswarm | test 代码仓，测试用 |
+| openclaw-task/xiaoyiclaw-pangu-v4 | xiaoyiclaw 专属代码仓，曹子轩维护 |
+| openclaw-task/trg0249_261112_fix2 | trg 专属代码仓，万轶维护 |
+
+## 7. 批量实验
+> 完整说明：<http://115.120.48.151:8087/#/wiki/batch-usage>
+
+```text
+Harness 列表 × 模型列表 × 重复次数 → 子任务数；每个子任务内部跑完整测试集
+```
+
+### 7.1 快速上手
+
+1. **准备数据集**：在「数据集管理」登记测试集。用户 Config 目录必填；
+2. **新建实验**：「批量实验 → 新建批量实验」，依次配置五个 Tab：
+   ![alt text](/api/wiki/assets/df83f47e647e42e898754c87db0e42a7.webp)
+3. **启动**：创建只写配置、秒级返回；进入实验详情，「更多 → 启动队列」后开始执行。
+4. **结果对比**：执行完成之后，可以横向多方面对比批量实验的执行结果，后续可以导出画图，形成最佳推荐
 
 
-## 7. Evaluator配置
-### 7.1 理解三个角色
+## 8. Evaluator配置
+### 8.1 理解三个角色
 
 | 角色 | 做什么 | 是否决定任务结束 |
 |---|---|---|
@@ -327,7 +330,7 @@ s3:
 | Evaluator | 读取原始任务、最近几轮回复、工具调用和磁盘文件，根据 Rubric 逐项检查，再把建议选择性反馈给 User Simulator | 否，只是顾问 |
 
 
-### 7.2 启用Evaluator
+### 8.2 启用Evaluator
 在task-00000.json中添加如下内容：
 ```json
 {
@@ -366,7 +369,7 @@ s3:
 }
 
 ``` 
-### 7.3 定义Rubric
+### 8.3 定义Rubric
 #### 简单任务：内联 `rubrics`
 
 直接写字符串列表即可。系统会自动生成 R1、R2 等 ID，所有项按普通最终评分项等权处理。
@@ -442,11 +445,11 @@ s3:
   }
 }
 ```
-#### 7.4 评估结果
+#### 8.4 评估结果
 ![alt text](/api/wiki/assets/6717c5af184e48f6b00669eee5fce0b8.webp)
+如果在高级配置中，开启了本地代理，则可以捕获更多模型调用详情如`输入TOKENS`、`输出TOKENS`、`次数`、`成功率`
 
-
-## 8. 资源看板
+## 9. 资源看板
 > 完整说明：<http://115.120.48.151:8087/#/wiki/dashboard-usage>
 
 平台有两个查看资源的入口，二者统计口径一致：
@@ -456,7 +459,7 @@ s3:
 | 首页顶部「当前资源使用情况」 | 创建、启动任务前快速确认 | 当前 CPU、内存、沙箱并发和任务状态 |
 | 侧栏「资源看板」 | 任务运行中排查资源占用 | 资源池、用户排行、实例分布、规格和历史趋势 |
 
-### 8.1 指标说明
+### 9.1 指标说明
 判断资源是否紧张时：（资源查看）CPU、内存或沙箱容量中的任意一项接近上限，都可能导致新实例长时间准备或排队。
 ![alt text](/api/wiki/assets/e59c8210d6314b1ab0f862e97ec1e050.webp)
 

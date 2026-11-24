@@ -49,6 +49,8 @@ class RegistrationUpdate(BaseModel):
     default_skills: Optional[str] = None
     traj_save_path: Optional[str] = None
     remark: Optional[str] = None
+    # 只用于给这次保存产生的版本写说明，不写回主表（见 registrations.update_registration）
+    change_summary: Optional[str] = None
 
 
 class RegistrationInfo(BaseModel):
@@ -85,3 +87,27 @@ class RegistrationInfo(BaseModel):
     count_status: str = ""
     count_error: str = ""
     counted_at: Optional[str] = None
+    # 版本功能：当前版本号 + 列表页用的两个聚合字段（与 HarnessConfigInfo 同款）
+    updated_at: Optional[str] = None
+    current_version: int = 0
+    version_count: int = 0
+    latest_change: str = ""
+    # 本地副本：注册后整份下载，编辑只改本地，云端由 sync_worker 异步回传
+    download_status: str = ""        # '' | downloading | done | error
+    download_error: str = ""
+    downloaded_at: Optional[str] = None
+    modified_count: int = 0          # 本地改过、尚未同步到云端的文件数
+    last_synced_at: Optional[str] = None
+
+
+class RegistrationVersionInfo(BaseModel):
+    """一次编辑的不可变快照。snapshot_json / change_json 是原样透传的 JSON 字符串，
+    由前端解析——后端不做字段裁剪，历史记录必须能原样回放。"""
+    id: int
+    registration_id: int
+    version: int
+    snapshot_json: str = "{}"
+    change_json: str = "[]"
+    summary: str = ""
+    created_by: str = ""
+    created_at: str = ""

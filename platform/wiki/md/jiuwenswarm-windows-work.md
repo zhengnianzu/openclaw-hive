@@ -2,7 +2,7 @@
 title: jiuwenswarm windows对齐小艺work技能镜像
 summary: 如何在jiuwenswarm windows上默认使用小艺work技能
 is_pinned: false
-sort_order: 100
+sort_order: 150
 author: c00845018
 created_at: '2026-11-10T16:49:05.993616'
 updated_at: '2026-11-10T16:49:05.993616'

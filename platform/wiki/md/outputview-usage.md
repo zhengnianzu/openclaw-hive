@@ -6,9 +6,8 @@ tags:
 - 入门
 summary: 面向平台使用者，说明任务实例【输出】页面各区域展示什么
 is_pinned: false
-sort_order: 100
+sort_order: 170
 author: admin
-updated_by: admin
 created_at: '2026-10-29T16:40:08.144638'
 updated_at: '2026-10-29T16:40:08.144647'
 ---

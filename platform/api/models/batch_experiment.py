@@ -221,7 +221,8 @@ class BatchExperimentInfo(BaseModel):
     startable_arms: int = 0     # 待启动/已停止、可被「启动队列」拉起的子任务数
     failed_arms: int = 0        # 子任务失败数（status='failed'），用于推导实验终态
     active_arms: int = 0        # 正在跑的子任务数（running/preparing）
-    success_rate: float = 0.0
+    success_rate: float = 0.0   # completed 口径：流水线正常跑完的比例
+    done_rate: float = 0.0      # DONE 口径（副指标）：agent 自己打标记的比例
     progress_percent: float = 0.0
 
 
@@ -280,9 +281,15 @@ class BatchCompareRow(BaseModel):
     avg_score: Optional[float] = None
     scored_count: int = 0
     unscored_count: int = 0
-    # Token：数据源 task_traj_records.total_tokens 已就绪，本期不计算，
-    # 恒为 None，前端渲染成 '—'。
+    # Token：来自 llm_proxy_lite 的 proxy_summary.txt（需任务开启「启动本地代理」）。
+    # None 表示没有可统计的数据（未开网关 / 轨迹缓存未下载），前端渲染成 '—' ——
+    # 与 0 区分开，0 会被误读成「真的没消耗」。
+    request_count: Optional[int] = None   # 成功调用次数
+    failed_calls: Optional[int] = None    # 失败调用次数
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    tokens_by_model: List[dict] = []      # [{model, ok, fail, input_tokens, ...}]
 
 
 class BatchMatrixCell(BaseModel):

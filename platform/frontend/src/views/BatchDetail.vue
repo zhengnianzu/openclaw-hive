@@ -29,8 +29,12 @@
                 :disabled="!exp.queue_id || (!exp.startable_arms && exp.status !== 'paused')">
                 {{ exp.status === 'paused' ? '继续执行' : '启动队列' }}
               </el-dropdown-item>
-              <el-dropdown-item command="rerun" :disabled="!exp.failed_arms">
-                重跑失败<span v-if="exp.failed_arms" class="menu-count">（{{ exp.failed_arms }}）</span>
+              <!-- 失败口径有两个：子任务整体 failed（准备/启动失败）+ 子任务内还有
+                   失败样本（状态 finished 但 failed_tasks > 0）。任一非零都要能点。 -->
+              <el-dropdown-item command="rerun" :disabled="!exp.failed_arms && !exp.failed">
+                重跑失败样本
+                <span v-if="exp.failed" class="menu-count">（{{ exp.failed }} 条样本）</span>
+                <span v-else-if="exp.failed_arms" class="menu-count">（{{ exp.failed_arms }}）</span>
               </el-dropdown-item>
               <el-dropdown-item command="copy" divided>复制实验</el-dropdown-item>
               <el-dropdown-item command="pause" :disabled="exp.status === 'paused'" divided>
@@ -60,13 +64,15 @@
               成功率
               <el-tooltip placement="top">
                 <template #content>
-                  DONE 口径：agent 自己打的【Task_Done】标记数 ÷ 已结算任务数。<br>
-                  与「完成数」不同 —— 后者只代表流水线没抛异常。
+                  完成口径：流水线正常跑完的任务数 ÷ 已结算任务数。<br>
+                  DONE 口径（agent 自己打的【Task_Done】标记）作为副指标：{{ exp.done_rate }}%。<br>
+                  很多任务类型不会打 DONE 标记，所以主指标不采用它。
                 </template>
                 <el-icon class="q"><QuestionFilled /></el-icon>
               </el-tooltip>
             </div>
             <div class="stat-v" :style="{color: rateColor(exp.success_rate)}">{{ exp.success_rate }}%</div>
+            <div class="muted" style="font-size:12px">DONE {{ exp.done_rate }}%</div>
           </div>
         </div>
 
@@ -75,8 +81,6 @@
             <span>整体进度</span>
             <span class="muted">{{ exp.progress_percent }}% ({{ settled }} / {{ exp.task_total }})</span>
           </div>
-          <el-progress :percentage="exp.progress_percent" :stroke-width="14"
-            :status="exp.progress_percent >= 100 ? 'success' : undefined" />
         </div>
 
         <!-- 任务列表并入执行概览：一屏看完「这批跑得怎么样 + 每个子任务怎么样」 -->
@@ -152,6 +156,10 @@
                       <el-dropdown-item command="start" :disabled="!['created','stopped'].includes(row.status)">
                         启动任务
                       </el-dropdown-item>
+                      <el-dropdown-item command="rerun"
+                        :disabled="!(row.failed_tasks > 0) || ['running','preparing','queued'].includes(row.status)">
+                        重跑失败样本<span v-if="row.failed_tasks" class="menu-count">（{{ row.failed_tasks }}）</span>
+                      </el-dropdown-item>
                       <el-dropdown-item command="stop" :disabled="!['running','preparing'].includes(row.status)">
                         停止任务
                       </el-dropdown-item>
@@ -194,12 +202,31 @@
                 sortable :sort-by="r => r.avg_task_seconds ?? Infinity">
                 <template #default="{row}">{{ fmtDuration(row.avg_task_seconds) }}</template>
               </el-table-column>
-              <el-table-column label="平均 Token" width="110" align="center">
+              <el-table-column label="调用次数" width="100" align="center"
+                sortable :sort-by="r => r.request_count ?? -1">
                 <template #default="{row}">
-                  <el-tooltip content="Token 统计暂未开放" placement="top">
-                    <span class="muted">{{ row.total_tokens ?? '—' }}</span>
+                  <span v-if="row.request_count != null">
+                    {{ row.request_count }}
+                    <span v-if="row.failed_calls" style="color:#f56c6c;font-size:12px">
+                      /失败 {{ row.failed_calls }}
+                    </span>
+                  </span>
+                  <el-tooltip v-else content="未开启本地代理，或轨迹缓存尚未下载" placement="top">
+                    <span class="muted">—</span>
                   </el-tooltip>
                 </template>
+              </el-table-column>
+              <el-table-column label="输入 Tokens" width="120" align="center"
+                sortable :sort-by="r => r.input_tokens ?? -1">
+                <template #default="{row}">{{ fmtTokens(row.input_tokens) }}</template>
+              </el-table-column>
+              <el-table-column label="输出 Tokens" width="120" align="center"
+                sortable :sort-by="r => r.output_tokens ?? -1">
+                <template #default="{row}">{{ fmtTokens(row.output_tokens) }}</template>
+              </el-table-column>
+              <el-table-column label="总 Tokens" width="120" align="center"
+                sortable :sort-by="r => r.total_tokens ?? -1">
+                <template #default="{row}">{{ fmtTokens(row.total_tokens) }}</template>
               </el-table-column>
               <el-table-column label="评分" width="130" align="center"
                 sortable :sort-by="r => r.avg_score ?? -1">
@@ -710,6 +737,14 @@ function fmtDuration(sec) {
   return m ? `${m}m ${s}s` : `${s}s`
 }
 
+// Token 数：null = 没有统计数据（未开网关 / 缓存未下载），渲染 '—' 而不是 0。
+// 大于 1 万时用 k 缩写，避免表格被长数字撑开。
+function fmtTokens(n) {
+  if (n == null) return '—'
+  if (n >= 10000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
 function gotoCell(instanceId, configName) {
   router.push(`/instance/${instanceId}?tab=outputs&config=${encodeURIComponent(configName)}`)
 }
@@ -778,17 +813,22 @@ function onTabChange(name) {
 // 终态实验不再轮询：数据不会再变，白耗请求
 const isActive = computed(() => ['created', 'running', 'paused'].includes(exp.value.status))
 
-// 子任务行内操作（启动/停止单个任务），与任务详情页的按钮同义
+// 子任务行内操作（启动/停止/重跑失败样本），与任务详情页的按钮同义。
+// 「重跑失败样本」走的是实例启动接口：hive 读 complete.jsonl 跳过已成功项，
+// 只跑剩下的，所以不会把整份测试集重跑一遍。
 async function onRowCommand(cmd, row) {
   if (!row.instance_id) return
-  const label = cmd === 'start' ? '启动' : '停止'
+  const label = cmd === 'start' ? '启动' : cmd === 'rerun' ? '重跑失败样本' : '停止'
+  const tip = cmd === 'rerun'
+    ? `任务「${row.instance_name || row.instance_id}」还有 ${row.failed_tasks} 条失败样本，`
+      + '将只重跑这些失败项（已成功的会跳过）。继续？'
+    : `${label}任务「${row.instance_name || row.instance_id}」？`
   try {
-    await ElMessageBox.confirm(`${label}任务「${row.instance_name || row.instance_id}」？`,
-      label + '确认', { type: 'warning' })
+    await ElMessageBox.confirm(tip, label + '确认', { type: 'warning' })
   } catch { return }
   try {
-    if (cmd === 'start') await api.post(`/instances/${row.instance_id}/start`)
-    else await api.post(`/instances/${row.instance_id}/stop`)
+    if (cmd === 'stop') await api.post(`/instances/${row.instance_id}/stop`)
+    else await api.post(`/instances/${row.instance_id}/start`)
     ElMessage.success(`已${label}`)
     loadMain()
   } catch { /* interceptor */ }

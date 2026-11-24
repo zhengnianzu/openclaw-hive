@@ -12,8 +12,11 @@
 """
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 import shutil
+import sys
 import time
 import threading
 from datetime import datetime, timedelta
@@ -37,6 +40,12 @@ WORKER_PID_FILES = {
     "proxy-tracker": "proxy_tracker.pid",          # 增量发现完成 task → 投队列
     "proxy-realtime": "proxy_realtime.pid",        # 实时车道：拉 OBS + 解析入库
     "proxy-auto": "proxy_auto.pid",                # 背景车道：历史回填
+    # 数据集同步（本地改动 → OBS）。此前不在表里，进程跑没跑面板上看不见。
+    "sync-worker": "sync_worker.pid",
+    # 这两个一直在跑、也在写心跳，但此前漏登记 —— 面板上永远看不到，
+    # 卡住时只能靠 ssh 才发现。
+    "auto-tracker": "auto_tracker.pid",            # 历史实例投递
+    "shallow-query": "shallow_query.pid",          # 任务描述回填
     # 旧进程名：保留以便升级期间仍能看到它们的状态与历史心跳。
     # shallow-local / shallow-obs 已被 shallow-realtime/auto 取代（按阶段拆 → 按场景拆），
     # shallow（--shallow-only）与 deep（--deep-only）是更早的单体循环。
@@ -47,6 +56,34 @@ WORKER_PID_FILES = {
 }
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# worker → 日志文件名。**同样是白名单**，日志路径绝不接受客户端输入 ——
+# 否则这里就成了「任意文件读取」接口。文件名与 run.sh 的 start_* 一一对应。
+WORKER_LOG_FILES = {
+    "tracker": "tracker.log",
+    "shallow-realtime": "shallow_realtime.log",
+    "shallow-auto": "shallow_auto.log",
+    "deep-realtime": "realtime_worker.log",
+    "proxy-tracker": "proxy_tracker.log",
+    "proxy-realtime": "proxy_realtime.log",
+    "proxy-auto": "proxy_auto.log",
+    "sync-worker": "sync_worker.log",
+    "auto-tracker": "auto_tracker.log",
+    "shallow-query": "shallow_query.log",
+    # 旧进程
+    "shallow-local": "shallow_local.log",
+    "shallow-obs": "shallow_obs.log",
+    "shallow": "worker.log",
+    "deep": "deep_worker.log",
+}
+
+# 已被取代的旧进程（按阶段拆分的 shallow-local/shallow-obs，以及更早的单体循环
+# shallow/deep）。它们只剩回滚价值：正常永远 offline，在表里堆四行「离线 / 尚无心跳」
+# 只会稀释真正的信号。
+# 处理方式：**未运行就隐藏**，而不是从白名单删掉 —— 万一有人用
+# `./run.sh shallow-start` 回滚，它照样能在面板上看到（活着就显示），
+# 而且历史心跳、日志入口都还在。
+LEGACY_WORKERS = {"shallow-local", "shallow-obs", "shallow", "deep"}
+
 WORKER_LABEL = {
     "tracker": "发现投递",
     "shallow-realtime": "实时分析（点击）",
@@ -55,6 +92,9 @@ WORKER_LABEL = {
     "proxy-tracker": "代理用量发现",
     "proxy-realtime": "代理用量采集（实时）",
     "proxy-auto": "代理用量采集（批量）",
+    "sync-worker": "数据集同步",
+    "auto-tracker": "历史实例投递",
+    "shallow-query": "任务描述回填",
     # 旧名
     "shallow-local": "本地 DONE（旧）",
     "shallow-obs": "OBS 定级（旧）",
@@ -224,11 +264,16 @@ async def overview(user: dict = Depends(require_operator)):
             item["metrics_available"] = m["available"]
         else:
             item["metrics_available"] = False
+        # 旧进程未运行就不展示（理由见 LEGACY_WORKERS）
+        if name in LEGACY_WORKERS and not alive:
+            continue
         workers.append(item)
 
     # 如果 deep worker 也跑产物，额外标出来；单独的 artifacts 进程（--artifacts-only）没有 pid 文件
     art_hb = _latest_heartbeat("artifacts")
-    if art_hb:
+    # 同 LEGACY_WORKERS：进程已经不在就不展示这条历史心跳，避免「离线」行堆积
+    art_alive = bool(art_hb and art_hb.get("pid") and _pid_alive(int(art_hb["pid"])))
+    if art_hb and art_alive:
         age = _heartbeat_age(art_hb)
         art_limit = _stale_limit(art_hb)
         workers.append({
@@ -293,34 +338,157 @@ def _artifact_bytes_total() -> int:
     return (row["s"] if row else 0) or 0
 
 
-# _queue_counts 的短 TTL 缓存：被 4 个接口共用，看板一次加载并发调 3 个。
-# 用锁保护 —— uvicorn 的 async_execute 把它丢进线程池，多请求会并发进来。
-_QC_TTL = 5.0
-_QC_LOCK = threading.Lock()
-_QC_CACHE: list = []
+# ── 看板数据缓存 ────────────────────────────────────────────────────────────
+#
+# 为什么需要：调度监控的三块数据都是**千万行表的全表聚合**，单次 1~5 秒：
+#   · _queue_counts    5.5s（overview / queue 用）
+#   · _load_inputs     1.9s（车道负载用）
+#   · _queue_page      0.7s（下载明细用）
+# 而前端每 30 秒轮询一次，等于每 30 秒把这几条聚合重跑一遍。
+#
+# 为什么是「文件 + 内存」两层：
+#   uvicorn 跑 --workers 4，**内存缓存各自一份**。只放内存的话，同一份聚合会被
+#   四个进程各算一遍（实测首屏连撞好几次 5 秒）。落成小 JSON 让进程间共享，
+#   再用 flock 保证同一时刻只有一个进程在算（跨进程单飞）。
+#
+# 读取策略是 stale-while-revalidate：有旧值就先返回旧值、后台刷新。
+# 任何请求都不会被聚合卡住 —— 唯一的例外是「从来没有算过」，所以下面还配了
+# prewarm_caches()，在后端启动时就把第一份算好。
+_CACHE_DIR = os.path.join(PLATFORM_DIR, "tmp")
+_CACHE_LOCK = threading.Lock()
+_CACHE_MEM: dict[str, list] = {}      # key -> [data, computed_at]
+_CACHE_REFRESHING: set[str] = set()   # 本进程正在刷新哪些 key
+
+_QC_TTL = 30.0      # 与前端 30s 轮询对齐
+_LOAD_TTL = 20.0
+_QUEUE_TTL = 15.0
+
+
+def _cache_paths(key: str) -> tuple[str, str]:
+    base = os.path.join(_CACHE_DIR, f"wm_cache_{key}.json")
+    return base, base + ".lock"
+
+
+def _cache_read(path: str) -> tuple[dict | None, float]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        data, at = d.get("data"), float(d.get("at") or 0)
+        if isinstance(data, dict):
+            return data, at
+    except (OSError, ValueError):
+        pass
+    return None, 0.0
+
+
+def _cache_write(path: str, data: dict, at: float) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"data": data, "at": at}, f, ensure_ascii=False)
+        # 本地盘，rename 可用（sfs_turbo 上不行，所以缓存必须落在 platform/tmp 下）
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _cache_compute_locked(key: str, compute) -> dict | None:
+    """跨进程单飞：拿不到文件锁说明别的进程正在算，返回 None。"""
+    path, lockpath = _cache_paths(key)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None
+        data = compute()
+        at = time.time()
+        _cache_write(path, data, at)
+        with _CACHE_LOCK:
+            _CACHE_MEM[key] = [data, at]
+        return data
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _cache_refresh_bg(key: str, compute) -> None:
+    try:
+        _cache_compute_locked(key, compute)
+    except Exception:
+        pass          # 刷新失败保留旧值，比让看板报错好
+    finally:
+        with _CACHE_LOCK:
+            _CACHE_REFRESHING.discard(key)
+
+
+def _file_cache(key: str, ttl: float, compute) -> dict:
+    now = time.time()
+
+    with _CACHE_LOCK:
+        mem = _CACHE_MEM.get(key)
+        if mem and now - mem[1] < ttl:
+            return mem[0]
+
+    path, _ = _cache_paths(key)
+    data, at = _cache_read(path)
+    if data is not None:
+        with _CACHE_LOCK:
+            _CACHE_MEM[key] = [data, at]
+        if now - at < ttl:
+            return data
+        # 过期：先给旧值，后台刷新，不阻塞请求
+        with _CACHE_LOCK:
+            spawn = key not in _CACHE_REFRESHING
+            if spawn:
+                _CACHE_REFRESHING.add(key)
+        if spawn:
+            threading.Thread(target=_cache_refresh_bg, args=(key, compute),
+                             daemon=True).start()
+        return data
+
+    # 从没算过（首次部署 / tmp 被清）：自己算；别的进程在算就等它写完
+    d = _cache_compute_locked(key, compute)
+    if d is not None:
+        return d
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        time.sleep(0.25)
+        data, at = _cache_read(path)
+        if data is not None:
+            with _CACHE_LOCK:
+                _CACHE_MEM[key] = [data, at]
+            return data
+    return compute()      # 兜底：自己算（慢，但总比返回空好）
+
+
+def prewarm_caches() -> None:
+    """后端启动时预热，避免部署后第一个用户请求吃 5 秒。
+
+    四个 worker 会同时调到这里；flock 保证每份只算一次，其余进程等文件出现后直接读。
+    """
+    for key, ttl, compute in (
+        ("queue_counts", _QC_TTL, _queue_counts_uncached),
+        ("load_10", _LOAD_TTL, lambda: _load_inputs(10)),
+        ("queue_active_50", _QUEUE_TTL, lambda: _queue_page(50, "active")),
+    ):
+        try:
+            _file_cache(key, ttl, compute)
+        except Exception:
+            pass
 
 
 def _queue_counts() -> dict:
-    """看板的队列/进度汇总。**带 5s TTL 缓存** —— 它被 4 个接口共用
-    （overview / queue / trend / stats），而看板一次加载会并发调 3 个，
-    不缓存就要把同样的全表扫描跑 3 遍。
-
-    为什么慢：里面有几条对 1000 万行表的全表聚合 —— 实测
-      · task_traj_records 按 artifacts_status 分组   0.81s
-      · task_records 的 L0~L3 / NULL / failed 五项聚合 0.94s
-      · shallow_queue 的车道计数（含两个 EXISTS 子查询） 0.44s
-    合计约 2.4s。三个接口各跑一遍 = 每次打开看板 7s+，30s 轮询又来一轮。
-    5s TTL 足够让「同一次页面加载的 3 个并发请求」只算一次，
-    又不会让看板数据看起来停滞（轮询间隔是 30s）。
-    """
-    now = time.time()
-    with _QC_LOCK:
-        if _QC_CACHE and now - _QC_CACHE[1] < _QC_TTL:
-            return _QC_CACHE[0]
-    data = _queue_counts_uncached()
-    with _QC_LOCK:
-        _QC_CACHE[:] = [data, now]
-    return data
+    """看板的队列/进度汇总。具体缓存策略见上面 _file_cache 的注释。"""
+    return _file_cache("queue_counts", _QC_TTL, _queue_counts_uncached)
 
 
 def _queue_counts_uncached() -> dict:
@@ -423,7 +591,8 @@ async def queue(
     """
     # 这条查询带 3 个相关子查询，实测 27s+（首次 97s），前端每 30 秒轮询。
     # 同步跑在 async handler 里 = 事件循环被钉住几十秒，必须整个丢线程池。
-    items = await async_execute(_queue_page, limit, status)
+    items = await async_execute(_file_cache, f"queue_{status}_{limit}", _QUEUE_TTL,
+                                lambda: _queue_page(limit, status))
     counts = await async_execute(_queue_counts)
     return {"items": items, "counts": counts}
 
@@ -558,7 +727,9 @@ async def trend(
 ):
     """心跳按时间分桶，供负载趋势图。桶宽自适应（最多 ~60 个点）。"""
     points, bucket, series = await async_execute(_trend_points, hours)
-    counts = await async_execute(_queue_counts)
+    # 不再顺带返回 _queue_counts：那个聚合单次 5 秒级，而前端 trend 只画
+    # points / series，counts 从来没用过（loadTrend 只读这两个字段）。
+    # overview 已经提供了同样的 counts，没必要每个趋势刷新都再算一遍。
     return {
         "hours": hours,
         "bucket_seconds": bucket,
@@ -566,7 +737,6 @@ async def trend(
         # 按 worker 拆开的曲线（tracker / shallow-local / shallow-obs / deep / realtime），
         # 每条与 points 的 ts 一一对齐。前端用它画分线，而不是把所有 worker 加成一条。
         "series": series,
-        "counts": counts,
     }
 
 
@@ -741,7 +911,8 @@ async def load(
       eta_seconds  按当前吞吐清空 pending 需要多久（吞吐为 0 时 null）
       overloaded   inflow > throughput 且 pending 在涨 → 会持续积压
     """
-    data = await async_execute(_load_inputs, window_minutes)
+    data = await async_execute(_file_cache, f"load_{window_minutes}", _LOAD_TTL,
+                               lambda: _load_inputs(window_minutes))
     return {"window_minutes": window_minutes, **data}
 
 
@@ -796,6 +967,148 @@ def _load_inputs(window_minutes: int) -> dict:
                 "workers": list(workers),
             })
     return {"lanes": lanes}
+
+
+@router.get("/log")
+async def worker_log(
+    worker: str = Query(..., description="worker 名（白名单内）"),
+    lines: int = Query(default=300, ge=1, le=2000),
+    user: dict = Depends(require_operator),
+):
+    """某个 worker 的日志尾部。
+
+    点「Worker 资源状态」里的行时调用 —— 状态标红却看不到原因，排查就得 ssh，
+    这个接口把那段补上。**worker 名走白名单**，不接受路径。
+    """
+    fn = WORKER_LOG_FILES.get(worker)
+    if not fn:
+        # artifacts 没有独立日志（跑在 deep 进程里），其余是非法名字
+        return {"available": False, "worker": worker,
+                "detail": "该 worker 没有独立日志文件"}
+    path = os.path.join(PLATFORM_DIR, fn)
+    if not os.path.exists(path):
+        return {"available": False, "worker": worker, "file": fn,
+                "detail": f"{fn} 不存在（进程可能未启动过）"}
+
+    # 只读尾部，不整文件加载：日志可能有几十 MB，而面板只需要最后几百行。
+    # 先按 256KB 试读，行数不够就翻倍，上限 8MB。
+    size = os.path.getsize(path)
+    budget = min(256 << 10, size)
+    text = ""
+    while True:
+        with open(path, "rb") as f:
+            if budget < size:
+                f.seek(size - budget)
+            data = f.read()
+        text = data.decode("utf-8", "replace")
+        if text.count("\n") > lines or budget >= size or budget >= (8 << 20):
+            break
+        budget *= 2
+
+    tail = text.splitlines()
+    # 从中间截断时，第一行很可能是半行，丢掉
+    cut = budget < size
+    if cut and tail:
+        tail = tail[1:]
+    truncated = len(tail) > lines
+    tail = tail[-lines:]
+    if cut or truncated:
+        tail.insert(0, f"...（仅显示最后 {len(tail)} 行，文件共 {size} 字节）")
+
+    return {
+        "available": True,
+        "worker": worker,
+        "file": fn,
+        "lines": tail,
+        "bytes": size,
+        "mtime": datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds"),
+        # 方便用户复制到终端里跑
+        "shell_hint": f"cd {PLATFORM_DIR} && tail -f {fn}",
+    }
+
+
+# ── 数据库备份状态 ──────────────────────────────────────────────────────────
+
+def _load_db_backup():
+    """按路径加载 platform/db_backup.py（它不在 api 包里，也不在任何 sys.path 上）。"""
+    import importlib.util
+    path = os.path.join(PLATFORM_DIR, "db_backup.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("db_backup", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@router.get("/backup")
+async def backup_status(user: dict = Depends(require_operator)):
+    """最新备份多新、多大、保留几份 + 现有清单。
+
+    备份停摆是「静默故障」：没人点开目录就不会发现。这里把它变成一个能一眼看到的数字。
+    只读 manifest 与文件大小（每个目录 3~4 个文件），不做目录递归。
+    """
+    def _collect():
+        mod = _load_db_backup()
+        if mod is None:
+            return {"available": False, "detail": "db_backup.py 不存在"}
+        dest = os.environ.get("BACKUP_DIR") or mod.DEFAULT_BACKUP_DIR
+        rows = mod.list_backups(dest)
+        items = []
+        for b in rows:
+            mf = b.get("manifest") or {}
+            items.append({
+                "name": b["name"],
+                "kind": mf.get("kind", "?"),
+                "complete": b["complete"],
+                "created_at": mf.get("created_at"),
+                "bytes": b["size"],
+            })
+        latest = items[0] if items else None
+        age_hours = None
+        if latest and latest.get("created_at"):
+            try:
+                age_hours = round((
+                    datetime.now() - datetime.fromisoformat(latest["created_at"])
+                ).total_seconds() / 3600, 1)
+            except ValueError:
+                pass
+        return {
+            "available": True,
+            "dest": dest,
+            "latest": latest,
+            "age_hours": age_hours,
+            "count": len(items),
+            "total_bytes": sum(i["bytes"] for i in items),
+            "keep_days": getattr(mod, "KEEP_DAYS", None),
+            "items": items[:20],
+        }
+
+    return await async_execute(_collect)
+
+
+@router.post("/backup")
+async def backup_run(user: dict = Depends(require_operator)):
+    """立即备份一次（每日套件）。
+
+    起子进程而不是在 handler 里直接调：备份要 20~30s，进程里跑完即弃，
+    异常也不会污染后端进程。并发由 db_backup.py 自己的 flock 挡住。
+    """
+    import asyncio
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-I", os.path.join(PLATFORM_DIR, "db_backup.py"), "run",
+        cwd=PLATFORM_DIR,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    text = (out or b"").decode("utf-8", "replace")
+    ok = proc.returncode == 0
+    return {
+        "ok": ok,
+        "returncode": proc.returncode,
+        # 只回最后几行：完整日志在 <dest>/db_backup.log
+        "output": "\n".join(text.splitlines()[-12:]),
+    }
 
 
 @router.post("/reclaim")

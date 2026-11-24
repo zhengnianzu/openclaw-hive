@@ -39,6 +39,19 @@
           </template>
         </div>
       </div>
+      <!-- 备份卡：停摆是「静默故障」—— 没人翻目录就不会发现。
+           放成 KPI 才有人看见；点开看清单 + 立即备份。 -->
+      <div class="wm-kpi wm-kpi-click" @click="openBackup">
+        <div class="wm-kpi-label">数据库备份</div>
+        <div class="wm-kpi-value" :class="{ warn: backupStale }">{{ backupValue }}</div>
+        <div class="wm-kpi-sub">
+          <template v-if="backup && backup.available">
+            {{ backup.count }} 份 · {{ fmtSize(backup.total_bytes) }}
+            · 保留 {{ backup.keep_days }} 天
+          </template>
+          <template v-else>备份状态不可用</template>
+        </div>
+      </div>
     </div>
 
     <!-- ===== Worker 状态 + 状态分布 ===== -->
@@ -49,7 +62,8 @@
             <span class="panel-title">Worker 资源状态 <span class="wm-count">{{ workers.length }}</span></span>
             <span class="panel-hint">本机进程实测（psutil / /proc）</span>
           </div>
-          <el-table :data="workers" size="small" class="wm-table">
+          <el-table :data="workers" size="small" class="wm-table"
+                    row-key="worker" @row-click="openWorkerLog">
             <el-table-column label="" width="34" align="center">
               <template #default="{ row }"><i class="wm-dot" :class="row.state"></i></template>
             </el-table-column>
@@ -207,6 +221,62 @@
       <span class="wm-dim" v-if="generatedAt">更新于 {{ generatedAt }}</span>
       <el-button size="small" :icon="Refresh" :loading="loading" @click="loadAll">刷新</el-button>
     </div>
+
+    <!-- ===== Worker 日志抽屉 ===== -->
+    <!-- 点「Worker 资源状态」里的行打开。状态标红却看不到原因，
+         以前只能 ssh 上去 tail；这里直接给尾部若干行。 -->
+    <el-drawer v-model="logDrawer" :size="drawerSize" :title="logTitle" destroy-on-close>
+      <div class="wm-log-head">
+        <span class="wm-dim">{{ logInfo.file || '—' }}</span>
+        <span class="wm-dim" v-if="logInfo.mtime">· 最后写入 {{ logInfo.mtime }}</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <el-checkbox v-model="logAutoRefresh" size="small">自动刷新</el-checkbox>
+          <el-button size="small" :icon="Refresh" :loading="logLoading" @click="loadWorkerLog">刷新</el-button>
+        </div>
+      </div>
+      <div v-if="logInfo.shell_hint" class="wm-log-hint">
+        <code>{{ logInfo.shell_hint }}</code>
+        <el-button size="small" link @click="copyHint">复制</el-button>
+      </div>
+      <pre v-if="logLines.length" class="wm-log-pre">{{ logLines.join('\n') }}</pre>
+      <el-empty v-else :description="logInfo.detail || '暂无日志'" :image-size="50" />
+    </el-drawer>
+
+    <!-- ===== 备份明细 ===== -->
+    <el-dialog v-model="backupDialog" title="数据库备份" :width="dialogWidth">
+      <div v-if="backup && backup.available">
+        <div class="wm-bk-meta">
+          <span>落点 <code>{{ backup.dest }}</code></span>
+          <span class="wm-dim">保留 {{ backup.keep_days }} 天 · 共 {{ backup.count }} 份
+            · {{ fmtSize(backup.total_bytes) }}</span>
+        </div>
+        <el-table :data="backup.items" size="small" max-height="320">
+          <el-table-column prop="name" label="名称" min-width="150" />
+          <el-table-column prop="kind" label="类型" width="80" />
+          <el-table-column label="大小" width="90" align="right">
+            <template #default="{ row }">{{ fmtSize(row.bytes) }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="80" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.complete ? 'success' : 'warning'">
+                {{ row.complete ? '完整' : '不完整' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="created_at" label="时间" min-width="150" />
+        </el-table>
+        <div v-if="lastBackupOutput" class="wm-log-hint" style="margin-top:10px">
+          <pre class="wm-log-pre" style="max-height:140px">{{ lastBackupOutput }}</pre>
+        </div>
+      </div>
+      <el-empty v-else :description="backup?.detail || '备份状态不可用'" :image-size="50" />
+      <template #footer>
+        <el-button @click="backupDialog = false">关闭</el-button>
+        <el-button type="primary" :loading="backupRunning" @click="runBackup">
+          立即备份
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -234,6 +304,44 @@ const trendPoints = ref([])
 const trendSeries = ref([])
 const trendHours = ref(1)
 const generatedAt = ref('')
+
+// ── 备份状态 ──
+// 备份停摆是静默故障：没人翻目录就不会发现。做成 KPI 才有人看见。
+const backup = ref(null)
+const backupDialog = ref(false)
+const backupRunning = ref(false)
+const lastBackupOutput = ref('')
+// 超过 36 小时没有新备份 = 昨日那次没跑成（每日 03:00）。标红。
+const BACKUP_STALE_HOURS = 36
+const backupStale = computed(() => {
+  const h = backup.value?.age_hours
+  return h == null || h > BACKUP_STALE_HOURS
+})
+const backupValue = computed(() => {
+  const h = backup.value?.age_hours
+  if (h == null) return '—'
+  if (h < 1) return `${Math.round(h * 60)} 分钟前`
+  if (h < 48) return `${Math.round(h)} 小时前`
+  return `${Math.round(h / 24)} 天前`
+})
+
+// ── Worker 日志抽屉 ──
+const logDrawer = ref(false)
+const logLoading = ref(false)
+const logAutoRefresh = ref(true)
+const logLines = ref([])
+const logInfo = ref({})
+const activeWorker = ref(null)
+// el-drawer / el-dialog 的尺寸都接受 CSS 值，用 min() 兼顾窄屏
+const drawerSize = 'min(820px, 94vw)'
+const dialogWidth = 'min(820px, 94vw)'
+let logTimer = null
+
+const logTitle = computed(() => {
+  const w = activeWorker.value
+  if (!w) return 'Worker 日志'
+  return `${w.label || w.worker} · ${w.worker}`
+})
 
 let timer = null
 
@@ -433,6 +541,7 @@ async function loadAll() {
   } catch { /* 单块失败不影响其他块 */ }
   finally { loading.value = false }
   loadTrend()
+  loadBackup()
 }
 
 async function loadTrend() {
@@ -448,6 +557,73 @@ async function loadTrend() {
 
 async function loadQueue() { loadAll() }
 
+// ── 备份 ──
+async function loadBackup() {
+  try {
+    const r = await api.get('/worker-monitor/backup', { silent: true })
+    backup.value = r
+  } catch {
+    backup.value = { available: false, detail: '读取备份状态失败' }
+  }
+}
+
+function openBackup() {
+  backupDialog.value = true
+  loadBackup()
+}
+
+async function runBackup() {
+  backupRunning.value = true
+  try {
+    const r = await api.post('/worker-monitor/backup')
+    lastBackupOutput.value = r.output || ''
+    if (r.ok) ElMessage.success('备份完成')
+    else ElMessage.error(`备份失败（exit ${r.returncode}），详见输出`)
+    await loadBackup()
+  } catch { /* interceptor 已提示 */ }
+  finally { backupRunning.value = false }
+}
+
+// ── Worker 日志 ──
+function openWorkerLog(row) {
+  activeWorker.value = row
+  logDrawer.value = true
+  logLines.value = []
+  logInfo.value = {}
+  loadWorkerLog()
+  if (logTimer) clearInterval(logTimer)
+  logTimer = setInterval(() => {
+    if (logAutoRefresh.value && logDrawer.value) loadWorkerLog()
+  }, 3000)
+}
+
+async function loadWorkerLog() {
+  const w = activeWorker.value
+  if (!w) return
+  logLoading.value = true
+  try {
+    const r = await api.get(
+      `/worker-monitor/log?worker=${encodeURIComponent(w.worker)}&lines=300`,
+      { silent: true },
+    )
+    logInfo.value = r
+    logLines.value = r.lines || []
+  } catch {
+    logInfo.value = { detail: '读取日志失败' }
+  } finally { logLoading.value = false }
+}
+
+async function copyHint() {
+  const t = logInfo.value.shell_hint
+  if (!t) return
+  try {
+    await navigator.clipboard.writeText(t)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选取')
+  }
+}
+
 async function reclaim() {
   reclaiming.value = true
   try {
@@ -462,7 +638,10 @@ onMounted(() => {
   loadAll()
   timer = setInterval(loadAll, 30000)
 })
-onUnmounted(() => { if (timer) clearInterval(timer) })
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+  if (logTimer) clearInterval(logTimer)
+})
 </script>
 
 <style scoped>
@@ -476,14 +655,17 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .wm-unit { font-size: 13px; font-weight: 400; margin-left: 3px; color: var(--text-muted, #909399); }
 
 .wm-kpi-row {
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+  display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
 }
-@media (max-width: 1400px) { .wm-kpi-row { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 1600px) { .wm-kpi-row { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 900px) { .wm-kpi-row { grid-template-columns: repeat(2, 1fr); } }
 .wm-kpi {
   background: #fff; border: 1px solid var(--el-border-color-lighter, #ebeef5);
   border-radius: 10px; padding: 14px 16px;
 }
+/* 可点的卡（备份）：给一点可交互提示，别让人以为是纯数字 */
+.wm-kpi-click { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.wm-kpi-click:hover { border-color: var(--el-color-primary, #2a78d6); box-shadow: 0 2px 10px rgba(42,120,214,.10); }
 .wm-kpi-label { font-size: 12px; color: #8f9aab; }
 .wm-kpi-value {
   font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums;
@@ -518,4 +700,32 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 
 .wm-foot { display: flex; justify-content: flex-end; align-items: center; gap: 10px; }
 .wm-table :deep(.el-table__cell) { padding: 6px 0; }
+/* 整行可点开日志 —— 用 pointer 明确提示，否则没人会想到能点 */
+.wm-table :deep(.el-table__row) { cursor: pointer; }
+
+/* Worker 日志抽屉 */
+.wm-log-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.wm-log-head > div:last-child { margin-left: auto; }
+.wm-log-hint {
+  display: flex; align-items: center; gap: 8px;
+  background: #f6f8fb; border-radius: 6px; padding: 6px 10px; margin-bottom: 8px;
+  font-size: 12px; overflow-x: auto;
+}
+.wm-log-hint code { white-space: nowrap; color: #475569; }
+.wm-log-pre {
+  margin: 0; padding: 10px 12px; border-radius: 8px;
+  background: #0f172a; color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5;
+  max-height: calc(100vh - 220px); overflow: auto;
+  white-space: pre-wrap; word-break: break-all;
+}
+.wm-bk-meta {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; margin-bottom: 10px;
+}
+.wm-bk-meta code { color: #475569; word-break: break-all; }
 </style>

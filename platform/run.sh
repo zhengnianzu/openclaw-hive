@@ -331,6 +331,22 @@ start_proxy_auto() {
 stop_proxy_auto() {
     _stop_pidfile proxy_auto.pid "proxy-auto"
 }
+
+# ── 数据集同步：本地改动 → OBS ──
+# 平台上的数据集浏览/编辑全部走本地副本，云端一致性靠这个进程按哈希异步回传。
+start_sync_worker() {
+    if [ -f sync_worker.pid ] && kill -0 "$(cat sync_worker.pid)" 2>/dev/null; then
+        echo "sync-worker 已在运行 (PID: $(cat sync_worker.pid))"
+        return
+    fi
+    rm -f sync_worker.pid
+    nohup $PYTHON offline/sync_worker.py --interval 30 > sync_worker.log 2>&1 &
+    echo $! > sync_worker.pid
+    echo "sync-worker 已启动 (PID: $(cat sync_worker.pid))"
+}
+stop_sync_worker() {
+    _stop_pidfile sync_worker.pid "sync-worker"
+}
 start_proxy_worker() {
     if [ -f proxy_worker.pid ] && kill -0 "$(cat proxy_worker.pid)" 2>/dev/null; then
         echo "proxy-worker 已在运行 (PID: $(cat proxy_worker.pid))"
@@ -582,6 +598,7 @@ case "$ACTION" in
         stop_proxy_tracker
         stop_proxy_realtime
         stop_proxy_auto
+        stop_sync_worker
         stop_shallow_local
         stop_shallow_obs
         stop_worker
@@ -610,6 +627,7 @@ case "$ACTION" in
         start_proxy_tracker
         start_proxy_realtime
         start_proxy_auto
+        start_sync_worker
 
         if command -v nginx &> /dev/null; then
             NGINX_CONF="$SCRIPT_DIR/nginx.conf"
@@ -768,6 +786,7 @@ case "$ACTION" in
         start_proxy_tracker
         start_proxy_realtime
         start_proxy_auto
+        start_sync_worker
         ;;
 
     worker-stop)
@@ -777,6 +796,7 @@ case "$ACTION" in
         stop_shallow_auto
         stop_shallow_query
         stop_realtime_worker
+        stop_sync_worker
         ;;
 
     worker-restart)
@@ -786,6 +806,7 @@ case "$ACTION" in
         stop_shallow_auto
         stop_shallow_query
         stop_realtime_worker
+        stop_sync_worker
         sleep 1
         start_tracker
         start_auto_tracker
@@ -796,6 +817,16 @@ case "$ACTION" in
         start_proxy_tracker
         start_proxy_realtime
         start_proxy_auto
+        start_sync_worker
+        ;;
+
+    # 数据集同步 worker：单独启停（改数据集的人常用）
+    sync-start|sync-stop|sync-restart)
+        case "$ACTION" in
+            sync-start) start_sync_worker ;;
+            sync-stop)  stop_sync_worker ;;
+            sync-restart) stop_sync_worker; sleep 1; start_sync_worker ;;
+        esac
         ;;
 
     shallow-start|shallow-stop|shallow-restart)
@@ -905,6 +936,86 @@ case "$ACTION" in
         esac
         ;;
 
+    # ── 数据库备份（db_backup.py）──
+    # 落点默认 /mnt/sfs_turbo/.../zhengnianzu/platform_backups，与 OUTPUT_CACHE 同级。
+    # 用 SQLite 在线备份 API，备份时不需要停服务（WAL 下一个读锁即可拿一致快照）。
+    # 注意不要透传 "$@"：$1 还是子命令名本身，会被 argparse 当成未知参数。
+    db-backup)
+        $PYTHON -I db_backup.py run
+        ;;
+    db-backup-full)
+        $PYTHON -I db_backup.py run --full
+        ;;
+    db-backup-list)
+        $PYTHON -I db_backup.py list
+        ;;
+    db-backup-audit)
+        $PYTHON -I db_backup.py audit
+        ;;
+
+    # 幂等写入 crontab：只增删带标记本脚本的两行，不动别的条目。
+    # 每日 03:00 每日套件；每周日 04:00 周级（含 task_data.db）。
+    db-backup-install-cron)
+        _mark="# openclaw-hive-db-backup"
+        _py="$(command -v "$PYTHON" || echo "$PYTHON")"
+        _dir="$SCRIPT_DIR"
+        _new="$(crontab -l 2>/dev/null | grep -v "$_mark")
+0 3 * * * cd $_dir && $_py -I db_backup.py run >> db_backup.cron.log 2>&1 $_mark
+0 4 * * 0 cd $_dir && $_py -I db_backup.py run --full >> db_backup.cron.log 2>&1 $_mark"
+        printf '%s\n' "$_new" | crontab -
+        echo "已安装（幂等）:"
+        crontab -l | grep "$_mark"
+        echo ""
+        echo "注意: cron 用的是本次解析出的解释器 $_py；换 venv 后需重跑本命令。"
+        echo "备份日志: $_dir/db_backup.cron.log"
+        ;;
+
+    # 恢复：故意做成「逐步确认」，不做一键覆盖。
+    db-backup-restore)
+        _src="${2:-}"
+        if [ -z "$_src" ]; then
+            echo "用法: $0 db-backup-restore <备份目录>"
+            echo "  例: $0 db-backup-restore /mnt/sfs_turbo/.../platform_backups/20261124-031000"
+            echo "先跑 ./run.sh db-backup-list 看有哪些可恢复的。"
+            exit 1
+        fi
+        _src="$($PYTHON -I -c "import os,sys;print(os.path.abspath(sys.argv[1]))" "$_src")"
+        if [ ! -f "$_src/manifest.json" ]; then
+            echo "错误: $_src 下没有 manifest.json —— 不是完整的备份目录，拒绝恢复。"
+            exit 1
+        fi
+        echo "将恢复 $_src 到 $SCRIPT_DIR/platform.db"
+        echo "步骤: 停服务 → 当前库改名为 platform.db.pre-restore.<时间戳> → 拷回 → 校验"
+        printf "确认继续？(yes/NO) "
+        read -r _ans
+        [ "$_ans" = "yes" ] || { echo "已取消。"; exit 1; }
+
+        echo "=== 停止服务 ==="
+        if [ -f platform.pid ]; then kill "$(cat platform.pid)" 2>/dev/null; rm -f platform.pid; fi
+        stop_tracker; stop_auto_tracker; stop_shallow_realtime; stop_shallow_auto
+        stop_shallow_query; stop_realtime_worker; stop_proxy_tracker
+        stop_proxy_realtime; stop_proxy_auto; stop_shallow_local; stop_shallow_obs
+        stop_worker; stop_deep_worker
+        free_port "$PORT"
+
+        _ts="$(date +%Y%m%d%H%M%S)"
+        if [ -f platform.db ]; then
+            mv platform.db "platform.db.pre-restore.$_ts"
+            echo "当前库已改名: platform.db.pre-restore.$_ts"
+        fi
+        rm -f platform.db-wal platform.db-shm
+        cp "$_src/platform.db" platform.db
+        echo "已拷贝 $_src/platform.db -> platform.db"
+        echo "=== 校验 ==="
+        sqlite3 platform.db "PRAGMA integrity_check;" || {
+            echo "校验失败！当前库已损坏。请回滚: mv platform.db.pre-restore.$_ts platform.db"
+            exit 1
+        }
+        echo ""
+        echo "恢复完成。请检查后执行 ./run.sh start"
+        echo "如需回滚: mv platform.db.pre-restore.$_ts platform.db"
+        ;;
+
     *)
         echo "用法: $0 {install|soffice-install|build|dev|start|stop|restart|logs|worker-status|worker-start|worker-stop|worker-restart|shallow-*|deep-*} [host] [port] [nginx_port]"
         echo ""
@@ -949,6 +1060,14 @@ case "$ACTION" in
         echo "  shallow-start|stop|restart   只动浅层（旧的 --shallow-only 单体循环）"
         echo "  deep-start|stop|restart      只动产物下载（deep/artifacts 两个名字等价）"
         echo "  artifacts-start|stop|restart 同 deep（产物下载跑在 deep_worker 进程里）"
+        echo ""
+        echo "  —— 数据库备份（落点 sfs_turbo，与 OUTPUT_CACHE 同级）——"
+        echo "  db-backup            立即备份 platform.db + 配置密钥"
+        echo "  db-backup-full       周级：额外备份 task_data.db（13G，较慢）"
+        echo "  db-backup-list       列出现有备份（只读）"
+        echo "  db-backup-audit      盘点 platform/ 下存量 .bak（只读，不删除）"
+        echo "  db-backup-install-cron  幂等写入 crontab（每日 3:00 / 周日 4:00）"
+        echo "  db-backup-restore <dir> 从备份恢复（逐步确认，会先停服务）"
         echo ""
         echo "默认端口: uvicorn=${PORT}, nginx=${NGINX_PORT}"
         ;;

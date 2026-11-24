@@ -462,7 +462,10 @@
 
         </div>
       </el-tab-pane>
-      <el-tab-pane label="调度监控" name="worker">
+      <!-- lazy: 不点开就不挂载。WorkerMonitor 一挂载会并发打 4 个接口
+           （overview / queue / load / trend），其中 overview 与 queue 都要跑
+           一次 5 秒级的全表聚合 —— 全在打开页面时就发，把「资源总览」拖慢。 -->
+      <el-tab-pane label="调度监控" name="worker" lazy>
         <WorkerMonitor :is-operator="authStore.isOperator" />
       </el-tab-pane>
     </el-tabs>

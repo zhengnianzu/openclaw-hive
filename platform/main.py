@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 
 import httpx
 from fastapi import Depends, HTTPException, Query
@@ -106,14 +107,16 @@ app.include_router(worker_monitor.router)
 # 实测卡在 locks_lock_inode_wait 永不返回。
 with init_db_lock():
     init_db_unlocked()
-    # 这两步也会写库，同样可能撞上离线 worker 的写锁（init_db_lock 管不到它们，
-    # 见 database.py 的 INIT_BUSY_TIMEOUT_MS 说明）。它们都是幂等的「补默认配置」，
+    # 这几步也会写库，同样可能撞上离线 worker 的写锁（init_db_lock 管不到它们，
+    # 见 database.py 的 INIT_BUSY_TIMEOUT_MS 说明）。它们都是幂等的「补默认配置 / 补历史版本」，
     # 不能因为一次拿不到锁就让整个 uvicorn worker 起不来 —— 下次启动会再补一遍。
-    for _ensure in (harness_configs.ensure_defaults, sandbox_configs.ensure_defaults):
+    for _ensure in (harness_configs.ensure_defaults, sandbox_configs.ensure_defaults,
+                    registrations.ensure_versions):
         try:
             _ensure()
         except Exception as e:
-            print(f"[startup] 警告: {_ensure.__module__}.ensure_defaults 失败（{e}），跳过", flush=True)
+            _name = getattr(_ensure, "__name__", str(_ensure))
+            print(f"[startup] 警告: {_ensure.__module__}.{_name} 失败（{e}），跳过", flush=True)
 
     # 首次部署时创建 admin。整块包起来：连接本身和 SELECT 也可能撞锁，
     # 而这段跑在模块顶层，任何异常都等于 uvicorn worker 起不来。
@@ -151,6 +154,18 @@ async def _start_background_tasks():
             print(f"[startup] 恢复 {n} 个队列的排队任务")
     except Exception as e:
         print(f"[startup] resume_all_queues error: {e}")
+
+    # 预热调度监控的聚合缓存（单次 1~5 秒的全表统计）。不预热的话，部署后
+    # 第一个打开「调度监控」的人要等 5 秒。四个 worker 同时预热，靠 flock 单飞，
+    # 只会算一次。放后台线程，不拖慢启动。
+    def _prewarm_worker_monitor():
+        try:
+            from api.routers import worker_monitor
+            worker_monitor.prewarm_caches()
+        except Exception as e:
+            print(f"[startup] prewarm worker-monitor error: {e}")
+
+    threading.Thread(target=_prewarm_worker_monitor, daemon=True).start()
 
 
 @app.post("/api/generate-api-key")

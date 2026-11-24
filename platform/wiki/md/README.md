@@ -7,9 +7,8 @@ tags:
 - 通知
 summary: 如何写文档、发布为全局通知；正文存在 platform/wiki/md/ 下，可在界面或 IDE 编辑。
 is_pinned: false
-sort_order: 20
+sort_order: 60
 author: admin
-updated_by: admin
 created_at: '2026-10-19T00:00:00'
 updated_at: '2026-10-30T17:23:55.630776'
 ---

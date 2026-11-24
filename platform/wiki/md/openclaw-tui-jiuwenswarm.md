@@ -9,7 +9,7 @@ summary: 新增openclaw-tui&&jiuwenswarm生产管线说明
 linked_entity_type: code_repo
 linked_entity_key: '137'
 is_pinned: false
-sort_order: 70
+sort_order: 110
 author: admin
 created_at: '2026-10-23T18:04:28.982764'
 updated_at: '2026-10-24T16:19:16.608473'
