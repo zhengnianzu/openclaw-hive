@@ -125,15 +125,19 @@
             </template>
           </el-table-column>
 
-          <el-table-column label="进度" min-width="150">
+          <el-table-column label="进度" width="110" align="center"
+            sortable :sort-by="r => (r.completed_tasks + r.failed_tasks) / (r.total_tasks || 1)">
             <template #default="{row}">
-              <template v-if="!row.create_error">
-                <el-progress :percentage="row.progress_percent" :stroke-width="8" :show-text="false" />
-                <div class="muted" style="font-size:12px">
-                  {{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}
-                </div>
-              </template>
-              <span v-else class="err">创建失败</span>
+              <span v-if="row.create_error" class="err">创建失败</span>
+              <span v-else>{{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="进度条" min-width="140">
+            <template #default="{row}">
+              <el-progress v-if="!row.create_error" :percentage="row.progress_percent"
+                :stroke-width="8" :show-text="false" />
+              <span v-else class="muted">—</span>
             </template>
           </el-table-column>
 
