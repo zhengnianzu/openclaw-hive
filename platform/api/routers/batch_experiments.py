@@ -120,6 +120,9 @@ def _expand_arms(req) -> list:
     model_base_url 原样传递，不做 /v1 规整：claude-code 会剥、openclaw 会补，
     由 create_instance 按各自 harness 的规则解析，所以同一个模型可以同时给
     任意几个 Harness 用。
+
+    invite_code 一并下沉到臂：批量里「key 留空 + 填 invite_code」意味着**每个子任务
+    各自申请一把新 key**（create_instance 的自动申请段），而不是全批共用一把。
     """
     if req.harnesses and req.models:
         out = []
@@ -136,6 +139,7 @@ def _expand_arms(req) -> list:
                     model_base_url=m.model_base_url,
                     model_api_key=m.model_api_key,
                     model_api_type=m.model_api_type,
+                    invite_code=m.invite_code,
                     image_name=h.image_name,
                     sandbox_config_id=h.sandbox_config_id,
                 ))
@@ -167,6 +171,7 @@ def _expand_arms(req) -> list:
                 model_base_url=m.model_base_url,
                 model_api_key=m.model_api_key,
                 model_api_type=m.model_api_type,
+                invite_code=m.invite_code,
                 image_name=b.image_name,
                 sandbox_config_id=b.sandbox_config_id,
             ))
@@ -819,7 +824,8 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
 
                 payload = dict(common)
                 # 臂的模型参数：仅非空时覆盖 common 的兜底值
-                for _f in ("model_base_url", "model_api_key", "model_id", "model_api_type"):
+                for _f in ("model_base_url", "model_api_key", "model_id", "model_api_type",
+                           "invite_code"):
                     _v = getattr(arm, _f, "") or ""
                     if _v:
                         payload[_f] = _v

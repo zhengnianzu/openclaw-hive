@@ -40,6 +40,8 @@ class BatchArm(BaseModel):
     model_api_key: str = ""
     model_id: str = ""
     model_api_type: str = ""
+    # 留空 = 继承 common.invite_code
+    invite_code: str = ""
 
     # 块内沙箱参数：镜像与沙箱配置是跟 Harness 走的（不同 harness 常需不同镜像/
     # 资源池），所以按臂配置。留空/None = 落回 common 的同名字段。
@@ -48,16 +50,23 @@ class BatchArm(BaseModel):
 
 
 class BatchModelParams(BaseModel):
-    """矩阵的一条模型轴 —— 与 Harness 完全解耦，对所有 Harness 生效。
+    """主 Agent 模型配置 —— 矩阵的一条轴，与 Harness 完全解耦，对所有 Harness 生效。
 
     一个模型 × 一个 Harness = 一个子任务配置（纯正交笛卡尔积）。
     model_base_url 原样传递，不做 /v1 规整：各 harness 在 create_instance 里
     自己补或剥（claude-code 剥、openclaw 补），带不带 /v1 都能被正确解析。
+
+    invite_code 与 model_api_key 是**二选一**的两条取 key 路径：
+      - 填了 key  → 所有子任务共用这把 key
+      - key 留空、填 invite_code → 每个子任务在创建时各自申请一把新 key
+        （见 instances.create_instance 的「自动申请 API Key」段）
+    批量里默认推荐后者：每个子任务独立计费/限流，互不影响。
     """
     model_id: str = ""
     model_base_url: str = ""
     model_api_key: str = ""
     model_api_type: str = ""
+    invite_code: str = ""
 
 
 class BatchHarness(BaseModel):

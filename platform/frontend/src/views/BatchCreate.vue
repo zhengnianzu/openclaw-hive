@@ -189,7 +189,7 @@
             </section>
           </div>
 
-          <!-- ---------- Tab: 模型配置（矩阵的另一条轴，独立于 Harness） ---------- -->
+          <!-- ---------- Tab: 主Agent模型配置（矩阵的另一条轴，独立于 Harness） ---------- -->
           <div v-else-if="tab === 'hconfig'" class="split">
             <!-- 左：模型列表。一条扁平的轴 —— 每个模型都在所有 Harness 上各跑一遍 -->
             <aside class="list-col">
@@ -269,7 +269,7 @@
                         @update:model-value="v => keyDraft[curModel._uid] = v"
                         @blur="commitDraftKey(curModel._uid, curModel)"
                         @keyup.enter="commitDraftKey(curModel._uid, curModel)"
-                        placeholder="留空继承兜底值" type="password" autocomplete="off" />
+                        placeholder="留空则按 Invite Code 自动申请" type="password" autocomplete="off" />
                       <el-button v-if="curModel.model_api_key"
                         @click="curModel.model_api_key = ''">清除</el-button>
                       <el-button type="primary"
@@ -277,6 +277,18 @@
                     </div>
                     <div v-if="curModel.model_api_key" class="hint">
                       已设置 Key，仅显示掩码；需更换请点「清除」后重新粘贴或新建
+                    </div>
+                  </div>
+
+                  <!-- Invite Code：与 key 二选一。填了 key 此字段被忽略；
+                       只有 key 留空时才生效 —— 每个子任务在创建时各自申请一把新 key。 -->
+                  <div class="field">
+                    <label class="lbl2">Invite Code</label>
+                    <el-input v-model="curModel.invite_code" placeholder="例如：glm_coding_plan（留空则不自动申请）" />
+                    <div class="hint">
+                      <b>批量默认推荐填这里</b>：key 留空时，每个子任务的每个模型都会用这个
+                      invite code 各自申请一把新 key，上游按 key 拆分用量，互不挤占额度。
+                      <template v-if="curModel.model_api_key">当前已填 Key，此字段不生效。</template>
                     </div>
                   </div>
 
@@ -371,7 +383,7 @@
                       @update:model-value="v => keyDraft[agentSlot(ai)] = v"
                       @blur="commitDraftKey(agentSlot(ai), ag)"
                       @keyup.enter="commitDraftKey(agentSlot(ai), ag)"
-                      placeholder="留空使用模板默认值" type="password" autocomplete="off" />
+                      placeholder="留空则按 Invite Code 自动申请" type="password" autocomplete="off" />
                     <el-button v-if="ag.api_key" @click="ag.api_key = ''">清除</el-button>
                     <el-button type="primary" @click="openKeyDialog('agent', agentSlot(ai))">
                       新建KEY
@@ -379,6 +391,17 @@
                   </div>
                   <div v-if="ag.api_key" class="hint">
                     已设置 Key，仅显示掩码；需更换请点「清除」
+                  </div>
+                </div>
+
+                <!-- agent 的 invite code：与 key 二选一，key 留空时每个子任务各自申请一把 -->
+                <div class="field">
+                  <label class="lbl2">Invite Code</label>
+                  <el-input v-model="ag.invite_code" placeholder="例如：glm_coding_plan（留空则不自动申请）" />
+                  <div class="hint">
+                    key 留空时，每个子任务会用这个 invite code 为「{{ ag.name || '该 agent' }}」
+                    各自申请一把新 key。
+                    <template v-if="ag.api_key">当前已填 Key，此字段不生效。</template>
                   </div>
                 </div>
 
@@ -654,7 +677,7 @@
                 {{ selectedReg?.task_name }}（{{ sampleTotal }} 条）
               </el-descriptions-item>
               <el-descriptions-item label="Harness 数">{{ form.harnesses.length }}</el-descriptions-item>
-              <el-descriptions-item label="模型配置数">{{ modelCount }}</el-descriptions-item>
+              <el-descriptions-item label="主Agent模型配置数">{{ modelCount }}</el-descriptions-item>
               <el-descriptions-item label="用户模拟 Agent">{{ form.agents.length || '模板默认' }}</el-descriptions-item>
               <el-descriptions-item label="重复次数">{{ form.repeat_times }}</el-descriptions-item>
               <el-descriptions-item label="队列">
@@ -739,7 +762,7 @@
             <div class="stat">
               <div class="stat-ic"><el-icon><Box /></el-icon></div>
               <div>
-                <div class="stat-k">模型配置数</div>
+                <div class="stat-k">主Agent模型配置数</div>
                 <div class="stat-v">{{ modelCount }}</div>
               </div>
             </div>
@@ -761,7 +784,7 @@
           </div>
           <div v-else class="ok-box small">
             <el-icon><CircleCheckFilled /></el-icon>
-            当前共 {{ form.harnesses.length }} 个 Harness（{{ modelCount }} 个模型配置），
+            当前共 {{ form.harnesses.length }} 个 Harness（{{ modelCount }} 个主Agent模型配置），
             用户模拟为通用配置，将生成 {{ totalTasks }} 个执行任务。
           </div>
         </div>
@@ -823,7 +846,7 @@ const STEPS = ['配置实验', '矩阵预览', '确认创建']
 // 而 main.js 只全局注册了部分图标，Collection / MagicStick 不在其中。
 const TABS = [
   { key: 'harness', label: 'Harness 类型', icon: Collection },
-  { key: 'hconfig', label: '模型配置', icon: Setting },
+  { key: 'hconfig', label: '主Agent模型配置', icon: Setting },
   { key: 'sim', label: '用户模拟配置', icon: User },
   { key: 'batch', label: '批量任务配置', icon: Tickets },
   { key: 'adv', label: '高级配置', icon: MagicStick },
@@ -887,7 +910,10 @@ const form = ref({
 })
 
 function emptyModel() {
-  return { _uid: uid(), model_id: '', model_base_url: '', model_api_key: '', model_api_type: '' }
+  return {
+    _uid: uid(), model_id: '', model_base_url: '', model_api_key: '',
+    model_api_type: '', invite_code: '',
+  }
 }
 function emptyHarness() {
   return {
@@ -904,7 +930,7 @@ function emptyAgent() {
 const curArm = computed(() =>
   selectedArm.value >= 0 ? form.value.harnesses[selectedArm.value] || null : null)
 
-// 「模型配置」tab：一条扁平的模型轴，不属于任何 Harness —— 每个模型都在所有
+// 「主Agent模型配置」tab：一条扁平的模型轴，不属于任何 Harness —— 每个模型都在所有
 // Harness 上各跑一遍（与 Harness 正交）。原名 allModels 保留，模板里直接用。
 const allModels = computed(() => form.value.models)
 const totalModels = computed(() => form.value.models.length)
@@ -1018,6 +1044,7 @@ function buildModels() {
     model_base_url: (m.model_base_url || '').trim(),
     model_api_key: m.model_api_key || '',
     model_api_type: m.model_api_type || '',
+    invite_code: (m.invite_code || '').trim(),
   }))
 }
 
@@ -1037,6 +1064,7 @@ function flattenArms() {
         model_api_key: m.model_api_key || '',
         model_id: (m.model_id || '').trim(),
         model_api_type: m.model_api_type || '',
+        invite_code: (m.invite_code || '').trim(),
       })
     }
   }

@@ -1617,8 +1617,24 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 entry["provider"] = ag.provider
             if ag.base_url:
                 entry["base_url"] = ag.base_url
-            if ag.api_key:
-                entry["api_key"] = ag.api_key
+            # agent 的 key 有两条路径，与主 Agent 同口径：
+            #   填了 api_key      → 直接用
+            #   只填 invite_code  → 用该 agent 自己的 base_url 申请一把新 key
+            # 后者是批量实验的默认姿势：每个子任务 × 每个 agent 各自一把，
+            # 上游可用 key 拆开用量，不会全批混在同一个额度里。
+            agent_key = ag.api_key
+            if not agent_key and ag.invite_code:
+                try:
+                    agent_key = await _request_api_key(
+                        ag.base_url or "",
+                        ag.invite_code,
+                        f"{user['username']}_{datetime.now().strftime('%y%m%d%H%M')}_"
+                        f"{req.name}_{ag.name}",
+                    )
+                except Exception as e:
+                    print(f"[api_key] agent {ag.name} 自动申请失败 (instance name={req.name}): {e}")
+            if agent_key:
+                entry["api_key"] = agent_key
             if ag.api:
                 entry["api"] = ag.api
             user_proxy_cfg[ag.name] = entry

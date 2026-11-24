@@ -84,8 +84,7 @@
         </div>
 
         <!-- 任务列表并入执行概览：一屏看完「这批跑得怎么样 + 每个子任务怎么样」 -->
-        <el-table :data="items" size="small" border style="width:100%;margin-top:20px"
-          :row-class-name="({ row }) => (row.failed_tasks > 0 || row.status === 'failed') ? 'row-has-fail' : ''">
+        <el-table :data="items" size="small" border style="width:100%;margin-top:20px">
           <!-- 序号：口头/截图指认任务时用（「第 3 个配置挂了」）。
                用行号而不是实例 ID —— 实例 ID 太长，而且带创建时间戳看不出顺序。 -->
           <el-table-column label="#" width="60" align="center" fixed>
@@ -122,16 +121,32 @@
             </template>
           </el-table-column>
 
-          <el-table-column label="任务进度" min-width="190">
+          <!-- 进度拆成三列：数字 / 失败 / 进度条。
+               原来挤在一列里，失败数被括号包在灰字后面，扫列时看不出哪几个有问题。 -->
+          <el-table-column label="进度" width="110" align="center"
+            sortable :sort-by="r => (r.completed_tasks + r.failed_tasks) / (r.total_tasks || 1)">
             <template #default="{row}">
-              <div v-if="row.create_error" class="err">创建失败</div>
-              <template v-else>
-                <div class="muted">
-                  {{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}
-                  <span v-if="row.failed_tasks" style="color:#f56c6c">（失败 {{ row.failed_tasks }}）</span>
-                </div>
-                <el-progress :percentage="row.progress_percent" :stroke-width="8" :show-text="false" />
-              </template>
+              <span v-if="row.create_error" class="err">创建失败</span>
+              <span v-else>{{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="失败" width="80" align="center"
+            sortable :sort-by="r => r.failed_tasks || 0">
+            <template #default="{row}">
+              <span v-if="row.create_error">—</span>
+              <span v-else-if="row.failed_tasks" style="color:#f56c6c;font-weight:600">
+                {{ row.failed_tasks }}
+              </span>
+              <span v-else class="muted">0</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="任务进度" min-width="150">
+            <template #default="{row}">
+              <el-progress v-if="!row.create_error" :percentage="row.progress_percent"
+                :stroke-width="8" :show-text="false" />
+              <span v-else class="muted">—</span>
             </template>
           </el-table-column>
 
@@ -498,7 +513,7 @@ const simSummary = computed(() => {
   return '模板默认'
 })
 
-// 参数分组与创建页的五个 Tab 一一对应：Harness 类型 / 模型配置 /
+// 参数分组与创建页的五个 Tab 一一对应：Harness 类型 / 主Agent模型配置 /
 // 用户模拟配置 / 批量任务配置 / 高级配置。
 // 数据源优先 params_json.harnesses + params_json.models —— 矩阵的两条正交轴，
 // 不是摊平后的 arms。展开成子任务配置是后端在建任务时才做的，
@@ -567,7 +582,7 @@ const paramGroups = computed(() => {
     sandbox_name: sandboxName(b.sandbox_config_id ?? p.sandbox_config_id),
   }))
 
-  // ---- 模型配置：一行一个模型（模型轴对新形状是独立的，对所有 Harness 生效） ----
+  // ---- 主Agent模型配置：一行一个模型（模型轴对新形状是独立的，对所有 Harness 生效） ----
   const modelCols = [
     { prop: 'model_id', label: '模型 ID', minWidth: 180 },
     { prop: 'model_api_type', label: 'API 类型', minWidth: 130 },
@@ -638,7 +653,7 @@ const paramGroups = computed(() => {
       })),
     },
     {
-      key: 'hconfig', title: '模型配置',
+      key: 'hconfig', title: '主Agent模型配置',
       icon: Cpu,
       columns: modelCols,
       rows: modelRows,
@@ -981,8 +996,6 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
   white-space: nowrap;
 }
 .row-ops :deep(.el-button + .el-button) { margin-left: 0; }
-/* 有失败样本（或子任务整体失败）的行淡红底，扫一眼就能定位到要处理的行 */
-:deep(.el-table .row-has-fail > td) { background: #fef0f0; }
 .btn-badge {
   display: inline-block;
   margin-left: 6px;
