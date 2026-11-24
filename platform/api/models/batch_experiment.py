@@ -260,6 +260,10 @@ class BatchItemInfo(BaseModel):
     queue_id: Optional[str] = None
     started_at: Optional[str] = None
     stopped_at: Optional[str] = None
+    # 独立并发：该子任务内部同时开几个沙箱（task_instances.concurrent_num）
+    concurrent_num: int = 0
+    # 子任务的创建时间（不是实验的）——重跑/续跑不会改它，用来对齐批次内的先后
+    instance_created_at: Optional[str] = None
     progress_percent: float = 0.0
 
 

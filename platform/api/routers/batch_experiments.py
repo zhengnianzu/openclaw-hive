@@ -626,7 +626,8 @@ def list_items(batch_id: str, user: dict = Depends(get_current_user)):
             """SELECT i.*,
                       t.name AS instance_name, t.status, t.total_tasks,
                       t.completed_tasks, t.failed_tasks,
-                      t.queue_id, t.started_at, t.stopped_at
+                      t.queue_id, t.started_at, t.stopped_at,
+                      t.concurrent_num, t.created_at AS instance_created_at
                  FROM batch_experiment_items i
                  LEFT JOIN task_instances t ON t.id = i.instance_id
                 WHERE i.batch_id = ?
@@ -640,7 +641,7 @@ def list_items(batch_id: str, user: dict = Depends(get_current_user)):
     for r in rows:
         d = dict(r)
         # LEFT JOIN 没命中时这些列是 None，Pydantic 声明的是 int，要兜住
-        for k in ("total_tasks", "completed_tasks", "failed_tasks"):
+        for k in ("total_tasks", "completed_tasks", "failed_tasks", "concurrent_num"):
             d[k] = d.get(k) or 0
         d["done_tasks"] = done.get(d.get("instance_id"), 0)
         d["instance_name"] = d.get("instance_name") or ""
@@ -799,6 +800,32 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
     from .instances import create_instance  # 延迟导入，避免循环依赖
 
     created, failed = 0, 0
+
+    # invite_code 是最高优先级：填了它就表示「每个子任务各要一把独立的 key」。
+    # 但已填的 key 不该浪费 —— 它本来就是一把可用的真 key，所以把它留给**第一个**
+    # 用到该 invite_code 的子任务，后续子任务一律把 key 清空，由 create_instance
+    # 按 invite_code 各自申请新的。
+    #
+    # 按 (invite_code, base_url) 分桶而不是全局一个标志位：同一实验里不同模型 /
+    # 不同 agent 可能用不同的 invite_code 和端点，各自的「第一把」互不相干。
+    _key_reuse_used: set[tuple] = set()
+
+    def _consume_first_key(invite_code: str, base_url: str, api_key: str) -> str:
+        """返回该位置最终要用的 key。
+
+        invite_code 为空 → 原样返回 api_key（老行为：全批共用）。
+        invite_code 非空 → 第一次遇到这个桶时沿用 api_key，之后一律返回 ""
+        （空 key 会让 create_instance 走自动申请分支）。
+        """
+        code = (invite_code or "").strip()
+        if not code:
+            return api_key
+        bucket = (code, (base_url or "").strip().rstrip("/"))
+        if api_key and bucket not in _key_reuse_used:
+            _key_reuse_used.add(bucket)
+            return api_key
+        return ""
+
     # 配置序号：arm × sim × repeat 展开后的第几个子任务，从 1 开始。
     # 它同时决定展示名（实验名-配置N）与 task_name（batch-cN）—— 必须是全局唯一
     # 的单调序号，否则同一 harness 配不同模型时 task_name 会撞（轨迹互相覆盖）。
@@ -830,6 +857,14 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
                     if _v:
                         payload[_f] = _v
 
+                # invite_code 优先：填了它就只让第一个子任务复用现成的 key，
+                # 其余子任务 key 清空 → create_instance 按 invite_code 各申请一把。
+                payload["model_api_key"] = _consume_first_key(
+                    payload.get("invite_code", ""),
+                    payload.get("model_base_url", ""),
+                    payload.get("model_api_key", ""),
+                )
+
                 # 块内沙箱参数：镜像 / 沙箱配置跟 Harness 走。
                 # sandbox_config_id 允许 0（= 不替换模板），所以判 None 而不是 falsy。
                 _img = (arm.image_name or "").strip()
@@ -840,6 +875,20 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
                 # 模拟臂的 agents：非空时整组替换（空则沿用 common.agents 兜底）
                 if sim is not None and sim.agents:
                     payload["agents"] = [a.model_dump() for a in sim.agents]
+
+                # agents 的 key 与主 Agent 同口径：填了 invite_code 就只让第一个
+                # 子任务复用现成 key，其余清空由 create_instance 各自申请。
+                # 必须逐个子任务重建 agent dict —— payload 可能直接引用 common 里
+                # 的同一份列表，就地改会污染后续所有子任务。
+                if payload.get("agents"):
+                    payload["agents"] = [
+                        {**ag, "api_key": _consume_first_key(
+                            ag.get("invite_code", ""),
+                            ag.get("base_url", ""),
+                            ag.get("api_key", ""),
+                        )} if isinstance(ag, dict) else ag
+                        for ag in payload["agents"]
+                    ]
 
                 payload.update({
                     # 展示名按「实验名-配置N」编号，一眼能对上是第几个配置
@@ -1048,17 +1097,71 @@ async def rerun_failed(batch_id: str, user: dict = Depends(require_operator)):
 
 
 @router.delete("/{batch_id}")
-def delete_experiment(batch_id: str, user: dict = Depends(require_operator)):
-    """删除实验记录。
+def delete_experiment(
+    batch_id: str,
+    keep_instances: bool = Query(False, description="true=只删编组关系，保留子任务"),
+    user: dict = Depends(require_operator),
+):
+    """删除实验。
 
-    **只删实验与编组关系，子任务（task_instances）一律保留** —— 它们是真实跑过的
-    任务，有日志、轨迹、产物，删实验不该连带销毁这些。要删任务请去任务详情页。
+    **默认连带删除子任务**：批量实验的子任务是实验自己建出来的，删了实验却把
+    N 个子任务留在「任务管理」里只是噪音，用户还得一个个手删。
+
+    `keep_instances=true` 时只删编组关系，子任务原样保留 —— 适合「实验分组建错了
+    但任务要留着」的场景。
+
+    正在运行的子任务不会被删（delete_instance 会拒绝），这类实例连同它的编组行
+    一起保留，并在返回体里列出，由调用方提示用户先停止再删。
     """
     _get_batch(batch_id)
+
+    if keep_instances:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM batch_experiment_items WHERE batch_id = ?", (batch_id,))
+            conn.execute("DELETE FROM batch_experiments WHERE id = ?", (batch_id,))
+        return {"message": "已删除实验（子任务保留）", "deleted_instances": 0, "skipped": []}
+
+    from .instances import delete_instance
+
+    instance_ids = _batch_instance_ids(batch_id)
+    deleted, skipped = 0, []
+    for iid in instance_ids:
+        try:
+            delete_instance(iid, user)
+            deleted += 1
+        except HTTPException as e:
+            # 运行中 / 已不存在：前者要用户先停，后者本来就没了，都不该中断整体删除
+            if e.status_code == 404:
+                continue
+            skipped.append({"instance_id": iid, "reason": str(e.detail)})
+        except Exception as e:
+            skipped.append({"instance_id": iid, "reason": str(e)[:200]})
+
     with get_connection() as conn:
-        conn.execute("DELETE FROM batch_experiment_items WHERE batch_id = ?", (batch_id,))
-        conn.execute("DELETE FROM batch_experiments WHERE id = ?", (batch_id,))
-    return {"message": "已删除实验（子任务保留）"}
+        if skipped:
+            # 删不掉的子任务保留它的编组行，否则实验没了、任务还在，彻底失联
+            ph = ",".join("?" * len(skipped))
+            conn.execute(
+                f"DELETE FROM batch_experiment_items WHERE batch_id = ? "
+                f"AND (instance_id IS NULL OR instance_id NOT IN ({ph}))",
+                (batch_id, *[s["instance_id"] for s in skipped]),
+            )
+        else:
+            conn.execute("DELETE FROM batch_experiment_items WHERE batch_id = ?", (batch_id,))
+            conn.execute("DELETE FROM batch_experiments WHERE id = ?", (batch_id,))
+
+    if skipped:
+        return {
+            "message": (f"已删除 {deleted} 个子任务，{len(skipped)} 个无法删除"
+                        f"（运行中的请先停止），实验记录保留"),
+            "deleted_instances": deleted,
+            "skipped": skipped,
+        }
+    return {
+        "message": f"已删除实验及其 {deleted} 个子任务",
+        "deleted_instances": deleted,
+        "skipped": [],
+    }
 
 
 @router.post("/{batch_id}/copy")

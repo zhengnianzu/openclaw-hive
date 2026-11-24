@@ -280,15 +280,18 @@
                     </div>
                   </div>
 
-                  <!-- Invite Code：与 key 二选一。填了 key 此字段被忽略；
-                       只有 key 留空时才生效 —— 每个子任务在创建时各自申请一把新 key。 -->
+                  <!-- Invite Code 是最高优先级：填了它就表示「每个子任务各要一把独立 key」。
+                       已填的 key 不浪费 —— 留给第一个子任务用，其余由后端各自申请。 -->
                   <div class="field">
                     <label class="lbl2">Invite Code</label>
                     <el-input v-model="curModel.invite_code" placeholder="例如：glm_coding_plan（留空则不自动申请）" />
                     <div class="hint">
-                      <b>批量默认推荐填这里</b>：key 留空时，每个子任务的每个模型都会用这个
-                      invite code 各自申请一把新 key，上游按 key 拆分用量，互不挤占额度。
-                      <template v-if="curModel.model_api_key">当前已填 Key，此字段不生效。</template>
+                      <b>批量默认推荐填这里</b>：填了之后每个子任务都会用这个 invite code
+                      各自申请一把独立 key，上游按 key 拆分用量，互不挤占额度。
+                      <template v-if="curModel.model_api_key">
+                        <b style="color:#e6a23c">已填的 Key 会分配给第一个子任务使用（不浪费），
+                        其余子任务另行申请。</b>
+                      </template>
                     </div>
                   </div>
 
@@ -394,14 +397,17 @@
                   </div>
                 </div>
 
-                <!-- agent 的 invite code：与 key 二选一，key 留空时每个子任务各自申请一把 -->
+                <!-- agent 的 invite code：与主 Agent 同口径，填了就每个子任务各申请一把 -->
                 <div class="field">
                   <label class="lbl2">Invite Code</label>
                   <el-input v-model="ag.invite_code" placeholder="例如：glm_coding_plan（留空则不自动申请）" />
                   <div class="hint">
-                    key 留空时，每个子任务会用这个 invite code 为「{{ ag.name || '该 agent' }}」
-                    各自申请一把新 key。
-                    <template v-if="ag.api_key">当前已填 Key，此字段不生效。</template>
+                    填了之后，每个子任务都会用这个 invite code 为「{{ ag.name || '该 agent' }}」
+                    各自申请一把独立 key。
+                    <template v-if="ag.api_key">
+                      <b style="color:#e6a23c">已填的 Key 会分配给第一个子任务使用（不浪费），
+                      其余子任务另行申请。</b>
+                    </template>
                   </div>
                 </div>
 

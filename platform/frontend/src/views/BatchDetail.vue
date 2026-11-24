@@ -104,30 +104,52 @@
             </template>
           </el-table-column>
 
-          <el-table-column label="Harness 类型" width="140">
+          <el-table-column label="Harness" min-width="200" show-overflow-tooltip>
             <template #default="{row}">
-              <el-tag :style="harnessStore.tagStyle(row.harness_type)" size="small">
-                {{ harnessStore.label(row.harness_type) }}
-              </el-tag>
-            </template>
-          </el-table-column>
-
-          <el-table-column label="Harness 配置" min-width="170" show-overflow-tooltip>
-            <template #default="{row}">
-              <div>{{ row.arm_label || '—' }}</div>
+              <div class="harness-cell">
+                <el-tag :style="harnessStore.tagStyle(row.harness_type)" size="small">
+                  {{ harnessStore.label(row.harness_type) }}
+                </el-tag>
+                <span class="muted">{{ row.arm_label || '—' }}</span>
+              </div>
               <div v-if="row.sim_label" class="muted" style="font-size:12px">
                 模拟：{{ row.sim_label }}
               </div>
             </template>
           </el-table-column>
 
-          <!-- 进度拆成三列：数字 / 失败 / 进度条。
-               原来挤在一列里，失败数被括号包在灰字后面，扫列时看不出哪几个有问题。 -->
-          <el-table-column label="进度" width="110" align="center"
-            sortable :sort-by="r => (r.completed_tasks + r.failed_tasks) / (r.total_tasks || 1)">
+          <el-table-column label="状态" width="100" align="center">
             <template #default="{row}">
-              <span v-if="row.create_error" class="err">创建失败</span>
-              <span v-else>{{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}</span>
+              <el-tag v-if="row.status" size="small" :type="instStatusType(row.status)">{{ row.status }}</el-tag>
+              <span v-else>—</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="进度" min-width="150">
+            <template #default="{row}">
+              <template v-if="!row.create_error">
+                <el-progress :percentage="row.progress_percent" :stroke-width="8" :show-text="false" />
+                <div class="muted" style="font-size:12px">
+                  {{ row.completed_tasks + row.failed_tasks }} / {{ row.total_tasks }}
+                </div>
+              </template>
+              <span v-else class="err">创建失败</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="成功" width="80" align="center"
+            sortable :sort-by="r => r.completed_tasks || 0">
+            <template #default="{row}">
+              <span v-if="row.create_error">—</span>
+              <span v-else>{{ row.completed_tasks }}</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="DONE" width="80" align="center"
+            sortable :sort-by="r => r.done_tasks || 0">
+            <template #default="{row}">
+              <span v-if="row.create_error">—</span>
+              <span v-else>{{ row.done_tasks }}</span>
             </template>
           </el-table-column>
 
@@ -142,22 +164,23 @@
             </template>
           </el-table-column>
 
-          <el-table-column label="任务进度" min-width="150">
+          <el-table-column label="并发" width="75" align="center"
+            sortable :sort-by="r => r.concurrent_num || 0">
             <template #default="{row}">
-              <el-progress v-if="!row.create_error" :percentage="row.progress_percent"
-                :stroke-width="8" :show-text="false" />
+              <span v-if="row.concurrent_num">{{ row.concurrent_num }}</span>
               <span v-else class="muted">—</span>
             </template>
           </el-table-column>
 
-          <el-table-column label="状态" width="100" align="center">
+          <el-table-column label="创建时间" width="150" align="center"
+            sortable :sort-by="r => r.instance_created_at || ''">
             <template #default="{row}">
-              <el-tag v-if="row.status" size="small" :type="instStatusType(row.status)">{{ row.status }}</el-tag>
-              <span v-else>—</span>
+              <span v-if="row.instance_created_at" class="muted" style="font-size:12px">
+                {{ fmtTime(row.instance_created_at) }}
+              </span>
+              <span v-else class="muted">—</span>
             </template>
           </el-table-column>
-
-          <el-table-column label="DONE" width="80" align="center" prop="done_tasks" />
 
           <el-table-column label="操作" width="250" fixed="right">
             <template #default="{row}">
@@ -766,6 +789,15 @@ function fmtTokens(n) {
   return String(n)
 }
 
+// 列表里的创建时间：同一批实验几乎同秒创建，年份没有信息量，只留「月-日 时:分」。
+// 后端给的可能是 ISO（2026-11-24T10:51:56.567646）或 SQLite 的空格分隔格式。
+function fmtTime(v) {
+  if (!v) return '—'
+  const s = String(v).replace('T', ' ')
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ ](\d{2}):(\d{2})/.exec(s)
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : s.slice(0, 16)
+}
+
 function gotoCell(instanceId, configName) {
   router.push(`/instance/${instanceId}?tab=outputs&config=${encodeURIComponent(configName)}`)
 }
@@ -988,6 +1020,9 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
   border-radius: 6px; padding: 12px; font-size: 12px;
   max-height: 360px; overflow: auto; margin: 0;
 }
+/* Harness 列：标签与配置名同行，配置名过长时由 show-overflow-tooltip 截断 */
+.harness-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.harness-cell .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-ops {
   display: flex;
   align-items: center;

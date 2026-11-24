@@ -254,14 +254,30 @@ async function handleCommand(cmd, row) {
     },
   }
   if (cmd === 'delete') {
+    // 默认连带删子任务（它们本来就是这个实验建出来的）。
+    // 「保留子任务」是取消按钮之外的第三个选项，走 distinguishCancelAndClose。
+    let keep = false
     try {
       await ElMessageBox.confirm(
-        `删除实验「${row.name}」？\n子任务（已跑过的任务、日志、轨迹）会保留，只删除实验编组。`,
-        '删除确认', { type: 'warning' })
-    } catch { return }
+        `删除实验「${row.name}」及其全部子任务？\n`
+        + `子任务的日志、轨迹、产物会一并删除，不可恢复。\n`
+        + `如果只想解散实验编组、保留这些任务，请点「保留子任务」。`,
+        '删除确认',
+        {
+          type: 'warning',
+          distinguishCancelAndClose: true,
+          confirmButtonText: '删除实验和子任务',
+          cancelButtonText: '保留子任务',
+        })
+    } catch (e) {
+      if (e === 'cancel') keep = true   // 点了「保留子任务」
+      else return                       // 关闭弹窗 / Esc → 什么都不做
+    }
     try {
-      const res = await api.delete(`/batch-experiments/${row.id}`)
-      ElMessage.success(res.message || '已删除')
+      const res = await api.delete(`/batch-experiments/${row.id}`,
+        { params: keep ? { keep_instances: true } : {} })
+      if (res.skipped && res.skipped.length) ElMessage.warning(res.message)
+      else ElMessage.success(res.message || '已删除')
       load()
     } catch { /* interceptor */ }
     return
