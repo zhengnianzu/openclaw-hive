@@ -369,19 +369,20 @@ def _cache_paths(key: str) -> tuple[str, str]:
     return base, base + ".lock"
 
 
-def _cache_read(path: str) -> tuple[dict | None, float]:
+def _cache_read(path: str) -> tuple[dict | list | None, float]:
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
         data, at = d.get("data"), float(d.get("at") or 0)
-        if isinstance(data, dict):
+        # 注意也接受 list：_queue_page 返回的是数组，只认 dict 会让它永远不命中
+        if isinstance(data, (dict, list)):
             return data, at
     except (OSError, ValueError):
         pass
     return None, 0.0
 
 
-def _cache_write(path: str, data: dict, at: float) -> None:
+def _cache_write(path: str, data, at: float) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}"
@@ -473,17 +474,28 @@ def _file_cache(key: str, ttl: float, compute) -> dict:
 def prewarm_caches() -> None:
     """后端启动时预热，避免部署后第一个用户请求吃 5 秒。
 
+    三份**并行**算：串行要 16 秒（5.5 + 1.9 + 0.7 再加等锁），并行只要最慢的那份。
     四个 worker 会同时调到这里；flock 保证每份只算一次，其余进程等文件出现后直接读。
     """
-    for key, ttl, compute in (
+    targets = (
         ("queue_counts", _QC_TTL, _queue_counts_uncached),
         ("load_10", _LOAD_TTL, lambda: _load_inputs(10)),
         ("queue_active_50", _QUEUE_TTL, lambda: _queue_page(50, "active")),
-    ):
-        try:
-            _file_cache(key, ttl, compute)
-        except Exception:
-            pass
+    )
+    threads = []
+    for key, ttl, compute in targets:
+        t = threading.Thread(target=_prewarm_one, args=(key, ttl, compute), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=30)
+
+
+def _prewarm_one(key: str, ttl: float, compute) -> None:
+    try:
+        _file_cache(key, ttl, compute)
+    except Exception:
+        pass
 
 
 def _queue_counts() -> dict:
