@@ -2124,7 +2124,11 @@ def _clear_failed_task_logs(output_dir: str) -> list[tuple[str, int, str | None]
             match = re.fullmatch(r"task-(\d+)\.log", entry.name)
             if not match or not entry.is_file(follow_symlinks=False):
                 continue
-            status, _code, config_name = _scan_task_file(entry.path)
+            # _scan_task_file 返回 (status, code, config, ts) 四元组；
+            # 这里只用前三项，第四个必须显式接住，否则 ValueError 会让
+            # 「重跑失败样本」在启动准备阶段直接失败（error_summary 里是
+            # "too many values to unpack (expected 3)"）。
+            status, _code, config_name, _ts = _scan_task_file(entry.path)
             if status in ("任务失败", "任务异常"):
                 failed.append((entry.path, int(match.group(1)), config_name))
 

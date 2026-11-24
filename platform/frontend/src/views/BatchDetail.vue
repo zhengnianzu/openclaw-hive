@@ -84,7 +84,13 @@
         </div>
 
         <!-- 任务列表并入执行概览：一屏看完「这批跑得怎么样 + 每个子任务怎么样」 -->
-        <el-table :data="items" size="small" border style="width:100%;margin-top:20px">
+        <el-table :data="items" size="small" border style="width:100%;margin-top:20px"
+          :row-class-name="({ row }) => (row.failed_tasks > 0 || row.status === 'failed') ? 'row-has-fail' : ''">
+          <!-- 序号：口头/截图指认任务时用（「第 3 个配置挂了」）。
+               用行号而不是实例 ID —— 实例 ID 太长，而且带创建时间戳看不出顺序。 -->
+          <el-table-column label="#" width="60" align="center" fixed>
+            <template #default="{ $index }">{{ $index + 1 }}</template>
+          </el-table-column>
           <el-table-column label="任务名称" min-width="230">
             <template #default="{row}">
               <el-link v-if="row.instance_id" type="primary"
@@ -153,12 +159,12 @@
                   <el-button size="small">更多<el-icon style="margin-left:2px"><ArrowDown /></el-icon></el-button>
                   <template #dropdown>
                     <el-dropdown-menu>
-                      <el-dropdown-item command="start" :disabled="!['created','stopped'].includes(row.status)">
-                        启动任务
-                      </el-dropdown-item>
-                      <el-dropdown-item command="rerun"
-                        :disabled="!(row.failed_tasks > 0) || ['running','preparing','queued'].includes(row.status)">
-                        重跑失败样本<span v-if="row.failed_tasks" class="menu-count">（{{ row.failed_tasks }}）</span>
+                      <!-- 「启动」= 在原实例上续跑：hive 读 complete.jsonl 跳过已成功
+                           的样本，只跑剩下的。failed 状态也允许 —— 那正是要续跑的场景，
+                           只拦真正在跑的（running/preparing/queued）。 -->
+                      <el-dropdown-item command="start"
+                        :disabled="['running','preparing','queued'].includes(row.status)">
+                        启动 / 续跑<span v-if="row.failed_tasks" class="menu-count">（失败 {{ row.failed_tasks }}）</span>
                       </el-dropdown-item>
                       <el-dropdown-item command="stop" :disabled="!['running','preparing'].includes(row.status)">
                         停止任务
@@ -818,10 +824,12 @@ const isActive = computed(() => ['created', 'running', 'paused'].includes(exp.va
 // 只跑剩下的，所以不会把整份测试集重跑一遍。
 async function onRowCommand(cmd, row) {
   if (!row.instance_id) return
-  const label = cmd === 'start' ? '启动' : cmd === 'rerun' ? '重跑失败样本' : '停止'
-  const tip = cmd === 'rerun'
+  const label = cmd === 'start' ? '启动/续跑' : '停止'
+  // 续跑是增量的：hive 读 complete.jsonl 跳过已成功项，只跑失败的那些。
+  // 有失败样本时把条数带进确认文案，避免用户以为要整份重跑。
+  const tip = cmd === 'start' && row.failed_tasks
     ? `任务「${row.instance_name || row.instance_id}」还有 ${row.failed_tasks} 条失败样本，`
-      + '将只重跑这些失败项（已成功的会跳过）。继续？'
+      + '将在原任务上继续跑（已成功的会跳过）。继续？'
     : `${label}任务「${row.instance_name || row.instance_id}」？`
   try {
     await ElMessageBox.confirm(tip, label + '确认', { type: 'warning' })
@@ -973,6 +981,8 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
   white-space: nowrap;
 }
 .row-ops :deep(.el-button + .el-button) { margin-left: 0; }
+/* 有失败样本（或子任务整体失败）的行淡红底，扫一眼就能定位到要处理的行 */
+:deep(.el-table .row-has-fail > td) { background: #fef0f0; }
 .btn-badge {
   display: inline-block;
   margin-left: 6px;
