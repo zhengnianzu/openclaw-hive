@@ -1045,7 +1045,9 @@ const form = ref({
     model_id: '',
     model_api_type: '',
     suffix_api_keys: true,
-    proxy_enable: false,
+    // 批量默认开本地代理：模型流量经本地端口转发、轨迹日志才完整。
+    // 单任务那边也是默认开启的，这里跟它对齐。
+    proxy_enable: true,
     agents: [],
     sandbox_config_id: 0,
     code_repo_id: null,
