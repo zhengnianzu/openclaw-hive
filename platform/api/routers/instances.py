@@ -11,7 +11,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -21,6 +21,7 @@ from ..core.config import settings
 from ..core.database import get_connection, async_execute, async_query, async_query_one
 from ..core.security import get_current_user, require_operator
 from ..models.instance import (
+    BulkKeyItem, BulkKeyRequest, BulkKeyResponse,
     InstanceCreate, InstanceInfo, InstanceOverview, OverviewBatchRequest,
 )
 from ..services.queue_scheduler import (
@@ -257,9 +258,36 @@ def _resolve_key_gen_rule(base_url: str, cfg: dict) -> dict:
     }
 
 
+# key 名字的字节上限。上游（tokenfly 网关）超长时返回
+# {"message":"Token name is too long"}，而且是 HTTP 200，raise_for_status 拦不住。
+# 实测 41 字节能过、56 字节被拒，取 40 这个保守值。
+# 批量实验里名字是「用户_时间戳_实验名-配置N_agent名」拼出来的，中文实验名
+# 一个字 3 字节，很容易顶破；截断发生在这里而不是各调用点，保证主 Agent、
+# user_proxy agent、手动「新建KEY」三条路径口径一致。
+_KEY_NAME_MAX_BYTES = 40
+
+
+def _truncate_key_name(name: str) -> str:
+    """把 key 名字截到上游能接受的字节长度，按字符边界切，不产生半个汉字。"""
+    s = str(name or "").strip()
+    if len(s.encode("utf-8")) <= _KEY_NAME_MAX_BYTES:
+        return s
+    out = []
+    used = 0
+    for ch in s:
+        n = len(ch.encode("utf-8"))
+        if used + n > _KEY_NAME_MAX_BYTES:
+            break
+        out.append(ch)
+        used += n
+    return "".join(out)
+
+
 async def _request_api_key(base_url: str, invite_code: str, name: str) -> str:
     cfg = _load_key_gen_config()
     rule = _resolve_key_gen_rule(base_url, cfg)
+
+    name = _truncate_key_name(name)
 
     effective_base = rule["base_url"]
     if not effective_base:
@@ -345,6 +373,64 @@ async def generate_api_key(
         raise HTTPException(status_code=502, detail=f"申请 key 失败：{e}")
 
     return {"api_key": api_key}
+
+
+@key_router.post("/generate-api-keys")
+async def generate_api_keys(
+    req: BulkKeyRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """批量申请 API Key（批量实验「每个 Harness 一把」用）。
+
+    与 /generate-api-key 的区别只有两点：
+      1. 一次申请多把，逐把返回成功/失败 —— 一把失败不该让整批白跑；
+      2. 两把之间有 interval_seconds 的间隔。上游（tokenfly 网关）对同一 token
+         的申请有速率限制，连打必然 429（实测建 3 个 Harness × 3 个 agent 会在
+         第一把之后全 429，最后一把 key 都没有）。
+
+    失败原因照原样透出：用户需要区分「邀请码不对」和「又限流了」——前者要改
+    表单，后者等一会儿重试即可。
+    """
+    if not req.invite_code:
+        raise HTTPException(status_code=400, detail="invite_code 不能为空")
+    if not req.names:
+        raise HTTPException(status_code=400, detail="names 不能为空")
+
+    interval = max(0.0, float(req.interval_seconds or 0))
+    items: List[BulkKeyItem] = []
+    for i, raw_name in enumerate(req.names):
+        name = str(raw_name or "").strip()
+        if not name:
+            items.append(BulkKeyItem(name="", error="名字为空"))
+            continue
+        if i > 0 and interval:
+            await asyncio.sleep(interval)
+        try:
+            api_key = await _request_api_key(req.base_url or "", req.invite_code, name)
+            items.append(BulkKeyItem(name=name, api_key=api_key))
+        except UpstreamKeyError as e:
+            items.append(BulkKeyItem(name=name, error=_truncate_upstream(str(e))))
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                detail = _upstream_message(e.response.json())
+            except Exception:
+                detail = ""
+            detail = detail or (e.response.text or "").strip()
+            if not detail:
+                detail = f"上游返回 HTTP {e.response.status_code}"
+                if e.response.status_code == 429:
+                    detail += "（限流，请稍后重试或调大间隔）"
+            items.append(BulkKeyItem(name=name, error=_truncate_upstream(detail)))
+        except Exception as e:
+            items.append(BulkKeyItem(name=name,
+                                     error=_truncate_upstream(str(e))))
+    return BulkKeyResponse(items=items)
+
+
+def _truncate_upstream(msg: str) -> str:
+    """上游报错可能夹着一个完整 URL，截断避免把 query 里的 token 顶到界面上。"""
+    return str(msg or "")[:200]
 
 
 def _get_instance_dir(instance_id: str) -> str:
@@ -1487,7 +1573,10 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     # base_url 可来自 req.model_base_url，或回退到 key_gen.yaml 的默认配置
     if req.invite_code and not req.model_api_key:
         try:
-            key_name = f"{user['username']}_{datetime.now().strftime('%y%m%d%H%M')}_{req.name}"
+            # 用 task_name 而不是展示名 req.name：后者是「实验名-配置N」，
+            # 中文实验名一个字 3 字节，很容易顶破上游的名字长度限制；
+            # task_name 形如 batch-20261124-007-c1，短、唯一、还能直接对回子任务。
+            key_name = f"{user['username']}_{req.task_name}"
             req.model_api_key = await _request_api_key(req.model_base_url or "", req.invite_code, key_name)
             if not req.model_api_key:
                 raise ValueError("申请接口未返回 api_key，请检查 key_gen.yaml 配置与响应字段")
@@ -1625,12 +1714,18 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             agent_key = ag.api_key
             if not agent_key and ag.invite_code:
                 try:
+                    # 同主 Agent：用 task_name 保持名字短且可追溯。
+                    # agent 名可能较长（user_simulator 就 14 字符），超长部分由
+                    # _request_api_key 内的 _truncate_key_name 统一截断。
                     agent_key = await _request_api_key(
                         ag.base_url or "",
                         ag.invite_code,
-                        f"{user['username']}_{datetime.now().strftime('%y%m%d%H%M')}_"
-                        f"{req.name}_{ag.name}",
+                        f"{req.task_name}_{ag.name}",
                     )
+                    # 回写到 req，与主 Agent 的 req.model_api_key = ... 同口径：
+                    # create_params 由 req.model_dump() 落库，只赋给局部变量会让
+                    # 详情页「创建参数」里 agents[].api_key 显示为空（文件里却有真 key）。
+                    ag.api_key = agent_key
                 except Exception as e:
                     print(f"[api_key] agent {ag.name} 自动申请失败 (instance name={req.name}): {e}")
             if agent_key:

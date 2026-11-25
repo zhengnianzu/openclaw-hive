@@ -258,7 +258,30 @@
                     </el-autocomplete>
                   </div>
 
+                  <!-- 取 key 的两条路径二选一。invite code 在左、是默认项：
+                       它在「矩阵预览」那步统一预申请，每个子任务各一把独立 key，
+                       上游按 key 拆用量；API Key 则是整批共用手里现成的那把。 -->
                   <div class="field">
+                    <label class="lbl2">取 Key 方式</label>
+                    <el-radio-group v-model="curModel.key_mode">
+                      <el-radio-button value="invite">Invite Code（自动申请）</el-radio-button>
+                      <el-radio-button value="key">
+                        {{ curArm.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key' }}
+                      </el-radio-button>
+                    </el-radio-group>
+                  </div>
+
+                  <div v-if="curModel.key_mode === 'invite'" class="field">
+                    <label class="lbl2">Invite Code</label>
+                    <el-input v-model="curModel.invite_code"
+                      placeholder="例如：glm_coding_plan" />
+                    <div class="hint">
+                      进入「任务矩阵」时会用它为<b>每个子任务各申请一把独立 Key</b>，
+                      申请结果逐条显示，失败可重试 —— 创建前就能确认，不会建出没有 key 的任务。
+                    </div>
+                  </div>
+
+                  <div v-else class="field">
                     <label class="lbl2">
                       {{ curArm.harness_type === 'claude-code' ? '模型 Token' : '模型 API Key' }}
                     </label>
@@ -269,7 +292,8 @@
                         @update:model-value="v => keyDraft[curModel._uid] = v"
                         @blur="commitDraftKey(curModel._uid, curModel)"
                         @keyup.enter="commitDraftKey(curModel._uid, curModel)"
-                        placeholder="留空则按 Invite Code 自动申请" type="password" autocomplete="off" />
+                        placeholder="粘贴已有 Key；所有子任务共用这一把"
+                        type="password" autocomplete="off" />
                       <el-button v-if="curModel.model_api_key"
                         @click="curModel.model_api_key = ''">清除</el-button>
                       <el-button type="primary"
@@ -277,21 +301,6 @@
                     </div>
                     <div v-if="curModel.model_api_key" class="hint">
                       已设置 Key，仅显示掩码；需更换请点「清除」后重新粘贴或新建
-                    </div>
-                  </div>
-
-                  <!-- Invite Code 是最高优先级：填了它就表示「每个子任务各要一把独立 key」。
-                       已填的 key 不浪费 —— 留给第一个子任务用，其余由后端各自申请。 -->
-                  <div class="field">
-                    <label class="lbl2">Invite Code</label>
-                    <el-input v-model="curModel.invite_code" placeholder="例如：glm_coding_plan（留空则不自动申请）" />
-                    <div class="hint">
-                      <b>批量默认推荐填这里</b>：填了之后每个子任务都会用这个 invite code
-                      各自申请一把独立 key，上游按 key 拆分用量，互不挤占额度。
-                      <template v-if="curModel.model_api_key">
-                        <b style="color:#e6a23c">已填的 Key 会分配给第一个子任务使用（不浪费），
-                        其余子任务另行申请。</b>
-                      </template>
                     </div>
                   </div>
 
@@ -330,275 +339,267 @@
           </div>
 
           <!-- ---------- Tab: 用户模拟配置（通用配置，对所有 Harness 生效） ---------- -->
-          <div v-else-if="tab === 'sim'" class="card">
-            <div class="panel-title">
-              用户模拟配置
-              <span class="panel-note">（通用配置 · 对本批次全部 Harness 生效，不是矩阵维度）</span>
-            </div>
-            <div class="hint" style="margin-bottom:14px">
-              这里配置的 Agent 会写进每个子任务的 <code>user_proxy_model.json</code>。
-              与「Harness 类型」「Harness 配置」两处不同 —— 那两处决定矩阵有几列，这里只决定每个子任务内部怎么跑。
-              不添加任何 Agent 时，子任务使用 Harness 模板自带的默认配置。
-            </div>
-
-            <div class="section-head" style="margin-bottom:10px">
-              <span class="muted">Agent 列表（{{ sharedAgents.length }}）</span>
-              <el-button type="primary" size="small" @click="addAgent">
+          <!-- 与「主Agent模型配置」同一套左右分栏：左列表、右配置。
+               agent 数量通常只有 2~3 个，但卡片式分页横着排、名字一长就挤成一行，
+               列表式和模型轴口径一致，也好扩展。 -->
+          <div v-else-if="tab === 'sim'" class="split">
+            <aside class="list-col">
+              <div class="list-head">
+                <span>Agent 列表（{{ sharedAgents.length }}）</span>
+              </div>
+              <el-button class="add-btn" @click="addAgent">
                 <el-icon><Plus /></el-icon> 添加 Agent
               </el-button>
-            </div>
 
-            <el-empty v-if="!sharedAgents.length" :image-size="60"
-              description="未添加 Agent —— 使用 Harness 模板默认的 user_proxy_model.json" />
+              <div v-if="!sharedAgents.length" class="list-empty">
+                未添加 Agent —— 子任务使用 Harness 模板自带的 user_proxy_model.json。
+              </div>
 
-            <!-- 与单任务「用户模拟配置」tab 同口径：card 式 agent 分页，首张不可关 -->
-            <el-tabs v-else :model-value="String(selectedAgentTab)"
-              type="card" class="agent-tabs" @update:model-value="v => selectedAgentTab = Number(v)"
-              @tab-remove="tabName => removeAgent(Number(tabName))">
-              <el-tab-pane v-for="(ag, ai) in sharedAgents" :key="ai"
-                :label="ag.name || '未命名'" :name="String(ai)" :closable="ai !== 0">
-                <div class="field">
-                  <label class="lbl2">Agent 名称</label>
-                  <el-input v-model="ag.name" placeholder="例如：user_simulator" />
+              <div v-for="(ag, ai) in sharedAgents" :key="ai" class="list-item"
+                :class="{ active: selectedAgentTab === ai }" @click="selectedAgentTab = ai">
+                <span class="li-tag">A{{ ai + 1 }}</span>
+                <div class="li-main">
+                  <div class="li-name">{{ ag.name || '未命名' }}</div>
+                  <div class="li-sub">{{ ag.model || '未填模型 ID' }}</div>
                 </div>
+                <el-button text class="li-more" @click.stop="removeAgent(ai)">
+                  <el-icon><Delete /></el-icon>
+                </el-button>
+              </div>
+            </aside>
 
-                <!-- 候选带 /v1：后端对 agents[].base_url 是原样写入 user_proxy_model.json，
-                     不像主 Agent 那样按 harness 自动补 /v1，所以这里必须给带后缀的值。 -->
-                <div class="field">
-                  <label class="lbl2">模型 Base URL</label>
-                  <el-autocomplete v-model="ag.base_url" :fetch-suggestions="queryAgentBaseUrls"
-                    placeholder="选择或输入，例如：http://192.168.30.95:8084/v1（需带 /v1）"
-                    style="width:100%" clearable :trigger-on-focus="true" fit-input-width>
-                    <template #default="{ item }">
-                      <span>{{ item.value }}</span>
-                      <span class="opt-meta">{{ item.proxy_name || '未登记' }}{{ item.used ? ` · ${item.used} 次` : '' }}</span>
-                    </template>
-                  </el-autocomplete>
-                  <div class="hint">user_simulator 的 Base URL 需带 /v1 后缀</div>
-                </div>
-
-                <div class="field">
-                  <label class="lbl2">模型 API Key</label>
-                  <div class="row">
-                    <!-- 与主 Agent 的 key 框同口径：已设置只显示掩码、不回显原文、无眼睛图标 -->
-                    <el-input v-if="ag.api_key" :model-value="maskKey(ag.api_key)" readonly />
-                    <el-input v-else :model-value="keyDraft[agentSlot(ai)] || ''"
-                      @update:model-value="v => keyDraft[agentSlot(ai)] = v"
-                      @blur="commitDraftKey(agentSlot(ai), ag)"
-                      @keyup.enter="commitDraftKey(agentSlot(ai), ag)"
-                      placeholder="留空则按 Invite Code 自动申请" type="password" autocomplete="off" />
-                    <el-button v-if="ag.api_key" @click="ag.api_key = ''">清除</el-button>
-                    <el-button type="primary" @click="openKeyDialog('agent', agentSlot(ai))">
-                      新建KEY
+            <section class="detail-col">
+              <div v-if="!curAgent" class="detail-empty">
+                <el-empty :image-size="80"
+                  description="点左侧「添加 Agent」配置 user_proxy_model.json" />
+              </div>
+              <template v-else>
+                <div class="detail-head">
+                  <div class="dh-left">
+                    <span class="dh-tag">A{{ selectedAgentTab + 1 }}</span>
+                    <span class="dh-title">{{ curAgent.name || '未命名' }}</span>
+                    <el-tag size="small">所有 Harness</el-tag>
+                  </div>
+                  <div class="dh-right">
+                    <el-button type="danger" plain @click="removeAgent(selectedAgentTab)">
+                      <el-icon><Delete /></el-icon> 删除
                     </el-button>
                   </div>
-                  <div v-if="ag.api_key" class="hint">
-                    已设置 Key，仅显示掩码；需更换请点「清除」
+                </div>
+
+                <div class="subpanel">
+                  <div class="field narrow">
+                    <label class="lbl2">Agent 名称</label>
+                    <el-input v-model="curAgent.name" placeholder="例如：user_simulator" />
+                  </div>
+
+                  <!-- 候选带 /v1：后端对 agents[].base_url 是原样写入 user_proxy_model.json，
+                       不像主 Agent 那样按 harness 自动补 /v1，所以这里必须给带后缀的值。 -->
+                  <div class="field">
+                    <label class="lbl2">模型 Base URL</label>
+                    <el-autocomplete v-model="curAgent.base_url" :fetch-suggestions="queryAgentBaseUrls"
+                      placeholder="选择或输入，例如：http://192.168.30.95:8084/v1（需带 /v1）"
+                      style="width:100%" clearable :trigger-on-focus="true" fit-input-width>
+                      <template #default="{ item }">
+                        <span>{{ item.value }}</span>
+                        <span class="opt-meta">{{ item.proxy_name || '未登记' }}{{ item.used ? ` · ${item.used} 次` : '' }}</span>
+                      </template>
+                    </el-autocomplete>
+                  </div>
+
+                  <!-- 与主 Agent 模型配置同口径的二选一：invite code 在左、为默认 -->
+                  <div class="field">
+                    <label class="lbl2">取 Key 方式</label>
+                    <el-radio-group v-model="curAgent.key_mode">
+                      <el-radio-button value="invite">Invite Code（自动申请）</el-radio-button>
+                      <el-radio-button value="key">模型 API Key</el-radio-button>
+                    </el-radio-group>
+                  </div>
+
+                  <div v-if="curAgent.key_mode === 'invite'" class="field">
+                    <label class="lbl2">Invite Code</label>
+                    <el-input v-model="curAgent.invite_code" placeholder="例如：glm_coding_plan" />
+                    <div class="hint">
+                      进入「任务矩阵」时为每个子任务的该 agent 各申请一把独立 Key，
+                      申请结果逐条显示、失败可重试。
+                    </div>
+                  </div>
+
+                  <div v-else class="field">
+                    <label class="lbl2">模型 API Key</label>
+                    <div class="row">
+                      <!-- 与主 Agent 的 key 框同口径：已设置只显示掩码、不回显原文、无眼睛图标 -->
+                      <el-input v-if="curAgent.api_key" :model-value="maskKey(curAgent.api_key)" readonly />
+                      <el-input v-else :model-value="keyDraft[agentSlot(selectedAgentTab)] || ''"
+                        @update:model-value="v => keyDraft[agentSlot(selectedAgentTab)] = v"
+                        @blur="commitDraftKey(agentSlot(selectedAgentTab), curAgent)"
+                        @keyup.enter="commitDraftKey(agentSlot(selectedAgentTab), curAgent)"
+                        placeholder="粘贴已有 Key，或点右侧「新建KEY」" type="password" autocomplete="off" />
+                      <el-button v-if="curAgent.api_key" @click="curAgent.api_key = ''">清除</el-button>
+                      <el-button type="primary" @click="openKeyDialog('agent', agentSlot(selectedAgentTab))">
+                        新建KEY
+                      </el-button>
+                    </div>
+                  </div>
+
+                  <div class="field narrow">
+                    <label class="lbl2">Provider</label>
+                    <el-input v-model="curAgent.provider" placeholder="例如：local-evaluator" />
+                  </div>
+
+                  <div class="field narrow">
+                    <label class="lbl2">API 类型</label>
+                    <el-select v-model="curAgent.api" placeholder="可选" clearable style="width:100%">
+                      <el-option label="OpenAI Completions" value="openai-completions" />
+                      <el-option label="Anthropic Messages" value="anthropic-messages" />
+                    </el-select>
+                  </div>
+
+                  <div class="field">
+                    <label class="lbl2">模型 ID</label>
+                    <div class="row">
+                      <el-input v-model="curAgent.model" placeholder="例如：gemini-3-flash-preview" />
+                      <el-button :loading="validating[agentSlot(selectedAgentTab)]"
+                        @click="validateAgent(selectedAgentTab)">验证模型</el-button>
+                    </div>
+                    <ValidateModelResult :result="validateResults[agentSlot(selectedAgentTab)]" />
+                  </div>
+                </div>
+              </template>
+            </section>
+          </div>
+
+          <!-- ---------- Tab: 运行配置（队列调度 + 子任务内部行为，左侧 tab 切换） ---------- -->
+          <div v-else-if="tab === 'run'" class="card">
+            <div class="panel-title">运行配置</div>
+
+            <el-tabs v-model="runTab" tab-position="left" class="run-tabs">
+              <!-- ===== 队列调度 ===== -->
+              <el-tab-pane label="队列调度" name="batch">
+                <div class="form-grid">
+                  <div class="field h">
+                    <label class="lbl">队列名称</label>
+                    <el-input v-model="form.queue.name" :placeholder="form.name || '留空则用实验名称'" />
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">队列并发量</label>
+                    <el-input-number v-model="form.queue.max_concurrent" :min="1" :max="50" />
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">独立并发</label>
+                    <el-input-number v-model="form.common.concurrent_num" :min="1" />
+                    <div class="hint">每个子任务内部同时跑几个沙箱</div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">每个样本重复次数</label>
+                    <el-input-number v-model="form.repeat_times" :min="1" :max="20" />
+                    <div class="hint">同一组合重复跑几轮（观察稳定性），会乘进总任务数</div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">长尾跳过</label>
+                    <el-switch v-model="form.queue.tail_skip_enabled"
+                      active-text="开启" inactive-text="关闭" />
+                    <div class="hint">
+                      队列里剩余任务已喂不满一轮并发时，额外放行一个，避免尾部拖长
+                    </div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">长尾阈值（%）</label>
+                    <el-input-number v-model="form.queue.tail_skip_percent" :min="1" :max="20"
+                      :disabled="!form.queue.tail_skip_enabled" />
+                    <div class="hint">分母是独立并发；10% 且独立并发 50 → 剩余不足 5 个时触发</div>
                   </div>
                 </div>
 
-                <!-- agent 的 invite code：与主 Agent 同口径，填了就每个子任务各申请一把 -->
-                <div class="field">
-                  <label class="lbl2">Invite Code</label>
-                  <el-input v-model="ag.invite_code" placeholder="例如：glm_coding_plan（留空则不自动申请）" />
+                <div class="field h wide" style="margin-top:16px">
+                  <label class="lbl">队列描述</label>
+                  <el-input v-model="form.queue.description" type="textarea" :rows="2"
+                    placeholder="可选，说明这条队列的用途" />
+                </div>
+              </el-tab-pane>
+
+              <!-- ===== 子任务参数 ===== -->
+              <el-tab-pane label="子任务参数" name="adv">
+                <div class="form-grid">
+                  <div class="field h">
+                    <label class="lbl">沙箱最大存活（秒）</label>
+                    <el-input-number v-model="form.common.max_ttl_second" :min="1800" :max="36000" :step="600" />
+                    <div class="hint">
+                      范围 1800 ~ 36000 秒；主程序超时 = 该值 − 600 秒，每条 queries[].timeout = 该值 − 1200 秒
+                    </div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">起始索引</label>
+                    <el-input-number v-model="form.common.start_index" :min="0" />
+                    <div class="hint">从测试集的第几条开始跑</div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">任务总数</label>
+                    <el-input-number v-model="form.common.total_num" :min="0" />
+                    <div class="hint">
+                      每个子任务跑几条。<b>0 表示按测试集样本数</b>（{{ sampleTotal }} 条）；
+                      填正数则只跑前 N 条，用于小样本冒烟或截断长数据集
+                    </div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">代码仓</label>
+                    <el-select v-model="form.common.code_repo_id" placeholder="选择代码仓（可选）"
+                      style="width:100%" clearable>
+                      <el-option v-for="r in codeRepoList" :key="r.id"
+                        :label="`${r.name} · ${r.version}`" :value="r.id" />
+                    </el-select>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">Key 追加沙箱后缀</label>
+                    <el-switch v-model="form.common.suffix_api_keys" active-text="开启" inactive-text="关闭" />
+                    <div class="hint">仅自部署模型需要；第三方模型须关闭，否则鉴权失败</div>
+                  </div>
+                  <div class="field h">
+                    <label class="lbl">启动本地代理</label>
+                    <el-switch v-model="form.common.proxy_enable" active-text="开启" inactive-text="关闭" />
+                    <div class="hint">模型流量经本地端口转发并记录轨迹日志</div>
+                  </div>
+                </div>
+
+                <div class="field" style="margin-top:16px">
+                  <label class="lbl">任务队列</label>
+                  <div class="hint" style="margin-top:4px">
+                    本批次全部子任务由「队列调度」里的策略统一编入同一个批次队列
+                    （<code>batch-&lt;实验ID&gt;</code>），不单独选择队列。
+                  </div>
+                </div>
+
+                <div class="field" style="margin-top:16px">
+                  <label class="lbl">数据集 OBS 配置（只读）</label>
+                  <el-descriptions v-if="selectedReg" :column="2" border size="small">
+                    <el-descriptions-item label="任务路径">
+                      <span :class="{ missing: !selectedReg.task_path_obs }">
+                        {{ selectedReg.task_path_obs || '未填写 —— 无法作为测试集' }}
+                      </span>
+                    </el-descriptions-item>
+                    <el-descriptions-item label="Skill 目录">
+                      {{ selectedReg.skill_dir_obs || '未填写 —— 用模板默认值' }}
+                    </el-descriptions-item>
+                    <el-descriptions-item label="Agent 目录">
+                      {{ selectedReg.agent_dir_obs || '未填写 —— 用模板默认值' }}
+                    </el-descriptions-item>
+                    <el-descriptions-item label="用户 Profile 目录">
+                      {{ selectedReg.user_folder_obs || '未填写（可选）' }}
+                    </el-descriptions-item>
+                    <el-descriptions-item label="默认技能">
+                      {{ selectedReg.default_skills || '未填写 —— 用模板默认值' }}
+                    </el-descriptions-item>
+                    <el-descriptions-item label="轨迹保存路径">
+                      {{ selectedReg.traj_save_path || '自动生成 {harness}_trajs/traj_{任务标识}' }}
+                    </el-descriptions-item>
+                  </el-descriptions>
                   <div class="hint">
-                    填了之后，每个子任务都会用这个 invite code 为「{{ ag.name || '该 agent' }}」
-                    各自申请一把独立 key。
-                    <template v-if="ag.api_key">
-                      <b style="color:#e6a23c">已填的 Key 会分配给第一个子任务使用（不浪费），
-                      其余子任务另行申请。</b>
-                    </template>
+                    OBS 配置由数据集统一管理，批量实验内不可改。需要调整请到
+                    <el-link type="primary" @click="router.push('/task-register')">数据集管理</el-link>。
                   </div>
-                </div>
-
-                <div class="field">
-                  <label class="lbl2">Provider</label>
-                  <el-input v-model="ag.provider" placeholder="例如：local-evaluator" />
-                  <div class="hint">留空时该 agent 不会被注入到 openclaw.json</div>
-                </div>
-
-                <div class="field">
-                  <label class="lbl2">API 类型</label>
-                  <el-select v-model="ag.api" placeholder="可选" clearable style="width:100%">
-                    <el-option label="OpenAI Completions" value="openai-completions" />
-                    <el-option label="Anthropic Messages" value="anthropic-messages" />
-                  </el-select>
-                </div>
-
-                <div class="field">
-                  <label class="lbl2">模型 ID</label>
-                  <div class="row">
-                    <el-input v-model="ag.model" placeholder="例如：gemini-3-flash-preview" />
-                    <el-button :loading="validating[agentSlot(ai)]"
-                      @click="validateAgent(ai)">验证模型</el-button>
-                  </div>
-                  <div class="hint">
-                    用该 agent 的 Base URL / API Key / 模型 ID 实打一次最小请求（base_url 带 /v1 也能识别）
-                  </div>
-                  <ValidateModelResult :result="validateResults[agentSlot(ai)]" />
                 </div>
               </el-tab-pane>
             </el-tabs>
-          </div>
-
-          <!-- ---------- Tab: 批量任务配置（队列配置 + 批次级参数） ---------- -->
-          <div v-else-if="tab === 'batch'" class="card">
-            <div class="panel-title">
-              批量任务配置
-              <span class="panel-note">（整批共用一条队列）</span>
-            </div>
-            <div class="hint" style="margin-bottom:14px">
-              实际吞吐由两级并发相乘决定：<b>队列并发</b>（同时跑几个子任务）×
-              <b>独立并发</b>（每个子任务内部同时开几个沙箱）。
-              队列并发最终还会受平台全局上限封顶。
-            </div>
-
-            <div class="form-grid">
-              <div class="field">
-                <label class="lbl">队列名称</label>
-                <el-input v-model="form.queue.name" :placeholder="form.name || '留空则用实验名称'" />
-              </div>
-              <div class="field">
-                <label class="lbl">队列并发量</label>
-                <el-input-number v-model="form.queue.max_concurrent" :min="1" :max="50" />
-                <div class="hint">这条队列同时放行几个子任务</div>
-              </div>
-              <div class="field">
-                <label class="lbl">独立并发</label>
-                <el-input-number v-model="form.common.concurrent_num" :min="1" />
-                <div class="hint">每个子任务内部同时跑几个沙箱</div>
-              </div>
-              <div class="field">
-                <label class="lbl">每个样本重复次数</label>
-                <el-input-number v-model="form.repeat_times" :min="1" :max="20" />
-                <div class="hint">同一组合重复跑几轮（观察稳定性），会乘进总任务数</div>
-              </div>
-              <div class="field">
-                <label class="lbl">长尾跳过</label>
-                <el-switch v-model="form.queue.tail_skip_enabled"
-                  active-text="开启" inactive-text="关闭" />
-                <div class="hint">
-                  队列里剩余任务已喂不满一轮并发时，额外放行一个，避免尾部拖长
-                </div>
-              </div>
-              <div class="field">
-                <label class="lbl">长尾阈值（%）</label>
-                <el-input-number v-model="form.queue.tail_skip_percent" :min="1" :max="20"
-                  :disabled="!form.queue.tail_skip_enabled" />
-                <div class="hint">分母是独立并发；10% 且独立并发 50 → 剩余不足 5 个时触发</div>
-              </div>
-            </div>
-
-            <div class="field" style="margin-top:16px">
-              <label class="lbl">队列描述</label>
-              <el-input v-model="form.queue.description" type="textarea" :rows="2"
-                placeholder="可选，说明这条队列的用途" />
-            </div>
-
-            <div class="total-box" style="margin-top:18px">
-              <div class="tb-left">
-                <div class="tb-k">总执行实例数</div>
-                <div class="tb-formula">
-                  {{ sampleTotal }} 样本 × {{ modelCount }} 模型<template
-                    v-if="form.repeat_times > 1"> × {{ form.repeat_times }} 轮</template>
-                </div>
-              </div>
-              <div class="tb-v" :class="{ warn: totalTasks > BIG_THRESHOLD }">{{ totalTasks }}</div>
-            </div>
-
-            <div class="hint" style="margin-top:10px">
-              同时最多占用沙箱 ≈ 队列并发 {{ form.queue.max_concurrent }}
-              × 独立并发 {{ form.common.concurrent_num }} =
-              <b>{{ form.queue.max_concurrent * form.common.concurrent_num }}</b>
-              （实际以平台全局上限为准）
-            </div>
-          </div>
-
-          <!-- ---------- Tab: 高级配置（子任务内部行为，不涉及矩阵维度） ---------- -->
-          <div v-else class="card">
-            <div class="panel-title">
-              高级配置
-              <span class="panel-note">（通用配置 · 对所有子任务生效）</span>
-            </div>
-
-            <div class="form-grid">
-              <div class="field">
-                <label class="lbl">沙箱最大存活（秒）</label>
-                <el-input-number v-model="form.common.max_ttl_second" :min="1800" :max="36000" :step="600" />
-                <div class="hint">
-                  范围 1800 ~ 36000 秒；主程序超时 = 该值 − 600 秒，每条 queries[].timeout = 该值 − 1200 秒
-                </div>
-              </div>
-              <div class="field">
-                <label class="lbl">起始索引</label>
-                <el-input-number v-model="form.common.start_index" :min="0" />
-                <div class="hint">从测试集的第几条开始跑</div>
-              </div>
-              <div class="field">
-                <label class="lbl">任务总数</label>
-                <el-input-number v-model="form.common.total_num" :min="0" />
-                <div class="hint">
-                  每个子任务跑几条。<b>0 表示按测试集样本数</b>（{{ sampleTotal }} 条）；
-                  填正数则只跑前 N 条，用于小样本冒烟或截断长数据集
-                </div>
-              </div>
-              <div class="field">
-                <label class="lbl">代码仓</label>
-                <el-select v-model="form.common.code_repo_id" placeholder="选择代码仓（可选）"
-                  style="width:100%" clearable>
-                  <el-option v-for="r in codeRepoList" :key="r.id"
-                    :label="`${r.name} · ${r.version}`" :value="r.id" />
-                </el-select>
-              </div>
-              <div class="field">
-                <label class="lbl">Key 追加沙箱后缀</label>
-                <el-switch v-model="form.common.suffix_api_keys" active-text="开启" inactive-text="关闭" />
-                <div class="hint">仅自部署模型需要；第三方模型须关闭，否则鉴权失败</div>
-              </div>
-              <div class="field">
-                <label class="lbl">启动本地代理</label>
-                <el-switch v-model="form.common.proxy_enable" active-text="开启" inactive-text="关闭" />
-                <div class="hint">模型流量经本地端口转发并记录轨迹日志</div>
-              </div>
-            </div>
-
-            <div class="field" style="margin-top:16px">
-              <label class="lbl">任务队列</label>
-              <div class="hint" style="margin-top:4px">
-                本批次全部子任务由「批量任务配置」里的调度策略统一编入同一个批次队列
-                （<code>batch-&lt;实验ID&gt;</code>），不单独选择队列。
-              </div>
-            </div>
-
-            <div class="field" style="margin-top:16px">
-              <label class="lbl">数据集 OBS 配置（只读）</label>
-              <el-descriptions v-if="selectedReg" :column="2" border size="small">
-                <el-descriptions-item label="任务路径">
-                  <span :class="{ missing: !selectedReg.task_path_obs }">
-                    {{ selectedReg.task_path_obs || '未填写 —— 无法作为测试集' }}
-                  </span>
-                </el-descriptions-item>
-                <el-descriptions-item label="Skill 目录">
-                  {{ selectedReg.skill_dir_obs || '未填写 —— 用模板默认值' }}
-                </el-descriptions-item>
-                <el-descriptions-item label="Agent 目录">
-                  {{ selectedReg.agent_dir_obs || '未填写 —— 用模板默认值' }}
-                </el-descriptions-item>
-                <el-descriptions-item label="用户 Profile 目录">
-                  {{ selectedReg.user_folder_obs || '未填写（可选）' }}
-                </el-descriptions-item>
-                <el-descriptions-item label="默认技能">
-                  {{ selectedReg.default_skills || '未填写 —— 用模板默认值' }}
-                </el-descriptions-item>
-                <el-descriptions-item label="轨迹保存路径">
-                  {{ selectedReg.traj_save_path || '自动生成 {harness}_trajs/traj_{任务标识}' }}
-                </el-descriptions-item>
-              </el-descriptions>
-              <div class="hint">
-                OBS 配置由数据集统一管理，批量实验内不可改。需要调整请到
-                <el-link type="primary" @click="router.push('/task-register')">数据集管理</el-link>。
-              </div>
-            </div>
           </div>
         </template>
 
@@ -607,10 +608,10 @@
           <div class="card">
             <div class="panel-title">任务矩阵</div>
             <div class="seg">
-              <button class="seg-item" :class="{ active: matrixView === 'combo' }"
-                @click="matrixView = 'combo'">组合视图</button>
               <button class="seg-item" :class="{ active: matrixView === 'tasks' }"
                 @click="matrixView = 'tasks'">任务视图</button>
+              <button class="seg-item" :class="{ active: matrixView === 'combo' }"
+                @click="matrixView = 'combo'">组合视图</button>
             </div>
 
             <template v-if="matrixView === 'combo'">
@@ -649,9 +650,33 @@
             </template>
 
             <template v-else>
-              <el-table :data="taskPreview" size="small" border max-height="520" style="width:100%">
-                <el-table-column type="index" label="#" width="60" />
-                <el-table-column label="Harness" min-width="180">
+              <!-- Key 预申请状态条：创建前就能确认每个子任务的 key 是否到位 -->
+              <div v-if="anyInviteMode" class="keybar"
+                :class="{ ok: keyStat.ready, bad: !keyStat.ready }">
+                <el-icon v-if="keyStat.ready"><CircleCheckFilled /></el-icon>
+                <el-icon v-else><WarningFilled /></el-icon>
+                <span class="kb-text">
+                  <template v-if="keyStat.ready">
+                    Key 已就绪：{{ keyStat.got }}/{{ keyStat.need }} 处全部申请成功
+                  </template>
+                  <template v-else>
+                    Key 未就绪：{{ keyStat.got }}/{{ keyStat.need }}，还缺 {{ keyStat.missing }} 处
+                  </template>
+                </span>
+                <el-button size="small" type="primary" :loading="keyPreparing"
+                  @click="prepareKeys(true)">
+                  {{ keyStat.got ? '申请缺失的 Key' : '申请 Key' }}
+                </el-button>
+                <el-button size="small" :disabled="keyPreparing"
+                  @click="resetPreparedKeys">全部作废重来</el-button>
+              </div>
+
+              <el-table :data="taskRows" size="small" border max-height="520" style="width:100%">
+                <el-table-column prop="cfg_no" label="#" width="56" align="center" />
+                <el-table-column label="子任务" min-width="190" show-overflow-tooltip>
+                  <template #default="{ row }">{{ row.name }}</template>
+                </el-table-column>
+                <el-table-column label="Harness" min-width="170" show-overflow-tooltip>
                   <template #default="{ row }">
                     <el-tag :style="harnessStore.tagStyle(row.harness_type)" size="small">
                       {{ harnessStore.label(row.harness_type) }}
@@ -659,16 +684,53 @@
                     <span style="margin-left:8px">{{ row.label }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="用户模拟" width="150">
-                  <template #default>{{ agentsLabel() }}</template>
+                <el-table-column prop="model_id" label="模型" width="160" show-overflow-tooltip />
+                <el-table-column label="Key 状态" width="150" align="center">
+                  <template #default="{ row }">
+                    <el-tag v-if="rowKeyOk(row)" size="small" type="success">
+                      全部就绪（{{ 1 + row.agents.length }}）
+                    </el-tag>
+                    <el-tag v-else size="small" type="danger">
+                      缺 {{ (row.model_key ? 0 : 1) + row.agents.filter(a => !a.key).length }} 把
+                    </el-tag>
+                  </template>
                 </el-table-column>
-                <el-table-column prop="model_id" label="模型" width="180" />
-                <el-table-column prop="repeat_idx" label="轮次" width="80" align="center" />
-                <el-table-column prop="sample_total" label="样本数" width="100" align="right" />
+                <el-table-column prop="repeat_idx" label="轮次" width="70" align="center" />
+                <el-table-column prop="sample_total" label="样本数" width="86" align="right" />
+                <el-table-column label="操作" width="86" align="center">
+                  <template #default="{ row }">
+                    <el-button text type="primary" @click="openTaskDetail(row)">详情</el-button>
+                  </template>
+                </el-table-column>
               </el-table>
-              <div v-if="taskPreviewTotal > taskPreview.length" class="hint" style="margin-top:8px">
-                共 {{ taskPreviewTotal }} 个子任务，上表只预览前 {{ taskPreview.length }} 条。
+              <div class="hint" style="margin-top:8px">
+                点「详情」查看该子任务的完整创建参数与每个 Agent 的 Key 分配。
+                <template v-if="taskPreviewTotal > taskRows.length">
+                  共 {{ taskPreviewTotal }} 个子任务，上表只预览前 {{ taskRows.length }} 条。
+                </template>
               </div>
+
+              <!-- Key 申请明细：成功/失败逐条列出，失败能看到上游原因 -->
+              <el-collapse v-if="keyPrepareLog.length" style="margin-top:12px">
+                <el-collapse-item :title="`Key 申请明细（${keyPrepareLog.length} 条，失败 ${keyPrepareLog.filter(x => !x.api_key).length} 条）`">
+                  <el-table :data="keyPrepareLog" size="small" border max-height="300">
+                    <el-table-column prop="cfg_key" label="配置" width="80" />
+                    <el-table-column prop="owner" label="角色" min-width="180" show-overflow-tooltip />
+                    <el-table-column prop="task" label="子任务" min-width="180" show-overflow-tooltip />
+                    <el-table-column label="Key" width="150">
+                      <template #default="{ row }">
+                        <span class="mono">{{ maskKey(row.api_key) || '—' }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="结果" min-width="200">
+                      <template #default="{ row }">
+                        <el-tag v-if="row.api_key" size="small" type="success">成功</el-tag>
+                        <span v-else class="err-text">{{ row.error || '失败' }}</span>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                </el-collapse-item>
+              </el-collapse>
             </template>
           </div>
         </template>
@@ -813,6 +875,76 @@
       </template>
     </el-dialog>
 
+    <!-- ============ 子任务详情（任务视图「详情」按钮） ============ -->
+    <el-dialog v-model="taskDetailVisible" title="子任务详情" width="720px"
+      destroy-on-close append-to-body>
+      <template v-if="taskDetailRow">
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="任务名称">{{ taskDetailRow.name }}</el-descriptions-item>
+          <el-descriptions-item label="配置序号">{{ taskDetailRow.cfg_key }}</el-descriptions-item>
+          <el-descriptions-item label="Harness">{{ taskDetailRow.label }}</el-descriptions-item>
+          <el-descriptions-item label="镜像">{{ taskDetailRow.image_name }}</el-descriptions-item>
+          <el-descriptions-item label="模型 ID">{{ taskDetailRow.model_id }}</el-descriptions-item>
+          <el-descriptions-item label="模型 Base URL">
+            {{ taskDetailRow.model_base_url || '继承兜底值' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="API 类型">
+            {{ taskDetailRow.model_api_type || '继承兜底值' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="样本数 × 轮次">
+            {{ taskDetailRow.sample_total }} × 第 {{ taskDetailRow.repeat_idx }} 轮
+          </el-descriptions-item>
+          <el-descriptions-item label="测试集">
+            {{ selectedReg?.task_name || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="队列">
+            {{ form.queue.name || form.name || '自动' }}
+            （并发 {{ form.queue.max_concurrent }} × 独立 {{ form.common.concurrent_num }}）
+          </el-descriptions-item>
+          <el-descriptions-item label="Key 追加沙箱后缀">
+            {{ form.common.suffix_api_keys ? '开启' : '关闭' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="启动本地代理">
+            {{ form.common.proxy_enable ? '开启' : '关闭' }}
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <!-- 重点：这个子任务里每个 agent 的 key 到底拿到没有 -->
+        <div class="kd-title">Key 分配（{{ taskDetailRow.cfg_key }}）</div>
+        <table class="bulk-table-inner">
+          <thead>
+            <tr><th>角色</th><th>取 Key 方式</th><th>Key</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>主 Agent · {{ taskDetailRow.model_id }}</td>
+              <td>{{ taskDetailRow.key_mode === 'invite' ? `Invite（${taskDetailRow.invite_code || '未填'}）` : '手填 Key' }}</td>
+              <td class="mono">{{ maskKey(taskDetailRow.model_key) || '—' }}</td>
+              <td>
+                <el-tag v-if="taskDetailRow.model_key" size="small" type="success">已就绪</el-tag>
+                <el-tag v-else size="small" type="danger">缺 Key</el-tag>
+              </td>
+            </tr>
+            <tr v-for="(ag, gi) in taskDetailRow.agents" :key="gi">
+              <td>{{ ag.name }}{{ ag.model ? ` · ${ag.model}` : '' }}</td>
+              <td>{{ ag.key_mode === 'invite' ? `Invite（${ag.invite_code || '未填'}）` : '手填 Key' }}</td>
+              <td class="mono">{{ maskKey(ag.key) || '—' }}</td>
+              <td>
+                <el-tag v-if="ag.key" size="small" type="success">已就绪</el-tag>
+                <el-tag v-else size="small" type="danger">缺 Key</el-tag>
+              </td>
+            </tr>
+            <tr v-if="!taskDetailRow.agents.length">
+              <td colspan="4" class="muted">未配置用户模拟 Agent —— 用 Harness 模板默认值</td>
+            </tr>
+          </tbody>
+        </table>
+      </template>
+      <template #footer>
+        <el-button type="primary" @click="taskDetailVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <!-- ================= 底部操作 ================= -->
     <footer class="bc-foot">
       <el-button v-if="step === 0" @click="router.push('/batch')">取消</el-button>
@@ -850,17 +982,23 @@ const PREVIEW_LIMIT = 200
 const STEPS = ['配置实验', '矩阵预览', '确认创建']
 // icon 用组件引用而不是字符串：<component :is="'X'"> 走的是全局注册表，
 // 而 main.js 只全局注册了部分图标，Collection / MagicStick 不在其中。
+// 「批量任务配置」与「高级配置」合并成一个「运行配置」tab，
+// 内部再用左侧 tab 切换 —— 两者都是「整批怎么跑」的参数，平铺成两个顶层 tab
+// 让顶部导航变长，也容易漏配。
 const TABS = [
   { key: 'harness', label: 'Harness 类型', icon: Collection },
   { key: 'hconfig', label: '主Agent模型配置', icon: Setting },
   { key: 'sim', label: '用户模拟配置', icon: User },
-  { key: 'batch', label: '批量任务配置', icon: Tickets },
-  { key: 'adv', label: '高级配置', icon: MagicStick },
+  { key: 'run', label: '运行配置', icon: Tickets },
 ]
+// 运行配置内部的左侧 tab：队列调度 / 子任务内部行为
+const runTab = ref('batch')
 
 const step = ref(0)
 const tab = ref('harness')
-const matrixView = ref('combo')
+// 默认任务视图：一行一个子任务、带完整创建参数与 key 状态，
+// 比 Harness×模型 网格更直接地回答「这批到底会建出什么、key 齐不齐」。
+const matrixView = ref('tasks')
 const creating = ref(false)
 const selectedArm = ref(-1)
 // 「Harness 配置」tab 里当前选中的模型（相对所属 Harness 的下标）
@@ -919,6 +1057,11 @@ function emptyModel() {
   return {
     _uid: uid(), model_id: '', model_base_url: '', model_api_key: '',
     model_api_type: '', invite_code: '',
+    // 取 key 的两条路径二选一。默认 invite：批量场景下每个子任务各一把独立 key
+    // 才是常态，共用一把会让上游的用量/限流全挤在一个 key 上。
+    key_mode: 'invite',
+    // 预申请结果：子任务标识 → key。在「矩阵预览」那步由 prepareKeys() 填充。
+    model_api_keys: {},
   }
 }
 function emptyHarness() {
@@ -930,7 +1073,12 @@ function emptyHarness() {
   }
 }
 function emptyAgent() {
-  return { name: '', model: '', provider: '', base_url: '', api_key: '', api: '', invite_code: '' }
+  return {
+    name: '', model: '', provider: '', base_url: '', api_key: '', api: '',
+    invite_code: '', key_mode: 'invite',
+    // 预申请结果：子任务标识 → key（该 agent 在每个子任务里各一把）
+    api_keys: {},
+  }
 }
 
 const curArm = computed(() =>
@@ -945,6 +1093,8 @@ const curModel = computed(() =>
   form.value.models[selectedModel.value] || null)
 // 用户模拟配置是通用配置：一份 agents，作用于全部子任务
 const sharedAgents = computed(() => form.value.agents)
+// 右栏当前编辑的 agent。列表可能被删空，所以这里必须允许为 null（模板用 v-if 兜底）
+const curAgent = computed(() => form.value.agents[selectedAgentTab.value] || null)
 
 const selectedReg = computed(() =>
   regList.value.find(r => r.id === form.value.registration_id) || null)
@@ -961,11 +1111,6 @@ const effectiveSampleTotal = computed(() => {
 const subtaskCount = computed(() =>
   form.value.harnesses.length * modelCount.value * form.value.repeat_times)
 const totalTasks = computed(() => subtaskCount.value * effectiveSampleTotal.value)
-
-function agentsLabel() {
-  const names = (form.value.agents || []).map(x => (x.name || '').trim()).filter(Boolean)
-  return names.length ? names.join('+') : '模板默认'
-}
 
 // ---------- 右侧迷你矩阵 ----------
 const sideCols = computed(() => {
@@ -1012,22 +1157,82 @@ const flatArms = computed(() => flattenArms())
 const taskPreviewTotal = computed(() =>
   flatArms.value.length * form.value.repeat_times)
 
-const taskPreview = computed(() => {
+// 每个子任务一行，带上它最终会拿到的全部创建参数。
+// 行的顺序必须与后端 create_experiment 的三重循环（arms → sim → repeat）
+// 完全一致 —— cfg_no 就是这个顺序的序号，key 按它分配，错位就会把 A 的 key
+// 发给 B。sim_arms 前端恒为空（用户模拟是通用配置），所以这里只有两层。
+const taskRows = computed(() => {
   const out = []
+  let cfgNo = 0
+  const multi = form.value.repeat_times > 1
   for (const a of flatArms.value) {
     for (let r = 1; r <= form.value.repeat_times; r++) {
+      cfgNo++
+      const model = form.value.models.find(m => m._uid === a._model_uid)
+      const cfgKey = `c${cfgNo}`
       out.push({
+        cfg_no: cfgNo,
+        cfg_key: cfgKey,
+        model_uid: a._model_uid,
+        // 与后端同口径：展示名「实验名-配置N」，task_name「batch-xxx-cN」
+        name: `${form.value.name || '实验'}-配置${cfgNo}${multi ? `-r${r}` : ''}`,
         harness_type: a.harness_type,
         label: a.label,
         model_id: a.model_id || '兜底',
+        model_base_url: a.model_base_url,
+        model_api_type: a.model_api_type,
         repeat_idx: r,
         sample_total: effectiveSampleTotal.value,
+        image_name: form.value.harnesses.find(
+          h => h.harness_type === a.harness_type
+            && h.harness_config_version_id === a.harness_config_version_id
+        )?.image_name || '模板默认',
+        key_mode: model?.key_mode || 'key',
+        invite_code: a.invite_code,
+        // 主 Agent 这个子任务最终用的 key
+        model_key: model?.key_mode === 'invite'
+          ? (model?.model_api_keys || {})[cfgKey] || ''
+          : (model?.model_api_key || ''),
+        // 各 user_proxy agent 在这个子任务里的 key
+        agents: form.value.agents.map(ag => ({
+          name: ag.name || '未命名',
+          model: ag.model || '',
+          base_url: ag.base_url || '',
+          provider: ag.provider || '',
+          api: ag.api || '',
+          key_mode: ag.key_mode || 'key',
+          invite_code: ag.invite_code || '',
+          key: ag.key_mode === 'invite'
+            ? (ag.api_keys || {})[cfgKey] || ''
+            : (ag.api_key || ''),
+        })),
       })
       if (out.length >= PREVIEW_LIMIT) return out
     }
   }
   return out
 })
+
+// 这一行所有 key 是否齐了（主 Agent + 每个 agent）
+function rowKeyOk(row) {
+  if (!row.model_key) return false
+  return row.agents.every(a => !!a.key)
+}
+// 整批的 key 统计，矩阵页顶部用
+const keyStat = computed(() => {
+  const rows = taskRows.value
+  const need = rows.length * (1 + form.value.agents.length)
+  let got = 0
+  for (const r of rows) {
+    if (r.model_key) got++
+    got += r.agents.filter(a => a.key).length
+  }
+  return { need, got, missing: need - got, ready: need > 0 && got === need }
+})
+// 是否有任何一处选了 invite 模式 —— 决定矩阵页要不要显示「申请 Key」按钮
+const anyInviteMode = computed(() =>
+  form.value.models.some(m => m.key_mode === 'invite')
+  || form.value.agents.some(a => a.key_mode === 'invite'))
 
 // 提交时把两条正交轴原样发给后端：harnesses（Harness 轴）+ models（模型轴）。
 // 后端按笛卡尔积展开成子任务，params_json 里也原样保存这两条轴 ——
@@ -1043,15 +1248,41 @@ function buildHarnesses() {
   }))
 }
 
+// key_mode 决定提交哪一条路径的值：选了 key 就不传 invite_code（否则后端会
+// 认为要「每个子任务各申请一把」而重复申请），选了 invite 就只传预申请结果。
 function buildModels() {
-  return form.value.models.map(m => ({
-    model_id: (m.model_id || '').trim(),
-    // base_url 原样传，不做 /v1 规整：各 harness 在 create_instance 里自己补或剥。
-    model_base_url: (m.model_base_url || '').trim(),
-    model_api_key: m.model_api_key || '',
-    model_api_type: m.model_api_type || '',
-    invite_code: (m.invite_code || '').trim(),
-  }))
+  return form.value.models.map(m => {
+    const useInvite = m.key_mode === 'invite'
+    return {
+      model_id: (m.model_id || '').trim(),
+      // base_url 原样传，不做 /v1 规整：各 harness 在 create_instance 里自己补或剥。
+      model_base_url: (m.model_base_url || '').trim(),
+      model_api_key: useInvite ? '' : (m.model_api_key || ''),
+      model_api_type: m.model_api_type || '',
+      invite_code: useInvite ? (m.invite_code || '').trim() : '',
+      // 预申请结果（子任务序号 → key）。后端按 cfg_no 取用，取到就清掉
+      // invite_code，不会再打一次上游。
+      model_api_keys: useInvite ? { ...(m.model_api_keys || {}) } : {},
+    }
+  })
+}
+
+// user_proxy agents 的提交形态。key_mode 是前端状态，不传给后端 ——
+// 后端只认「有没有 invite_code / api_key / 预申请的 api_keys」。
+function buildAgents() {
+  return form.value.agents.map(ag => {
+    const useInvite = ag.key_mode === 'invite'
+    return {
+      name: (ag.name || '').trim(),
+      model: ag.model || '',
+      provider: ag.provider || '',
+      base_url: ag.base_url || '',
+      api: ag.api || '',
+      api_key: useInvite ? '' : (ag.api_key || ''),
+      invite_code: useInvite ? (ag.invite_code || '').trim() : '',
+      api_keys: useInvite ? { ...(ag.api_keys || {}) } : {},
+    }
+  })
 }
 
 // 摊平后的臂：显式给后端一份「Harness × 模型」，同时用作前端预览。
@@ -1061,16 +1292,20 @@ function flattenArms() {
   for (const a of form.value.harnesses) {
     const base = a.label || configName(a.harness_config_id) || a.harness_type
     for (const m of form.value.models) {
+      const useInvite = m.key_mode === 'invite'
       out.push({
         harness_type: a.harness_type,
         harness_config_id: a.harness_config_id,
         harness_config_version_id: a.harness_config_version_id,
         label: m.model_id ? `${base} · ${m.model_id}` : base,
         model_base_url: (m.model_base_url || '').trim(),
-        model_api_key: m.model_api_key || '',
+        model_api_key: useInvite ? '' : (m.model_api_key || ''),
         model_id: (m.model_id || '').trim(),
         model_api_type: m.model_api_type || '',
-        invite_code: (m.invite_code || '').trim(),
+        invite_code: useInvite ? (m.invite_code || '').trim() : '',
+        model_api_keys: useInvite ? { ...(m.model_api_keys || {}) } : {},
+        // 预申请时要知道这条臂对应哪个模型（按 _uid 回写申请结果）
+        _model_uid: m._uid,
       })
     }
   }
@@ -1099,9 +1334,25 @@ const blockingIssues = computed(() => {
   })
   form.value.models.forEach((m, mi) => {
     if (!(m.model_id || '').trim()) issues.push(`第 ${mi + 1} 个模型未填模型 ID`)
+    // 选了 invite 模式就必须填 invite code —— 否则矩阵页无从申请，建出来的
+    // 子任务 key 为空、跑不起来。选 key 模式则必须有手填的那把。
+    if (m.key_mode === 'invite') {
+      if (!(m.invite_code || '').trim()) {
+        issues.push(`第 ${mi + 1} 个模型选了「Invite Code」模式但没填邀请码`)
+      }
+    } else if (!m.model_api_key) {
+      issues.push(`第 ${mi + 1} 个模型选了「模型 API Key」模式但没填 Key`)
+    }
   })
   form.value.agents.forEach((ag, ai) => {
     if (!(ag.name || '').trim()) issues.push(`第 ${ai + 1} 个模拟 Agent 未填名称`)
+    if (ag.key_mode === 'invite') {
+      if (!(ag.invite_code || '').trim()) {
+        issues.push(`第 ${ai + 1} 个模拟 Agent 选了「Invite Code」模式但没填邀请码`)
+      }
+    } else if (!ag.api_key) {
+      issues.push(`第 ${ai + 1} 个模拟 Agent 选了「模型 API Key」模式但没填 Key`)
+    }
   })
   if (totalTasks.value > BIG_THRESHOLD) {
     // 只是提醒，不阻止创建
@@ -1129,6 +1380,9 @@ function gotoStep(i) {
   }
   if (i > step.value + 1) return
   step.value = i
+  // 一进矩阵页就把 invite 模式的 key 提前申请好：申请结果逐条可见、可重试，
+  // 不用等建完才发现有人没拿到 key。
+  if (i === 1 && anyInviteMode.value) prepareKeys(true)
 }
 
 // ---------- 展示辅助 ----------
@@ -1288,10 +1542,10 @@ async function generateApiKey() {
     const res = await api.post('/generate-api-key', null, { params })
     if (target) {
       if (keyTarget.type === 'model') target.model_api_key = res.api_key
-      else {
-        target.api_key = res.api_key
-        target.invite_code = keyForm.value.invite_code
-      }
+      // agent：只填 key，不回写 invite_code。回写了的话后端会认为「要每个子任务
+      // 各申请一把」，于是在创建瞬间连打 N 次上游被限流，key 反而一把都拿不到
+      // （Batch-20261124-012 实测如此）。这里已经拿到真 key，直接用即可。
+      else target.api_key = res.api_key
     }
     localStorage.setItem('last_invite_code', keyForm.value.invite_code)
     ElMessage.success(`API Key 已生成并填入：${maskKey(res.api_key)}（原文不回显）`)
@@ -1306,6 +1560,120 @@ function commitDraftKey(slot, target) {
   const v = String(keyDraft.value[slot] || '').trim()
   if (v && target && !target.api_key) target.api_key = v
   keyDraft.value[slot] = ''
+}
+
+// ---------- 批量生成 KEY：每个 Harness 一把 ----------
+// 为什么不在建任务时逐个申请：那是请求里同一个事务串行打 N 次上游（Harness 数 ×
+// agent 数），必然 429 —— 实测 Batch-20261124-009/012 就是这样一把都没拿到，
+// 建出来的子任务 key 全是空。改成创建前显式申请好、逐把填进表单。
+// 任务视图「详情」弹窗：存当前查看的那一行（taskRows 的成员）
+const taskDetailVisible = ref(false)
+const taskDetailRow = ref(null)
+function openTaskDetail(row) {
+  taskDetailRow.value = row
+  taskDetailVisible.value = true
+}
+
+const keyPreparing = ref(false)
+const keyPrepareLog = ref([])     // 逐条申请结果，矩阵页展开可看
+const keyInterval = ref(0.5)
+
+// 申请一批 key 并按 (持有者, 子任务序号) 回写。
+// holder 是模型对象或 agent 对象，field 是它存 key 表的字段名。
+async function requestKeysFor(holder, field, baseUrl, slots, namePrefix) {
+  const byName = new Map()
+  const names = slots.map(s => {
+    // 上游限 40 字节，后端还会再截断一次 —— 这里先压短，避免截断后撞名
+    const nm = `${namePrefix}-${s.cfg_key}`
+    byName.set(nm, s)
+    return nm
+  })
+  const res = await api.post('/generate-api-keys', {
+    invite_code: (holder.invite_code || '').trim(),
+    names,
+    base_url: baseUrl,
+    interval_seconds: Number(keyInterval.value) || 0,
+  })
+  const out = []
+  for (const it of (res.items || [])) {
+    const slot = byName.get(it.name)
+    if (!slot) continue
+    if (it.api_key) {
+      holder[field] = { ...(holder[field] || {}), [slot.cfg_key]: it.api_key }
+    }
+    out.push({
+      cfg_key: slot.cfg_key,
+      owner: slot.owner,
+      task: slot.task,
+      api_key: it.api_key || '',
+      error: it.error || '',
+    })
+  }
+  return out
+}
+
+// 进「任务矩阵」时统一预申请：每个子任务 × 每个 invite 模式的持有者各一把。
+// 为什么放在这一步而不是建实验时：建实验是一个请求里串行打 N 次上游，失败了
+// 用户要等建完才知道（34# 就是这样建出一批没 key 的任务）。放在预览页，申请
+// 结果逐条看得见、失败能单独重试、确认齐了再创建。
+// onlyMissing=true 用于重试：已经拿到的不重复申请，省得浪费配额。
+async function prepareKeys(onlyMissing = true) {
+  const rows = taskRows.value
+  if (!rows.length) return
+  const ts = new Date().toISOString().slice(2, 16).replace(/[-T:]/g, '')
+  const prefix = `${ts}-${(form.value.name || 'batch').trim()}`.slice(0, 18)
+
+  keyPreparing.value = true
+  const log = []
+  try {
+    // 主 Agent 模型：按模型分组，一个模型一次请求（它名下所有子任务的 key）
+    for (const m of form.value.models) {
+      if (m.key_mode !== 'invite') continue
+      if (!(m.invite_code || '').trim()) continue
+      // 按 _uid 认人，不按 model_id：同一个 model_id 可以在模型轴上配置多条
+      // （比如同模型不同 base_url），按名字匹配会把两条的 key 混在一起。
+      const slots = rows
+        .filter(r => r.model_uid === m._uid
+          && (onlyMissing ? !(m.model_api_keys || {})[r.cfg_key] : true))
+        .map(r => ({ cfg_key: r.cfg_key, owner: `主Agent · ${m.model_id || '兜底'}`, task: r.name }))
+      if (!slots.length) continue
+      log.push(...await requestKeysFor(
+        m, 'model_api_keys', (m.model_base_url || '').trim(), slots, prefix))
+    }
+
+    // user_proxy agents：同样每个 agent 一次请求
+    for (const ag of form.value.agents) {
+      if (ag.key_mode !== 'invite') continue
+      if (!(ag.invite_code || '').trim()) continue
+      const slots = rows
+        .filter(r => (onlyMissing ? !(ag.api_keys || {})[r.cfg_key] : true))
+        .map(r => ({ cfg_key: r.cfg_key, owner: `Agent · ${ag.name || '未命名'}`, task: r.name }))
+      if (!slots.length) continue
+      log.push(...await requestKeysFor(
+        ag, 'api_keys', (ag.base_url || '').trim(), slots, prefix))
+    }
+
+    if (log.length) {
+      keyPrepareLog.value = onlyMissing
+        ? [...keyPrepareLog.value.filter(x => x.api_key), ...log]
+        : log
+      const ok = log.filter(x => x.api_key).length
+      const bad = log.length - ok
+      if (bad) ElMessage.warning(`申请 Key：成功 ${ok}，失败 ${bad} —— 展开「Key 申请明细」看原因`)
+      else ElMessage.success(`已为 ${ok} 处申请到 Key`)
+    }
+  } catch {
+    // 错误已由 api 拦截器提示
+  } finally {
+    keyPreparing.value = false
+  }
+}
+
+// 把已申请到的 key 全部作废重来（换了 invite code / 想重新分配时用）
+function resetPreparedKeys() {
+  for (const m of form.value.models) m.model_api_keys = {}
+  for (const ag of form.value.agents) ag.api_keys = {}
+  keyPrepareLog.value = []
 }
 
 // ---------- Harness 增删改 ----------
@@ -1589,15 +1957,25 @@ async function submit() {
       // 笛卡尔积展开成子任务（一个模型在一个 Harness 上 = 一个子任务）
       harnesses: buildHarnesses(),
       models: buildModels(),
-      // 兼容字段：摊平后的臂，后端在 harnesses/models 缺省时才用
-      arms: flattenArms(),
+      // 兼容字段：摊平后的臂，后端在 harnesses/models 缺省时才用。
+      // _model_uid 只是前端用来认人的，别让它落进 params_json。
+      arms: flattenArms().map(({ _model_uid, ...rest }) => rest),
       // 用户模拟是通用配置：进 common，由后端写进每个子任务的 user_proxy_model.json
       sim_arms: [],
       repeat_times: form.value.repeat_times,
       queue: form.value.queue,
-      common: { ...form.value.common, agents: form.value.agents },
+      common: { ...form.value.common, agents: buildAgents() },
     }
-    const res = await api.post('/batch-experiments', payload)
+    // 批量创建是同步建完 N 个子任务才返回，任务多时会超过 axios 默认的 30s。
+    // 超时后前端拿不到 res.experiment，页面上就表现为「点了创建却没跳转」——
+    // 而后端其实已经在建了。这里单独放宽到 10 分钟，覆盖大批量创建。
+    const res = await api.post('/batch-experiments', payload, { timeout: 600000 })
+    if (!res?.experiment?.id) {
+      // 保险丝：后端结构变了/被网关截断时，别静默什么都不做
+      ElMessage.warning('已提交，但未拿到实验 ID，请到「批量实验」列表查看创建结果')
+      router.push('/batch')
+      return
+    }
     if (res.failed) ElMessage.warning(res.message)
     else ElMessage.success(res.message || '创建成功')
     router.push(`/batch/${res.experiment.id}`)
@@ -1649,6 +2027,12 @@ async function prefillFromCopy(batchId) {
       // 已经是源子任务的明文 key，直接回填；取不到时才为空（回落模板默认值）
       model_api_key: m.model_api_key || '',
       model_api_type: m.model_api_type || '',
+      invite_code: m.invite_code || '',
+      // 复制一律默认 invite 模式：每任务一把独立 key 是批量场景的常态，
+      // 源实验手填的那把 key 也留着当兜底，用户想改回手填随时可切。
+      key_mode: 'invite',
+      // 预申请的 key 后端已清空（那批属于上一次的子任务），这里只留空表
+      model_api_keys: {},
     })
 
     const harnessList = Array.isArray(saved.harnesses) ? saved.harnesses : []
@@ -1708,7 +2092,11 @@ async function prefillFromCopy(batchId) {
           name: a.name || '', model: a.model || '', provider: a.provider || '',
           base_url: a.base_url || '',
           // 与模型 key 同源：后端已按 agent 名字从子任务 create_params 还原明文
-          api_key: a.api_key || '', api: a.api || '', invite_code: a.invite_code || '',
+          api_key: a.api_key || '', api: a.api || '',
+          // 同主模型：复制一律默认 invite 模式。源实验手填的那把 key 留着当兜底。
+          invite_code: a.invite_code || '',
+          key_mode: 'invite',
+          api_keys: {},
         }))
       }
     }
@@ -1766,6 +2154,9 @@ onMounted(async () => {
 .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .field.grow { flex: 1; }
 .field.shrink { width: 90px; flex: none; }
+/* 短值字段（名称 / Provider / 枚举）不该跟 URL 一样铺满整行 —— 一个 20 字符的
+   agent 名拉到 900px 宽，既难扫读也显得输入要求比实际长。 */
+.field.narrow { max-width: 320px; }
 .lbl {
   font-size: 12.5px; color: #5b6070; font-weight: 500;
   display: flex; align-items: center; gap: 3px;
@@ -1854,8 +2245,74 @@ onMounted(async () => {
 .panel-note { font-size: 12px; font-weight: 400; color: #9aa0b0; }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 20px; }
+/* 每个字段独占一行、宽度受控：并排会让「队列名称」这类短输入被拉得很宽，
+   挤成一行反而不易扫读。竖向排列，字段保持紧凑宽度。 */
+.form-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.form-grid .field:not(.h) { max-width: 360px; }
+
+/* 名称、值、备注同一行：标签在左、控件居中、hint 作为备注排在控件右边。
+   用于「子任务参数」这种标签短、控件也窄的字段 —— 上下排列会白占一行高度。 */
+.field.h {
+  display: grid;
+  grid-template-columns: 132px 220px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 14px;
+  max-width: 100%;
+}
+.field.h > .lbl { grid-column: 1; }
+.field.h > *:not(.lbl):not(.hint) { grid-column: 2; }
+.field.h > .hint { grid-column: 3; margin: 0; }
+/* 多行输入（如队列描述）用更宽的值列 */
+.field.h.wide { grid-template-columns: 132px minmax(0, 560px); }
+
+/* 运行配置：左侧 tab 切换（队列调度 / 子任务参数） */
+.run-tabs :deep(.el-tabs__header.is-left) { margin-right: 24px; }
+.run-tabs :deep(.el-tabs__item) { font-size: 13px; height: 40px; justify-content: flex-start; }
+.run-tabs :deep(.el-tabs__content) { padding-top: 2px; }
+
+/* 执行规模：多列卡片，不再挤成一行 */
+.run-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+  margin-top: 18px;
+}
+.run-stat {
+  padding: 12px 14px; border: 1px solid #eef0f5; border-radius: 10px;
+  background: #fafbff;
+}
+.run-stat.total { background: #eef0ff; border-color: #c7ccf8; }
+.rs-k { font-size: 11.5px; color: #8b90a0; }
+.rs-v { font-size: 22px; font-weight: 800; color: #4f46e5; line-height: 1.25; margin-top: 2px; }
+.rs-v.warn { color: #d97706; }
 .hint { font-size: 11.5px; color: #9aa0b0; line-height: 1.6; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+/* Key 预申请状态条：一眼看出「齐没齐」，旁边就是申请/重试按钮 */
+.keybar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; margin-bottom: 12px; border-radius: 8px; font-size: 13px;
+}
+.keybar.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; }
+.keybar.bad { background: #fff7ed; border: 1px solid #fed7aa; color: #c2410c; }
+.keybar .kb-text { flex: 1; font-weight: 600; }
+
+/* 任务视图展开区：完整创建参数 + 每个 agent 的 key 分配 */
+.task-detail { padding: 6px 16px 14px; }
+.kd-title {
+  font-size: 12.5px; font-weight: 600; color: var(--text-primary);
+  margin: 14px 0 6px;
+}
+.bulk-table-inner { width: 100%; border-collapse: collapse; }
+.bulk-table-inner th, .bulk-table-inner td {
+  padding: 6px 10px; text-align: left; font-size: 12px;
+  border: 1px solid #eef0f5;
+}
+.bulk-table-inner th { background: #f7f8fb; color: #6b7280; font-weight: 600; }
+.err-text { color: #ef4444; font-size: 12px; }
 .hint.danger { color: #ef4444; }
 .missing { color: #ef4444; }
 .muted { color: #9aa0b0; font-size: 12px; }
@@ -1885,10 +2342,6 @@ onMounted(async () => {
 }
 .rc-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .rc-desc { font-size: 11.5px; color: #9aa0b0; margin-top: 3px; }
-
-.agent-tabs { margin-top: 6px; }
-.agent-tabs :deep(.el-tabs__header) { margin-bottom: 14px; }
-.agent-tabs :deep(.el-tabs__item) { font-size: 12.5px; height: 34px; line-height: 34px; }
 
 /* 块 / 模型 / agent 卡 */
 .cfg-block, .model-card, .agent-card {

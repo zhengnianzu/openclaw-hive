@@ -1,5 +1,5 @@
 from pydantic import BaseModel, computed_field, field_validator
-from typing import Optional, List
+from typing import Dict, Optional, List
 
 
 class AgentConfig(BaseModel):
@@ -10,6 +10,11 @@ class AgentConfig(BaseModel):
     api_key: str = ""
     api: str = ""
     invite_code: str = ""
+
+    # 批量实验专用：预申请好的 key，键是子任务序号 "c{cfg_no}"。
+    # 单任务创建用不到（那里 api_key 就是最终值），由 batch_experiments 在展开
+    # 子任务时按序号取出写进 api_key，并把这里清空 —— 不该带进 create_params。
+    api_keys: Dict[str, str] = {}
 
 
 class QueueInfo(BaseModel):
@@ -237,3 +242,30 @@ class ObsItem(BaseModel):
 class ObsListResponse(BaseModel):
     path: str
     items: List[ObsItem]
+
+
+# ---- 批量申请 API Key（批量实验的「按 Harness 各要一把」）----
+
+class BulkKeyRequest(BaseModel):
+    """一次向上游申请多把 key。
+
+    批量实验里每个子任务都要一把独立 key：建实验时临时申请的形态会被上游
+    限流成「一个都没拿到」（429），所以改成创建前先显式申请好、逐把填进表单。
+    """
+    invite_code: str
+    # 每把 key 的名字。上游对名字长度有限制，调用方传短名；超长由后端截断。
+    names: List[str] = []
+    # 申请服务按 base_url 匹配 key_gen.yaml 的规则，同一批应属同一端点。
+    base_url: Optional[str] = None
+    # 两次申请之间的间隔（秒）。上游按 key 名/时间窗限流，连着打必 429。
+    interval_seconds: float = 0.5
+
+
+class BulkKeyItem(BaseModel):
+    name: str
+    api_key: str = ""
+    error: str = ""
+
+
+class BulkKeyResponse(BaseModel):
+    items: List[BulkKeyItem] = []

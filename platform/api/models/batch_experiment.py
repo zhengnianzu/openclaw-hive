@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Dict, Optional, List
 
 from .instance import AgentConfig
 
@@ -43,6 +43,10 @@ class BatchArm(BaseModel):
     # 留空 = 继承 common.invite_code
     invite_code: str = ""
 
+    # 预申请好的 key，键是子任务序号 "c{cfg_no}"。由 _expand_arms 从模型轴带下来，
+    # create_experiment 按当前 cfg_no 取用。详见 BatchModelParams.model_api_keys。
+    model_api_keys: Dict[str, str] = {}
+
     # 块内沙箱参数：镜像与沙箱配置是跟 Harness 走的（不同 harness 常需不同镜像/
     # 资源池），所以按臂配置。留空/None = 落回 common 的同名字段。
     image_name: Optional[str] = None
@@ -56,17 +60,22 @@ class BatchModelParams(BaseModel):
     model_base_url 原样传递，不做 /v1 规整：各 harness 在 create_instance 里
     自己补或剥（claude-code 剥、openclaw 补），带不带 /v1 都能被正确解析。
 
-    invite_code 与 model_api_key 是**二选一**的两条取 key 路径：
-      - 填了 key  → 所有子任务共用这把 key
-      - key 留空、填 invite_code → 每个子任务在创建时各自申请一把新 key
-        （见 instances.create_instance 的「自动申请 API Key」段）
-    批量里默认推荐后者：每个子任务独立计费/限流，互不影响。
+    key 有三条路径，优先级从高到低：
+      1. model_api_keys["c{配置序号}"] —— 前端在「矩阵预览」那步用 invite_code
+         预申请好、按子任务分开的 key。配置序号就是 create_experiment 里的
+         cfg_no（臂 × 模拟臂 × 重复轮次展开后的全局序号，从 1 开始），
+         所以前端必须按同样的三重循环顺序编号，否则 key 会错配到别的子任务上。
+      2. model_api_key —— 所有子任务共用的兜底 key（用户选「模型 API Key」模式）。
+      3. key 留空、填 invite_code —— 退回由 create_instance 在创建瞬间现申请。
+         批量里不推荐：N 个子任务同时打上游容易被限流成「一个 key 都没拿到」，
+         而且失败了也要等建完才发现。
     """
     model_id: str = ""
     model_base_url: str = ""
     model_api_key: str = ""
     model_api_type: str = ""
     invite_code: str = ""
+    model_api_keys: Dict[str, str] = {}
 
 
 class BatchHarness(BaseModel):

@@ -101,10 +101,17 @@ def _mask_secret(v: str) -> str:
 
 
 def _mask_agents(agents) -> None:
-    """就地脱敏一组 agent 的 api_key。"""
+    """就地脱敏一组 agent 的 api_key 与预申请的 api_keys。"""
     for ag in agents or []:
-        if isinstance(ag, dict) and ag.get("api_key"):
+        if not isinstance(ag, dict):
+            continue
+        if ag.get("api_key"):
             ag["api_key"] = _mask_secret(ag["api_key"])
+        # 预申请的那批（子任务序号 → key）同样是明文，漏了就是整批明文落库
+        per = ag.get("api_keys")
+        if isinstance(per, dict):
+            ag["api_keys"] = {k: (_mask_secret(v) if v else v)
+                              for k, v in per.items()}
 
 
 def _expand_arms(req) -> list:
@@ -123,6 +130,10 @@ def _expand_arms(req) -> list:
 
     invite_code 一并下沉到臂：批量里「key 留空 + 填 invite_code」意味着**每个子任务
     各自申请一把新 key**（create_instance 的自动申请段），而不是全批共用一把。
+    但创建瞬间向上游打 N 次申请极易被限流成「一个都没拿到」，所以前端支持在
+    「矩阵预览」那步提前申请 —— 那批 key 按子任务序号存在 models[].model_api_keys
+    里，由 create_experiment 的三重循环按 cfg_no 取用（不在这里下沉：臂还没有
+    乘上模拟臂与重复轮次，拿不到最终的子任务序号）。
     """
     if req.harnesses and req.models:
         out = []
@@ -142,6 +153,8 @@ def _expand_arms(req) -> list:
                     invite_code=m.invite_code,
                     image_name=h.image_name,
                     sandbox_config_id=h.sandbox_config_id,
+                    # 预申请的 key 原样带到臂上，建子任务时按 cfg_no 取
+                    model_api_keys=dict(m.model_api_keys or {}),
                 ))
         return out
 
@@ -197,8 +210,15 @@ def _masked_params(params: dict) -> dict:
         if isinstance(arm, dict) and arm.get("model_api_key"):
             arm["model_api_key"] = _mask_secret(arm["model_api_key"])
     for m in d.get("models") or []:
-        if isinstance(m, dict) and m.get("model_api_key"):
+        if not isinstance(m, dict):
+            continue
+        if m.get("model_api_key"):
             m["model_api_key"] = _mask_secret(m["model_api_key"])
+        per = m.get("model_api_keys")
+        if isinstance(per, dict):
+            m["model_api_keys"] = {
+                k: (_mask_secret(v) if v else v) for k, v in per.items()
+            }
     for blk in d.get("blocks") or []:
         if not isinstance(blk, dict):
             continue
@@ -224,6 +244,7 @@ def _norm_base_url(v: str) -> str:
 def _norm_model_id(v: str) -> str:
     """模型 ID 归一化。取 `@` 前的本体，兼容带版本后缀的写法（如 `glm-5.3@zhipu`）。"""
     return str(v or "").strip().split("@", 1)[0].strip()
+
 
 
 def _restore_params_secrets(batch_id: str, params: dict) -> dict:
@@ -320,6 +341,11 @@ def _restore_params_secrets(batch_id: str, params: dict) -> dict:
         base = _norm_base_url(m.get("model_base_url"))
         k = axis_keys.get((mid, base)) or axis_keys_loose.get((mid,), "")
         m["model_api_key"] = _resolved(m.get("model_api_key"), k)
+        # 预申请的 key（子任务序号 → key）一律不还原：那批 key 是上一次实验
+        # 「每个子任务各一把」的产物，复制出来的是**另一批**子任务，沿用会让
+        # 两个实验共用同一把 key，上游的用量就分不开了 —— 而这正是当初要
+        # 每个子任务各申请一把的原因。清空后由前端在矩阵预览那步重新申请。
+        m["model_api_keys"] = {}
 
     for blk in out.get("blocks") or []:
         if not isinstance(blk, dict):
@@ -339,6 +365,8 @@ def _restore_params_secrets(batch_id: str, params: dict) -> dict:
                 arm.get("harness_config_version_id"))
         k = _lookup(trio, arm.get("model_id"), arm.get("model_base_url"))
         arm["model_api_key"] = _resolved(arm.get("model_api_key"), k)
+        # 同 models：预申请的那批属于上一次的子任务，复制时不沿用
+        arm["model_api_keys"] = {}
 
     # 兜底模型（common）：老实验的模型参数只存在 common 里（没有 blocks/arms 的
     # 模型字段），那里的 key 也同样是掩码。用源实例里的任意一把补上 —— 同一实验的
@@ -356,6 +384,8 @@ def _restore_params_secrets(batch_id: str, params: dict) -> dict:
             name = (ag.get("name") or "").strip()
             ag["api_key"] = _resolved(ag.get("api_key"),
                                       agent_keys.get(name, ""))
+            # 同 models：预申请的那批是上一次子任务的，复制时重新申请
+            ag["api_keys"] = {}
 
     _fill_agents(out.get("agents"))
     for sim in out.get("sim_arms") or []:
@@ -857,13 +887,23 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
                     if _v:
                         payload[_f] = _v
 
-                # invite_code 优先：填了它就只让第一个子任务复用现成的 key，
-                # 其余子任务 key 清空 → create_instance 按 invite_code 各申请一把。
-                payload["model_api_key"] = _consume_first_key(
-                    payload.get("invite_code", ""),
-                    payload.get("model_base_url", ""),
-                    payload.get("model_api_key", ""),
-                )
+                # 预申请的 key 最优先：前端在「矩阵预览」那步已按 cfg_no 为每个
+                # 子任务各申请了一把，直接取用。取到了就不要再留 invite_code ——
+                # 否则 create_instance 看到「有 invite_code」会再申请一次，白白
+                # 多打一次上游（还可能因此被限流）。
+                _pre = (arm.model_api_keys or {}).get(f"c{cfg_no}", "")
+                if _pre:
+                    payload["model_api_key"] = _pre
+                    payload["invite_code"] = ""
+                else:
+                    # 没有预申请（用户选了「共用一把 key」，或预申请那步失败了）：
+                    # 维持原行为 —— 填了 invite_code 就只让第一个子任务复用现成的
+                    # key，其余清空由 create_instance 各自申请。
+                    payload["model_api_key"] = _consume_first_key(
+                        payload.get("invite_code", ""),
+                        payload.get("model_base_url", ""),
+                        payload.get("model_api_key", ""),
+                    )
 
                 # 块内沙箱参数：镜像 / 沙箱配置跟 Harness 走。
                 # sandbox_config_id 允许 0（= 不替换模板），所以判 None 而不是 falsy。
@@ -876,19 +916,30 @@ async def create_experiment(req: BatchExperimentCreate, user: dict = Depends(req
                 if sim is not None and sim.agents:
                     payload["agents"] = [a.model_dump() for a in sim.agents]
 
-                # agents 的 key 与主 Agent 同口径：填了 invite_code 就只让第一个
-                # 子任务复用现成 key，其余清空由 create_instance 各自申请。
+                # agents 的 key 与主 Agent 同口径：预申请的最优先，其次才是
+                # 「第一个子任务复用现成 key、其余各自申请」的老路径。
                 # 必须逐个子任务重建 agent dict —— payload 可能直接引用 common 里
                 # 的同一份列表，就地改会污染后续所有子任务。
                 if payload.get("agents"):
-                    payload["agents"] = [
-                        {**ag, "api_key": _consume_first_key(
-                            ag.get("invite_code", ""),
-                            ag.get("base_url", ""),
-                            ag.get("api_key", ""),
-                        )} if isinstance(ag, dict) else ag
-                        for ag in payload["agents"]
-                    ]
+                    _new_agents = []
+                    for ag in payload["agents"]:
+                        if not isinstance(ag, dict):
+                            _new_agents.append(ag)
+                            continue
+                        pre = (ag.get("api_keys") or {}).get(f"c{cfg_no}", "")
+                        if pre:
+                            # 同主 Agent：拿到预申请的 key 就清掉 invite_code，
+                            # 免得 create_instance 又去申请一次。
+                            _new_agents.append({**ag, "api_key": pre, "invite_code": "",
+                                                "api_keys": {}})
+                        else:
+                            _new_agents.append({**ag, "api_keys": {},
+                                                "api_key": _consume_first_key(
+                                                    ag.get("invite_code", ""),
+                                                    ag.get("base_url", ""),
+                                                    ag.get("api_key", ""),
+                                                )})
+                    payload["agents"] = _new_agents
 
                 payload.update({
                     # 展示名按「实验名-配置N」编号，一眼能对上是第几个配置
