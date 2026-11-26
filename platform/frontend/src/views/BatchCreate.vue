@@ -247,7 +247,7 @@
                   <div class="field">
                     <label class="lbl2">模型 Base URL</label>
                     <el-autocomplete v-model="curModel.model_base_url" :fetch-suggestions="queryBaseUrls"
-                      :placeholder="['opencode','pi','codex','grok'].includes(curArm.harness_type)
+                      :placeholder="['opencode','pi','codex','grok','taichu'].includes(curArm.harness_type)
                         ? '选择或输入，例如：http://192.168.30.95:8084（自动补 /v1）'
                         : '选择或输入，例如：http://192.168.30.95:8084'"
                       style="width:100%" clearable :trigger-on-focus="true" fit-input-width>
@@ -1427,6 +1427,7 @@ const API_TYPE_HINTS = {
   'jiuwenswarm-dev': '写入 harness 配置文件（dev= jw_dev_config.yaml）的 client_provider；base_url 的 /v1 由后端按此自动补齐或去除',
   'jiuwenswarm-xiaoyi': '写入 harness 配置文件（xiaoyi= jw_xiaoyi_config.yaml）的 client_provider；base_url 的 /v1 由后端按此自动补齐或去除',
   openjiuwen: 'tokenfly 网关走 anthropic-messages 协议，一般选 Anthropic',
+  taichu: 'TaiChu 只支持 OpenAI 兼容协议，此项不生效：始终写入 wire_protocol=chat-completions',
 }
 function apiTypeHint(t) {
   return API_TYPE_HINTS[t] || ''

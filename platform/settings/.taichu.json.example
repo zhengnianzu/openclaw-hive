@@ -1,0 +1,17 @@
+{
+  "providers": [
+    {
+      "name": "default",
+      "base_url": "http://192.168.30.95:8084/v1",
+      "api_key": "sk-xxxxx",
+      "models": [
+        {
+          "id": "kimi-k3",
+          "wire_protocol": "chat-completions"
+        }
+      ]
+    }
+  ],
+  "default_provider": "default",
+  "default_model": "kimi-k3"
+}

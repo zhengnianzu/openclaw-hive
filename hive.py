@@ -47,6 +47,7 @@ from prepare_config import (
     load_yaml_config,
     prepare_local_agent_config,
     adapt_layout_for_windows,
+    taichu_agent_root,
     HiveError,
     _log_sandbox_detail,
     _classify_task_stdout,
@@ -280,6 +281,10 @@ class SandboxConfig:
         if not self.default_skill_path:
             if self.harness_type in _JIUWENSWARM_TYPES:
                 self.default_skill_path = str(cls(_FW["workspace_base"], "skills"))
+            elif self.harness_type == "taichu":
+                # 默认技能落到 main 分身的 meta_data/skills
+                self.default_skill_path = str(cls(taichu_agent_root("main", self.home, cls),
+                                                  "meta_data", "skills"))
             else:
                 self.default_skill_path = str(cls(self.harness_dir, "skills"))
         if self.sandbox_type == "windows":
@@ -613,6 +618,62 @@ class OpenClawDistillationTask:
         await self._upload_file("agent config", self.local_config_file, remote_path)
         await self._upload_user_proxy_model_config()
         self.logger.info(f"Copied agent config: {self.local_config_file} -> {remote_path}")
+
+    # ---- 临时补丁: Linux 镜像缺的 obsutil 凭据 / 辅助目录 -------------------------
+    # TODO: 稳定后并入 utils/win_util.py 的 _WINDOWS_AUX_DIRS_BY_IMAGE（改成跨平台表）。
+    _LINUX_AUX_DIRS_BY_IMAGE = {
+        "swr.cn-east-4.myhuaweicloud.com/rl_team/taichu-cli-linux:0.2.0": [
+            ("/root/sandbox-log/windows/skills/serper",
+             "taichu/user/agent_instances/sys_celia_main/meta_data/skills/serper"),
+        ],
+    }
+
+    async def _setup_linux_obsutil(self) -> None:
+        """Linux 沙箱补丁: 1) 用 platform/.env 的 IK/KK/EK 配置 obsutil; 2) 上传镜像缺的辅助目录。
+
+        只对 _LINUX_AUX_DIRS_BY_IMAGE 里登记的镜像生效, 其他 Linux 镜像原样跳过。
+        """
+        from utils.win_util import _read_obs_credentials, _build_windows_aux_tar
+
+        image = (self.config.sandbox_config.image or "").strip()
+        aux_dirs = self._LINUX_AUX_DIRS_BY_IMAGE.get(image)
+        if aux_dirs is None:
+            return
+        home = self.config.sandbox_config.home
+
+        # 1) obsutil 凭据。镜像以 65532 运行且 HOME=/tmp, obsutil 默认读 $HOME/.obsutilconfig,
+        #    这里不传 -config, 写到默认位置, 后续 hive 的 obsutil 调用无需额外参数。
+        obsutil_exe = self.client_config.s3.s3_download_script
+        ik, kk, ek = _read_obs_credentials()
+        result = await self.execution_client.extend(args=ExtendExecCommand(
+            command=["/bin/bash", "-c", f"{obsutil_exe} config -i={ik} -k={kk} -e={ek}"],
+            timeout=self.config.simple_bash_timeout,
+        ).to_dict())
+        if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+            _log_sandbox_detail(self.logger, "obsutil config failed", result, level=logging.ERROR)
+            raise HiveError("C001", detail="obsutil config", sandbox_result=result)
+        self.logger.info(f"obsutil configured: {obsutil_exe} (endpoint={ek})")
+
+        # 2) 辅助目录: tar 打包上传后在 home 下解压（ExtendUploadFile 不能直接传目录）
+        if not any(os.path.isdir(src) for src, _ in aux_dirs):
+            self.logger.warning(f"linux aux dirs not found locally, skip: {[s for s, _ in aux_dirs]}")
+            return
+        tar_name = "hive_aux_dirs.tar"
+        tar_local = _build_windows_aux_tar(aux_dirs)
+        try:
+            await self._upload_file("linux aux dirs", tar_local, f"{home}/{tar_name}")
+            result = await self.execution_client.extend(args=ExtendExecCommand(
+                command=["/bin/bash", "-c", f"cd {home} && tar -xf {tar_name} && rm -f {tar_name}"],
+                timeout=self.config.simple_bash_timeout,
+            ).to_dict())
+            if result.code != ErrorCode.SUCCESS[0] or result.data["exit_code"] != 0:
+                _log_sandbox_detail(self.logger, "extract linux aux dirs failed", result, level=logging.ERROR)
+                raise HiveError("C001", detail="extract linux aux dirs", sandbox_result=result)
+            self.logger.info(
+                f"uploaded linux aux dirs -> {home}: {', '.join(arc for _, arc in aux_dirs)}"
+            )
+        finally:
+            os.unlink(tar_local)
 
     async def _upload_and_extract_code(self, sandbox_type) -> None:
         """Upload and extract the main code tarball in sandbox."""
@@ -1599,6 +1660,14 @@ class OpenClawDistillationTask:
                 for ws in per_agent_workspaces
                 for d in ([skill_subdir, ".opencode"] if self.config.sandbox_config.harness_type == "opencode" else [skill_subdir])
             ]
+        if self.config.sandbox_config.harness_type == "taichu":
+            # taichu 上传整个 user/agent_instances，其中每个 persona 的 meta_data/skills
+            # 也会被带上（image-search 等常带 node_modules），上传前按 persona 清掉。
+            home = sandbox_cfg.home
+            purge_targets = [
+                str(PathCls(taichu_agent_root(n, home, PathCls), "meta_data", "skills"))
+                for n in self._derive_agent_names(config_file)
+            ]
 
         # 固定路径直接落到 bucket_path 下（workdir / logs / per-agent workspace）。
         uploads = [
@@ -1737,6 +1806,8 @@ class OpenClawDistillationTask:
         sandbox_type = self.config.sandbox_config.sandbox_type
         if sandbox_type == "windows":
             await self._setup_windows_obsutil()
+        else:
+            await self._setup_linux_obsutil()   # 临时补丁: 仅对登记的 Linux 镜像生效
         await self._upload_and_extract_code(sandbox_type)
         await self._download_s3_skills(config_file, sandbox_type)
         await self._download_s3_user_profile(config_file, sandbox_type)

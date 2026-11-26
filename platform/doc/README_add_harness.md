@@ -260,4 +260,5 @@ workspace/<code_stem>/<agent_dir>/__default__/*.md
 | jiuwenswarm-dev | JiuwenSwarm-dev | jw_dev_config.yaml | #e91e63 | jiuwenswarm-dev_trajs |
 | jiuwenswarm-xiaoyi | JiuwenSwarm-xiaoyi | jw_xiaoyi_config.yaml | #9c27b0 | jiuwenswarm-xiaoyi_trajs |
 | jiuwenswarm | JiuwenSwarm（旧标识） | jw_config.yaml | #e91e63 | jiuwenswarm_trajs |
+| taichu | TaiChu | .taichu.json | #d4a017 | taichu_trajs |
 | common | 通用 | (无) | #c0c4cc | (兜底 openclaw_trajs) |

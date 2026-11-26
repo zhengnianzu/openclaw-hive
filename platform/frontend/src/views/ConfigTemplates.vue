@@ -50,7 +50,7 @@
         <el-tabs v-model="activeTab" style="margin-top:8px">
           <el-tab-pane label="Harness 配置" name="harness">
             <el-form-item label="模型 Base URL">
-              <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
+              <el-input v-model="form.model_base_url" :placeholder="['opencode','pi','codex','grok','taichu'].includes(form.harness_type) ? '例如：http://192.168.30.95:8084（自动补 /v1）' : '例如：http://192.168.30.95:8084'" />
             </el-form-item>
             <el-form-item label="Invite Code">
               <el-input v-model="form.invite_code" placeholder="pangu" />

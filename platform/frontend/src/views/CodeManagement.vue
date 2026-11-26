@@ -30,7 +30,12 @@
       <el-table :data="pagedRepos" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="id" label="序号" width="80" align="center" />
         <el-table-column prop="name" label="名称" min-width="160" show-overflow-tooltip resizable />
-        <el-table-column prop="version" label="版本" min-width="180" show-overflow-tooltip resizable />
+        <el-table-column label="版本" min-width="180" show-overflow-tooltip resizable>
+          <template #default="{row}">
+            <span style="color:#f59e0b" v-if="row.is_default">★</span>
+            {{ row.version }}
+          </template>
+        </el-table-column>
         <el-table-column prop="tag" label="标签" width="120" align="center" resizable>
           <template #default="{row}">
             <el-tag v-if="row.tag" size="small">{{ row.tag }}</el-tag>
@@ -41,11 +46,6 @@
           <template #default="{row}">
             <span v-if="row.description">{{ row.description }}</span>
             <span v-else class="muted">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="默认" width="80" align="center" resizable>
-          <template #default="{row}">
-            <el-switch :model-value="row.is_default === true" @change="v => setDefaultRepo(row, v)" />
           </template>
         </el-table-column>
         <el-table-column label="启用" width="80" align="center" resizable>
@@ -299,18 +299,6 @@ watch(() => repos.value.length, (n) => {
 })
 
 // 启用开关: 只影响创建页下拉可见性; 存量实例引用的是版本快照, 不受影响
-// 行内切换默认代码仓(与启用开关同款交互): 全局唯一,
-// 后端设新默认时自动清旧默认, 这里本地同步其他行的标记免整页刷新。
-async function setDefaultRepo(row, v) {
-  try {
-    await api.patch(`/code-repos/${row.id}`, { is_default: v })
-    row.is_default = v
-    if (v) {
-      repos.value.forEach(r => { if (r.id !== row.id) r.is_default = false })
-    }
-    ElMessage.success(v ? `已设为默认：${row.name} / ${row.version}` : '已取消默认')
-  } catch { ElMessage.error('切换失败') }
-}
 
 async function toggleEnabled(row, v) {
   try {

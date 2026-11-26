@@ -135,6 +135,15 @@
     "model_api_key": "models.defaults[is_default].model_client_config.api_key",
     "model_api_type": "models.defaults[is_default].model_client_config.client_provider"
   },
+  "taichu": {
+    "model_id": [
+      "providers[name=default].models[0].id",
+      "default_model"
+    ],
+    "model_base_url": "providers[name=default].base_url",
+    "model_api_key": "providers[name=default].api_key",
+    "model_api_type": "providers[name=default].models[0].wire_protocol"
+  },
   "user_proxy_model": {
     "_note": "agents数组中每个agent以name为key，字段直接映射",
     "agents[i].name": "顶层key",

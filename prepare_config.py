@@ -10,6 +10,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
@@ -167,8 +169,24 @@ _FRAMEWORK_LAYOUTS: dict = {
         "workspace_base": "/home/ma-user/.jiuwenswarm/agent/workspace",
         "skill_subdir": "skills",
     },
-
+    "taichu": {
+        "harness_dir":            "/home/ma-user/taichu",
+        "harness_local_config":   "uploads/.taichu.json",
+        "harness_sandbox_config": "/home/ma-user/taichu/configs/.taichu.json",
+        "upload_paths": [
+            "/home/ma-user/taichu/evidence",
+            "/home/ma-user/taichu/user/agent_instances"
+        ],
+        "workspace_base": None,
+    },
 }
+
+def taichu_agent_root(agent_name: str, home: str = "/home/ma-user",
+                      path_cls=PurePosixPath) -> str:
+    """``$TAICHU_HOME/user/agent_instances/<persona>``（所有 agent 共用一个 user-data-root）。"""
+    persona = "sys_celia_main" if agent_name == "main" else agent_name
+    return str(path_cls(home, "taichu", "user", "agent_instances", persona))
+
 
 def adapt_layout_for_windows(layout: dict, win_home: str) -> dict:
     """把 Linux 风格 layout 的 /home/ma-user/... 路径适配为 Windows 路径。
@@ -239,6 +257,42 @@ def _build_team_style_agent_model(
     }
 
 
+def normalize_base_url(url: str, api: Optional[str] = None, *, strip: bool = True) -> str:
+    """
+    Args:
+        url: 原始基址。
+        api: 协议名，见上；``None`` 表示强制 OpenAI 兼容形态。
+        strip: 是否先去掉首尾空白（codex 历史上不 strip，传 False 保持一致）。
+    """
+    if api is None or api == "openai-completions":
+        url = url.strip() if strip else url
+        url = url.rstrip("/")
+        return url if url.endswith("/v1") else url + "/v1"
+    if api == "anthropic-messages":
+        url = (url.strip() if strip else url).rstrip("/")
+        return url.removesuffix("/v1").rstrip("/") if url.endswith("/v1") else url
+    return url
+
+
+def _usable_agents(model_cfg: dict, *, need_provider: bool = True):
+    """遍历 user_proxy_model.json 里可注入的 agent（跳过 user_simulator 与缺字段条目）。"""
+    required = ("model", "base_url", "api_key") + (("provider",) if need_provider else ())
+    label = "/".join(required)
+    for agent_name, cfg in model_cfg.items():
+        if agent_name == "user_simulator" or not isinstance(cfg, dict):
+            continue
+        if not all(cfg.get(k) for k in required):
+            logging.warning(f"agent {agent_name} missing {label}, skip")
+            continue
+        yield agent_name, cfg
+
+
+def _write_json(path: str, data) -> None:
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+
+
 def load_yaml_config(config_file: str):
     """Load and return an OmegaConf config object."""
     return OmegaConf.load(config_file)
@@ -264,6 +318,505 @@ def _read_agent_system_prompts(data_config_file: Optional[str]) -> dict:
     }
 
 
+def _prepare_openjiuwen(ctx: "_PrepareContext") -> None:
+    """openjiuwen.json：把 provider 名里的 anthropic 归一成 Anthropic；
+    user_proxy_model.json 的 api 也同步归一。"""
+    data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
+    if "anthropic" in data["default"]["provider"]:
+        data["default"]["provider"] = "Anthropic"
+    _write_json(ctx.local_path, data)
+
+    for agent in ctx.model_cfg.values():
+        if "anthropic" in agent.get("api", ""):
+            agent["api"] = "Anthropic"
+    _write_json(ctx.model_path, ctx.model_cfg)
+
+
+def _prepare_opencode(ctx: "_PrepareContext") -> None:
+    """opencode.json：注入 provider，并把 data_config 的 system_prompt 写进 agent.prompt。"""
+    data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
+    providers = data.setdefault("provider", {})
+    agents = data.setdefault("agent", {})
+    agent_sp = _read_agent_system_prompts(ctx.data_config_file)
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg):
+        provider_key = cfg["provider"]
+        model_name = cfg["model"]
+        api_kind = cfg.get("api", "openai-completions")
+        base_url = normalize_base_url(cfg["base_url"])
+
+        if provider_key not in providers:
+            npm_pkg = ("@ai-sdk/openai-compatible"
+                       if "openai" in api_kind.lower()
+                       else "@ai-sdk/anthropic")
+            providers[provider_key] = {
+                "name": provider_key,
+                "npm": npm_pkg,
+                "options": {"baseURL": base_url, "apiKey": cfg["api_key"]},
+                "models": {model_name: {"name": model_name}},
+            }
+            logging.info(f"Added provider: {provider_key}")
+        else:
+            existing_models = providers[provider_key].setdefault("models", {})
+            if model_name not in existing_models:
+                existing_models[model_name] = {"name": model_name}
+                logging.info(f"Added model {model_name} to existing provider {provider_key}")
+
+        model_ref = f"{provider_key}/{model_name}"
+        if agent_name in agents:
+            agents[agent_name]["model"] = model_ref
+            if agent_name in agent_sp:
+                agents[agent_name]["prompt"] = agent_sp.get(agent_name) or ""
+            logging.info(f"Updated agent {agent_name} with model {model_ref}")
+        else:
+            agents[agent_name] = {
+                "model": model_ref,
+                "prompt": agent_sp.get(agent_name) or "",
+            }
+            logging.info(f"Added new agent {agent_name} with model {model_ref}")
+
+    _write_json(ctx.local_path, data)
+    logging.info(f"Updated opencode.json with provider/agent from {ctx.model_path}")
+
+
+def _main_model_limits(providers, default_ctx: int, default_max: int) -> tuple:
+    """取模板里主 agent 模型条目的 contextWindow/maxTokens，注入的 agent 与之对齐。
+
+    模板改参后这里自动跟随，不用同步改代码；找不到时退回给定默认值。
+    兼容 dict 与 OmegaConf（用 hasattr(get) 判定）。
+    """
+    main_model = next(
+        (m for p in providers.values() if hasattr(p, "get")
+         for m in p.get("models", []) if hasattr(m, "get") and "contextWindow" in m),
+        {},
+    )
+    return main_model.get("contextWindow", default_ctx), main_model.get("maxTokens", default_max)
+
+
+def _prepare_pi(ctx: "_PrepareContext") -> None:
+    """models.json：注入 provider，base_url 按协议规范化。"""
+    data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
+    providers = data.setdefault("providers", {})
+    context_window, max_tokens = _main_model_limits(providers, 200000, 131072)
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg):
+        provider_key = cfg["provider"]
+        model_name = cfg["model"]
+        api_kind = cfg.get("api", "openai-completions")
+        base_url = normalize_base_url(cfg["base_url"], api_kind)
+
+        if provider_key not in providers:
+            providers[provider_key] = {
+                "baseUrl": base_url,
+                "api": api_kind,
+                "apiKey": cfg["api_key"],
+                "models": [
+                    {
+                        "id": model_name,
+                        "name": model_name,
+                        "reasoning": False,
+                        "input": ["text"],
+                        "contextWindow": context_window,
+                        "maxTokens": max_tokens,
+                        # pi 会拿会话的 usage 统计，乘以单价
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    }
+                ],
+            }
+            logging.info(f"Added pi provider: {provider_key} ({model_name})")
+        else:
+            existing_models = providers[provider_key].setdefault("models", [])
+            existing_ids = {m.get("id") for m in existing_models if isinstance(m, dict)}
+            if model_name not in existing_ids:
+                existing_models.append({"id": model_name})
+                logging.info(f"Added model {model_name} to existing pi provider {provider_key}")
+
+    _write_json(ctx.local_path, data)
+    logging.info(f"Updated models.json with provider from {ctx.model_path}")
+
+
+def _append_toml_blocks(ctx: "_PrepareContext", header_fmt: str, label: str, build_block) -> None:
+    """codex/grok 共用：按 provider 追加 TOML 段，已存在的段跳过。"""
+    toml_text = Path(ctx.local_path).read_text(encoding="utf-8")
+    new_blocks: List[str] = []
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg):
+        provider_key = cfg["provider"]
+        if header_fmt.format(provider_key) in toml_text:
+            logging.info(f"{label} provider {provider_key} already exists in config.toml, skip")
+            continue
+        new_blocks.append(build_block(provider_key, cfg))
+        logging.info(f"Added {label} provider: {provider_key} (agent={agent_name})")
+
+    if new_blocks:
+        toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
+        Path(ctx.local_path).write_text(toml_text, encoding="utf-8")
+        logging.info(
+            f"Updated config.toml with {len(new_blocks)} provider(s) from {ctx.model_path}"
+        )
+
+
+def _prepare_codex(ctx: "_PrepareContext") -> None:
+    """config.toml：追加 [model_providers.<key>]，统一走 responses。"""
+    def block(provider_key: str, cfg: dict) -> str:
+        # codex 历史上不 strip 空白，保留该行为。
+        base_url = normalize_base_url(cfg["base_url"], strip=False)
+        return (
+            f"[model_providers.{provider_key}]\n"
+            f'name     = "{provider_key}"\n'
+            f'base_url = "{base_url}"\n'
+            f'experimental_bearer_token = "{cfg["api_key"]}"\n'
+            f'wire_api = "responses"\n'
+        )
+    _append_toml_blocks(ctx, "[model_providers.{}]", "codex", block)
+
+
+def _prepare_grok(ctx: "_PrepareContext") -> None:
+    """config.toml：追加 [model.<key>]，按 api 映射 api_backend。"""
+    def block(provider_key: str, cfg: dict) -> str:
+        base_url = normalize_base_url(cfg["base_url"])
+        api_backend = {
+            "anthropic-messages": "messages",
+            "openai-completions": "chat_completions",
+        }.get(cfg.get("api"))
+        api_backend_line = f'api_backend = "{api_backend}"\n' if api_backend else ""
+        return (
+            f"[model.{provider_key}]\n"
+            f'model     = "{cfg.get("model")}"\n'
+            f'name      = "{cfg.get("model")}"\n'
+            f'base_url  = "{base_url}"\n'
+            f'api_key   = "{cfg["api_key"]}"\n'
+            f"{api_backend_line}"
+        )
+    _append_toml_blocks(ctx, "[model.{}]", "grok", block)
+
+
+def _prepare_dsh(ctx: "_PrepareContext") -> None:
+    """settings.yaml：llm-pi-ai.providers 追加 provider，key 放进 credentials。"""
+    data = load_yaml_config(ctx.local_path)
+    template_providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
+    dsh_context_window, dsh_max_tokens = _main_model_limits(template_providers, 200000, 326800)
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg):
+        provider_key = cfg["provider"]
+        providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
+        api_kind = cfg.get("api", "openai-completions")
+        base_url = normalize_base_url(cfg["base_url"], api_kind)
+        model_name = cfg["model"]
+        credentials = data.get("credentials") or {}
+
+        if provider_key not in providers:
+            api_key_env = provider_key.replace("-", "_").upper() + "_API_KEY"
+            providers[provider_key] = {
+                "displayName": provider_key,
+                "apiKeyEnv": api_key_env,
+                "api": api_kind,
+                "baseURL": base_url,
+                "models": [
+                    {
+                        "id": model_name,
+                        "contextWindow": dsh_context_window,
+                        "maxTokens": dsh_max_tokens,
+                    }
+                ],
+            }
+            credentials[api_key_env] = cfg["api_key"]
+            logging.info(f"Added dsh provider: {provider_key} ({model_name})")
+        else:
+            existing_models = providers[provider_key].setdefault("models", [])
+            existing_ids = {m.get("id") for m in existing_models if hasattr(m, "get")}
+            if model_name not in existing_ids:
+                existing_models.append({"id": model_name})
+                logging.info(f"Added model {model_name} to existing dsh provider {provider_key}")
+    OmegaConf.save(data, ctx.local_path)
+    logging.info(f"Updated settings.yaml with provider from {ctx.model_path}")
+
+
+def _prepare_jiuwenswarm(ctx: "_PrepareContext") -> None:
+    """jw_config.yaml：每个 agent 追加一条带 alias 的 models.defaults，
+    并在 agents.<name>.model 内联完整模型块（team 模式的 per-agent 绑模型）。"""
+    data = yaml.safe_load(Path(ctx.local_path).read_text(encoding="utf-8")) or {}
+    models = data.setdefault("models", {})
+    defaults = models.setdefault("defaults", [])
+    entries = [e for e in defaults if isinstance(e, dict)]
+    default_entry = next((e for e in entries if e.get("is_default")), None)
+
+    # 新条目沿用默认模型条目的可选字段, 不硬编码。
+    # 注意别往 model_config_obj 塞 context_window: 它会被并进 extra_params,
+    # 再传给 openai SDK 的 chat.completions.create(), 后者不认这个键, 直接 TypeError。
+    proto_mcc = (default_entry or {}).get("model_client_config") or {}
+    proto_mcc_obj = (default_entry or {}).get("model_config_obj") or {}
+
+    # jiuwenswarm 拒绝 alias 与任何条目的 model_name 撞名, 一并纳入校验。
+    taken_names = {
+        n for e in entries
+        for n in (str(e.get("alias") or "").strip(),
+                  str((e.get("model_client_config") or {}).get("model_name") or "").strip())
+        if n
+    }
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg, need_provider=False):
+        if agent_name in taken_names:
+            logging.info(f"jiuwenswarm model alias={agent_name} already exists, skip")
+            continue
+
+        api_kind = cfg.get("api", "openai-completions")
+        cfg["base_url"] = normalize_base_url(cfg["base_url"])
+        agent_model = _build_team_style_agent_model(cfg, proto_mcc, proto_mcc_obj)
+        client_provider = "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
+
+        # (a) models.defaults 追加一条带 alias 的条目:让网关 _model_cache 能用
+        #     别名解析(evaluator 等具名 agent 在请求侧透传 model_name 时命中)。
+        defaults.append({
+            **agent_model,
+            "model_config_obj": copy.deepcopy(proto_mcc_obj),
+            "is_default": False,
+            "alias": agent_name,
+        })
+        # (b) 顶层 agents.<name>.model 内联完整模型块:不靠 is_default 落点、
+        #     也不靠 alias 猜测。已存在同名 agent 条目时只补 model。
+        agents_section = data.setdefault("agents", {})
+        existing = agents_section.get(agent_name)
+        if isinstance(existing, dict):
+            existing.setdefault("model", agent_model)
+        elif existing is None:
+            agents_section[agent_name] = {"model": agent_model}
+        else:
+            logging.warning(
+                f"jiuwenswarm agent {agent_name} 已是非 dict 形态({type(existing).__name__}),"
+                f"跳过内联模型绑定"
+            )
+
+        taken_names.add(agent_name)
+        logging.info(
+            f"Added jiuwenswarm model: alias={agent_name} "
+            f"model={cfg['model']} provider={client_provider} (agents.{agent_name}.model 已内联)"
+        )
+
+    Path(ctx.local_path).write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8",
+    )
+    logging.info(f"Updated jw_config.yaml with models from {ctx.model_path}")
+
+
+def _prepare_taichu(ctx: "_PrepareContext") -> None:
+    """.taichu.json：每个 agent 注册成同名 provider，user_proxy_model 同步 provider。
+
+    - 每个非 user_simulator 的 agent 注册成同名 provider（已存在则只补模型）；
+    - user_proxy_model.json 里该 agent 补上 ``provider``，api 归一成 OpenAI 兼容，
+      让 openclaw-task 的 TaichuAgentManager 按 simulator_config 精确命中；
+    - 协议一律强制为 OpenAI chat-completions；原 api 不是 openai-completions
+      （如 anthropic-messages / openai-responses）时改写并告警。
+    """
+    data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
+    providers = data.setdefault("providers", [])
+    by_name = {p.get("name"): p for p in providers if isinstance(p, dict)}
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg, need_provider=False):
+        # taichu 一律走 OpenAI chat-completions；原协议不同就强制改写并告警。
+        api_kind = cfg.get("api", "openai-completions")
+        if api_kind != "openai-completions":
+            logging.warning(
+                f"taichu agent={agent_name} 的 api={api_kind} 已强制改为 openai-completions"
+                f"（wire_protocol=chat-completions）；请确认 {cfg['base_url']} 提供 OpenAI 兼容接口"
+            )
+        cfg["api"] = "openai-completions"
+        wire = "chat-completions"
+
+        provider_name = agent_name
+        base_url = normalize_base_url(cfg["base_url"])   # taichu 只吃 OpenAI 兼容基址
+        model_entry = {"id": cfg["model"], "wire_protocol": wire}
+
+        existing = by_name.get(provider_name)
+        if existing is None:
+            entry = {
+                "name": provider_name,
+                "base_url": base_url,
+                "api_key": cfg["api_key"],
+                "models": [model_entry],
+            }
+            providers.append(entry)
+            by_name[provider_name] = entry
+            logging.info(f"Added taichu provider: {provider_name} ({cfg['model']}, {wire})")
+        else:
+            models = existing.setdefault("models", [])
+            ids = {m.get("id") if isinstance(m, dict) else str(m) for m in models}
+            if cfg["model"] not in ids:
+                models.append(model_entry)
+                logging.info(f"Added model {cfg['model']} to taichu provider {provider_name}")
+
+        # simulator_config 侧：provider 与 .taichu.json 对齐。
+        cfg["provider"] = provider_name
+        cfg["base_url"] = base_url
+
+    if not data.get("default_provider") or data["default_provider"] not in by_name:
+        raise ValueError(
+            f"taichu 配置 {ctx.local_path} 的 default_provider 不在 providers 中: "
+            f"{data.get('default_provider')!r}（已有 {sorted(n for n in by_name if n)}）"
+        )
+
+    _write_json(ctx.local_path, data)
+    _write_json(ctx.model_path, ctx.model_cfg)
+    logging.info(f"Updated .taichu.json with providers from {ctx.model_path}")
+
+
+def _prepare_openclaw(ctx: "_PrepareContext") -> None:
+    """openclaw.json：注入 provider 与 agent，兼容 10.6（entries）与 6.6（list）两代 schema。"""
+    data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
+    data.setdefault("models", {}).setdefault("mode", "merge")
+    providers = data["models"].setdefault("providers", {})
+    agents_section = data.setdefault("agents", {})
+
+    # 两代 agent schema, 按模板里有没有 entries 键判定(不依赖版本号文本):
+    #   - 10.6: agents.entries 按 agent 名键控的对象;
+    #   - 6.6:  agents.list 数组, 条目带 id 字段。
+    entries_mode = isinstance(agents_section.get("entries"), dict)
+    agents_entries = agents_section.setdefault("entries", {}) if entries_mode else None
+    agents_list = agents_section.setdefault("list", []) if not entries_mode else None
+
+    # 按 sandbox_type 归一化 home 路径: windows 用 PureWindowsPath(反斜杠), 其余用 PurePosixPath
+    path_cls = PureWindowsPath if ctx.sandbox_type == "windows" else PurePosixPath
+    home = ctx.home
+
+    for agent_name, cfg in _usable_agents(ctx.model_cfg):
+        api_kind = cfg.get("api") or "anthropic-messages"
+        provider_key = cfg["provider"]
+        model_ref = f"{provider_key}/{cfg['model']}"
+        base_url = normalize_base_url(cfg["base_url"])
+
+        providers[provider_key] = {
+            "baseUrl": base_url,
+            "apiKey": cfg["api_key"],
+            "api": api_kind,
+            "timeoutSeconds": 300000,
+            "models": [
+                {
+                    "id": cfg["model"],
+                    "name": cfg["model"],
+                    "api": api_kind,
+                    "reasoning": True,
+                    "input": ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": 200000,
+                    "maxTokens": 327680,
+                    "compat": {"maxTokensField": "max_tokens"},
+                }
+            ],
+        }
+
+        workspace = str(path_cls(home, ".openclaw", f"workspace-{agent_name}"))
+
+        if entries_mode:
+            # entries 的键就是 agent 名, 条目里不再写 id/name。
+            # agentDir 由下方统一按 10.6 的 agents/<id>/agent 补齐。
+            agents_entries[agent_name] = {
+                **agents_entries.get(agent_name, {}),
+                "workspace": workspace,
+                "model": {"primary": model_ref},
+                "models": {model_ref: {}},
+            }
+        else:
+            agent_dir = str(path_cls(home, ".openclaw", "agents", agent_name))
+            entry = {
+                "id": agent_name,
+                "name": agent_name,
+                "workspace": workspace,
+                "agentDir": agent_dir,
+                "model": {"primary": model_ref},
+                "models": {model_ref: {}},
+            }
+            idx = next(
+                (i for i, e in enumerate(agents_list)
+                 if isinstance(e, dict) and e.get("id") == agent_name),
+                None,
+            )
+            if idx is None:
+                agents_list.append(entry)
+            else:
+                agents_list[idx] = {**agents_list[idx], **entry}
+
+        logging.info(f"Injected provider={provider_key} model={model_ref} for agent {agent_name}")
+
+    # 补注册 oc_agent_names 里传入但配置中还没有的 agent。
+    # workspace 仍按 <base>-<name> 派生, 与 harness 的命名规则一致。
+    added: List[str] = []
+    for name in (ctx.oc_agent_names or []):
+        name = str(name).strip()
+        if not name:
+            continue
+        if entries_mode:
+            if name in agents_entries:
+                continue
+            agents_entries[name] = {
+                "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
+            }
+        else:
+            if any(isinstance(e, dict) and e.get("id") == name for e in agents_list):
+                continue
+            agents_list.append({
+                "id": name,
+                "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
+            })
+        added.append(name)
+    if added:
+        logging.info(f"Registered agents from oc_agent_names: {added}")
+
+    # 归一化 agentDir: 每个条目都要有 agentDir。缺了它, gateway 会用自己进程的
+    # home 派生默认路径(Windows 上 gateway 以 SYSTEM 跑, home=systemprofile)落
+    # session 状态, 而不是 home 派生的路径 → upload_paths 指向的
+    # ~/.openclaw/agents 一直是空的, 且跨 query 续聊(session 复用)会报
+    # "Session history or replay state is invalid"。统一按 home 派生补齐。
+    if entries_mode:
+        # 10.6 多 agent 名册必须显式声明归属, 否则整份配置被判非法:
+        # "multi-agent rosters require agents.ownership='explicit' or one legacy
+        #  default=true marker"。单条目时加也无害, 故 entries 模式恒写。
+        agents_section["ownership"] = "explicit"
+        for name, e in agents_entries.items():
+            if isinstance(e, dict) and not e.get("agentDir"):
+                # 10.6 的 agentDir 默认是 <home>/.openclaw/agents/<id>/agent;
+                # 显式写成 agents/<id> 会让 agent 状态库落到父目录。
+                e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name, "agent"))
+    else:
+        for e in agents_list:
+            if not isinstance(e, dict):
+                continue
+            name = (e.get("id") or e.get("name") or "").strip()
+            if name and not e.get("agentDir"):
+                e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
+
+    _write_json(ctx.local_path, data)
+
+
+@dataclass
+class _PrepareContext:
+    """各 harness 分支共用的入参。model_cfg 已从 model_path 读入。"""
+    framework: str
+    local_path: str
+    model_path: str
+    model_cfg: dict
+    data_config_file: Optional[str]
+    home: str
+    sandbox_type: str
+    oc_agent_names: list
+
+
+# framework → 处理函数。未登记的 framework（hermes/claude-code 等）不需要本地改写。
+_PREPARERS = {
+    "openjiuwen": _prepare_openjiuwen,
+    "opencode": _prepare_opencode,
+    "pi": _prepare_pi,
+    "codex": _prepare_codex,
+    "grok": _prepare_grok,
+    "dsh": _prepare_dsh,
+    "jiuwenswarm": _prepare_jiuwenswarm,
+    "jiuwenswarm-dev": _prepare_jiuwenswarm,
+    "jiuwenswarm-xiaoyi": _prepare_jiuwenswarm,
+    "taichu": _prepare_taichu,
+    "openclaw": _prepare_openclaw,
+    "openclaw-tui": _prepare_openclaw,
+}
+
+
 def prepare_local_agent_config(
     framework: str,
     data_config_file: Optional[str] = None,
@@ -271,572 +824,35 @@ def prepare_local_agent_config(
     local_user_proxy_model_path: Optional[str] = None,
     home: str = "/home/ma-user",
     sandbox_type: str = "x86_cpu",
-    oc_agent_names: Optional[list] = [],
+    oc_agent_names: Optional[list] = None,
 ) -> None:
     """在 spawn worker 之前把本地 agent 配置文件按 framework 修改到位。
 
+    只负责分派；每个 harness 的改写逻辑见 ``_PREPARERS`` 里对应的 ``_prepare_*``。
+
     Args:
         framework: 当前 agent 框架名 (openclaw/openclaw-tui/hermes/dsh/...)
-        data_config_file: opencode/openclaw/openclaw-tui 分支需要读 data_config 里的 agents
+        data_config_file: opencode 需要读 data_config 里的 agents.system_prompt
+        local_path: 本地 harness 配置副本（会被原地改写）
+        local_user_proxy_model_path: 本地 user_proxy_model.json 副本
         home: 沙箱内的 home 根
         sandbox_type: 沙箱类型 ("windows" | "x86_cpu"), 决定 home 路径归一化形态
+        oc_agent_names: openclaw/openclaw-tui 需要预注册的 agent 名
     """
     model_cfg = json.loads(Path(local_user_proxy_model_path).read_text(encoding="utf-8"))
-
-    if framework == "openjiuwen":
-        # 1) openjiuwen.json: 归一化 default.provider 里的 anthropic -> Anthropic
-        data = json.loads(Path(local_path).read_text(encoding="utf-8"))
-        if "anthropic" in data["default"]["provider"]:
-            data["default"]["provider"] = "Anthropic"
-        Path(local_path).write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        # 2) 修改 user_proxy_model_local_file
-        for agent in model_cfg.values():
-            if "anthropic" in agent.get("api", ""):
-                agent["api"] = "Anthropic"
-        Path(local_user_proxy_model_path).write_text(
-            json.dumps(model_cfg, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-
-    elif framework == "opencode":
-        # opencode.json: agents.system_prompt 和 agent:evaluator 注入
-        data = json.loads(Path(local_path).read_text(encoding="utf-8"))
-        providers = data.setdefault("provider", {})
-        agents = data.setdefault("agent", {})
-
-        # opencode 需要把 data_config 里 agent.system_prompt 注入到 agent.prompt
-        agent_sp = _read_agent_system_prompts(data_config_file)
-
-        # 更新 provider 和 agent
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url")
-                    and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
-                )
-                continue
-
-            provider_key = cfg["provider"]
-            model_name = cfg["model"]
-            api_key = cfg["api_key"]
-            api_kind = cfg.get("api", "openai-completions")
-            base_url = cfg["base_url"].strip().rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-
-            if provider_key not in providers:
-                npm_pkg = ("@ai-sdk/openai-compatible"
-                           if "openai" in api_kind.lower()
-                           else "@ai-sdk/anthropic")
-                providers[provider_key] = {
-                    "name": provider_key,
-                    "npm": npm_pkg,
-                    "options": {"baseURL": base_url, "apiKey": api_key},
-                    "models": {model_name: {"name": model_name}},
-                }
-                logging.info(f"Added provider: {provider_key}")
-            else:
-                existing_models = providers[provider_key].setdefault("models", {})
-                if model_name not in existing_models:
-                    existing_models[model_name] = {"name": model_name}
-                    logging.info(f"Added model {model_name} to existing provider {provider_key}")
-
-            model_ref = f"{provider_key}/{model_name}"
-            if agent_name in agents:
-                agents[agent_name]["model"] = model_ref
-                if agent_name in agent_sp:
-                    agents[agent_name]["prompt"] = agent_sp.get(agent_name) or ""
-                logging.info(f"Updated agent {agent_name} with model {model_ref}")
-            else:
-                agents[agent_name] = {
-                    "model": model_ref,
-                    "prompt": agent_sp.get(agent_name) or ""
-                }
-                logging.info(f"Added new agent {agent_name} with model {model_ref}")
-
-        Path(local_path).write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        logging.info(f"Updated opencode.json with provider/agent from {local_user_proxy_model_path}")
-
-    elif framework == "pi":
-        # models.json: 注入 provider
-        data = json.loads(Path(local_path).read_text(encoding="utf-8"))
-        providers = data.setdefault("providers", {})
-
-        # 注入 agent 的 contextWindow/maxTokens 与主 agent(模板里已有的
-        # provider 模型条目)保持一致, 模板改参后这里自动跟随, 不用同步改代码;
-        # 模板里找不到带该字段的条目时, 退回历史默认值。
-        main_model = next(
-            (m for p in providers.values() if isinstance(p, dict)
-             for m in p.get("models", []) if isinstance(m, dict) and "contextWindow" in m),
-            {},
-        )
-        context_window = main_model.get("contextWindow", 200000)
-        max_tokens = main_model.get("maxTokens", 131072)
-
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url")
-                    and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
-                )
-                continue
-
-            provider_key = cfg["provider"]
-            model_name = cfg["model"]
-            api_kind = cfg.get("api", "openai-completions")
-            base_url = cfg["base_url"]
-            if api_kind == "openai-completions":
-                base_url = base_url.strip().rstrip("/")
-                if not base_url.endswith("/v1"):
-                    base_url += "/v1"
-            elif api_kind == "anthropic-messages":
-                base_url = base_url.strip().rstrip("/")
-                if base_url.endswith("/v1"):
-                    base_url = base_url.removesuffix("/v1").rstrip("/")
-
-            if provider_key not in providers:
-                providers[provider_key] = {
-                    "baseUrl": base_url,
-                    "api": api_kind,
-                    "apiKey": cfg["api_key"],
-                    "models": [
-                        {
-                            "id": model_name,
-                            "name": model_name,
-                            "reasoning": False,
-                            "input": ["text"],
-                            "contextWindow": context_window,
-                            "maxTokens": max_tokens,
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, # pi 会拿会话的 usage 统计，乘以单价
-                        }
-                    ],
-                }
-                logging.info(f"Added pi provider: {provider_key} ({model_name})")
-            else:
-                existing_models = providers[provider_key].setdefault("models", [])
-                existing_ids = {m.get("id") for m in existing_models if isinstance(m, dict)}
-                if model_name not in existing_ids:
-                    existing_models.append({"id": model_name})
-                    logging.info(
-                        f"Added model {model_name} to existing pi provider {provider_key}"
-                    )
-
-        Path(local_path).write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        logging.info(f"Updated models.json with provider from {local_user_proxy_model_path}")
-
-    elif framework == "codex":
-        # [model_providers.<key>] 追加到 config.toml, 已存在则跳过
-        toml_text = Path(local_path).read_text(encoding="utf-8")
-        new_blocks: List[str] = []
-
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url")
-                    and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
-                )
-                continue
-
-            provider_key = cfg["provider"]
-            if f"[model_providers.{provider_key}]" in toml_text:
-                logging.info(
-                    f"codex provider {provider_key} already exists in config.toml, skip"
-                )
-                continue
-
-            # Responses 不在本次统一规范化范围内，保留 Codex 原有的 /v1 行为。
-            base_url = cfg["base_url"].rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url = base_url + "/v1"
-            api_key = cfg["api_key"]
-
-            block = (
-                f"[model_providers.{provider_key}]\n"
-                f'name     = "{provider_key}"\n'
-                f'base_url = "{base_url}"\n'
-                f'experimental_bearer_token = "{api_key}"\n'
-                f'wire_api = "responses"\n'
-            )
-            new_blocks.append(block)
-            logging.info(f"Added codex provider: {provider_key} (agent={agent_name})")
-
-        if new_blocks:
-            toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
-            Path(local_path).write_text(toml_text, encoding="utf-8")
-            logging.info(
-                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_user_proxy_model_path}"
-            )
-
-    elif framework == "grok":
-        # [model.<provider>] 追加到 config.toml, 已存在则跳过
-        toml_text = Path(local_path).read_text(encoding="utf-8")
-        new_blocks: List[str] = []
-
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url")
-                    and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
-                )
-                continue
-
-            provider_key = cfg["provider"]
-            if f"[model.{provider_key}]" in toml_text:
-                logging.info(
-                    f"grok provider {provider_key} already exists in config.toml, skip"
-                )
-                continue
-
-            base_url = cfg["base_url"].strip().rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-            api_key = cfg["api_key"]
-            api_backend = {
-                "anthropic-messages": "messages",
-                "openai-completions": "chat_completions",
-            }.get(cfg.get("api"))
-            api_backend_line = (
-                f'api_backend = "{api_backend}"\n' if api_backend else ""
-            )
-
-            block = (
-                f"[model.{provider_key}]\n"
-                f'model     = "{cfg.get("model")}"\n'
-                f'name      = "{cfg.get("model")}"\n'
-                f'base_url  = "{base_url}"\n'
-                f'api_key   = "{api_key}"\n'
-                f'{api_backend_line}'
-            )
-            new_blocks.append(block)
-            logging.info(f"Added grok provider: {provider_key} (agent={agent_name})")
-
-        if new_blocks:
-            toml_text = toml_text.rstrip() + "\n\n" + "\n".join(new_blocks)
-            Path(local_path).write_text(toml_text, encoding="utf-8")
-            logging.info(
-                f"Updated config.toml with {len(new_blocks)} provider(s) from {local_user_proxy_model_path}"
-            )
-
-    elif framework == "dsh":
-        # llm-pi-ai.providers 追加 provider 到 settings.yaml, 已存在则跳过
-        data = load_yaml_config(local_path)
-
-        # 注入 agent(evaluator 等)的 contextWindow/maxTokens 与主 agent(模板里
-        # 已有的 provider 模型条目)保持一致, 模板改参后这里自动跟随;
-        _template_providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
-        main_model = next(
-            (m for p in _template_providers.values() if hasattr(p, "get")
-             for m in p.get("models", []) if hasattr(m, "get") and "contextWindow" in m),
-            {},
-        )
-        dsh_context_window = main_model.get("contextWindow", 200000)
-        dsh_max_tokens = main_model.get("maxTokens", 326800)
-
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url")
-                    and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
-                )
-                continue
-
-            provider_key = cfg["provider"]
-            providers = (data.get("llm-pi-ai") or {}).get("providers") or {}
-            api_kind = cfg.get("api", "openai-completions")
-            base_url = cfg["base_url"]
-            if api_kind == "openai-completions":
-                base_url = base_url.strip().rstrip("/")
-                if not base_url.endswith("/v1"):
-                    base_url += "/v1"
-            elif api_kind == "anthropic-messages":
-                base_url = base_url.strip().rstrip("/")
-                if base_url.endswith("/v1"):
-                    base_url = base_url.removesuffix("/v1").rstrip("/")
-            api_key = cfg["api_key"]
-            model_name = cfg["model"]
-            credentials = data.get("credentials") or {}
-
-            if provider_key not in providers:
-                api_key_env = provider_key.replace('-', '_').upper() + "_API_KEY"
-                providers[provider_key] = {
-                    "displayName": provider_key,
-                    "apiKeyEnv": api_key_env,
-                    "api": api_kind,
-                    "baseURL": base_url,
-                    "models": [
-                        {
-                            "id": model_name,
-                            "contextWindow": dsh_context_window,
-                            "maxTokens": dsh_max_tokens
-                        }
-                    ],
-                }
-                credentials[api_key_env] = api_key
-                logging.info(f"Added dsh provider: {provider_key} ({model_name})")
-            else:
-                existing_models = providers[provider_key].setdefault("models", [])
-                existing_ids = {m.get("id") for m in existing_models if hasattr(m, "get")}
-                if model_name not in existing_ids:
-                    existing_models.append({"id": model_name})
-                    logging.info(
-                        f"Added model {model_name} to existing dsh provider {provider_key}"
-                    )
-        OmegaConf.save(data, local_path)
-        logging.info(f"Updated settings.yaml with provider from {local_user_proxy_model_path}")
-
-    elif framework in {"jiuwenswarm", "jiuwenswarm-dev", "jiuwenswarm-xiaoyi"}:
-        # jw_config.yaml: 把 user_proxy_model.json 的
-        # 每个模型追加成 models.defaults 的一条, 用 alias 区分; 默认模型靠
-        # is_default: true 标记, 其余段(permissions 等)原样保留。
-        data = yaml.safe_load(Path(local_path).read_text(encoding="utf-8")) or {}
-        models = data.setdefault("models", {})
-        defaults = models.setdefault("defaults", [])
-        entries = [e for e in defaults if isinstance(e, dict)]
-
-        default_entry = next((e for e in entries if e.get("is_default")), None)
-
-        # 新条目沿用默认模型条目的可选字段, 不硬编码。
-        # 注意别往 model_config_obj 塞 context_window: 它会被并进 extra_params,
-        # 再传给 openai SDK 的 chat.completions.create(), 后者不认这个键, 直接 TypeError。
-        proto_mcc = (default_entry or {}).get("model_client_config") or {}
-        proto_mcc_obj = (default_entry or {}).get("model_config_obj") or {}
-
-        # jiuwenswarm 拒绝 alias 与任何条目的 model_name 撞名, 一并纳入校验。
-        taken_names = {
-            n for e in entries
-            for n in (str(e.get("alias") or "").strip(),
-                      str((e.get("model_client_config") or {}).get("model_name") or "").strip())
-            if n
-        }
-
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url") and cfg.get("api_key")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key, skip"
-                )
-                continue
-            if agent_name in taken_names:
-                logging.info(
-                    f"jiuwenswarm model alias={agent_name} already exists, skip"
-                )
-                continue
-
-            api_kind = cfg.get("api", "openai-completions")
-            base_url = cfg["base_url"].strip().rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-            cfg["base_url"] = base_url
-            agent_model = _build_team_style_agent_model(cfg, proto_mcc, proto_mcc_obj)
-            client_provider = (
-                "Anthropic" if "anthropic" in api_kind.lower() else "OpenAI"
-            )
-
-            # (a) models.defaults 追加一条带 alias 的条目:让网关 _model_cache 能用
-            #     别名解析(evaluator 等具名 agent 在请求侧透传 model_name 时命中)。
-            defaults.append({
-                **agent_model,
-                "model_config_obj": copy.deepcopy(proto_mcc_obj),
-                "is_default": False,
-                "alias": agent_name,
-            })
-            # (b) 顶层 agents.<name>.model 内联完整模型块:team 模式的多 agent 策略。
-            #     每个 agent 自带 model_client_config + model_request_config,不靠
-            #     is_default 落点、也不靠 alias 猜测,真正做到 per-agent 绑模型。
-            #     已存在同名 agent 条目时只补 model,保留其 workspace/skills 等设置。
-            agents_section = data.setdefault("agents", {})
-            existing = agents_section.get(agent_name)
-            if isinstance(existing, dict):
-                existing.setdefault("model", agent_model)
-            elif existing is None:
-                agents_section[agent_name] = {"model": agent_model}
-            else:
-                logging.warning(
-                    f"jiuwenswarm agent {agent_name} 已是非 dict 形态({type(existing).__name__}),"
-                    f"跳过内联模型绑定"
-                )
-
-            taken_names.add(agent_name)
-            logging.info(
-                f"Added jiuwenswarm model: alias={agent_name} "
-                f"model={cfg['model']} provider={client_provider} (agents.{agent_name}.model 已内联)"
-            )
-
-        Path(local_path).write_text(
-            yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
-        )
-        logging.info(
-            f"Updated jw_config.yaml with models from {local_user_proxy_model_path}"
-        )
-
-    elif framework in {"openclaw", "openclaw-tui"}:
-        data = json.loads(Path(local_path).read_text(encoding="utf-8"))
-        data.setdefault("models", {}).setdefault("mode", "merge")
-        providers = data["models"].setdefault("providers", {})
-        agents_section = data.setdefault("agents", {})
-
-        # 两代 agent schema, 按模板里有没有 entries 键判定(不依赖版本号文本):
-        #   - 10.6: agents.entries 按 agent 名键控的对象;
-        #   - 6.6:  agents.list 数组, 条目带 id 字段。
-        entries_mode = isinstance(agents_section.get("entries"), dict)
-        agents_entries = agents_section.setdefault("entries", {}) if entries_mode else None
-        agents_list = (
-            agents_section.setdefault("list", [])
-            if not entries_mode else None
-        )
-
-        # 按 sandbox_type 归一化 home 路径: windows 用 PureWindowsPath(反斜杠), 其余用 PurePosixPath
-        path_cls = PureWindowsPath if sandbox_type == "windows" else PurePosixPath
-
-        for agent_name, cfg in model_cfg.items():
-            if agent_name == "user_simulator":
-                continue
-            if not (cfg.get("model") and cfg.get("base_url")
-                    and cfg.get("api_key") and cfg.get("provider")):
-                logging.warning(
-                    f"agent {agent_name} missing model/base_url/api_key/provider, skip"
-                )
-                continue
-
-            api_kind = cfg.get("api") or "anthropic-messages"
-            provider_key = cfg["provider"]
-            model_ref = f"{provider_key}/{cfg['model']}"
-            base_url = cfg["base_url"].strip().rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-
-            providers[provider_key] = {
-                "baseUrl": base_url,
-                "apiKey": cfg["api_key"],
-                "api": api_kind,
-                "timeoutSeconds": 300000,
-                "models": [
-                    {
-                        "id": cfg["model"],
-                        "name": cfg["model"],
-                        "api": api_kind,
-                        "reasoning": True,
-                        "input": ["text"],
-                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                        "contextWindow": 200000,
-                        "maxTokens": 327680,
-                        "compat": {"maxTokensField": "max_tokens"},
-                    }
-                ],
-            }
-
-            workspace = str(path_cls(home, ".openclaw", f"workspace-{agent_name}"))
-
-            if entries_mode:
-                # entries 的键就是 agent 名, 条目里不再写 id/name。
-                # agentDir 由下方统一按 10.6 的 agents/<id>/agent 补齐。
-                agents_entries[agent_name] = {
-                    **agents_entries.get(agent_name, {}),
-                    "workspace": workspace,
-                    "model": {"primary": model_ref},
-                    "models": {model_ref: {}},
-                }
-            else:
-                agent_dir = str(path_cls(home, ".openclaw", "agents", agent_name))
-                entry = {
-                    "id": agent_name,
-                    "name": agent_name,
-                    "workspace": workspace,
-                    "agentDir": agent_dir,
-                    "model": {"primary": model_ref},
-                    "models": {model_ref: {}},
-                }
-                idx = next(
-                    (i for i, e in enumerate(agents_list)
-                     if isinstance(e, dict) and e.get("id") == agent_name),
-                    None,
-                )
-                if idx is None:
-                    agents_list.append(entry)
-                else:
-                    agents_list[idx] = {**agents_list[idx], **entry}
-
-            logging.info(
-                f"Injected provider={provider_key} model={model_ref} for agent {agent_name}"
-            )
-
-        # 补注册 oc_agent_names 里传入但配置中还没有的 agent。
-        # workspace 仍按 <base>-<name> 派生, 与 harness 的命名规则一致。
-        added: List[str] = []
-        for name in (oc_agent_names or []):
-            name = str(name).strip()
-            if not name:
-                continue
-            if entries_mode:
-                if name in agents_entries:
-                    continue
-                agents_entries[name] = {
-                    "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
-                }
-            else:
-                if any(isinstance(e, dict) and e.get("id") == name
-                       for e in agents_list):
-                    continue
-                agents_list.append({
-                    "id": name,
-                    "workspace": str(path_cls(home, ".openclaw", f"workspace-{name}")),
-                })
-            added.append(name)
-        if added:
-            logging.info(f"Registered agents from oc_agent_names: {added}")
-
-        # 归一化 agentDir: 每个条目都要有 agentDir。缺了它, gateway 会用自己进程的
-        # home 派生默认路径(Windows 上 gateway 以 SYSTEM 跑, home=systemprofile)落
-        # session 状态, 而不是 home 派生的路径 → upload_paths 指向的
-        # ~/.openclaw/agents 一直是空的, 且跨 query 续聊(session 复用)会报
-        # "Session history or replay state is invalid"。统一按 home 派生补齐。
-        # entries 模式的键即名字; list 模式条目自带 id/name。
-        if entries_mode:
-            # 10.6 多 agent 名册必须显式声明归属, 否则整份配置被判非法:
-            # "multi-agent rosters require agents.ownership='explicit' or one legacy
-            #  default=true marker"。单条目时加也无害, 故 entries 模式恒写。
-            agents_section["ownership"] = "explicit"
-            for name, e in agents_entries.items():
-                if isinstance(e, dict) and not e.get("agentDir"):
-                    # 10.6 的 agentDir 默认是 <home>/.openclaw/agents/<id>/agent
-                    # (模板里 test/test1/test2 也是这个形态), 与本分支保持一致;
-                    # 显式写成 agents/<id> 会让 agent 状态库落到父目录, 与
-                    # openclaw 自己的解析结果不一致。
-                    e["agentDir"] = str(
-                        path_cls(home, ".openclaw", "agents", name, "agent"))
-        else:
-            for e in agents_list:
-                if not isinstance(e, dict):
-                    continue
-                name = (e.get("id") or e.get("name") or "").strip()
-                if name and not e.get("agentDir"):
-                    e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
-
-        Path(local_path).write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+    preparer = _PREPARERS.get(framework)
+    if preparer is None:
+        return
+    preparer(_PrepareContext(
+        framework=framework,
+        local_path=local_path,
+        model_path=local_user_proxy_model_path,
+        model_cfg=model_cfg,
+        data_config_file=data_config_file,
+        home=home,
+        sandbox_type=sandbox_type,
+        oc_agent_names=list(oc_agent_names or []),
+    ))
 
 # ============================================================================
 # Error catalog / classification / log formatting (shared with utils/win_util.py)
@@ -1014,17 +1030,35 @@ def _strip_api_use_lines(text: str) -> str:
 
 def _classify_task_stdout(stdout: str) -> tuple[str, str]:
     """
-    从主脚本 stdout 里推断更具体的错误码（优先匹配最后出现的错误信息）。
+    从主脚本 stdout 里推断更具体的错误码。
+
+    判定优先级：
+      1. 存在「Task_Done」标记（hermes: 任务完成【Task_Done】/ pi、openclaw 等：
+         【Task_Done】）→ 一票通过，返回无错误 —— 中间过程的工具报错
+         （Traceback / ModuleNotFound 等）都只是 agent 的正常试错，不算失败；
+      2. hermes 完成语「🎉 Conversation completed after N ... API call(s)」
+         → 视为正常结束（hermes 无 Task_Done 标记时以它为准），同样一票通过；
+      3. 以上都没有时，倒序查找 T 类错误短语（最后出现者优先）；
+      4. 兜底 Traceback → T010。
     """
     stdout = _strip_api_use_lines(stdout)
-    if not stdout or "【Task_Done】" in stdout:
+    if not stdout:
+        return "", ""
+
+    # ---- 优先级 1: Task_Done 一票决定权（两种标记形态都认） ----
+    if "【Task_Done】" in stdout or "任务完成【Task_Done】" in stdout:
+        return "", ""
+
+    # ---- 优先级 2: hermes 完成语 ----
+    # 示例: "🎉 Conversation completed after 18 OpenAI-compatible API call(s)"
+    if re.search(r"🎉 Conversation completed after \d+ .{0,40}API call", stdout):
         return "", ""
 
     best_pos = -1
     best_code = ""
     best_phrase = ""
 
-    # 遍历错误目录，但仅处理以 'T' 开头且不等于 'T010' 的条目
+    # ---- 优先级 3: 倒序查找 T 类错误短语（最后出现者优先） ----
     for code, phrase in ERROR_CATALOG.items():
         if not code.startswith("T") or code == "T010":
             continue
@@ -1038,7 +1072,7 @@ def _classify_task_stdout(stdout: str) -> tuple[str, str]:
     if best_pos != -1:
         return best_code, best_phrase
 
-    # 若未匹配到任何 T 类错误，再检查是否含有 Traceback
+    # ---- 优先级 4: 兜底 Traceback → T010 ----
     if "Traceback" in stdout:
         return "T010", "Traceback"
 

@@ -75,3 +75,13 @@
 
 
 
+
+- taichu
+~/taichu/user/agent_instances/<persona>/meta_data   （main → sys_celia_main）
+├── AGENTS.md
+├── IDENTITY.md
+├── MEMORY.md
+├── SOUL.md
+├── TOOLS.md
+└── USER.md
+（模板取自 taichu-cli 0.2.0 首次运行时原生 bootstrap 生成的默认内容）

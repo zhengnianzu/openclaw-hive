@@ -102,7 +102,7 @@
                改成 select 后就复制不了地址了。 -->
           <el-form-item label="模型 Base URL">
             <el-autocomplete v-model="form.model_base_url" :fetch-suggestions="queryBaseUrls"
-              :placeholder="['opencode','pi','codex','grok'].includes(form.harness_type) ? '选择或输入，例如：http://192.168.30.95:8084（自动补 /v1）' : '选择或输入，例如：http://192.168.30.95:8084'"
+              :placeholder="['opencode','pi','codex','grok','taichu'].includes(form.harness_type) ? '选择或输入，例如：http://192.168.30.95:8084（自动补 /v1）' : '选择或输入，例如：http://192.168.30.95:8084'"
               style="width:100%" clearable :trigger-on-focus="true" fit-input-width>
               <template #default="{ item }">
                 <span>{{ item.value }}</span>

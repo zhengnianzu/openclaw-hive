@@ -107,6 +107,14 @@
         "agent_config": "jw_config.yaml",
         "ui_color": "#e91e63"
     },
+    "taichu": {
+        "id": "taichu",
+        "name": "TaiChu",
+        "hive_config": "config.yaml",
+        "user_config": "user_proxy_model.json",
+        "agent_config": ".taichu.json",
+        "ui_color": "#d4a017"
+    },
     "common": {
         "id": "common",
         "name": "通用",
