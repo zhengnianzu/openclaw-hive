@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     EXPORT_BASE: str = ""
     EXPORT_ACCESS_KEY: str = ""
 
+    # Git 来源代码仓的拉取凭据（单个全局 token，私有仓必填，公开仓可留空）。
+    # 只在 code_repo_sync 里拼进 clone URL，不入库、不进日志、报错前先脱敏。
+    # 按仓独立凭据等以后有需要再说，现在全局一个够用。
+    GITHUB_TOKEN: str = ""
+
     class Config:
         env_file = ".env"
 

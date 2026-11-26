@@ -1,10 +1,7 @@
-import asyncio
-import os
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..core.config import settings
 from ..core.database import get_connection
 from ..core.security import get_current_user, require_operator
 from ..models.code_repo import (
@@ -14,16 +11,14 @@ from ..models.code_repo import (
     CodeRepoTagInfo,
     CodeRepoUpdate,
 )
+from ..services.code_repo_sync import (
+    ensure_repo_ready,
+    is_git,
+    repo_status,
+    resolve_remote_head,
+)
 
 router = APIRouter(prefix="/api/code-repos", tags=["code-repos"])
-
-
-def _get_code_dir() -> str:
-    return os.path.join(settings.HIVE_ROOT, "platform", "code")
-
-
-def _obs_dir_name(obs_path: str) -> str:
-    return obs_path.rstrip("/").split("/")[-1]
 
 
 @router.get("", response_model=List[CodeRepoInfo])
@@ -58,10 +53,13 @@ def create_code_repo(req: CodeRepoCreate, user: dict = Depends(require_operator)
         if existing:
             raise HTTPException(status_code=400, detail=f"代码仓 {req.name.strip()} 版本 {req.version.strip()} 已存在")
         cursor = conn.execute(
-            "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, tag, is_default, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            "INSERT INTO code_repos (name, obs_path, version, description, main_python_file, tag, is_default, "
+            "source_type, repo_url, branch, subdir, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             (req.name.strip(), req.obs_path.strip(), req.version.strip(), req.description.strip(),
-             req.main_python_file.strip(), _check_tag(conn, req.tag), user["username"]),
+             req.main_python_file.strip(), _check_tag(conn, req.tag),
+             req.source_type, req.repo_url.strip(), req.branch.strip(), req.subdir.strip().strip("/"),
+             user["username"]),
         )
         if req.is_default:
             _set_default_repo(conn, cursor.lastrowid)
@@ -129,21 +127,25 @@ def delete_code_repo_tag(tag_id: int, user: dict = Depends(require_operator)):
 
 @router.patch("/{repo_id}", response_model=CodeRepoInfo)
 def update_code_repo(repo_id: int, req: CodeRepoUpdate, user: dict = Depends(require_operator)):
-    """允许改 obs_path / main_python_file / description / tag，但不允许改 name / version。
+    """允许改来源地址 / main_python_file / description / tag，但不允许改 name / version / source_type。
 
     name+version 决定了 code/src/{name}/{version} 与 code/tar/{name}/{version} 两个目录，
     实例配置里的 main_code_tar 也是这么拼的（见 instances.py 的代码仓分支）。改了会让
-    已经下载/打包好的产物对不上，所以要换名称或版本应当新建一条记录。
+    已经下载/打包好的产物对不上，所以要换名称或版本应当新建一条记录。source_type 同理：
+    两种来源的目录规则不同（git 多一层 commit），切换会让存量产物对不上。
 
     只拼请求里实际给了的字段，避免「只改描述」把 obs_path 一起覆盖掉。
     """
     sets, params = [], []
-    if req.obs_path is not None:
-        obs_path = req.obs_path.strip()
-        if not obs_path:
-            raise HTTPException(status_code=400, detail="OBS路径不能为空")
-        sets.append("obs_path = ?")
-        params.append(obs_path)
+    if req.repo_url is not None:
+        sets.append("repo_url = ?")
+        params.append(req.repo_url.strip())
+    if req.branch is not None:
+        sets.append("branch = ?")
+        params.append(req.branch.strip())
+    if req.subdir is not None:
+        sets.append("subdir = ?")
+        params.append(req.subdir.strip().strip("/"))
     if req.main_python_file is not None:
         main_py = req.main_python_file.strip()
         if not main_py:
@@ -155,8 +157,19 @@ def update_code_repo(repo_id: int, req: CodeRepoUpdate, user: dict = Depends(req
         params.append(req.description.strip())
 
     with get_connection() as conn:
-        if not conn.execute("SELECT 1 FROM code_repos WHERE id = ?", (repo_id,)).fetchone():
+        row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (repo_id,)).fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="代码仓不存在")
+        # 「地址不能清空」的判据要看来源：obs 仓离了 obs_path 没法下载，
+        # 但 git 仓的 obs_path 本就该是空的，不能照搬原来的非空校验。
+        if req.obs_path is not None:
+            obs_path = req.obs_path.strip()
+            if not obs_path and not is_git(dict(row)):
+                raise HTTPException(status_code=400, detail="OBS路径不能为空")
+            sets.append("obs_path = ?")
+            params.append(obs_path)
+        if req.repo_url is not None and not req.repo_url.strip() and is_git(dict(row)):
+            raise HTTPException(status_code=400, detail="仓库地址不能为空")
         if req.tag is not None:
             sets.append("tag = ?")
             params.append(_check_tag(conn, req.tag))
@@ -187,83 +200,65 @@ def delete_code_repo(repo_id: int, user: dict = Depends(require_operator)):
     return {"detail": "已删除"}
 
 
-@router.post("/{repo_id}/download")
-async def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
+def _fetch_repo(repo_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (repo_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="代码仓不存在")
+    return dict(row)
 
-    repo = dict(row)
-    src_dir = os.path.join(_get_code_dir(), "src", repo["name"], repo["version"])
-    tar_dir = os.path.join(_get_code_dir(), "tar", repo["name"], repo["version"])
-    tar_path = os.path.join(tar_dir, "openclaw-task.tar")
 
-    if os.path.isfile(tar_path):
-        return {"message": "代码仓已下载并打包", "tar_path": tar_path, "already_exists": True}
+@router.post("/{repo_id}/download")
+async def download_code_repo(repo_id: int, user: dict = Depends(require_operator)):
+    """惰性下载并打包：产物已在就直接返回，不重复拉取。
 
-    # Download from OBS
-    if not (os.path.isdir(src_dir) and os.listdir(src_dir)):
-        os.makedirs(src_dir, exist_ok=True)
-        obs_path = repo["obs_path"]
-        if not obs_path.endswith("/"):
-            obs_path += "/"
-        proc = await asyncio.create_subprocess_exec(
-            settings.OBSUTIL_PATH, "cp", obs_path, src_dir, "-r", "-f",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            raise HTTPException(status_code=500, detail="OBS下载超时(600s)")
-        if proc.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"OBS下载失败: {stderr.decode(errors='replace')[:500]}")
+    两种来源的实际拉取都在 services/code_repo_sync.ensure_repo_ready 里，
+    与实例准备阶段（instances.py）共用同一份实现。
+    """
+    result = await ensure_repo_ready(_fetch_repo(repo_id))
+    return {
+        "message": "代码仓已下载并打包" if result["already_exists"] else "下载并打包成功",
+        **result,
+    }
 
-    dir_name = _obs_dir_name(repo["obs_path"])
-    actual_dir = os.path.join(src_dir, dir_name)
 
-    # Package as tar
-    os.makedirs(tar_dir, exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
-        "tar", "cf", tar_path, dir_name,
-        cwd=src_dir,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise HTTPException(status_code=500, detail="打包超时(120s)")
-    if proc.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"打包失败: {stderr.decode(errors='replace')[:500]}")
+@router.post("/{repo_id}/sync")
+async def sync_code_repo(repo_id: int, user: dict = Depends(require_operator)):
+    """同步到来源的最新代码。
 
-    return {"message": "下载并打包成功", "tar_path": tar_path, "src_path": actual_dir, "already_exists": False}
+    git 仓：先 ls-remote 比对远端 HEAD 与本地 resolved_commit，一致且产物还在就
+    直接返回 updated=false（重复点按钮不该白跑一次 clone）；不一致则拉到一个新的
+    commit 目录、回写 resolved_commit/synced_at，旧目录保留。
+    obs 仓：没有「版本」概念可比，退化为强制重下重打包。
+    """
+    repo = _fetch_repo(repo_id)
+    result = await ensure_repo_ready(repo, force=True)
+    if result["updated"]:
+        msg = f"已同步到 {result['commit'][:12]}" if result["commit"] else "已重新下载并打包"
+    else:
+        msg = "已是最新，无需同步"
+    return {"message": msg, **result}
+
+
+@router.get("/{repo_id}/remote-head")
+async def code_repo_remote_head(repo_id: int, user: dict = Depends(get_current_user)):
+    """只读探测远端最新 commit，用于页面提示「远端有新 commit」。
+
+    obs 仓没有远端版本可查，返回 supported=false 让前端不显示该提示。
+    """
+    repo = _fetch_repo(repo_id)
+    if not is_git(repo):
+        return {"supported": False, "remote_commit": "", "local_commit": "", "behind": False}
+    remote = await resolve_remote_head(repo)
+    local = (repo.get("resolved_commit") or "").strip()
+    return {
+        "supported": True,
+        "remote_commit": remote,
+        "local_commit": local,
+        "behind": remote != local,
+    }
 
 
 @router.get("/{repo_id}/status")
 def check_code_repo_status(repo_id: int, user: dict = Depends(get_current_user)):
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (repo_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="代码仓不存在")
-
-    repo = dict(row)
-    tar_path = os.path.join(_get_code_dir(), "tar", repo["name"], repo["version"], "openclaw-task.tar")
-    src_dir = os.path.join(_get_code_dir(), "src", repo["name"], repo["version"])
-    dir_name = _obs_dir_name(repo["obs_path"])
-    actual_dir = os.path.join(src_dir, dir_name)
-
-    tar_exists = os.path.isfile(tar_path)
-    src_exists = os.path.isdir(actual_dir)
-
-    return {
-        "downloaded": src_exists,
-        "packaged": tar_exists,
-        "tar_path": tar_path if tar_exists else None,
-        "src_path": actual_dir if src_exists else None,
-    }
+    return repo_status(_fetch_repo(repo_id))

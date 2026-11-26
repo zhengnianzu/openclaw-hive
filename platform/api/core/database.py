@@ -649,6 +649,23 @@ TASK_EXTRA_COLUMNS = (
     "query_text TEXT",
 )
 
+# code_repos 的 Git 来源列。代码仓原先只有 OBS 一种来源（obs_path + obsutil cp），
+# 这几列让同一张表也能登记一个 GitHub 仓，由平台自己 clone。
+#
+# source_type 默认 'obs' 是兼容的关键：存量行不动一个字节就自动归入原有分支，
+# 路径仍是 code/{src,tar}/{name}/{version}/，与改动前逐字一致。
+# git 仓则在后面多一层 commit 短 sha（见 services/code_repo_sync.py 的 repo_dirs）。
+CODE_REPO_GIT_COLUMNS = (
+    "source_type TEXT NOT NULL DEFAULT 'obs'",
+    "repo_url TEXT DEFAULT ''",
+    "branch TEXT DEFAULT ''",
+    # 仓内子目录；空 = 仓根。对应 obs 来源里「obs_path 末段」那个目录名的角色。
+    "subdir TEXT DEFAULT ''",
+    # 最近一次同步到的完整 sha。git 仓靠它定位 commit 目录，空 = 从未同步过。
+    "resolved_commit TEXT DEFAULT ''",
+    "synced_at TIMESTAMP",
+)
+
 # shallow_queue 的「新增可选列」。产物下载维（artifact_*）是为了让 task_tracker
 # 成为唯一的发现方：它在 complete.jsonl 增量读时把 artifact_state 标 'queued'，
 # output_worker 只领取、不再全量 UPSERT task_traj_records。
@@ -749,7 +766,7 @@ def ensure_traj_extra_columns() -> None:
                            ("task_records", TASK_EXTRA_COLUMNS),
                            ("images", ("enabled INTEGER NOT NULL DEFAULT 1",)),
                            ("code_repos", ("is_default INTEGER NOT NULL DEFAULT 0",
-                                           "enabled INTEGER NOT NULL DEFAULT 1"))):
+                                           "enabled INTEGER NOT NULL DEFAULT 1") + CODE_REPO_GIT_COLUMNS)):
         try:
             with get_connection() as conn:
                 if not _table_exists(conn, table):
@@ -1164,7 +1181,8 @@ def init_db_unlocked():
             CREATE TABLE IF NOT EXISTS code_repos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                obs_path TEXT NOT NULL,
+                -- git 来源的仓不填这列，故可空（原先是 NOT NULL）。
+                obs_path TEXT DEFAULT '',
                 version TEXT NOT NULL DEFAULT 'v1',
                 description TEXT DEFAULT '',
                 main_python_file TEXT DEFAULT 'openclaw_automation.py',
@@ -1176,6 +1194,14 @@ def init_db_unlocked():
                 is_default INTEGER NOT NULL DEFAULT 0,
                 -- 创建页可见性开关: 0=停用(高级配置下拉不再列出, 存量实例不受影响)
                 enabled INTEGER NOT NULL DEFAULT 1,
+                -- 来源：obs(默认, obsutil 拉取) / git(平台自己 clone)。
+                -- 详见 CODE_REPO_GIT_COLUMNS 的注释。
+                source_type TEXT NOT NULL DEFAULT 'obs',
+                repo_url TEXT DEFAULT '',
+                branch TEXT DEFAULT '',
+                subdir TEXT DEFAULT '',
+                resolved_commit TEXT DEFAULT '',
+                synced_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by TEXT DEFAULT ''
             );
@@ -1207,6 +1233,14 @@ def init_db_unlocked():
             conn.execute("ALTER TABLE code_repos ADD COLUMN main_python_file TEXT DEFAULT 'openclaw_automation.py'")
         except Exception:
             pass
+
+        # migrate: add git 来源列 to code_repos
+        # source_type 默认 'obs'，所以存量行无需回填，自动保持原有行为。
+        for _col in CODE_REPO_GIT_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE code_repos ADD COLUMN {_col}")
+            except Exception:
+                pass
 
         # migrate: add os to images
         # 新列对历史行一律是默认值 linux，所以紧接着按名称/地址里的 windows 关键字

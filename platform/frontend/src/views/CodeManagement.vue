@@ -29,11 +29,24 @@
     <div class="glass-card" style="padding:0;overflow:hidden">
       <el-table :data="pagedRepos" v-loading="loading" stripe style="width:100%" border>
         <el-table-column prop="id" label="序号" width="80" align="center" />
-        <el-table-column prop="name" label="名称" min-width="160" show-overflow-tooltip resizable />
+        <el-table-column prop="name" label="名称" min-width="160" show-overflow-tooltip resizable>
+          <template #default="{row}">
+            <el-tag :type="isGit(row) ? 'success' : 'info'" size="small" effect="plain"
+              style="margin-right:6px">{{ isGit(row) ? 'Git' : 'OBS' }}</el-tag>
+            {{ row.name }}
+          </template>
+        </el-table-column>
         <el-table-column label="版本" min-width="180" show-overflow-tooltip resizable>
           <template #default="{row}">
             <span style="color:#f59e0b" v-if="row.is_default">★</span>
             {{ row.version }}
+          </template>
+        </el-table-column>
+        <el-table-column label="当前 commit" width="120" align="center" resizable>
+          <template #default="{row}">
+            <span v-if="!isGit(row)" class="muted">—</span>
+            <span v-else-if="row.resolved_commit" class="mono">{{ shortSha(row.resolved_commit) }}</span>
+            <el-tag v-else type="info" size="small">未同步</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="tag" label="标签" width="120" align="center" resizable>
@@ -48,9 +61,10 @@
             <span v-else class="muted">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="启用" width="80" align="center" resizable>
+        <el-table-column label="状态" width="80" align="center" resizable>
           <template #default="{row}">
-            <el-switch :model-value="row.enabled !== false" @change="v => toggleEnabled(row, v)" />
+            <el-tag v-if="row.enabled !== false" type="success" size="small">已启用</el-tag>
+            <el-tag v-else type="info" size="small">已停用</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="created_by" label="创建者" width="100" resizable />
@@ -64,9 +78,13 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item v-if="authStore.isOperator" command="edit">编辑</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator && isGit(row)" command="sync">同步最新</el-dropdown-item>
                     <el-dropdown-item command="download">下载</el-dropdown-item>
                     <el-dropdown-item command="status">检查状态</el-dropdown-item>
-                    <el-dropdown-item v-if="authStore.isOperator" command="delete" divided style="color:#f56c6c">删除</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator" command="toggle" divided>
+                      {{ row.enabled !== false ? '停用' : '启用' }}
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator" command="delete" style="color:#f56c6c">删除</el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -85,13 +103,34 @@
 
     <el-dialog v-model="createVisible" title="新建代码仓" width="600px" destroy-on-close>
       <el-form :model="createForm" label-width="100px">
+        <el-form-item label="来源" required>
+          <el-radio-group v-model="createForm.source_type">
+            <el-radio-button value="obs">OBS</el-radio-button>
+            <el-radio-button value="git">GitHub</el-radio-button>
+          </el-radio-group>
+          <div class="field-hint">
+            OBS：由 obsutil 从对象存储拉取；GitHub：平台自己 clone，可随时「同步最新」拉到新 commit
+          </div>
+        </el-form-item>
         <el-form-item label="名称" required>
           <el-input v-model="createForm.name" placeholder="例如：openclaw-task" />
         </el-form-item>
         <el-form-item label="版本" required>
-          <el-input v-model="createForm.version" placeholder="例如：v1" />
+          <el-input v-model="createForm.version" :placeholder="createForm.source_type === 'git' ? '例如：main（建议用分支名）' : '例如：v1'" />
         </el-form-item>
-        <el-form-item label="OBS路径" required>
+        <template v-if="createForm.source_type === 'git'">
+          <el-form-item label="仓库地址" required>
+            <el-input v-model="createForm.repo_url" placeholder="例如：https://github.com/org/openclaw-task.git" />
+            <div class="field-hint">私有仓需在后端 .env 配置 GITHUB_TOKEN</div>
+          </el-form-item>
+          <el-form-item label="分支" required>
+            <el-input v-model="createForm.branch" placeholder="默认 main" />
+          </el-form-item>
+          <el-form-item label="子目录">
+            <el-input v-model="createForm.subdir" placeholder="可选，例如：packages/openclaw-task；留空表示仓库根目录" />
+          </el-form-item>
+        </template>
+        <el-form-item v-else label="OBS路径" required>
           <el-input v-model="createForm.obs_path" :placeholder="`例如：${joinBucket('code')}openclaw-task/v1/openclaw-task/`">
             <template #append>
               <el-button @click="openObsBrowser('obs_path')">浏览</el-button>
@@ -101,10 +140,12 @@
         <el-form-item label="入口文件" required>
           <el-input v-model="createForm.main_python_file" placeholder="例如：harness_automation.py">
             <template #append>
-              <el-button @click="openObsBrowser('main_python_file')">选择</el-button>
+              <el-button v-if="createForm.source_type !== 'git'" @click="openObsBrowser('main_python_file')">选择</el-button>
             </template>
           </el-input>
-          <div style="font-size:12px;color:#999;margin-top:4px">从OBS代码目录中选择.py入口文件，只需填文件名</div>
+          <div style="font-size:12px;color:#999;margin-top:4px">
+            {{ createForm.source_type === 'git' ? '仓库内的 .py 入口文件名' : '从OBS代码目录中选择.py入口文件，只需填文件名' }}
+          </div>
         </el-form-item>
         <el-form-item label="标签">
           <el-select v-model="createForm.tag" placeholder="选择标签（可选）" clearable filterable style="width:100%">
@@ -134,7 +175,35 @@
           <el-tag v-if="detail.tag" size="small">{{ detail.tag }}</el-tag>
           <span v-else class="muted">—</span>
         </el-descriptions-item>
-        <el-descriptions-item label="OBS路径">
+        <el-descriptions-item label="来源">
+          <el-tag :type="isGit(detail) ? 'success' : 'info'" size="small" effect="plain">
+            {{ isGit(detail) ? 'GitHub' : 'OBS' }}
+          </el-tag>
+        </el-descriptions-item>
+        <template v-if="isGit(detail)">
+          <el-descriptions-item label="仓库地址">
+            <span class="mono">{{ detail.repo_url || '—' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="分支">
+            <span class="mono">{{ detail.branch || 'main' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="子目录">
+            <span class="mono">{{ detail.subdir || '（仓库根目录）' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="当前 commit">
+            <span v-if="detail.resolved_commit" class="mono">{{ detail.resolved_commit }}</span>
+            <el-tag v-else type="info" size="small">未同步</el-tag>
+            <div v-if="remoteHeadLoading" class="field-hint">正在探测远端…</div>
+            <div v-else-if="remoteHead && remoteHead.behind" class="field-hint" style="color:#e6a23c">
+              远端有新 commit（{{ shortSha(remoteHead.remote_commit) }}），点「同步最新」拉取
+            </div>
+            <div v-else-if="remoteHead && remoteHead.supported" class="field-hint" style="color:#67c23a">
+              已是远端最新
+            </div>
+          </el-descriptions-item>
+          <el-descriptions-item label="最近同步">{{ detail.synced_at || '—' }}</el-descriptions-item>
+        </template>
+        <el-descriptions-item v-else label="OBS路径">
           <span class="mono">{{ detail.obs_path }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="入口文件">
@@ -169,7 +238,25 @@
           <el-input :model-value="editForm.version" disabled />
           <div class="field-hint">名称与版本决定下载目录和打包路径，不可修改；如需更换请新建一条记录</div>
         </el-form-item>
-        <el-form-item label="OBS路径" required>
+        <el-form-item label="来源">
+          <el-tag :type="isGit(editForm) ? 'success' : 'info'" size="small" effect="plain">
+            {{ isGit(editForm) ? 'GitHub' : 'OBS' }}
+          </el-tag>
+          <div class="field-hint">来源不可切换（两种来源的目录规则不同，切换会让已打包产物对不上）；如需更换请新建一条记录</div>
+        </el-form-item>
+        <template v-if="isGit(editForm)">
+          <el-form-item label="仓库地址" required>
+            <el-input v-model="editForm.repo_url" placeholder="例如：https://github.com/org/openclaw-task.git" />
+          </el-form-item>
+          <el-form-item label="分支" required>
+            <el-input v-model="editForm.branch" placeholder="默认 main" />
+            <div class="field-hint">改分支后需点「同步最新」才会拉取新代码</div>
+          </el-form-item>
+          <el-form-item label="子目录">
+            <el-input v-model="editForm.subdir" placeholder="可选；留空表示仓库根目录" />
+          </el-form-item>
+        </template>
+        <el-form-item v-else label="OBS路径" required>
           <el-input v-model="editForm.obs_path" :placeholder="`例如：${joinBucket('code')}openclaw-task/v1/openclaw-task/`">
             <template #append>
               <el-button @click="openObsBrowser('obs_path', 'edit')">浏览</el-button>
@@ -179,10 +266,12 @@
         <el-form-item label="入口文件" required>
           <el-input v-model="editForm.main_python_file" placeholder="例如：harness_automation.py">
             <template #append>
-              <el-button @click="openObsBrowser('main_python_file', 'edit')">选择</el-button>
+              <el-button v-if="!isGit(editForm)" @click="openObsBrowser('main_python_file', 'edit')">选择</el-button>
             </template>
           </el-input>
-          <div class="field-hint">从OBS代码目录中选择.py入口文件，只需填文件名</div>
+          <div class="field-hint">
+            {{ isGit(editForm) ? '仓库内的 .py 入口文件名' : '从OBS代码目录中选择.py入口文件，只需填文件名' }}
+          </div>
         </el-form-item>
         <el-form-item label="标签">
           <el-select v-model="editForm.tag" placeholder="选择标签（可选）" clearable filterable style="width:100%">
@@ -267,7 +356,12 @@ const creatingTag = ref(false)
 
 const createVisible = ref(false)
 const creating = ref(false)
-const createForm = ref({ name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'harness_automation.py', tag: '', is_default: false })
+const emptyCreateForm = () => ({
+  name: '', version: 'v1', source_type: 'obs', obs_path: '',
+  repo_url: '', branch: 'main', subdir: '',
+  description: '', main_python_file: 'harness_automation.py', tag: '', is_default: false,
+})
+const createForm = ref(emptyCreateForm())
 const creatorFilter = ref('')
 const creatorOptions = computed(() =>
   [...new Set((repos.value || []).map(r => r.created_by).filter(Boolean))].sort()
@@ -275,12 +369,22 @@ const creatorOptions = computed(() =>
 
 const editVisible = ref(false)
 const updating = ref(false)
-const editForm = ref({ id: null, name: '', version: '', obs_path: '', description: '', main_python_file: '', tag: '' })
+const editForm = ref({
+  id: null, name: '', version: '', source_type: 'obs', obs_path: '',
+  repo_url: '', branch: '', subdir: '',
+  description: '', main_python_file: '', tag: '',
+})
 
 const detailVisible = ref(false)
 const detail = ref({})
 const detailStatus = ref(null)
 const detailStatusLoading = ref(false)
+const remoteHead = ref(null)
+const remoteHeadLoading = ref(false)
+
+// 存量记录没有 source_type 这一列（后端默认 'obs'），缺值一律按 OBS 处理
+const isGit = (row) => (row?.source_type || 'obs') === 'git'
+const shortSha = (sha) => (sha || '').slice(0, 7)
 
 const creatorFiltered = computed(() =>
   !creatorFilter.value ? repos.value : repos.value.filter(r => r.created_by === creatorFilter.value)
@@ -299,12 +403,16 @@ watch(() => repos.value.length, (n) => {
 })
 
 // 启用开关: 只影响创建页下拉可见性; 存量实例引用的是版本快照, 不受影响
+//
+// 入口是「更多」里的一个菜单项（文案随当前状态在「启用/停用」间切换），
+// 而不是表格里的 el-switch —— 开关自带新值，菜单项得自己按当前状态取反。
 
-async function toggleEnabled(row, v) {
+async function toggleEnabled(row) {
+  const next = row.enabled === false
   try {
-    await api.patch(`/code-repos/${row.id}`, { enabled: v })
-    row.enabled = v
-    ElMessage.success(v ? '已启用' : '已停用（创建页不再列出）')
+    await api.patch(`/code-repos/${row.id}`, { enabled: next })
+    row.enabled = next
+    ElMessage.success(next ? '已启用' : '已停用（创建页不再列出）')
   } catch { ElMessage.error('切换失败') }
 }
 
@@ -373,22 +481,33 @@ async function handleDeleteTag(row) {
 }
 
 function openCreateDialog() {
-  createForm.value = { name: '', version: 'v1', obs_path: '', description: '', main_python_file: 'harness_automation.py', tag: '' }
+  createForm.value = emptyCreateForm()
   createVisible.value = true
 }
 
 async function handleCreate() {
-  if (!createForm.value.name || !createForm.value.obs_path) {
-    ElMessage.warning('请填写名称和OBS路径')
+  const f = createForm.value
+  if (!f.name) {
+    ElMessage.warning('请填写名称')
     return
   }
-  if (!createForm.value.main_python_file) {
+  // 必填项按来源分支判断：git 要仓库地址，obs 要 OBS 路径
+  if (f.source_type === 'git') {
+    if (!f.repo_url.trim()) {
+      ElMessage.warning('请填写仓库地址')
+      return
+    }
+  } else if (!f.obs_path) {
+    ElMessage.warning('请填写OBS路径')
+    return
+  }
+  if (!f.main_python_file) {
     ElMessage.warning('请指定入口文件')
     return
   }
   creating.value = true
   try {
-    await api.post('/code-repos', createForm.value)
+    await api.post('/code-repos', f)
     ElMessage.success('创建成功')
     createVisible.value = false
     // 后端按 created_at DESC 排序，新代码仓在第一页；留在原页会看不到刚建的那条
@@ -401,14 +520,17 @@ async function handleCreate() {
 
 function handleMore(cmd, row) {
   if (cmd === 'edit') openEdit(row)
+  else if (cmd === 'sync') syncRepo(row)
   else if (cmd === 'download') downloadRepo(row)
   else if (cmd === 'status') checkStatus(row)
+  else if (cmd === 'toggle') toggleEnabled(row)
   else if (cmd === 'delete') deleteRepo(row)
 }
 
 async function openDetail(row) {
   detail.value = { ...row }
   detailStatus.value = null
+  remoteHead.value = null
   detailVisible.value = true
   // 顺带查一次打包状态，省得再单独点「检查状态」
   detailStatusLoading.value = true
@@ -419,6 +541,17 @@ async function openDetail(row) {
   } finally {
     detailStatusLoading.value = false
   }
+  // git 仓再探一次远端，好在详情里直接告诉用户「是否落后」。
+  // 单独一个请求、失败就静默：它要走网络（ls-remote），不该拖住或弄坏详情本身。
+  if (!isGit(row)) return
+  remoteHeadLoading.value = true
+  try {
+    remoteHead.value = await api.get(`/code-repos/${row.id}/remote-head`)
+  } catch {
+    remoteHead.value = null
+  } finally {
+    remoteHeadLoading.value = false
+  }
 }
 
 function openEdit(row) {
@@ -426,7 +559,11 @@ function openEdit(row) {
     id: row.id,
     name: row.name,
     version: row.version,
-    obs_path: row.obs_path,
+    source_type: row.source_type || 'obs',
+    obs_path: row.obs_path || '',
+    repo_url: row.repo_url || '',
+    branch: row.branch || '',
+    subdir: row.subdir || '',
     description: row.description || '',
     main_python_file: row.main_python_file || '',
     tag: row.tag || '',
@@ -436,7 +573,13 @@ function openEdit(row) {
 
 async function handleUpdate() {
   const f = editForm.value
-  if (!f.obs_path.trim()) {
+  const git = isGit(f)
+  if (git) {
+    if (!f.repo_url.trim()) {
+      ElMessage.warning('请填写仓库地址')
+      return
+    }
+  } else if (!f.obs_path.trim()) {
     ElMessage.warning('请填写OBS路径')
     return
   }
@@ -446,18 +589,41 @@ async function handleUpdate() {
   }
   updating.value = true
   try {
-    // 不传 name / version —— 后端也不接受，它们决定下载与打包目录
-    await api.patch(`/code-repos/${f.id}`, {
-      obs_path: f.obs_path.trim(),
+    // 不传 name / version / source_type —— 后端也不接受，它们决定下载与打包目录
+    const payload = {
       main_python_file: f.main_python_file.trim(),
       description: f.description.trim(),
       tag: f.tag || '',
-    })
+    }
+    // 只提交当前来源用得上的地址字段，免得把另一种来源的值清空
+    if (git) {
+      payload.repo_url = f.repo_url.trim()
+      payload.branch = f.branch.trim()
+      payload.subdir = f.subdir.trim()
+    } else {
+      payload.obs_path = f.obs_path.trim()
+    }
+    await api.patch(`/code-repos/${f.id}`, payload)
     ElMessage.success('已保存')
     editVisible.value = false
     loadRepos()
   } finally {
     updating.value = false
+  }
+}
+
+async function syncRepo(row) {
+  downloadingId.value = row.id
+  try {
+    const res = await api.post(`/code-repos/${row.id}/sync`)
+    if (res.updated) {
+      ElMessage.success(res.message)
+      loadRepos()  // resolved_commit / synced_at 变了，刷新列表
+    } else {
+      ElMessage.info(res.message)
+    }
+  } finally {
+    downloadingId.value = null
   }
 }
 
@@ -482,6 +648,8 @@ async function checkStatus(row) {
       ElMessage.success(`已打包: ${res.tar_path}`)
     } else if (res.downloaded) {
       ElMessage.warning('已下载但未打包，请点击"下载"触发打包')
+    } else if (isGit(row)) {
+      ElMessage.warning('尚未同步，请点击"同步最新"拉取代码')
     } else {
       ElMessage.warning('尚未下载到本地')
     }

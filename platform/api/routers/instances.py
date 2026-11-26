@@ -30,6 +30,11 @@ from ..services.queue_scheduler import (
     slot_condition_params as _slot_condition_params,
 )
 from ..services.create_params import build_create_params
+from ..services.code_repo_sync import (
+    ensure_repo_ready,
+    is_git as is_git_repo,
+    repo_tar_path,
+)
 from ..services.secrets import instance_create_params, mask_create_params, redact_text
 from . import harness_meta
 from . import harness_configs
@@ -1178,8 +1183,20 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             repo_row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (req.code_repo_id,)).fetchone()
         if repo_row:
             repo = dict(repo_row)
-            code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar", repo["name"], repo["version"])
-            tar_path = os.path.join(code_tar_dir, "openclaw-task.tar")
+            # git 仓的 tar 路径带 commit 层，而本函数刻意不做下载，首次使用时
+            # resolved_commit 还是空的，算不出目录。这种情况下必须先拉一次把
+            # commit 定下来，否则写进 config.yaml 的路径就是错的。
+            # 代价是「首个实例的创建」会多等一次 clone；之后同一 commit 走惰性分支，秒回。
+            if is_git_repo(repo) and not (repo.get("resolved_commit") or "").strip():
+                await ensure_repo_ready(repo)
+                with get_connection() as conn:
+                    repo_row = conn.execute(
+                        "SELECT * FROM code_repos WHERE id = ?", (req.code_repo_id,)
+                    ).fetchone()
+                repo = dict(repo_row)
+            # 路径在这里就被钉死在当时的 commit 上：之后代码仓再同步到新 commit
+            # 只会新增目录，不会改变这个实例实际跑的代码。
+            tar_path = repo_tar_path(repo)
             base.run_config.task.main_code_tar = tar_path
             base.run_config.task.main_code_dir = ""
             if repo.get("main_python_file"):
@@ -2121,38 +2138,15 @@ async def _prepare_instance(instance_id: str, inst: dict):
         OmegaConf.save(base, config_path)
 
     # --- 下载代码仓并打包 ---
+    # 实际拉取/打包在 services/code_repo_sync 里，与「代码仓管理」页的下载接口共用。
+    # 惰性：产物已在就直接返回。git 仓这里不强制同步到最新 —— 实例要跑的 commit
+    # 在创建时就定了（见 create_instance 的代码仓分支），准备阶段只负责把它备好。
     code_repo_id = create_params.get("code_repo_id")
     if code_repo_id:
         with get_connection() as conn:
             repo_row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (code_repo_id,)).fetchone()
         if repo_row:
-            repo = dict(repo_row)
-            code_src_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "src", repo["name"], repo["version"])
-            code_tar_dir = os.path.join(settings.HIVE_ROOT, "platform", "code", "tar", repo["name"], repo["version"])
-            tar_path = os.path.join(code_tar_dir, "openclaw-task.tar")
-
-            if not os.path.isfile(tar_path):
-                if not (os.path.isdir(code_src_dir) and os.listdir(code_src_dir)):
-                    os.makedirs(code_src_dir, exist_ok=True)
-                    obs_src = repo["obs_path"]
-                    if not obs_src.endswith("/"):
-                        obs_src += "/"
-                    returncode, _, stderr = await _async_subprocess_run(
-                        [settings.OBSUTIL_PATH, "cp", obs_src, code_src_dir, "-r", "-f"],
-                        timeout=600,
-                    )
-                    if returncode != 0:
-                        raise HTTPException(status_code=500, detail=f"代码仓下载失败: {stderr[:500]}")
-
-                obs_dir_name = repo["obs_path"].rstrip("/").split("/")[-1]
-                os.makedirs(code_tar_dir, exist_ok=True)
-                returncode, _, stderr = await _async_subprocess_run(
-                    ["tar", "cf", tar_path, obs_dir_name],
-                    cwd=code_src_dir,
-                    timeout=120,
-                )
-                if returncode != 0:
-                    raise HTTPException(status_code=500, detail=f"打包失败: {stderr[:500]}")
+            await ensure_repo_ready(dict(repo_row))
 
     # --- 统计任务数 ---
     base = OmegaConf.load(config_path)

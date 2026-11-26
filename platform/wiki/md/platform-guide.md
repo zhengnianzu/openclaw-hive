@@ -9,8 +9,9 @@ summary: 从准备 OBS 材料、任务配置格式，到新建实例批跑、查
 is_pinned: true
 sort_order: 10
 author: admin
+updated_by: admin
 created_at: '2026-11-16T20:11:26'
-updated_at: '2026-11-16T20:11:26'
+updated_at: '2026-11-25T10:15:19.375754'
 ---
 
 # OpenClaw Hive 平台新手操作手册
@@ -21,7 +22,7 @@ updated_at: '2026-11-16T20:11:26'
 
 ## 1. 准备工作
 
-在上平台批跑任务之前，请提前准备以下材料，上传到蓝区（华东二）的 `obs://s3-asset-b-hd-cce-aifm-nlp-exp/` 桶下，并保存好对应路径。上传方法见参考资料 [1]。
+在上平台批跑任务之前，请提前准备以下材料，上传到蓝区（华东二）的 `obs://s3-asset-b-hd-cce-aifm-nlp-exp/` 桶下，并保存好对应路径。上传方法见参考资料 \[1]。
 
 ```text
 ├── task_configs/
@@ -92,6 +93,7 @@ updated_at: '2026-11-16T20:11:26'
 ```
 
 ### 1.3 生产Key平台申请
+
 > 完整说明：<http://115.120.48.151:8087/#/wiki/Application_Process_for_the_Production_Key_Platform.md>
 
 1. AI数据技术创新平台 - 外部API管理 - 数据生产申请里面申请。
@@ -101,50 +103,51 @@ updated_at: '2026-11-16T20:11:26'
 
 ### 2.1 新建任务
 
-- 步骤 1：新建 OBS 配置
+* 步骤 1：新建 OBS 配置
 
-![alt text](/api/wiki/assets/dce3c15534514f009410ac1a8c63a39c.webp)
+![1.00](/api/wiki/assets/dce3c15534514f009410ac1a8c63a39c.webp)
 
-- 步骤 2：Harness 配置
+* 步骤 2：Harness 配置
 
-![alt text](/api/wiki/assets/3711345fff3b485a945ac88d7c147a1d.webp)
+![1.00](/api/wiki/assets/3711345fff3b485a945ac88d7c147a1d.webp)
 
-- 步骤 3：用户模拟配置
+* 步骤 3：用户模拟配置
 
-![alt text](/api/wiki/assets/3609d1522d6342c5bd75081654f68732.webp)
+![1.00](/api/wiki/assets/3609d1522d6342c5bd75081654f68732.webp)
 
-- 步骤 4：高级配置
+* 步骤 4：高级配置
 
-![alt text](/api/wiki/assets/8170177a288d42748ecae27ca9b28233.webp)
+![1.00](/api/wiki/assets/8170177a288d42748ecae27ca9b28233.webp)
+
 1. 使用自部署模型时，必须强制开启【Key追加沙箱后缀】，使用第三方模型则请关闭；
-2. 任务生成后，请检查任务名称是否带【红色*】号，带上则表示user_id配置成功
+2. 任务生成后，请检查任务名称是否带【红色\*】号，带上则表示user_id配置成功
 3. 最后点击 **创建实例**，跳转到主界面，再点击该实例的【更多】→【启动】
 
 ### 2.2 查看任务
 
 #### 2.2.1 任务详情页
 
-![alt text](/api/wiki/assets/f35c9d9572b34050977a94123a09442a.webp)
+![1.00](/api/wiki/assets/f35c9d9572b34050977a94123a09442a.webp)
 
 #### 2.2.2 日志页
 
-![alt text](/api/wiki/assets/c9147faa465a409bae77d0111bc6673e.webp)
+![1.00](/api/wiki/assets/c9147faa465a409bae77d0111bc6673e.webp)
 
 #### 2.2.3 输出页
 
 > 完整说明：<http://115.120.48.151:8087/#/wiki/outputview-usage>
 
-![alt text](/api/wiki/assets/e82e5f9ec73e46cbaacb7cfd56518c0e.webp)
+![1.00](/api/wiki/assets/e82e5f9ec73e46cbaacb7cfd56518c0e.webp)
 
 **会话等级**
 
-| 等级 | 含义 |
-|---|---|
-| L0 | 存在轨迹 |
-| L1 | assistant 轨迹的工具调用次数 ≥ 3，且出现过至少一次纯文字回复 |
-| L1.5 | 在 L1 基础上，有 evaluator 裁决 |
-| L2 | 在 L1.5 基础上，首轮 completion ≥ 0.5 |
-| L3 | 在 L1.5 基础上，首轮 completion = 1 |
+| 等级   | 含义                                    |
+| ---- | ------------------------------------- |
+| L0   | 存在轨迹                                  |
+| L1   | assistant 轨迹的工具调用次数 ≥ 3，且出现过至少一次纯文字回复 |
+| L1.5 | 在 L1 基础上，有 evaluator 裁决               |
+| L2   | 在 L1.5 基础上，首轮 completion ≥ 0.5        |
+| L3   | 在 L1.5 基础上，首轮 completion = 1          |
 
 **模型配置 / 用户模拟配置**
 
@@ -164,7 +167,8 @@ updated_at: '2026-11-16T20:11:26'
 可以选择性下载对应的沙箱报错的session轨迹，用于后续导出轨迹；
 
 #### 2.2.5 任务导出
-![alt text](/api/wiki/assets/3c223c3dd47d4eca97da27cb25cc29db.webp)
+
+![1.00](/api/wiki/assets/3c223c3dd47d4eca97da27cb25cc29db.webp)
 
 ## 3. Harness 配置管理
 
@@ -180,16 +184,16 @@ Harness 类型
 
 常见 Runtime 文件包括：
 
-- `config.yaml`
-- `openclaw.json`
-- `user_proxy_model.json`
+* `config.yaml`
+* `openclaw.json`
+* `user_proxy_model.json`
 
 可选的 Harness Markdown 包括：
 
-- `AGENTS.md`
-- `SOUL.md`
-- `Claude.md`
-- 其他该类型模板提供的 Markdown 文件
+* `AGENTS.md`
+* `SOUL.md`
+* `Claude.md`
+* 其他该类型模板提供的 Markdown 文件
 
 不需要的文件可以保持“未初始化”状态。
 
@@ -208,8 +212,11 @@ Harness 类型
 ```
 
 ### 3.3 现有配置说明
+
 配置的三个文件：
+
 1. config.yaml，任务实例的配置文件
+
 ```yaml
 # ==================== 全局配置固定模板 ====================
 略
@@ -267,44 +274,48 @@ s3:
 > 完整说明：<http://115.120.48.151:8087/#/wiki/queue-usage>
 
 ### 4.1 新建队列
+
 在高级配置中，可以选择 **任务队列**，用来让多个任务按顺序串行执行：一个跑完，下一个自动开始，不用自己盯着。
 
-![alt text](/api/wiki/assets/7268ad0971944b6db79dd72d9c61d641.webp)
+![1.00](/api/wiki/assets/7268ad0971944b6db79dd72d9c61d641.webp)
 
 ### 4.2 插队
+
 ![alt text](/api/wiki/assets/357f0486084b4af2b35ef1a6181c4312.webp)
 队列里如果有任务想插队到最优先的放行位置，可以点击插队，操作入口如下：
 
-| 位置 | 操作 |
-|---|---|
-| **任务管理**（首页） | 该任务的「更多」→ **插队**；已插队的显示 **取消插队** |
-| **任务详情 → 队列信息** | 顶部「插队」/「取消插队」按钮，下方队列任务列表每行也有 |
+| 位置              | 操作                               |
+| --------------- | -------------------------------- |
+| **任务管理**（首页）    | 该任务的「更多」→ **插队**；已插队的显示 **取消插队** |
+| **任务详情 → 队列信息** | 顶部「插队」/「取消插队」按钮，下方队列任务列表每行也有     |
 
-- 取消插队后，任务回到它原本的名次（插队只改优先级，从来没动过入队序号）。
-- 任务被重新「启动」时，插队标记会被清空，按正常流程排到队尾。
-
+* 取消插队后，任务回到它原本的名次（插队只改优先级，从来没动过入队序号）。
+* 任务被重新「启动」时，插队标记会被清空，按正常流程排到队尾。
 
 ## 5. 镜像管理
-![alt text](/api/wiki/assets/7e8841936bf7459dab13b60ce3a9b00a.webp)
-- **一个镜像可以映射多个 Harness**：注册/编辑镜像时可多选 Harness 类型
-- **默认镜像（每个 Harness 唯一）**：注册或编辑时打开「设为默认镜像」开关，它就成为其映射的每个 Harness 的默认镜像；镜像列表的 Harness 映射列中，默认项以 + ★ 标识。
-- **启用开关**：停用的镜像不再出现在创建页下拉，不影响已运行实例。
-- **与创建页联动**：高级配置中选好 Harness 类型后，「镜像名称」会自动填入该 Harness 的默认镜像，并带【推荐】标记；仍可手动改选其他。镜像下拉还会按所选沙箱配置的操作系统（Linux/Windows）过滤。
 
+![1.00](/api/wiki/assets/7e8841936bf7459dab13b60ce3a9b00a.webp)
+
+* **一个镜像可以映射多个 Harness**：注册/编辑镜像时可多选 Harness 类型
+* **默认镜像（每个 Harness 唯一）**：注册或编辑时打开「设为默认镜像」开关，它就成为其映射的每个 Harness 的默认镜像；镜像列表的 Harness 映射列中，默认项以 + ★ 标识。
+* **启用开关**：停用的镜像不再出现在创建页下拉，不影响已运行实例。
+* **与创建页联动**：高级配置中选好 Harness 类型后，「镜像名称」会自动填入该 Harness 的默认镜像，并带【推荐】标记；仍可手动改选其他。镜像下拉还会按所选沙箱配置的操作系统（Linux/Windows）过滤。
 
 ## 6. 代码管理
-![alt text](/api/wiki/assets/b8905809b62f48e0bb7ce3a9ac35ab1c.webp)
+
+![1.00](/api/wiki/assets/b8905809b62f48e0bb7ce3a9ac35ab1c.webp)
 
 ### 6.1 当前常用代码仓
 
-| 代码仓 | 描述 |
-|---|---|
-| openclaw-task/v1117 | **主代码仓版本**（建议设为默认） |
-| openclaw-task/test-jiuwenswarm | test 代码仓，测试用 |
+| 代码仓                               | 描述                     |
+| --------------------------------- | ---------------------- |
+| openclaw-task/v1117               | **主代码仓版本**（建议设为默认）     |
+| openclaw-task/test-jiuwenswarm    | test 代码仓，测试用           |
 | openclaw-task/xiaoyiclaw-pangu-v4 | xiaoyiclaw 专属代码仓，曹子轩维护 |
-| openclaw-task/trg0249_261112_fix2 | trg 专属代码仓，万轶维护 |
+| openclaw-task/trg0249_261112_fix2 | trg 专属代码仓，万轶维护         |
 
 ## 7. 批量实验
+
 > 完整说明：<http://115.120.48.151:8087/#/wiki/batch-usage>
 
 ```text
@@ -319,19 +330,20 @@ Harness 列表 × 模型列表 × 重复次数 → 子任务数；每个子任�
 3. **启动**：创建只写配置、秒级返回；进入实验详情，「更多 → 启动队列」后开始执行。
 4. **结果对比**：执行完成之后，可以横向多方面对比批量实验的执行结果，后续可以导出画图，形成最佳推荐
 
-
 ## 8. Evaluator配置
+
 ### 8.1 理解三个角色
 
-| 角色 | 做什么 | 是否决定任务结束 |
-|---|---|---|
-| 执行 Agent | 真正执行 Query、调用工具、生成文件或回答问题 | 否 |
-| User Simulator | 模拟用户追问，并输出 `【Task_Done】` 或 `【Task_Failed】` | 是 |
-| Evaluator | 读取原始任务、最近几轮回复、工具调用和磁盘文件，根据 Rubric 逐项检查，再把建议选择性反馈给 User Simulator | 否，只是顾问 |
-
+| 角色             | 做什么                                                              | 是否决定任务结束 |
+| -------------- | ---------------------------------------------------------------- | -------- |
+| 执行 Agent       | 真正执行 Query、调用工具、生成文件或回答问题                                        | 否        |
+| User Simulator | 模拟用户追问，并输出 `【Task_Done】` 或 `【Task_Failed】`                       | 是        |
+| Evaluator      | 读取原始任务、最近几轮回复、工具调用和磁盘文件，根据 Rubric 逐项检查，再把建议选择性反馈给 User Simulator | 否，只是顾问   |
 
 ### 8.2 启用Evaluator
+
 在task-00000.json中添加如下内容：
+
 ```json
 {
 "agents": [
@@ -368,8 +380,10 @@ Harness 列表 × 模型列表 × 重复次数 → 子任务数；每个子任�
   ]
 }
 
-``` 
+```
+
 ### 8.3 定义Rubric
+
 #### 简单任务：内联 `rubrics`
 
 直接写字符串列表即可。系统会自动生成 R1、R2 等 ID，所有项按普通最终评分项等权处理。
@@ -445,28 +459,31 @@ Harness 列表 × 模型列表 × 重复次数 → 子任务数；每个子任�
   }
 }
 ```
+
 #### 8.4 评估结果
+
 ![alt text](/api/wiki/assets/6717c5af184e48f6b00669eee5fce0b8.webp)
 如果在高级配置中，开启了本地代理，则可以捕获更多模型调用详情如`输入TOKENS`、`输出TOKENS`、`次数`、`成功率`
 
 ## 9. 资源看板
+
 > 完整说明：<http://115.120.48.151:8087/#/wiki/dashboard-usage>
 
 平台有两个查看资源的入口，二者统计口径一致：
 
-| 入口 | 适合什么时候看 | 能看到什么 |
-|---|---|---|
-| 首页顶部「当前资源使用情况」 | 创建、启动任务前快速确认 | 当前 CPU、内存、沙箱并发和任务状态 |
-| 侧栏「资源看板」 | 任务运行中排查资源占用 | 资源池、用户排行、实例分布、规格和历史趋势 |
+| 入口             | 适合什么时候看      | 能看到什么                 |
+| -------------- | ------------ | --------------------- |
+| 首页顶部「当前资源使用情况」 | 创建、启动任务前快速确认 | 当前 CPU、内存、沙箱并发和任务状态   |
+| 侧栏「资源看板」       | 任务运行中排查资源占用  | 资源池、用户排行、实例分布、规格和历史趋势 |
 
 ### 9.1 指标说明
+
 判断资源是否紧张时：（资源查看）CPU、内存或沙箱容量中的任意一项接近上限，都可能导致新实例长时间准备或排队。
 ![alt text](/api/wiki/assets/e59c8210d6314b1ab0f862e97ec1e050.webp)
 
-
 ## 参考资料
 
-### [1] obsutil 连接配置脚本（以 Linux 为例）
+### \[1] obsutil 连接配置脚本（以 Linux 为例）
 
 ```bash
 # 下载
@@ -476,7 +493,7 @@ tar -xzvf obsutil_linux_amd64.tar.gz
 # 移动
 mv obsutil_linux_amd64_5.8.3 obsutil
 # 配置
-./obsutil/obsutil config -i=HPUABVUGOTP2OPODPEKP -k=1lNcDkVMBV7tVQq3aBWXirTWClbpiWJ1r08zbkSD -e=obs.cn-southwest-2.myhuaweicloud.com
+./obsutil/obsutil config -i=HPUAEGWMKUI3IZO3HKL0 -k=kuKJHgufvXcXNw7AFgRBFVsKsMCGD0pPFMSB12Tt -e=http://obs.cn-east-4.myhuaweicloud.com
 # 验证
 ./obsutil/obsutil ls -d obs://s3-asset-b-hd-cce-aifm-nlp-exp/
 # 双向复制
