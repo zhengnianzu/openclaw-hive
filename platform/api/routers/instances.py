@@ -1157,6 +1157,7 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
     pi_path = os.path.join(instance_dir, "models.json")
     grok_path = os.path.join(instance_dir, "grok_config.toml")
     dsh_path = os.path.join(instance_dir, "dsh_settings.yaml")
+    taichu_path = os.path.join(instance_dir, ".taichu.json")
     user_proxy_path = os.path.join(instance_dir, "user_proxy_model.json")
 
     # harness_local_config_file: 直接用 agent_config 文件名拼路径, 兜底 openclaw.json
@@ -1391,6 +1392,50 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
 
         with open(pi_path, "w", encoding="utf-8") as f:
             json.dump(pi_cfg, f, indent=2, ensure_ascii=False)
+    elif req.harness_type == "taichu":
+        # .taichu.json 结构: providers[{name, base_url, api_key, models[{id, wire_protocol}]}]
+        #                    + default_provider / default_model。
+        # 前端表单只改主 provider(default_provider 指向的那一条); 其余 agent 的 provider
+        # 由 hive 侧 prepare_config._prepare_taichu 从 user_proxy_model.json 注入。
+        taichu_template = os.path.join(harness_settings_dir, ".taichu.json")
+        if not os.path.exists(taichu_template):
+            taichu_template = os.path.join(settings.SETTINGS_DIR, ".taichu.json")
+        with open(taichu_template, "r", encoding="utf-8") as f:
+            taichu_cfg = json.load(f)
+
+        providers = taichu_cfg.setdefault("providers", [])
+        main_name = taichu_cfg.get("default_provider") or "default"
+        prov = next((p for p in providers
+                     if isinstance(p, dict) and p.get("name") == main_name), None)
+        if prov is None:
+            prov = {"name": main_name, "base_url": "", "api_key": "", "models": []}
+            providers.insert(0, prov)
+        taichu_cfg["default_provider"] = main_name
+
+        if req.model_api_key:
+            prov["api_key"] = req.model_api_key
+        if req.model_base_url:
+            # taichu 只支持 OpenAI 兼容协议, base_url 统一以 /v1 结尾。
+            base_url = req.model_base_url.strip().rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            prov["base_url"] = base_url
+        if req.model_id:
+            models_list = prov.setdefault("models", [])
+            if models_list and isinstance(models_list[0], dict):
+                models_list[0]["id"] = req.model_id
+            elif models_list:
+                models_list[0] = {"id": req.model_id}
+            else:
+                models_list.append({"id": req.model_id})
+            taichu_cfg["default_model"] = req.model_id
+        # 协议固定为 chat-completions; 选了别的 API 类型也不生效(taichu 不支持 Anthropic 等)。
+        for m in prov.get("models", []):
+            if isinstance(m, dict):
+                m["wire_protocol"] = "chat-completions"
+
+        with open(taichu_path, "w", encoding="utf-8") as f:
+            json.dump(taichu_cfg, f, indent=2, ensure_ascii=False)
     elif req.harness_type == "grok":
         import tomllib
         import tomli_w
@@ -1635,6 +1680,15 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
                 pi_cfg.setdefault("providers", {}).setdefault("custom", {})["apiKey"] = req.model_api_key
                 with open(pi_path, "w", encoding="utf-8") as f:
                     json.dump(pi_cfg, f, indent=2, ensure_ascii=False)
+            elif req.harness_type == "taichu" and os.path.exists(taichu_path):
+                with open(taichu_path, "r", encoding="utf-8") as f:
+                    taichu_cfg = json.load(f)
+                main_name = taichu_cfg.get("default_provider") or "default"
+                for p in taichu_cfg.get("providers", []):
+                    if isinstance(p, dict) and p.get("name") == main_name:
+                        p["api_key"] = req.model_api_key
+                with open(taichu_path, "w", encoding="utf-8") as f:
+                    json.dump(taichu_cfg, f, indent=2, ensure_ascii=False)
             elif req.harness_type == "grok" and os.path.exists(grok_path):
                 import tomllib
                 import tomli_w

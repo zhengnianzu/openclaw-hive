@@ -1,0 +1,99 @@
+global:
+  # 控制面服务地址，SDK 通过此地址与控制面通信
+  controlplane_base_url: http://local_host:30081
+  # API 认证密钥，用于 SDK 与控制面之间的身份校验
+  api_key: "api-key"
+  logger:
+    name: test
+    level: INFO
+    dir: logs
+    console: true
+    file: true
+    stream: stdout
+    max_backup_count: 14
+    encoding: utf-8
+    format: '%(asctime)s|%(filename)s:%(lineno)d|%(funcName)s|%(process)d|%(thread)d|%(threadName)s|%(levelname)s|%(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+    when: midnight
+    interval: 1
+sandbox:
+  x86_cpu:
+    cluster_id: internal-green-prod-worker
+    architecture: x86
+    accelerator: null
+    lease_ttl_seconds: 900
+    max_ttl_second: 36000
+    max_ttl_seconds: 36000
+    wait_timeout_seconds: 1200
+    sandbox:
+      image: swr.cn-east-4.myhuaweicloud.com/rl_team/taichu-cli-linux:0.2.0
+      env:
+      - name: PIP_INDEX_URL
+        value: https://mirrors.huaweicloud.com/repository/pypi/simple
+      - name: PIP_TRUSTED_HOST
+        value: mirrors.huaweicloud.com
+      - name: NODE_TLS_REJECT_UNAUTHORIZED
+        value: '0'
+      - name: SERPER_API_KEY
+        value: sk-xxx
+      - name: SERPER_API_URL
+        value: https://yibuapi.com/serper/
+      - name: MCP_PLAYWRIGHT
+        value: 'off'
+      - name: IMAGE_READING
+        value: 'off'
+      - name: IMAGE_READING_PATH
+        value: /home/ma-user/claude_code_image_reading_tool/mcp-image-reading/server.js
+      - name: VL_API_URL
+        value: http://115.33.106.57:8082/v1
+      - name: VL_API_KEY
+        value: sk-xxx
+      - name: VL_MODEL_ID
+        value: gemini-3.7-flash
+      resources:
+        cpu_request: '1'
+        cpu_limit: '3'
+        memory_request: 6Gi
+        memory_limit: 8Gi
+sandbox_id_prefix: admin2611241520
+sandbox_namespace: omni-env-default-worker
+s3:
+  s3_uploader_script: /home/ma-user/obsutil/obsutil
+  s3_download_script: /home/ma-user/obsutil/obsutil
+  bucket_name: obs://s3-asset-b-hd-cce-aifm-nlp-exp
+sandbox_active_key: x86_cpu
+run_config:
+  harness_md:
+  harness_type: taichu
+  start_index: 0
+  total_num: 0
+  concurrent_num: 8
+  sandbox:
+    result_log: run.log
+    user_proxy_model_local_file: /mnt/sfs_turbo/s3-asset-b-hd-cce-aifm-nlp-exp/platform/platform/instances/2611241521-admin2611241520-e559/user_proxy_model.json
+    openclaw_start_timeout: 180
+    harness_local_config_file: uploads/.taichu.json
+  task:
+    suffix_api_keys: true
+    task_input_path: /mnt/sfs_turbo/s3-asset-b-hd-cce-aifm-nlp-exp/platform/platform/instances/2611241521-admin2611241520-e559/configs/smoke
+    task_output_path: outputs/
+    task_complete_record: complete.jsonl
+    task_failed_record: failed.jsonl
+    task_download_path: /mnt/sfs_turbo/s3-asset-b-hd-cce-aifm-nlp-exp/platform/platform/instances/2611241521-admin2611241520-e559/downloads
+    main_code_tar: 
+    main_code_dir: /root/zengxiang/openclaw-task
+    main_python_file: harness_automation.py
+    main_python_timeout: 35400
+    model_base_url: http://115.33.106.57:8082/v1
+    query_timeout: 34800
+  obs:
+    download_timeout: 1200
+    upload_timeout: 900
+    traj_save_bucket: obs://s3-asset-b-hd-cce-aifm-nlp-exp
+    traj_save_path: taichu_trajs/traj_admin_1125test1
+    skill_download_path: zengxiang/test_cases/test_skills
+    user_config_download_path: ''
+    user_profile_download_path: zengxiang/test_cases
+    agents_download_path: zengxiang/test_cases/test_agents
+    default_skills: null
+  proxy_enable: true
