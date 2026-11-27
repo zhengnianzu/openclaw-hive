@@ -612,12 +612,45 @@ class OpenClawDistillationTask:
         """复制两份独立副本 → 改写 → 上传 agent config + user_proxy_model。
 
         每任务一份副本(env_id 隔离), 无需锁; port 不为 None(openclaw)时把端口写进副本。
+        taichu 会额外生成并上传每个 agent 的 .taichu.<persona>.json 专属配置。
         """
         await asyncio.to_thread(self._prepare_local_configs, data_config_file, port)
         remote_path = self.config.sandbox_config.harness_sandbox_config_file
         await self._upload_file("agent config", self.local_config_file, remote_path)
         await self._upload_user_proxy_model_config()
+        if self.config.sandbox_config.harness_type == "taichu":
+            await self._upload_taichu_persona_configs()
         self.logger.info(f"Copied agent config: {self.local_config_file} -> {remote_path}")
+
+    async def _upload_taichu_persona_configs(self) -> None:
+        """上传 taichu 每个 persona 的专属配置 .taichu.<persona>.json。"""
+        config_dir = Path(self.local_config_file).parent
+        # 远端路径是 Windows 形态时必须用 PureWindowsPath 取父目录：
+        # POSIX Path 不把反斜杠当分隔符，parent 会塌缩成 "."，沙箱会拒绝相对路径。
+        path_cls = (PureWindowsPath if self.config.sandbox_config.sandbox_type == "windows"
+                    else PurePosixPath)
+        remote_cfg_dir = path_cls(
+            self.config.sandbox_config.harness_sandbox_config_file).parent
+        model_cfg = json.loads(Path(self.local_model_config_file).read_text(encoding="utf-8"))
+        uploaded = 0
+        for agent_name in model_cfg:
+            if agent_name == "user_simulator":
+                continue
+            local_persona = config_dir / f".taichu.{agent_name}.json"
+            if not local_persona.is_file():
+                self.logger.warning(
+                    f"taichu persona config 缺失（_prepare_taichu 未生成）: {local_persona}")
+                continue
+            remote_persona = remote_cfg_dir / f".taichu.{agent_name}.json"
+            await self._upload_file(
+                f"taichu persona config {agent_name}",
+                str(local_persona),
+                str(remote_persona))
+            self.logger.info(
+                f"taichu persona config: {local_persona} -> {remote_persona}")
+            uploaded += 1
+        self.logger.info(
+            f"Uploaded {uploaded} taichu persona configs -> {remote_cfg_dir}")
 
     # ---- 临时补丁: Linux 镜像缺的 obsutil 凭据 / 辅助目录 -------------------------
     # TODO: 稳定后并入 utils/win_util.py 的 _WINDOWS_AUX_DIRS_BY_IMAGE（改成跨平台表）。

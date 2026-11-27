@@ -2,16 +2,35 @@
   "providers": [
     {
       "name": "default",
-      "base_url": "http://192.168.30.95:8084/v1",
-      "api_key": "sk-xxxxx",
+      "base_url": "http://115.33.106.57:8082/v1",
+      "api_key": "sk-xxxxxxxx",
       "models": [
         {
           "id": "kimi-k3",
-          "wire_protocol": "chat-completions"
+          "wire_protocol": "chat-completions",
+          "supports_images": false,
+          "max_tokens": 16384
         }
       ]
     }
   ],
   "default_provider": "default",
-  "default_model": "kimi-k3"
+  "default_model": "kimi-k3",
+  "default_thinking": "medium",
+  "context": {
+    "window_tokens": 128000,
+    "active_limit_tokens": 110000,
+    "static_limit_tokens": 20000,
+    "capability_context_weight_percent": 20,
+    "reserve_tokens": 8192,
+    "compaction": {
+      "session_enabled": true,
+      "trigger_tokens": 100000,
+      "keep_recent_tokens": 16000
+    },
+    "lcm": {
+      "active_context_target_tokens": 48000,
+      "leaf_chunk_tokens": 16000
+    }
+  }
 }
