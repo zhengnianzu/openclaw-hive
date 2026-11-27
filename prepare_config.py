@@ -599,67 +599,6 @@ def _prepare_jiuwenswarm(ctx: "_PrepareContext") -> None:
     logging.info(f"Updated jw_config.yaml with models from {ctx.model_path}")
 
 
-def _prepare_taichu(ctx: "_PrepareContext") -> None:
-    """.taichu.json：每个 agent 注册成同名 provider，user_proxy_model 同步 provider。
-
-    - 每个非 user_simulator 的 agent 注册成同名 provider（已存在则只补模型）；
-    - user_proxy_model.json 里该 agent 补上 ``provider``，api 归一成 OpenAI 兼容，
-      让 openclaw-task 的 TaichuAgentManager 按 simulator_config 精确命中；
-    - 协议一律强制为 OpenAI chat-completions；原 api 不是 openai-completions
-      （如 anthropic-messages / openai-responses）时改写并告警。
-    """
-    data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
-    providers = data.setdefault("providers", [])
-    by_name = {p.get("name"): p for p in providers if isinstance(p, dict)}
-
-    for agent_name, cfg in _usable_agents(ctx.model_cfg, need_provider=False):
-        # taichu 一律走 OpenAI chat-completions；原协议不同就强制改写并告警。
-        api_kind = cfg.get("api", "openai-completions")
-        if api_kind != "openai-completions":
-            logging.warning(
-                f"taichu agent={agent_name} 的 api={api_kind} 已强制改为 openai-completions"
-                f"（wire_protocol=chat-completions）；请确认 {cfg['base_url']} 提供 OpenAI 兼容接口"
-            )
-        cfg["api"] = "openai-completions"
-        wire = "chat-completions"
-
-        provider_name = agent_name
-        base_url = normalize_base_url(cfg["base_url"])   # taichu 只吃 OpenAI 兼容基址
-        model_entry = {"id": cfg["model"], "wire_protocol": wire}
-
-        existing = by_name.get(provider_name)
-        if existing is None:
-            entry = {
-                "name": provider_name,
-                "base_url": base_url,
-                "api_key": cfg["api_key"],
-                "models": [model_entry],
-            }
-            providers.append(entry)
-            by_name[provider_name] = entry
-            logging.info(f"Added taichu provider: {provider_name} ({cfg['model']}, {wire})")
-        else:
-            models = existing.setdefault("models", [])
-            ids = {m.get("id") if isinstance(m, dict) else str(m) for m in models}
-            if cfg["model"] not in ids:
-                models.append(model_entry)
-                logging.info(f"Added model {cfg['model']} to taichu provider {provider_name}")
-
-        # simulator_config 侧：provider 与 .taichu.json 对齐。
-        cfg["provider"] = provider_name
-        cfg["base_url"] = base_url
-
-    if not data.get("default_provider") or data["default_provider"] not in by_name:
-        raise ValueError(
-            f"taichu 配置 {ctx.local_path} 的 default_provider 不在 providers 中: "
-            f"{data.get('default_provider')!r}（已有 {sorted(n for n in by_name if n)}）"
-        )
-
-    _write_json(ctx.local_path, data)
-    _write_json(ctx.model_path, ctx.model_cfg)
-    logging.info(f"Updated .taichu.json with providers from {ctx.model_path}")
-
-
 def _prepare_openclaw(ctx: "_PrepareContext") -> None:
     """openclaw.json：注入 provider 与 agent，兼容 10.6（entries）与 6.6（list）两代 schema。"""
     data = json.loads(Path(ctx.local_path).read_text(encoding="utf-8"))
@@ -785,6 +724,55 @@ def _prepare_openclaw(ctx: "_PrepareContext") -> None:
                 e["agentDir"] = str(path_cls(home, ".openclaw", "agents", name))
 
     _write_json(ctx.local_path, data)
+
+
+def _prepare_taichu(ctx: "_PrepareContext") -> None:
+    """.taichu.<agent-name>.json：每个 agent 生成独立配置，
+    用该 agent 的 model/base_url/api_key 直接覆盖模板里唯一的 provider。
+    """
+    template_path = Path(ctx.local_path)
+    template_text = template_path.read_text(encoding="utf-8")
+    data = json.loads(template_text)
+
+    produced = 0
+    for agent_name, cfg in _usable_agents(ctx.model_cfg, need_provider=False):
+        api_kind = cfg.get("api", "openai-completions")
+        if api_kind != "openai-completions":
+            logging.warning(
+                "taichu agent=%s 的 api=%s 已强制改为 chat-completions", agent_name, api_kind)
+
+        # 基于模板深拷贝，保留 context/default_thinking 等所有其他字段
+        out = copy.deepcopy(data)
+        providers = out.get("providers") or [{}]
+        entry = providers[0]
+        entry["name"] = "default"
+        entry["base_url"] = normalize_base_url(cfg["base_url"])
+        entry["api_key"] = cfg["api_key"]
+
+        models = entry.get("models") or [{}]
+        model_entry = models[0]
+        model_entry["id"] = cfg["model"]
+        model_entry["wire_protocol"] = "chat-completions"
+        model_entry.setdefault("supports_images", False)
+        model_entry.setdefault("max_tokens", 16384)
+        entry["models"] = [model_entry]
+        out["providers"] = [entry]
+
+        out["default_provider"] = entry["name"]
+        out["default_model"] = model_entry["id"]
+
+        # 每个 agent 一个文件：.taichu.<agent-name>.json，放在模板同目录
+        out_path = template_path.with_name(f".taichu.{agent_name}.json")
+        out_path.write_text(
+            json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        logging.info(
+            "taichu %s: 生成 %s（provider=%s model=%s base_url=%s）", agent_name,
+            out_path.name, entry["name"], model_entry["id"], entry["base_url"])
+        produced += 1
+
+    if not produced:
+        logging.warning("taichu: user_proxy_model 里没有可注入的 agent")
 
 
 @dataclass
