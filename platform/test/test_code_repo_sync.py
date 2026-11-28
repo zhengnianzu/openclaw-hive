@@ -14,7 +14,11 @@
 运行：cd platform && python -m unittest discover -s test -p "test_code_repo_sync.py" -v
 """
 import os
+import shutil
 import sys
+import tempfile
+import threading
+import time
 import unittest
 
 PLATFORM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -221,6 +225,92 @@ class TestRepoStatus(unittest.TestCase):
             set(st),
             {"downloaded", "packaged", "tar_path", "src_path", "commit"},
         )
+
+
+class TestSyncLock(unittest.TestCase):
+    """同步互斥锁。
+
+    线上事故：连点几次「同步」，并发的 clone 写同一个 `.clone-{sha}.tmp`，
+    后进来的把先来的半成品 rmtree 掉，git 随即失败 —— 表现成「点了没反应」。
+    锁必须真的互斥，否则这个 bug 会原样回来。
+    """
+
+    def setUp(self):
+        self.repo = _git_repo()
+
+    def tearDown(self):
+        path = crs._lock_path(self.repo)
+        if os.path.exists(path):
+            os.close(os.open(path, os.O_RDWR))
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_lock_path_is_repo_scoped(self):
+        a = crs._lock_path(_git_repo())
+        b = crs._lock_path(_git_repo(version="dev"))
+        self.assertNotEqual(a, b)
+        # 不同 commit 不该影响锁粒度：锁的是「这个仓的这个版本」
+        self.assertEqual(a, crs._lock_path(_git_repo(resolved_commit="f" * 40)))
+
+    def test_second_acquire_while_held_raises_409(self):
+        """非阻塞模式下，锁被占用必须立刻 409，而不是陪着等。"""
+        fd = crs._acquire_repo_lock(self.repo, blocking=False)
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                crs._acquire_repo_lock(self.repo, blocking=False)
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertIn("正在同步中", ctx.exception.detail)
+        finally:
+            crs._release_repo_lock(fd)
+
+    def test_lock_released_allows_reacquire(self):
+        fd = crs._acquire_repo_lock(self.repo, blocking=False)
+        crs._release_repo_lock(fd)
+        fd2 = crs._acquire_repo_lock(self.repo, blocking=False)
+        crs._release_repo_lock(fd2)
+
+    def test_blocking_acquire_waits_for_release(self):
+        """阻塞模式要等到前一个释放后拿到锁，供实例创建/准备阶段排队使用。"""
+        fd = crs._acquire_repo_lock(self.repo, blocking=False)
+        threading.Timer(0.4, lambda: crs._release_repo_lock(fd)).start()
+        t0 = time.monotonic()
+        fd2 = crs._acquire_repo_lock(self.repo, blocking=True)
+        waited = time.monotonic() - t0
+        try:
+            self.assertGreaterEqual(waited, 0.3)
+        finally:
+            crs._release_repo_lock(fd2)
+
+
+class TestFailedFetchCleanup(unittest.TestCase):
+    """失败不该留下空壳目录 —— 那会让「同步过」和「同步失败」在磁盘上无法区分。"""
+
+    def test_empty_dir_removed(self):
+        d = tempfile.mkdtemp()
+        try:
+            empty = os.path.join(d, "sha")
+            os.makedirs(empty)
+            crs._cleanup_failed_fetch(empty)
+            self.assertFalse(os.path.exists(empty))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_non_empty_dir_kept(self):
+        """里面已有上次成功的产物时不能删。"""
+        d = tempfile.mkdtemp()
+        try:
+            keep = os.path.join(d, "sha")
+            os.makedirs(keep)
+            open(os.path.join(keep, "x"), "w").close()
+            crs._cleanup_failed_fetch(keep)
+            self.assertTrue(os.path.isdir(keep))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_missing_dir_is_noop(self):
+        crs._cleanup_failed_fetch("/nonexistent/never/there")
 
 
 if __name__ == "__main__":

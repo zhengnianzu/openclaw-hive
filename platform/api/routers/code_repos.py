@@ -37,7 +37,10 @@ def list_code_repos(
         params.append(f"%{version.strip()}%")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC"
+    # 默认代码仓置顶：is_default DESC 让唯一那条默认记录排最前，其余仍按时间倒序。
+    # 排序放在 SQL 而不是前端，因为列表是后端分页的（前端只切当前页），
+    # 前端排序只能作用于当前页，置顶会失效。
+    sql += " ORDER BY is_default DESC, created_at DESC"
     with get_connection() as conn:
         rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
@@ -232,7 +235,9 @@ async def sync_code_repo(repo_id: int, user: dict = Depends(require_operator)):
     obs 仓：没有「版本」概念可比，退化为强制重下重打包。
     """
     repo = _fetch_repo(repo_id)
-    result = await ensure_repo_ready(repo, force=True)
+    # wait_lock=False：已有一个同步在跑时立即返回 409「正在同步中」，
+    # 而不是让按钮点下去之后长时间无声等待（并发同步会互相破坏，见服务层注释）。
+    result = await ensure_repo_ready(repo, force=True, wait_lock=False)
     if result["updated"]:
         msg = f"已同步到 {result['commit'][:12]}" if result["commit"] else "已重新下载并打包"
     else:

@@ -6,12 +6,14 @@ tags:
 - 镜像
 - kubectl
 - 操作
-summary: 沙箱的查看/进入/手动清理（kubectl）、Linux 镜像的制作与推送（docker）、Windows 镜像制作（简化版）、Windows 沙箱 VNC 连接、资源监控看板，以及 sync_resource_pools / run_clear 两个操作脚本的用法。
+summary: 沙箱的查看/进入/手动清理（kubectl）、Linux 镜像的制作与推送（docker）、Windows 镜像制作（简化版）、Windows 沙箱
+  VNC 连接、资源监控看板，以及 sync_resource_pools / run_clear 两个操作脚本的用法。
 is_pinned: false
 sort_order: 55
 author: admin
+updated_by: admin
 created_at: '2026-11-23T10:00:00'
-updated_at: '2026-11-23T10:00:00'
+updated_at: '2026-11-26T20:45:13.172248'
 ---
 
 # 沙箱与镜像操作手册
@@ -69,12 +71,13 @@ python3 sync_resource_pools.py --map omni-env-default-worker=192.168.33.116
 ```
 
 ### 1.3 沙箱资源看板
+
 ```bash
 # SSH 端口转发到监控看板
 ssh -N -L 30010:192.168.11.87:30010 root@115.120.48.151
 ```
-浏览器打开：<http://localhost:30010>
 
+浏览器打开：<http://localhost:30010>
 
 ## 2. Linux 镜像制作与推送（docker）
 
@@ -148,6 +151,7 @@ cp -a /root/sandbox-log/Windows镜像制作/scripts/. "$WORKDIR/"
 ```
 
 ### 3.2 连接 VNC
+
 三步：port-forward → SSH 隧道 → VNC Viewer。
 
 ```bash
@@ -166,25 +170,34 @@ ssh -NT -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCoun
 ### 3.3 封盘并打包镜像
 
 1. 在跳板机 Bash 的工作目录原样执行：
+
 ```bash
 /usr/bin/python3 -u finish_windows.py prepare
 ```
+
 2. 在 **VNC PowerShell**原样输入正常关机命令：
+
 ```powershell
 shutdown.exe /s /t 0
 ```
+
 3. 回到跳板机 Bash 的工作目录确认：
+
 ```bash
 /usr/bin/python3 -u finish_windows.py wait-stopped
 ```
+
 必须出现 `WORK_QEMU_STOPPED`。仅 VNC 断开不等于关机；返回 `STILL_RUNNING` 时不要封盘。
-4. 确认停止后，在同一跳板机终端原样执行一次：
+4\. 确认停止后，在同一跳板机终端原样执行一次：
+
 ```bash
 "${K[@]}" cp -c build seal_work.sh "${POD}:/work/seal_work.sh"
 "${K[@]}" exec "$POD" -c build -- bash /work/seal_work.sh
 "${K[@]}" exec "$POD" -c build -- cat /work/sealed/virtual-disk-compare.log
 ```
+
 5. regctl 不存在时下载；已存在时只核对散列：
+
 ```bash
 mkdir -p registry-tools
 if [ ! -f registry-tools/regctl ]; then
@@ -193,7 +206,9 @@ fi
 echo '8e0e62a497fcdb8048d18aa927a139613176ba0531f412bc541044e28f9856bd  registry-tools/regctl' | sha256sum -c -
 chmod 700 registry-tools/regctl
 ```
+
 6. 打包并发布镜像
+
 ```bash
 # 打包镜像：
 /usr/bin/python3 -u fetch_source_config.py --base-image "$BASE_IMAGE" --regctl ./registry-tools/regctl
@@ -215,5 +230,40 @@ set -o pipefail
 "${K[@]}" exec "$POD" -c build -- python3 -u /work/publish_image.py "$TARGET" 2>&1 | tee publish.log
 ```
 
+# 4. 基础镜像具体要求：
 
+### 4.1 下载配置obsutil：
 
+```Shell
+# 下载 
+cd /home/ma-user/ && wget https://obs-community.obs.cn-north-1.myhuaweicloud.com/obsutil/current/obsutil_linux_amd64.tar.gz 
+# 解压 
+tar -xzvf obsutil_linux_amd64.tar.gz # 移动 mv obsutil_linux_amd64_5.8.3 obsutil 
+# 配置 
+./obsutil/obsutil config -i=HPUAEGWMKUI3IZO3HKL0 -k=kuKJHgufvXcXNw7AFgRBFVsKsMCGD0pPFMSB12Tt -e=http://obs.cn-east-4.myhuaweicloud.com 
+# 验证
+./obsutil/obsutil ls -d obs://s3-asset-b-hd-cce-aifm-nlp-exp/ 
+# 双向复制 
+./obsutil/obsutil cp -r -f <local_dir> <obs_dir>
+```
+
+### &#x20;4.2. 上传文件（以taichu为例）：
+
+| 内容     | 源地址                                                                              | 沙箱地址                                                               | 备注                                                 |
+| :----- | :------------------------------------------------------------------------------- | :----------------------------------------------------------------- | :------------------------------------------------- |
+| 默认通用技能 | obs\://s3-asset-b-hd-cce-aifm-nlp-exp/zengxiang/image_default_skills/skill_test/ | home/ma-user/taichu/agent_instances/{persona_id}/meta_data/skills/ | persona_id=sys_celia_main，下面存放了serper和image-search |
+| 临时技能库  | obs\://s3-asset-b-hd-cce-aifm-nlp-exp/skills_library/1112/skills_library         | /home/ma-user/skills_library/                                      | 包含92个skills和1个md文件                                 |
+|        |                                                                                  |                                                                    |                                                    |
+
+## 4.3. 安装python依赖和Chromium工具
+
+```markdown
+zstandard
+fastapi
+uvicorn
+python-dotenv
+pyyaml
+python-pptx
+# 使用清华镜像源加速：https://pypi.tuna.tsinghua.edu.cn/simple
+# 安装其他工具：Chromium
+```

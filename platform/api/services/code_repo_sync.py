@@ -21,8 +21,11 @@ git 仓按 commit 分目录带来的性质：实例 config.yaml 里的 tar 路�
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import os
 import shutil
+import time
 from datetime import datetime
 
 from fastapi import HTTPException
@@ -109,6 +112,68 @@ def content_path(repo: dict, commit: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 同步互斥锁
+#
+# 为什么必须有：一次同步会 clone 到 `.clone-{sha}.tmp` 再改名。两个同步并发跑
+# 时目标 tmp 路径完全相同（同一 commit），后进来的那个会把先来的半成品目录
+# rmtree 掉，git 随即失败 —— 现象就是「点了同步没反应 / 卡住」，而且每多点一次
+# 就多一个并发的破坏者。
+#
+# 用 flock 而不是 asyncio.Lock：uvicorn 是 --workers 4，多个 worker 是**不同进程**，
+# 进程内的锁互相看不见。这也与本仓库 db_backup.py / worker_monitor.py 的既有做法一致。
+# ---------------------------------------------------------------------------
+
+# 等锁上限：一次同步最坏 `ls-remote 60s + clone 600s + tar 120s`，留点余量。
+LOCK_WAIT_SECONDS = 900
+LOCK_POLL_SECONDS = 0.5
+
+
+def _lock_path(repo: dict) -> str:
+    """锁文件路径。name/version 已被用作目录名，直接拿来拼是安全的。"""
+    return os.path.join(_code_dir(), ".sync-locks", f"{repo['name']}__{repo['version']}.lock")
+
+
+def _acquire_repo_lock(repo: dict, *, blocking: bool) -> int:
+    """拿该代码仓的排他锁，返回持锁的 fd（调用方负责释放）。
+
+    blocking=False 时若已被占用立即抛 409：给「同步」按钮快速反馈，
+    而不是让请求挂在那里让用户以为卡死。
+    """
+    path = _lock_path(repo)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EACCES):
+                os.close(fd)
+                raise
+            if not blocking:
+                os.close(fd)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"代码仓 {repo['name']}/{repo['version']} 正在同步中，请稍后再试",
+                )
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"等待代码仓 {repo['name']}/{repo['version']} 的同步锁超时({LOCK_WAIT_SECONDS}s)",
+                )
+            time.sleep(LOCK_POLL_SECONDS)
+
+
+def _release_repo_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # 子进程
 # ---------------------------------------------------------------------------
 
@@ -186,12 +251,27 @@ async def resolve_remote_head(repo: dict) -> str:
     return sha
 
 
+def _cleanup_failed_fetch(src_dir: str) -> None:
+    """拉取失败后清掉空壳目录。
+
+    不正视这个的话，失败会留下一个空的 `{sha}/` 目录，肉眼看起来像「同步过但内容没了」，
+    排查时极易误判。只删空目录：若里面已有别的东西（比如上一次成功的产物），不能动。
+    """
+    try:
+        if os.path.isdir(src_dir) and not os.listdir(src_dir):
+            os.rmdir(src_dir)
+    except OSError:
+        pass
+
+
 async def _git_fetch(repo: dict, commit: str) -> str:
     """把 commit 对应的源码落到 content_path 并返回该路径。
 
     每个 commit 独占目录，所以这里永远是「干净目录里新 clone」，不需要 fetch
     合并既有 checkout。clone 到临时目录再整体 rename：中途失败不会留下一个
     半拉子的 content_path 被后续调用误判成「已下载」。
+
+    调用方必须已持有该仓库的锁 —— 否则并发调用会互相 rmtree 对方的 tmp。
     """
     src_dir, _ = repo_dirs(repo, commit)
     dest = os.path.join(src_dir, content_dir_name(repo))
@@ -215,12 +295,14 @@ async def _git_fetch(repo: dict, commit: str) -> str:
     )
     if rc != 0:
         shutil.rmtree(tmp, ignore_errors=True)
+        _cleanup_failed_fetch(src_dir)
         raise HTTPException(status_code=500, detail=f"代码仓克隆失败: {_safe(err)}")
 
     rc, out, err = await _run(["git", "rev-parse", "HEAD"], cwd=tmp, timeout=30, what="读取 commit")
     actual = out.strip() if rc == 0 else ""
     if rc != 0 or not actual:
         shutil.rmtree(tmp, ignore_errors=True)
+        _cleanup_failed_fetch(src_dir)
         raise HTTPException(status_code=500, detail=f"读取 commit 失败: {_safe(err)}")
 
     if actual != commit:
@@ -302,15 +384,30 @@ def _record_sync(repo_id: int, commit: str) -> None:
         )
 
 
-async def ensure_repo_ready(repo: dict, *, force: bool = False) -> dict:
+async def ensure_repo_ready(repo: dict, *, force: bool = False, wait_lock: bool = True) -> dict:
     """保证该代码仓的 tar 就位，返回 {tar_path, src_path, commit, already_exists, updated}。
 
     惰性语义与改动前一致：tar 已存在且 force=False 就直接返回，不重复拉取。
     git 仓在 force 时会先探测远端 HEAD；若与本地 resolved_commit 相同且 tar 已在，
     同样跳过——「同步」按钮点第二次不该白跑一次 clone。
 
+    整段工作在**该仓库的排他锁**内执行（见 _acquire_repo_lock）：并发同步会互相
+    清掉对方的临时 clone 目录，是之前「点了没反应」的直接原因。
+    wait_lock=False 用于用户手动的「同步」按钮：锁被占用时立即 409，
+    而不是陪着排队等上十分钟。实例创建/准备阶段用默认的 wait_lock=True，
+    让它们排在正在进行的同步后面，不该因为别人正在同步就创建失败。
+
     repo 是 code_repos 的一行（dict）。调用方不必关心来源类型。
     """
+    fd = _acquire_repo_lock(repo, blocking=wait_lock)
+    try:
+        return await _ensure_repo_ready_locked(repo, force=force)
+    finally:
+        _release_repo_lock(fd)
+
+
+async def _ensure_repo_ready_locked(repo: dict, *, force: bool) -> dict:
+    """ensure_repo_ready 的实际逻辑。调用方必须已持有该仓库的锁。"""
     if not is_git(repo):
         src_dir, _ = repo_dirs(repo)
         tar_path = os.path.join(repo_dirs(repo)[1], TAR_NAME)

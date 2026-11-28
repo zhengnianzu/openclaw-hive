@@ -368,8 +368,8 @@ async def _gen_proxy_summary_windows(self, project_dir: str) -> None:
     stats_cmd = ps_command(
         f"Set-Location -LiteralPath '{ps_project}'; "
         f"New-Item -ItemType Directory -Force logs_proxy | Out-Null; "
-        f"python llm_proxy_lite\\print_stats_summary.py "
-        f"> logs_proxy/proxy_summary.txt 2>&1; "
+        'cmd.exe /c "python -X utf8 llm_proxy_lite\\print_stats_summary.py '
+        '> logs_proxy/proxy_summary.txt 2>&1"; '
         "Write-Output 'HIVE_PROXY_SUMMARY_DONE'",
         config_dir,
     )
