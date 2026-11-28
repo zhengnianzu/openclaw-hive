@@ -65,6 +65,8 @@ class CodeRepoInfo(BaseModel):
     subdir: str = ""
     resolved_commit: str = ""
     synced_at: Optional[str] = None
+    # 此刻是否有同步在跑（由同步锁的占用状态推出）。只对 git 来源有意义。
+    syncing: bool = False
     version: str
     description: str = ""
     main_python_file: str = "harness_automation.py"

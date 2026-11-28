@@ -32,7 +32,6 @@ from ..services.queue_scheduler import (
 from ..services.create_params import build_create_params
 from ..services.code_repo_sync import (
     ensure_repo_ready,
-    is_git as is_git_repo,
     repo_tar_path,
 )
 from ..services.secrets import instance_create_params, mask_create_params, redact_text
@@ -1183,19 +1182,8 @@ async def create_instance(req: InstanceCreate, user: dict = Depends(require_oper
             repo_row = conn.execute("SELECT * FROM code_repos WHERE id = ?", (req.code_repo_id,)).fetchone()
         if repo_row:
             repo = dict(repo_row)
-            # git 仓的 tar 路径带 commit 层，而本函数刻意不做下载，首次使用时
-            # resolved_commit 还是空的，算不出目录。这种情况下必须先拉一次把
-            # commit 定下来，否则写进 config.yaml 的路径就是错的。
-            # 代价是「首个实例的创建」会多等一次 clone；之后同一 commit 走惰性分支，秒回。
-            if is_git_repo(repo) and not (repo.get("resolved_commit") or "").strip():
-                await ensure_repo_ready(repo)
-                with get_connection() as conn:
-                    repo_row = conn.execute(
-                        "SELECT * FROM code_repos WHERE id = ?", (req.code_repo_id,)
-                    ).fetchone()
-                repo = dict(repo_row)
-            # 路径在这里就被钉死在当时的 commit 上：之后代码仓再同步到新 commit
-            # 只会新增目录，不会改变这个实例实际跑的代码。
+            # 两种来源的 tar 路径规则一致（不含 commit 层），这里不做下载，
+            # 真正的拉取/打包留给准备阶段（见 _prepare_instance）。
             tar_path = repo_tar_path(repo)
             base.run_config.task.main_code_tar = tar_path
             base.run_config.task.main_code_dir = ""

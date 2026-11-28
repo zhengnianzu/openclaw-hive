@@ -10,13 +10,16 @@ commit 目录，散着改必然漏，所以先在这里收口：
     ensure_repo_ready          —— 拉取 + 打包，router 和 instances 共用
     resolve_remote_head        —— 只读探测远端 HEAD，给「有新版本」提示用
 
-目录规则（兼容存量是硬要求）：
-    obs: code/{src,tar}/{name}/{version}/              —— 与改动前逐字一致
-    git: code/{src,tar}/{name}/{version}/{sha[:12]}/   —— 多一层短 sha
+目录规则（两种来源一致，也与 OBS 改动前逐字一致）：
+    code/{src,tar}/{name}/{version}/
 
-git 仓按 commit 分目录带来的性质：实例 config.yaml 里的 tar 路径一旦写定，
-就钉在当时那个 commit 上。之后仓库同步到新 commit 只会新增目录，不会改写
-已有实例实际跑的代码——这正是按 commit 隔离想换来的可复现性。
+git 仓的更新方式是**原地 pull**：工作副本长期保留在 src 目录里，同步时
+fetch + reset 到远端分支最新，然后重新打包 tar。不按 commit 分目录 ——
+历史 sha 的目录没有保留价值，只会让磁盘无限增长。
+
+由此带来的取舍：实例 config.yaml 里的 main_code_tar 路径是固定的，仓库同步后
+**新启动的实例会拿到新代码**，而已经在跑的实例因为 tar 已上传进沙箱、不再回读，
+不受影响。重复启动同一实例时则会读到新 tar。
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ import asyncio
 import errno
 import fcntl
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -44,6 +48,27 @@ TAR_TIMEOUT = 120
 
 SOURCE_OBS = "obs"
 SOURCE_GIT = "git"
+
+# Git 网络的健壮性参数。
+#
+# 实测（2026-11-28）：同一分钟里 `curl` 请求 git 的 /info/refs 只要 0.5s，
+# 而 `git ls-remote` 能挂满 60s、`git clone` 卡在 124K 十分钟不动 —— 链路到
+# GitHub 有间歇性卡顿。git 默认对「连接建立后不再前进」的传输不设上限，
+# 会一路等到我们的 FETCH_TIMEOUT(600s)，于是用户看到的就是「同步没反应」。
+#
+# 两个措施：
+#   1) lowSpeedLimit/Time：30 秒内平均速度低于 1KB/s 就主动放弃这条连接，
+#      把一个卡死的十分钟缩短到半分钟；
+#   2) 失败/超时后重开一条新连接重试 —— 卡顿多是某条路径的问题，重连经常就通了。
+# http.version=HTTP/1.1：部分出口链路上 HTTP/2 的多路复用会卡住（GitHub 官方
+# 也建议在网络不稳时降级），降到 1.1 能避开这一类卡顿。这不是根治 —— 根治在链路，
+# 但它把「偶发卡死」的频率压低了一个已知来源。
+GIT_NET_OPTS = (
+    "-c", "http.version=HTTP/1.1",
+    "-c", "http.lowSpeedLimit=1000",
+    "-c", "http.lowSpeedTime=30",
+)
+GIT_ATTEMPTS = 3
 
 
 def _code_dir() -> str:
@@ -83,32 +108,27 @@ def content_dir_name(repo: dict) -> str:
     return _obs_dir_name(repo.get("obs_path") or "")
 
 
-def repo_dirs(repo: dict, commit: str | None = None) -> tuple[str, str]:
-    """(src_dir, tar_dir)。git 仓多一层 commit 短 sha。
+def repo_dirs(repo: dict) -> tuple[str, str]:
+    """(src_dir, tar_dir)。两种来源同一套路径，不含 commit 层。
 
-    commit 显式传入时优先于 repo['resolved_commit']——同步流程要先按新拉到的
-    sha 算目录，而此时库里存的还是旧值。
+    路径不再依赖 resolved_commit：git 仓原地更新，所以「还没同步过」也能
+    直接算出 tar 路径，实例创建时不需要先拉一次。
     """
     parts = [repo["name"], repo["version"]]
-    if is_git(repo):
-        sha = (commit if commit is not None else repo.get("resolved_commit") or "").strip()
-        if not sha:
-            raise HTTPException(
-                status_code=409,
-                detail=f"代码仓 {repo['name']}/{repo['version']} 尚未同步，无法确定 commit 目录，请先执行同步",
-            )
-        parts.append(sha[:12])
     base = _code_dir()
     return os.path.join(base, "src", *parts), os.path.join(base, "tar", *parts)
 
 
-def repo_tar_path(repo: dict, commit: str | None = None) -> str:
-    return os.path.join(repo_dirs(repo, commit)[1], TAR_NAME)
+def repo_tar_path(repo: dict) -> str:
+    return os.path.join(repo_dirs(repo)[1], TAR_NAME)
 
 
-def content_path(repo: dict, commit: str | None = None) -> str:
-    """源码实际落地的目录（src_dir 下那层内容目录）。"""
-    return os.path.join(repo_dirs(repo, commit)[0], content_dir_name(repo))
+def content_path(repo: dict) -> str:
+    """源码实际落地的目录（src_dir 下那层内容目录）。
+
+    git 仓这个目录本身就是工作副本，内含 .git（打包时排除）。
+    """
+    return os.path.join(repo_dirs(repo)[0], content_dir_name(repo))
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +193,36 @@ def _release_repo_lock(fd: int) -> None:
         os.close(fd)
 
 
+def is_syncing(repo: dict) -> bool:
+    """该代码仓此刻是否有同步在跑（只读探测，不占锁）。
+
+    直接复用同步锁本身作为状态来源：锁被别的进程拿着 = 正在同步。
+    这样不需要额外维护一张「同步中」的表，也不会出现锁与状态不一致
+    （进程崩了锁自动释放，状态也跟着消失）。
+
+    同进程内若自己正持锁再调用会误报为 True，故只给「别的请求」用，
+    不要在同一次同步的调用栈里调它。
+    """
+    path = _lock_path(repo)
+    if not os.path.exists(path):
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EACCES):
+                return True
+            raise
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 # ---------------------------------------------------------------------------
 # 子进程
 # ---------------------------------------------------------------------------
@@ -212,6 +262,37 @@ def _safe(text: str, limit: int = 500) -> str:
     return text[:limit]
 
 
+async def _git_net(args: list[str], *, cwd: str | None = None, timeout: int = FETCH_TIMEOUT,
+                   what: str = "Git 操作") -> tuple[int, str, str]:
+    """跑一条**走网络**的 git 命令，带低速熔断与重试。
+
+    只用于需要联网的子命令（ls-remote / clone）。rev-parse 这类纯本地操作
+    仍走 _run，不该因为网络参数多一层重试。
+
+    重试对两种失败都生效：非零退出，以及 _run 抛出的超时。前者常见于
+    「卡顿超时后 git 自己报 early EOF」，后者是链路彻底不动。
+    """
+    last = ""
+    for attempt in range(1, GIT_ATTEMPTS + 1):
+        try:
+            rc, out, err = await _run(
+                ["git", *GIT_NET_OPTS, *args], cwd=cwd, timeout=timeout, what=what,
+            )
+        except HTTPException as e:
+            last = str(e.detail)
+        else:
+            if rc == 0:
+                return rc, out, err
+            last = _safe(err)
+        if attempt < GIT_ATTEMPTS:
+            # 递增退避：卡顿通常是短暂的路由抖动，隔一下再试换到别的路径。
+            await asyncio.sleep(1.5 * attempt)
+    raise HTTPException(
+        status_code=500,
+        detail=f"{what}失败（已重试 {GIT_ATTEMPTS} 次）: {last}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Git
 # ---------------------------------------------------------------------------
@@ -234,13 +315,11 @@ def _branch(repo: dict) -> str:
 async def resolve_remote_head(repo: dict) -> str:
     """远端分支当前 sha（只读，不落盘）。"""
     branch = _branch(repo)
-    rc, out, err = await _run(
-        ["git", "ls-remote", _git_url(repo), f"refs/heads/{branch}"],
+    rc, out, err = await _git_net(
+        ["ls-remote", _git_url(repo), f"refs/heads/{branch}"],
         timeout=60,
         what="探测远端分支",
     )
-    if rc != 0:
-        raise HTTPException(status_code=500, detail=f"探测远端分支失败: {_safe(err)}")
     line = out.strip().split("\n")[0].strip() if out.strip() else ""
     sha = line.split("\t")[0].strip() if line else ""
     if not sha:
@@ -254,8 +333,8 @@ async def resolve_remote_head(repo: dict) -> str:
 def _cleanup_failed_fetch(src_dir: str) -> None:
     """拉取失败后清掉空壳目录。
 
-    不正视这个的话，失败会留下一个空的 `{sha}/` 目录，肉眼看起来像「同步过但内容没了」，
-    排查时极易误判。只删空目录：若里面已有别的东西（比如上一次成功的产物），不能动。
+    失败会留下空目录，肉眼看起来像「同步过但内容没了」，排查时极易误判。
+    只删空目录：里面已有上一次成功的产物时不能动。
     """
     try:
         if os.path.isdir(src_dir) and not os.listdir(src_dir):
@@ -264,71 +343,101 @@ def _cleanup_failed_fetch(src_dir: str) -> None:
         pass
 
 
-async def _git_fetch(repo: dict, commit: str) -> str:
-    """把 commit 对应的源码落到 content_path 并返回该路径。
+def _work_root(repo: dict) -> str:
+    """git 工作副本的根目录。整个仓库一份，长期保留，同步时原地更新。
 
-    每个 commit 独占目录，所以这里永远是「干净目录里新 clone」，不需要 fetch
-    合并既有 checkout。clone 到临时目录再整体 rename：中途失败不会留下一个
-    半拉子的 content_path 被后续调用误判成「已下载」。
-
-    调用方必须已持有该仓库的锁 —— 否则并发调用会互相 rmtree 对方的 tmp。
+    放在 src_dir 下的 `.repo`：与 tar 里那层内容目录（content_dir_name）分开，
+    subdir 模式下也不会与它重名。
     """
-    src_dir, _ = repo_dirs(repo, commit)
-    dest = os.path.join(src_dir, content_dir_name(repo))
-    if os.path.isdir(dest):
-        shutil.rmtree(dest)
+    return os.path.join(repo_dirs(repo)[0], ".repo")
+
+
+async def _git_pull(repo: dict) -> tuple[str, str]:
+    """把工作副本更新到远端分支最新，返回 (实际 sha, commit 标题)。
+
+    首次 clone，之后 fetch + reset --hard —— 即「原地 pull」。不直接调
+    `git pull` 的原因：浅克隆上 pull 会带 rebase 相关的告警，且工作区任何脏
+    改动都会导致它失败；reset --hard 到 FETCH_HEAD 的结果确定，正是我们要的
+    「无条件跟随远端分支」。
+
+    调用方必须已持有该仓库的锁。
+    """
+    work = _work_root(repo)
+    src_dir = repo_dirs(repo)[0]
     os.makedirs(src_dir, exist_ok=True)
-
-    tmp = os.path.join(src_dir, f".clone-{commit[:12]}.tmp")
-    if os.path.isdir(tmp):
-        shutil.rmtree(tmp)
-
     branch = _branch(repo)
-    # --depth 1 只能配 --branch 取分支头。如果远端在我们探测 sha 之后又推了新
-    # commit，这里 clone 到的会是更新的那个；下面用实际 sha 校正，避免目录名
-    # 与内容对不上。
-    rc, _, err = await _run(
-        ["git", "clone", "--depth", "1", "--single-branch", "--branch", branch,
-         _git_url(repo), tmp],
-        timeout=FETCH_TIMEOUT,
-        what="代码仓克隆",
-    )
-    if rc != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        _cleanup_failed_fetch(src_dir)
-        raise HTTPException(status_code=500, detail=f"代码仓克隆失败: {_safe(err)}")
+    url = _git_url(repo)
 
-    rc, out, err = await _run(["git", "rev-parse", "HEAD"], cwd=tmp, timeout=30, what="读取 commit")
-    actual = out.strip() if rc == 0 else ""
-    if rc != 0 or not actual:
-        shutil.rmtree(tmp, ignore_errors=True)
-        _cleanup_failed_fetch(src_dir)
+    if not os.path.isdir(os.path.join(work, ".git")):
+        # 首次：clone 到临时目录再整体 rename，失败不会留下半成品被误判成可用。
+        tmp = work + ".tmp"
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp)
+        try:
+            await _git_net(
+                ["clone", "--depth", "1", "--single-branch", "--branch", branch, url, tmp],
+                timeout=FETCH_TIMEOUT, what="代码仓克隆",
+            )
+        except HTTPException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            _cleanup_failed_fetch(src_dir)
+            raise
+        if os.path.isdir(work):
+            shutil.rmtree(work)
+        os.replace(tmp, work)
+    else:
+        # 之后：只拉增量。--depth 1 让浅克隆保持浅，不会越同步越厚。
+        await _git_net(
+            ["-C", work, "fetch", "--depth", "1", "origin", branch],
+            timeout=FETCH_TIMEOUT, what="代码仓拉取",
+        )
+        rc, _, err = await _run(
+            ["git", "-C", work, "reset", "--hard", "FETCH_HEAD"],
+            timeout=60, what="更新工作副本",
+        )
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"更新工作副本失败: {_safe(err)}")
+
+    rc, out, err = await _run(
+        ["git", "-C", work, "rev-parse", "HEAD"], timeout=30, what="读取 commit",
+    )
+    sha = out.strip() if rc == 0 else ""
+    if not sha:
         raise HTTPException(status_code=500, detail=f"读取 commit 失败: {_safe(err)}")
 
-    if actual != commit:
-        # 远端在探测与 clone 之间前进了。按实际 sha 重新定位目标目录，
-        # 否则 sha 目录里装的是另一个 commit 的代码。
-        src_dir, _ = repo_dirs(repo, actual)
-        dest = os.path.join(src_dir, content_dir_name(repo))
-        os.makedirs(src_dir, exist_ok=True)
-        if os.path.isdir(dest):
-            shutil.rmtree(dest)
+    # 标题取不到不算失败：描述里少一行说明，比让整次同步失败要好得多。
+    rc, out, _ = await _run(
+        ["git", "-C", work, "log", "-1", "--format=%s"], timeout=30, what="读取 commit 标题",
+    )
+    subject = out.strip() if rc == 0 else ""
+    return sha, subject
 
-    # .git 不进 tar：沙箱里用不到，白占体积，且含远端 URL。
-    shutil.rmtree(os.path.join(tmp, ".git"), ignore_errors=True)
 
+async def _pack_git(repo: dict) -> str:
+    """用 git archive 直接产出 tar。
+
+    用 archive 而不是 tar 打包工作副本：
+      - .git 天然不进包，不必拼 --exclude；
+      - 只含受版本控制的文件，工作区里误留的 __pycache__/日志不会混进沙箱；
+      - 顶层目录名由 --prefix 指定，与沙箱侧 `Path(main_code_tar).stem`
+        推出的工程目录（code_stem）一致。
+    subdir 非空时用 `HEAD:<subdir>` 只导出该子树，前缀仍用叶子目录名。
+    """
+    work = _work_root(repo)
+    tar_dir = repo_dirs(repo)[1]
+    tar_path = repo_tar_path(repo)
+    os.makedirs(tar_dir, exist_ok=True)
     subdir = (repo.get("subdir") or "").strip().strip("/")
-    if subdir:
-        inner = os.path.join(tmp, subdir)
-        if not os.path.isdir(inner):
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise HTTPException(status_code=400, detail=f"仓库内不存在子目录 {subdir}")
-        os.replace(inner, dest)
-        shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        os.replace(tmp, dest)
-
-    return actual
+    source = f"HEAD:{subdir}" if subdir else "HEAD"
+    rc, _, err = await _run(
+        ["git", "-C", work, "archive", "--format=tar",
+         f"--prefix={content_dir_name(repo)}/", "--output", tar_path, source],
+        timeout=TAR_TIMEOUT,
+        what="打包",
+    )
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=f"打包失败: {_safe(err)}")
+    return tar_path
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +465,9 @@ async def _obs_fetch(repo: dict) -> None:
 # 打包
 # ---------------------------------------------------------------------------
 
-async def _pack(repo: dict, commit: str | None = None) -> str:
-    src_dir, tar_dir = repo_dirs(repo, commit)
+async def _pack_obs(repo: dict) -> str:
+    """OBS 来源打包：tar 掉 obsutil 拉到的那层目录。"""
+    src_dir, tar_dir = repo_dirs(repo)
     dir_name = content_dir_name(repo)
     tar_path = os.path.join(tar_dir, TAR_NAME)
     os.makedirs(tar_dir, exist_ok=True)
@@ -376,11 +486,34 @@ async def _pack(repo: dict, commit: str | None = None) -> str:
 # 对外入口
 # ---------------------------------------------------------------------------
 
-def _record_sync(repo_id: int, commit: str) -> None:
+# 描述首行是自动维护的 commit 摘要，形如：
+#   [commit a2816cd1adf1] 校核：精简网关日志与任务状态处理
+# 换行之后的才是用户自己写的内容，同步时原样保留 —— 描述是人的字段，
+# 只该被「当前 commit 是哪次」这一行覆盖，不能把说明冲掉。
+_COMMIT_TAG_RE = re.compile(r"^\[commit [0-9a-f]{7,40}\][^\n]*\n?")
+
+
+def with_commit_tag(desc: str, commit: str, subject: str = "") -> str:
+    """把描述首行的 commit 摘要换成这次的 sha + 标题，保留换行后的用户内容。
+
+    幂等：连着同步两次不会堆出两行标记。
+    """
+    rest = _COMMIT_TAG_RE.sub("", desc or "").lstrip("\n").strip()
+    head = f"[commit {commit[:12]}]"
+    if subject:
+        head = f"{head} {subject}"
+    return f"{head}\n{rest}" if rest else head
+
+
+def _record_sync(repo_id: int, commit: str, subject: str = "") -> None:
     with get_connection() as conn:
+        row = conn.execute(
+            "SELECT description FROM code_repos WHERE id = ?", (repo_id,)
+        ).fetchone()
+        desc = with_commit_tag(row["description"] if row else "", commit, subject)
         conn.execute(
-            "UPDATE code_repos SET resolved_commit = ?, synced_at = ? WHERE id = ?",
-            (commit, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), repo_id),
+            "UPDATE code_repos SET resolved_commit = ?, synced_at = ?, description = ? WHERE id = ?",
+            (commit, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), desc, repo_id),
         )
 
 
@@ -408,9 +541,10 @@ async def ensure_repo_ready(repo: dict, *, force: bool = False, wait_lock: bool 
 
 async def _ensure_repo_ready_locked(repo: dict, *, force: bool) -> dict:
     """ensure_repo_ready 的实际逻辑。调用方必须已持有该仓库的锁。"""
+    tar_path = repo_tar_path(repo)
+
     if not is_git(repo):
         src_dir, _ = repo_dirs(repo)
-        tar_path = os.path.join(repo_dirs(repo)[1], TAR_NAME)
         if os.path.isfile(tar_path) and not force:
             return {
                 "tar_path": tar_path,
@@ -421,7 +555,7 @@ async def _ensure_repo_ready_locked(repo: dict, *, force: bool) -> dict:
             }
         if force or not (os.path.isdir(src_dir) and os.listdir(src_dir)):
             await _obs_fetch(repo)
-        tar_path = await _pack(repo)
+        tar_path = await _pack_obs(repo)
         return {
             "tar_path": tar_path,
             "src_path": content_path(repo),
@@ -431,38 +565,41 @@ async def _ensure_repo_ready_locked(repo: dict, *, force: bool) -> dict:
         }
 
     local = (repo.get("resolved_commit") or "").strip()
+    work = _work_root(repo)
 
-    # 非强制且本地已有打包产物：直接用，不碰网络。实例准备阶段走的就是这条，
-    # 不然每次创建实例都要等一次 ls-remote。
-    if local and not force:
-        tar_path = repo_tar_path(repo, local)
-        if os.path.isfile(tar_path):
-            return {
-                "tar_path": tar_path,
-                "src_path": content_path(repo, local),
-                "commit": local,
-                "already_exists": True,
-                "updated": False,
-            }
-
-    target = await resolve_remote_head(repo)
-
-    # 远端没动且产物还在 —— 包括 force 的情形：重复点「同步」不该重拉。
-    if target == local and os.path.isfile(repo_tar_path(repo, target)):
+    # 非强制且本地已有工作副本与产物：直接用，不碰网络。实例准备阶段走这条，
+    # 否则每次创建实例都要等一次 fetch。
+    if local and not force and os.path.isfile(tar_path) and os.path.isdir(work):
         return {
-            "tar_path": repo_tar_path(repo, target),
-            "src_path": content_path(repo, target),
-            "commit": target,
+            "tar_path": tar_path,
+            "src_path": work,
+            "commit": local,
             "already_exists": True,
             "updated": False,
         }
 
-    actual = await _git_fetch(repo, target)
-    tar_path = await _pack(repo, actual)
-    _record_sync(repo["id"], actual)
+    # 原地更新到远端分支最新。不再先 ls-remote 比对：fetch 本身就能拿到最新 sha，
+    # 多一次往返只会在慢链路上放大等待。
+    actual, subject = await _git_pull(repo)
+
+    if actual == local and os.path.isfile(tar_path):
+        # 即使没有新 commit 也回写一次：描述首行的摘要可能是旧格式（只有 sha）
+        # 或压根没有（历史记录），synced_at 也该反映这次同步。
+        # 否则「点同步却什么都没变」会让人以为操作没生效。
+        _record_sync(repo["id"], actual, subject)
+        return {
+            "tar_path": tar_path,
+            "src_path": work,
+            "commit": actual,
+            "already_exists": True,
+            "updated": False,
+        }
+
+    tar_path = await _pack_git(repo)
+    _record_sync(repo["id"], actual, subject)
     return {
         "tar_path": tar_path,
-        "src_path": content_path(repo, actual),
+        "src_path": work,
         "commit": actual,
         "already_exists": False,
         "updated": actual != local,
@@ -470,24 +607,30 @@ async def _ensure_repo_ready_locked(repo: dict, *, force: bool) -> dict:
 
 
 def repo_status(repo: dict) -> dict:
-    """只读磁盘，判断该仓是否已下载 / 已打包。"""
+    """只读磁盘，判断该仓是否已下载 / 已打包。
+
+    git 仓的「已下载」指工作副本存在（src_dir/.repo 里有 .git），
+    因为原地更新的产物就是那个工作副本，不再有按 commit 分的内容目录。
+    """
     commit = (repo.get("resolved_commit") or "").strip()
-    if is_git(repo) and not commit:
-        return {
-            "downloaded": False,
-            "packaged": False,
-            "tar_path": None,
-            "src_path": None,
-            "commit": "",
-        }
-    tar_path = repo_tar_path(repo, commit or None)
-    src_path = content_path(repo, commit or None)
+    tar_path = repo_tar_path(repo)
     tar_exists = os.path.isfile(tar_path)
-    src_exists = os.path.isdir(src_path)
+
+    if is_git(repo):
+        work = _work_root(repo)
+        src_exists = os.path.isdir(os.path.join(work, ".git"))
+        src_path = work
+    else:
+        src_path = content_path(repo)
+        src_exists = os.path.isdir(src_path)
+
     return {
         "downloaded": src_exists,
         "packaged": tar_exists,
         "tar_path": tar_path if tar_exists else None,
         "src_path": src_path if src_exists else None,
         "commit": commit,
+        # 只有 git 仓会长时间同步；OBS 的下载/打包是创建实例时顺手做的，
+        # 不该在代码仓列表上闪「同步中」。
+        "syncing": is_git(repo) and is_syncing(repo),
     }

@@ -14,6 +14,7 @@ from ..models.code_repo import (
 from ..services.code_repo_sync import (
     ensure_repo_ready,
     is_git,
+    is_syncing,
     repo_status,
     resolve_remote_head,
 )
@@ -43,7 +44,14 @@ def list_code_repos(
     sql += " ORDER BY is_default DESC, created_at DESC"
     with get_connection() as conn:
         rows = conn.execute(sql, tuple(params)).fetchall()
-    return [dict(r) for r in rows]
+    # 顺带把「是否正在同步」带上：前端据此在状态列显示「同步中」。
+    # 只探 git 仓 —— OBS 仓没有同步态，逐个试也会平白建出一堆锁文件。
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["syncing"] = is_git(item) and is_syncing(item)
+        out.append(item)
+    return out
 
 
 @router.post("", response_model=CodeRepoInfo)

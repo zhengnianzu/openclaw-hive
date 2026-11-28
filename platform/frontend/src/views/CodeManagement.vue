@@ -45,6 +45,7 @@
         <el-table-column label="当前 commit" width="120" align="center" resizable>
           <template #default="{row}">
             <span v-if="!isGit(row)" class="muted">—</span>
+            <el-icon v-else-if="row.syncing" class="is-loading"><Loading /></el-icon>
             <span v-else-if="row.resolved_commit" class="mono">{{ shortSha(row.resolved_commit) }}</span>
             <el-tag v-else type="info" size="small">未同步</el-tag>
           </template>
@@ -57,13 +58,16 @@
         </el-table-column>
         <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip resizable>
           <template #default="{row}">
-            <span v-if="row.description">{{ row.description }}</span>
+            <!-- pre-line：首行是同步写入的 commit 摘要，换行后是用户说明，
+                 默认的空白折叠会把两行并成一行 -->
+            <span v-if="row.description" style="white-space:pre-line">{{ row.description }}</span>
             <span v-else class="muted">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="80" align="center" resizable>
+        <el-table-column label="状态" width="90" align="center" resizable>
           <template #default="{row}">
-            <el-tag v-if="row.enabled !== false" type="success" size="small">已启用</el-tag>
+            <el-tag v-if="row.syncing" type="warning" size="small">同步中</el-tag>
+            <el-tag v-else-if="row.enabled !== false" type="success" size="small">已启用</el-tag>
             <el-tag v-else type="info" size="small">已停用</el-tag>
           </template>
         </el-table-column>
@@ -78,7 +82,9 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item v-if="authStore.isOperator" command="edit">编辑</el-dropdown-item>
-                    <el-dropdown-item v-if="authStore.isOperator && isGit(row)" command="sync">同步最新</el-dropdown-item>
+                    <el-dropdown-item v-if="authStore.isOperator && isGit(row)" command="sync" :disabled="row.syncing">
+                      {{ row.syncing ? '同步中…' : '同步最新' }}
+                    </el-dropdown-item>
                     <el-dropdown-item command="download">下载</el-dropdown-item>
                     <el-dropdown-item command="status">检查状态</el-dropdown-item>
                     <el-dropdown-item v-if="authStore.isOperator" command="toggle" divided>
@@ -332,9 +338,9 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, ArrowDown, Search } from '@element-plus/icons-vue'
+import { Plus, ArrowDown, Search, Loading } from '@element-plus/icons-vue'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
 import { obsBucket, joinBucket } from '../api/obsConfig'
@@ -416,16 +422,19 @@ async function toggleEnabled(row) {
   } catch { ElMessage.error('切换失败') }
 }
 
-async function loadRepos() {
-  loading.value = true
+async function loadRepos({ silent = false } = {}) {
+  if (!silent) loading.value = true
   try {
     // 筛选交给后端做，避免前端只在当前页内过滤
     const params = {}
     if (versionQuery.value.trim()) params.version = versionQuery.value.trim()
     if (tagFilter.value) params.tag = tagFilter.value
     repos.value = await api.get('/code-repos', { params })
+    // 有同步在跑就自动续上轮询，全结束就停，避免空转
+    if (hasSyncing()) startSyncPolling()
+    else stopSyncPollingIfIdle()
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -613,17 +622,25 @@ async function handleUpdate() {
 }
 
 async function syncRepo(row) {
+  if (row.syncing) return
   downloadingId.value = row.id
+  // 同步是阻塞的（POST 直到拉取+打包结束才返回），先把本地状态点亮，
+  // 让「同步中」立刻可见；同时后台轮询，别的页面/别的用户也能看到。
+  row.syncing = true
+  startSyncPolling()
   try {
     const res = await api.post(`/code-repos/${row.id}/sync`)
     if (res.updated) {
       ElMessage.success(res.message)
-      loadRepos()  // resolved_commit / synced_at 变了，刷新列表
     } else {
       ElMessage.info(res.message)
     }
+  } catch {
+    // 409 = 已有同步在跑；其余交给全局拦截器提示，这里只保证状态归位
   } finally {
     downloadingId.value = null
+    await loadRepos()  // resolved_commit / synced_at / 描述里的 commit 都变了
+    stopSyncPollingIfIdle()
   }
 }
 
@@ -640,6 +657,30 @@ async function downloadRepo(row) {
     downloadingId.value = null
   }
 }
+
+// ---- 同步中的轮询 ----
+// 同步可能要十几秒到一分钟（取决于到 GitHub 的链路）。轮询只做一件事：
+// 让「同步中」这个状态在别处也能看见，并在同步结束时自动刷新成新 commit。
+let syncPollTimer = null
+
+const hasSyncing = () => (repos.value || []).some(r => r.syncing)
+
+function startSyncPolling() {
+  if (syncPollTimer) return
+  // silent：轮询刷新不该让表格每 3 秒闪一次 loading 遮罩
+  syncPollTimer = setInterval(() => loadRepos({ silent: true }), 3000)
+}
+
+function stopSyncPollingIfIdle() {
+  if (syncPollTimer && !hasSyncing()) {
+    clearInterval(syncPollTimer)
+    syncPollTimer = null
+  }
+}
+
+onUnmounted(() => {
+  if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null }
+})
 
 async function checkStatus(row) {
   try {
